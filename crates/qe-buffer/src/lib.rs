@@ -25,18 +25,80 @@ mod undo;
 #[cfg(windows)]
 pub use mapped::{IndexTiming, MappedStore, Notify};
 pub use tree::TreeShape;
-pub use undo::{DEFAULT_UNDO_LIMIT_BYTES, UndoHistory};
+pub use undo::{DEFAULT_UNDO_LIMIT_BYTES, ReleasedHistory, UndoHistory};
 
 use measure::Sum;
 #[cfg(windows)]
 use measure::measure;
-use tree::{Kind, Node, Tree, byte_at, from_text, is_boundary, prefix, splice, split, visit};
+use tree::{
+    Kind, Node, Tree, TreeBuilder, byte_at, from_text, is_boundary, prefix, splice, split, visit,
+};
 use undo::Edit;
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
 
 fn fresh_stamp() -> u64 {
     NEXT_STAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Text already cut into a store's tree. A worker makes it, because that takes time in
+/// proportion to the text. `UndoHistory::replace_built` then puts it in the store without
+/// reading the text again. A clone costs one reference count.
+#[derive(Clone)]
+pub struct BuiltText {
+    tree: Tree,
+}
+
+impl BuiltText {
+    pub fn len(&self) -> usize {
+        self.tree.as_ref().map_or(0, |n| n.sum.bytes)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tree.is_none()
+    }
+    /// The whole text. It costs a copy of it, so it is for checks.
+    pub fn to_text(&self) -> String {
+        let mut text = String::with_capacity(self.len());
+        if let Some(n) = &self.tree {
+            visit(n, 0, n.sum.bytes, &mut |part| {
+                text.push_str(part);
+                true
+            });
+        }
+        text
+    }
+}
+
+impl PartialEq for BuiltText {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.to_text() == other.to_text()
+    }
+}
+
+impl Eq for BuiltText {}
+
+impl std::fmt::Debug for BuiltText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BuiltText({} bytes)", self.len())
+    }
+}
+
+/// Makes a `BuiltText` from text that arrives in parts, on any thread.
+#[derive(Default)]
+pub struct TextBuilder(TreeBuilder);
+
+impl TextBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn push_str(&mut self, text: &str) {
+        self.0.push_str(text);
+    }
+    pub fn finish(self) -> BuiltText {
+        BuiltText {
+            tree: self.0.finish(),
+        }
+    }
 }
 
 /// The editable store. Each real edit makes a new stamp, unique in the process,
@@ -159,12 +221,23 @@ impl PieceStore {
         range: Range<ByteOffset>,
         text: &str,
     ) -> (TrackedChange, Tree) {
+        self.splice_tree(range, from_text(text))
+    }
+    /// The same, with text that is already a tree. Its cost does not follow the text's size.
+    pub(crate) fn splice_built(
+        &mut self,
+        range: Range<ByteOffset>,
+        text: &BuiltText,
+    ) -> (TrackedChange, Tree) {
+        self.splice_tree(range, text.tree.clone())
+    }
+    fn splice_tree(&mut self, range: Range<ByteOffset>, middle: Tree) -> (TrackedChange, Tree) {
         let before = self.line_count();
         let start16 = self.utf16_at(range.start.0).0;
         let (left, rest) = split(self.root.clone(), range.start.0);
         let (removed, right) = split(rest, range.end.0 - range.start.0);
-        let middle = from_text(text);
         let new_units = units_of(&middle);
+        let new_len = middle.as_ref().map_or(0, |n| n.sum.bytes);
         let utf16 = Utf16Change {
             start: Utf16Offset(start16),
             old_end: Utf16Offset(start16 + units_of(&removed)),
@@ -175,7 +248,7 @@ impl PieceStore {
         self.stamp = fresh_stamp();
         let change = TextChange {
             replaced: range,
-            new_len: text.len(),
+            new_len,
             line_count_delta: self.line_count() as isize - before as isize,
             revision: self.revision,
         };

@@ -57,6 +57,8 @@ pub enum ShellEvent {
     ContentInput(InputEvent),
     /// The text area held the mouse, and another window took it. A selection drag ends.
     ContentCaptureLost,
+    /// The pointer left the window's client area or its frame. Hover in the text area ends.
+    ContentPointerLeft,
     /// A timer from `ShellHandle::set_timer` or `ViewRequest::RequestTimer` fired.
     Timer(u32),
     /// Another thread called `ShellWaker::wake`. Several calls can arrive as one event.

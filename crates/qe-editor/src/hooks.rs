@@ -10,7 +10,7 @@ use qe_api::{
     LineLayout, LookupError, Point, Rect, StoreStatus, TextPosition, TextSnapshot, TextStore,
     Theme, TrackedChange, Utf16Change, Utf16Offset, ViewContext,
 };
-use qe_buffer::PieceStore;
+use qe_buffer::{BuiltText, PieceStore, TextBuilder};
 use std::{
     collections::VecDeque,
     ops::Range,
@@ -30,6 +30,8 @@ fn new_document() -> u64 {
     NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// How much text before the caret a typing filter sees.
+const TYPING_FILTER_BYTES: usize = 8;
 /// How many changes `changes_since` remembers.
 const CHANGE_LOG: usize = 4096;
 /// `range_rects` refuses a range over more lines than this.
@@ -149,14 +151,17 @@ impl RangeList {
     /// a range the edit touches inside is dropped. An insertion at either end of a range
     /// leaves the range as it was, without the new text.
     fn edit(&mut self, start: usize, old_end: usize, new_len: usize) {
-        while self.before.last().is_some_and(|r| r.end > start) {
-            if let Some(range) = self.before.pop() {
-                self.after.push((
-                    range.start as isize - self.delta,
-                    range.end as isize - self.delta,
-                ));
-            }
-        }
+        // Marks inside the edit go at once, so an edit over 100,000 of them does not walk them.
+        let keep = self.before.partition_point(|r| r.end <= start);
+        let gone = keep + self.before[keep..].partition_point(|r| r.start < old_end);
+        let delta = self.delta;
+        self.after.extend(
+            self.before[gone..]
+                .iter()
+                .rev()
+                .map(|r| (r.start as isize - delta, r.end as isize - delta)),
+        );
+        self.before.truncate(keep);
         while let Some(range) = self.after.last().map(|r| self.shifted(r)) {
             if range.end > start {
                 break;
@@ -164,12 +169,10 @@ impl RangeList {
             self.after.pop();
             self.before.push(range);
         }
-        while let Some(range) = self.after.last().map(|r| self.shifted(r)) {
-            if range.start >= old_end {
-                break;
-            }
-            self.after.pop();
-        }
+        let kept = self
+            .after
+            .partition_point(|r| self.shifted(r).start >= old_end);
+        self.after.truncate(kept);
         self.delta += new_len as isize - (old_end - start) as isize;
     }
     /// The ranges that overlap `window`, in order.
@@ -354,7 +357,7 @@ pub struct TextEdit {
 pub struct PreparedEdits {
     base_revision: u64,
     range: Range<ByteOffset>,
-    text: String,
+    text: BuiltText,
     count: usize,
 }
 impl PreparedEdits {
@@ -379,7 +382,8 @@ impl PreparedEdits {
 /// memory in proportion to the bytes from the first edit to the last, however few the
 /// edits are. So run it on a worker unless that span is small and the snapshot is of an
 /// editable view. `edits` must be sorted, must not overlap, and must start and end on
-/// character edges. It stops soon after `cancel` turns true.
+/// character edges. It stops soon after `cancel` turns true. The result is text already
+/// cut into the store's own tree, which `apply_edits` takes without reading it again.
 pub fn prepare_edits(
     snapshot: &dyn TextSnapshot,
     edits: &[TextEdit],
@@ -404,14 +408,18 @@ pub fn prepare_edits(
     let removed: usize = edits.iter().map(|e| e.range.end.0 - e.range.start.0).sum();
     let added: usize = edits.iter().map(|e| e.text.len()).sum();
     let kept = (span.end.0 - span.start.0) - removed;
-    let mut text = String::new();
-    text.try_reserve_exact(kept.saturating_add(added))
+    // The tree asks for its memory leaf by leaf, and a failed leaf ends the app. So ask for
+    // it all once first, which reads as a message when it cannot be had.
+    let mut room = String::new();
+    room.try_reserve_exact(kept.saturating_add(added))
         .map_err(|_| {
             format!(
                 "There is not enough memory to replace this text ({}).",
                 crate::plain_size(kept.saturating_add(added))
             )
         })?;
+    drop(room);
+    let mut text = TextBuilder::new();
     let mut next = span.start;
     for edit in edits {
         if cancel.load(Ordering::Acquire) {
@@ -433,9 +441,36 @@ pub fn prepare_edits(
     Ok(PreparedEdits {
         base_revision: snapshot.revision(),
         range: span,
-        text,
+        text: text.finish(),
         count: edits.len(),
     })
+}
+
+/// Called for one typed character, before it goes in, on the UI thread. It gets the
+/// character and the last 8 bytes before the caret, cut back to a character's edge. It gives
+/// the bytes to remove before the caret and the text to put there, or `None` to type as usual.
+pub type TypingFilter = Box<dyn FnMut(&str, &str) -> Option<(usize, String)>>;
+
+/// Changes what Cut, Delete and Paste do, for Smart Copy. Runs on the UI thread. `before` and
+/// `after` are the characters next to the selection.
+pub trait ClipboardFilter {
+    /// What a Cut or a Delete of `selected` removes. A Cut still copies only `selected`.
+    fn cut_range(
+        &mut self,
+        selected: Range<ByteOffset>,
+        before: Option<char>,
+        after: Option<char>,
+        was_word: bool,
+    ) -> Range<ByteOffset>;
+    /// The text a Paste puts in. `was_word` says that the last Copy or Cut here took a word
+    /// selection, and that the clipboard still holds that same text.
+    fn paste_text(
+        &mut self,
+        text: &str,
+        before: Option<char>,
+        after: Option<char>,
+        was_word: bool,
+    ) -> String;
 }
 
 /// What a host asks of the editor, in order with the keys before it.
@@ -576,6 +611,14 @@ pub(crate) struct HookState {
     /// A layout, a width or a font changed, so the composition lays out again.
     pub(crate) composition_stale: bool,
     pub(crate) composition_end: Option<CompositionEnd>,
+    pub(crate) typing_filter: Option<TypingFilter>,
+    pub(crate) clipboard_filter: Option<Box<dyn ClipboardFilter>>,
+    /// The selection came from a double click or a drag from one.
+    pub(crate) word_selection: bool,
+    /// The text of the last Copy or Cut, if it was of a word selection and a filter was set.
+    pub(crate) copied_word: Option<String>,
+    /// The anchor in `pending_anchor` came from `reveal_range`, and goes to the top or not.
+    pub(crate) reveal_to_top: Option<bool>,
 }
 impl Default for HookState {
     fn default() -> Self {
@@ -595,6 +638,11 @@ impl Default for HookState {
             save_point_gone: false,
             composition_stale: false,
             composition_end: None,
+            typing_filter: None,
+            clipboard_filter: None,
+            word_selection: false,
+            copied_word: None,
+            reveal_to_top: None,
         }
     }
 }
@@ -1745,6 +1793,49 @@ impl EditorView {
         }
         self.finish(Instant::now(), ctx);
     }
+    /// Puts this line at the top of the view: its first row for a whole number, and that
+    /// share of its height for a fraction. It is the line's real place, however lines above
+    /// it wrap, and it stays that line as their layouts arrive. A line past the end means
+    /// the last line. It ends any wait for a place, as the wheel does.
+    pub fn set_top_line(&mut self, first: f64, ctx: &mut ViewContext) {
+        let first = if first.is_finite() {
+            first.max(0.0)
+        } else {
+            0.0
+        };
+        let line = (first.floor() as usize).min(self.heights.len().saturating_sub(1));
+        let line = LineIndex(line);
+        let share = (first - line.0 as f64).clamp(0.0, 1.0);
+        let height = self
+            .heights
+            .line_height(line)
+            .map_or(f64::from(self.row_height), |h| f64::from(h.0));
+        self.set_scroll_position(self.heights.line_to_scroll(line) + share * height, ctx);
+    }
+    /// Scrolls until the start of `range` is at the top of the view, or its end at the
+    /// bottom. The caret and the selection stay. Text with no layout yet is placed by
+    /// estimate at once, and the place is corrected as its layout arrives, unless the user
+    /// scrolls first. Text the store does not yet know gives its `LookupError`, and nothing
+    /// moves.
+    pub fn reveal_range(
+        &mut self,
+        range: Range<ByteOffset>,
+        align_top: bool,
+        ctx: &mut ViewContext,
+    ) -> Result<(), LookupError> {
+        self.source().try_byte_to_position(range.start)?;
+        self.source().try_byte_to_position(range.end)?;
+        let byte = if align_top { range.start } else { range.end };
+        let now = Instant::now();
+        self.keep_caret_visible = false;
+        self.reveal_pending = false;
+        self.pending_anchor = Some((byte, now));
+        self.hooks.reveal_to_top = Some(align_top);
+        self.apply_anchor(now, ctx);
+        self.schedule(ctx);
+        self.finish(now, ctx);
+        Ok(())
+    }
     /// The text's height so far. Lines with no layout count at their estimated height, so
     /// this changes as layouts arrive.
     pub fn total_height(&self) -> f64 {
@@ -1788,6 +1879,154 @@ impl EditorView {
         self.bounds.x.0 + self.page_margin()
     }
 
+    // ---- Typing and the clipboard ----
+
+    /// Sets what runs on each typed character. With none, typing goes straight in.
+    pub fn set_typing_filter(&mut self, filter: Option<TypingFilter>) {
+        self.hooks.typing_filter = filter;
+    }
+    /// True when the selection was made by double click, by word.
+    pub fn selection_is_word(&self) -> bool {
+        self.hooks.word_selection && self.caret != self.anchor
+    }
+    /// Sets what runs on Cut, Delete and Paste. With none, each works on the selection alone.
+    pub fn set_clipboard_filter(&mut self, filter: Option<Box<dyn ClipboardFilter>>) {
+        self.hooks.clipboard_filter = filter;
+    }
+    pub(crate) fn has_typing_filter(&self) -> bool {
+        self.hooks.typing_filter.is_some()
+    }
+    /// The last few bytes before `at`, from a character's edge.
+    fn text_before(&mut self, at: ByteOffset, bytes: usize) -> Result<String, LookupError> {
+        let from = at.0.saturating_sub(bytes);
+        let from = self.with_stops(|s| s.edge_forward(from, at.0))?;
+        let mut text = String::with_capacity(bytes);
+        self.source()
+            .try_visit_chunks(ByteOffset(from)..at, &mut |part| text.push_str(part))?;
+        Ok(text)
+    }
+    /// The text from `at` to a few bytes after it, up to a character's edge.
+    fn text_after(&mut self, at: ByteOffset, bytes: usize) -> Result<String, LookupError> {
+        let known = self.source().status().known_bytes.0;
+        let to = at.0.saturating_add(bytes).min(known);
+        let to = self.with_stops(|s| s.edge_backward(to, at.0))?;
+        let mut text = String::with_capacity(bytes);
+        self.source()
+            .try_visit_chunks(at..ByteOffset(to), &mut |part| text.push_str(part))?;
+        Ok(text)
+    }
+    /// The characters on each side of a range. A side that cannot be read counts as nothing
+    /// there, and a warning says so.
+    fn chars_around(&mut self, range: &Range<ByteOffset>) -> (Option<char>, Option<char>) {
+        const LONGEST_CHAR: usize = 4;
+        let sides = self
+            .text_before(range.start, LONGEST_CHAR)
+            .and_then(|before| {
+                let after = self.text_after(range.end, LONGEST_CHAR)?;
+                Ok((before, after))
+            });
+        match sides {
+            Ok((before, after)) => (before.chars().next_back(), after.chars().next()),
+            Err(problem) => {
+                self.set_warning(
+                    format!("The text next to the selection could not be read: {problem:?}."),
+                    false,
+                );
+                (None, None)
+            }
+        }
+    }
+    /// A typed character, through the filter. The caller checked that there is one.
+    pub(crate) fn type_filtered(&mut self, typed: &str, ctx: &mut ViewContext) {
+        // A composition's text goes in first, because the filter must see it before the caret.
+        self.commit_composition_first(ctx);
+        let range = self.selection();
+        let before = match self.text_before(range.start, TYPING_FILTER_BYTES) {
+            Ok(before) => before,
+            Err(problem) => {
+                // After the edit, because an edit clears the warning before it.
+                self.apply_edit(range, typed, true, ctx);
+                self.set_warning(
+                    format!("Substitution was skipped for this character: {problem:?}."),
+                    false,
+                );
+                return;
+            }
+        };
+        let answer = self
+            .hooks
+            .typing_filter
+            .as_mut()
+            .and_then(|filter| filter(typed, &before));
+        let Some((remove, insert)) = answer else {
+            self.apply_edit(range, typed, true, ctx);
+            return;
+        };
+        let keeps_edges = remove <= before.len() && before.is_char_boundary(before.len() - remove);
+        if keeps_edges {
+            let start = ByteOffset(range.start.0 - remove);
+            self.apply_edit(start..range.end, &insert, true, ctx);
+        } else {
+            self.apply_edit(range, typed, true, ctx);
+            self.set_warning(
+                format!("A substitution asked to remove {remove} bytes, and it was skipped."),
+                false,
+            );
+        }
+    }
+    /// What a Cut or a Delete of the selection removes.
+    pub(crate) fn range_to_remove(&mut self, selected: Range<ByteOffset>) -> Range<ByteOffset> {
+        if self.hooks.clipboard_filter.is_none() {
+            return selected;
+        }
+        let was_word = self.selection_is_word();
+        let (before, after) = self.chars_around(&selected);
+        match self.hooks.clipboard_filter.as_mut() {
+            Some(filter) => filter.cut_range(selected, before, after, was_word),
+            None => selected,
+        }
+    }
+    /// What a Paste puts in.
+    pub(crate) fn text_to_paste(&mut self, text: String, selected: &Range<ByteOffset>) -> String {
+        if self.hooks.clipboard_filter.is_none() {
+            return text;
+        }
+        let was_word = self.hooks.copied_word.as_deref() == Some(text.as_str());
+        let (before, after) = self.chars_around(selected);
+        match self.hooks.clipboard_filter.as_mut() {
+            Some(filter) => filter.paste_text(&text, before, after, was_word),
+            None => text,
+        }
+    }
+    /// A Copy or a Cut of this text just reached the clipboard. `was_word` is from before
+    /// the Cut removed the selection. A big copy passes `None`, and never counts as a word.
+    pub(crate) fn note_copied(&mut self, text: Option<&str>, was_word: bool) {
+        if self.hooks.clipboard_filter.is_some() {
+            self.hooks.copied_word = text.filter(|_| was_word).map(str::to_string);
+        }
+    }
+
+    // ---- Caret stops ----
+
+    /// The caret stop after `byte`, or `None` at the end of the text. This is the rule the
+    /// arrow keys use. It can shape one short piece of text, as they do. A byte inside a
+    /// character is `LookupError::OutOfRange`.
+    pub fn caret_stop_after(
+        &mut self,
+        byte: ByteOffset,
+    ) -> Result<Option<ByteOffset>, LookupError> {
+        self.with_stops(|s| s.after(byte.0))
+            .map(|stop| stop.map(ByteOffset))
+    }
+    /// The caret stop before `byte`, or `None` at the start of the text. See `caret_stop_after`.
+    pub fn caret_stop_before(
+        &mut self,
+        byte: ByteOffset,
+    ) -> Result<Option<ByteOffset>, LookupError> {
+        self.with_stops(|s| s.before(byte.0))
+            .map(|stop| stop.map(ByteOffset))
+    }
+
     // ---- Edits from tools ----
 
     /// Runs `apply_edits` with its edit refused by the history, as an out-of-step store
@@ -1806,8 +2045,10 @@ impl EditorView {
     }
     /// Applies edits that `prepare_edits` made, as one edit and one undo step, and then
     /// sets the selection. It refuses edits made for another revision, because their
-    /// offsets no longer mean the same text. Its cost follows `new_len`, and not how many
-    /// replacements went into it.
+    /// offsets no longer mean the same text. `prepare_edits` did the work that follows the
+    /// text's size, so this takes the finished tree by reference count. The caller may drop
+    /// `edits` here afterward, and that frees little. Edits that were refused still hold
+    /// their whole tree, so give those to `discard_edits`.
     pub fn apply_edits(
         &mut self,
         edits: &PreparedEdits,
@@ -1817,6 +2058,11 @@ impl EditorView {
         let result = self.apply_edits_inner(edits, selection, ctx);
         self.finish(Instant::now(), ctx);
         result
+    }
+    /// Frees edits that will not be applied away from the UI thread, because freeing a
+    /// big tree takes time in proportion to it.
+    pub fn discard_edits(&mut self, edits: PreparedEdits) {
+        self.send_to_free(Box::new(edits));
     }
     fn apply_edits_inner(
         &mut self,
@@ -1839,7 +2085,7 @@ impl EditorView {
         if self.hooks.test_refuse_edit {
             self.set_warning("The edit failed: refused by a test.".to_string(), false);
         } else {
-            self.apply_edit(edits.range.clone(), &edits.text, false, ctx);
+            self.apply_built(edits.range.clone(), &edits.text, selection.end, ctx);
         }
         self.history.break_group();
         // A failed edit leaves the same revision, and its warning says why.

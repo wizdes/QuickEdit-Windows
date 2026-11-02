@@ -25,9 +25,9 @@ mod load;
 mod stops;
 
 pub use hooks::{
-    ChangesSince, CompositionClause, CompositionEnd, CompositionState, DecorationKind,
-    GeometryError, HostCommand, PageWrap, PreparedEdits, RangeRect, TextEdit, VisibleRow,
-    VisibleRows, prepare_edits,
+    ChangesSince, ClipboardFilter, CompositionClause, CompositionEnd, CompositionState,
+    DecorationKind, GeometryError, HostCommand, PageWrap, PreparedEdits, RangeRect, TextEdit,
+    TypingFilter, VisibleRow, VisibleRows, prepare_edits,
 };
 pub use load::{EDITABLE_FILE_LIMIT, FileLoad, LoadOptions, LoadResult, LoadedFile};
 pub use stops::preferred_line_ending_bytes;
@@ -1078,6 +1078,20 @@ impl EditorView {
             self.set_warning("The layout workers stopped.".to_string(), true);
         }
     }
+    /// Gives something big to a worker to free.
+    pub(crate) fn send_to_free(&mut self, big: Box<dyn std::any::Any + Send>) {
+        // A failed send gives it back in the error, which frees it here.
+        if self.tasks.send(WorkerTask::DropDocument(big)).is_err() {
+            self.set_warning("The layout workers stopped.".to_string(), true);
+        }
+    }
+    /// A release list can hold a whole document after a big edit, so a worker frees it.
+    fn send_released_history(&mut self) {
+        if self.history.has_memory_to_release() {
+            let released = self.history.take_released();
+            self.send_to_free(Box::new(released));
+        }
+    }
     fn source(&self) -> &dyn TextSnapshot {
         self.mapped
             .as_ref()
@@ -1327,7 +1341,7 @@ impl EditorView {
             && now.saturating_duration_since(self.last_input) >= IDLE_BEFORE_RELEASE
             && self.history.has_memory_to_release()
         {
-            self.history.release_memory();
+            self.send_released_history();
         }
         self.finish(now, ctx);
     }
@@ -1475,6 +1489,7 @@ impl EditorView {
     fn remember_view(&mut self) {
         if self.pending_anchor.is_none() {
             let anchor = self.byte_at_top();
+            self.hooks.reveal_to_top = None;
             self.pending_anchor = Some((anchor, Instant::now()));
             self.keep_caret_visible = self.caret_is_on_screen();
         } else if let Some((_, since)) = &mut self.pending_anchor {
@@ -1562,18 +1577,35 @@ impl EditorView {
         let Some((anchor, since)) = self.pending_anchor else {
             return;
         };
-        let Some(place) = self.place(anchor, Affinity::After) else {
+        let reveal = self.hooks.reveal_to_top;
+        // A range's end belongs to the row it ends, even when that end is where a row wraps.
+        let affinity = if reveal == Some(false) {
+            Affinity::Before
+        } else {
+            Affinity::After
+        };
+        let Some(place) = self.place(anchor, affinity) else {
             if now.saturating_duration_since(since) >= DEFER_LIMIT {
                 self.pending_anchor = None;
             }
             return;
         };
         let before = (self.scroll, self.scroll_x);
-        self.scroll = place.y.clamp(0.0, self.max_scroll());
+        let y = if reveal == Some(false) {
+            place.y + f64::from(place.height) - f64::from(self.bounds.height.0)
+        } else {
+            place.y
+        };
+        self.scroll = y.clamp(0.0, self.max_scroll());
         // With wrap off the text can be far to the side, and it must be on screen too.
         if !self.wrap && place.x_known {
             self.widest = self.widest.max(place.x);
-            self.scroll_x = place.x.clamp(0.0, self.max_scroll_x());
+            let width = f64::from(self.bounds.width.0);
+            let on_screen = place.x >= self.scroll_x && place.x <= self.scroll_x + width - 2.0;
+            // A reveal leaves the view where it is sideways when the text already shows.
+            if reveal.is_none() || !on_screen {
+                self.scroll_x = place.x.clamp(0.0, self.max_scroll_x());
+            }
         }
         if (self.scroll, self.scroll_x) != before {
             ctx.invalidate(self.bounds);
@@ -2572,6 +2604,7 @@ impl EditorView {
         if caret != self.caret {
             self.history.cursor_moved();
         }
+        self.hooks.word_selection = false;
         let old = self.selection();
         let (old_caret, old_affinity) = (self.caret, self.affinity);
         self.repaint_caret(old_caret, old_affinity, ctx);
@@ -2655,6 +2688,35 @@ impl EditorView {
         {
             Ok(tracked) => {
                 let caret = ByteOffset(range.start.0 + value.len());
+                self.after_change(old, tracked.change, caret, ctx);
+            }
+            Err(e) => self.set_warning(format!("The edit failed: {e:?}"), false),
+        }
+    }
+    /// `apply_edit` for text a worker already made. Its cost does not follow the text's size.
+    /// The caret goes straight to `caret`, because a stop at the end of the edit would scroll
+    /// there and lay out a whole screen that is never shown.
+    pub(crate) fn apply_built(
+        &mut self,
+        range: Range<ByteOffset>,
+        value: &qe_buffer::BuiltText,
+        caret: ByteOffset,
+        ctx: &mut ViewContext,
+    ) {
+        if range.is_empty() && value.is_empty() {
+            return;
+        }
+        let range = match self.commit_composition_first(ctx) {
+            Some(commit) => commit.moved(range.start)..commit.moved(range.end),
+            None => range,
+        };
+        let old = self.store.snapshot();
+        match self
+            .history
+            .replace_built(&mut self.store, range.clone(), value)
+        {
+            Ok(tracked) => {
+                let caret = caret.min(self.store.len_bytes());
                 self.after_change(old, tracked.change, caret, ctx);
             }
             Err(e) => self.set_warning(format!("The edit failed: {e:?}"), false),
@@ -3066,12 +3128,15 @@ impl EditorView {
                     return;
                 }
                 let bytes = range.end.0 - range.start.0;
+                let was_word = self.selection_is_word();
+                let removes = self.range_to_remove(range.clone());
                 if bytes > COPY_ON_UI_BYTES {
                     // The edit happens now. A snapshot keeps the text for the thread.
                     if self.copy_size_is_allowed(bytes) {
                         let snapshot = self.store.snapshot();
-                        self.apply_edit(range.clone(), "", false, ctx);
+                        self.apply_edit(removes, "", false, ctx);
                         self.start_copy(range, snapshot, true);
+                        self.note_copied(None, false);
                     }
                     return;
                 }
@@ -3085,7 +3150,10 @@ impl EditorView {
                 }
                 self.cancel_copy();
                 match self.clipboard.write(&text) {
-                    Ok(()) => self.apply_edit(range, "", false, ctx),
+                    Ok(()) => {
+                        self.note_copied(Some(&text), was_word);
+                        self.apply_edit(removes, "", false, ctx);
+                    }
                     Err(e) => self.set_warning(e, false),
                 }
             }
@@ -3096,6 +3164,7 @@ impl EditorView {
             EditorCommand::Paste => match self.clipboard.read() {
                 Ok(Some(text)) if !text.is_empty() => {
                     let range = self.selection();
+                    let text = self.text_to_paste(text, &range);
                     self.apply_edit(range, &text, false, ctx);
                 }
                 Ok(_) => {}
@@ -3106,6 +3175,7 @@ impl EditorView {
             EditorCommand::DeleteBackward => {
                 let range = self.selection();
                 if !range.is_empty() {
+                    let range = self.range_to_remove(range);
                     self.apply_edit(range, "", true, ctx);
                     return;
                 }
@@ -3117,6 +3187,7 @@ impl EditorView {
             EditorCommand::DeleteForward => {
                 let range = self.selection();
                 if !range.is_empty() {
+                    let range = self.range_to_remove(range);
                     self.apply_edit(range, "", false, ctx);
                     return;
                 }
@@ -3128,6 +3199,7 @@ impl EditorView {
             EditorCommand::DeleteWordBackward => {
                 let range = self.selection();
                 if !range.is_empty() {
+                    let range = self.range_to_remove(range);
                     self.apply_edit(range, "", false, ctx);
                     return;
                 }
@@ -3139,6 +3211,7 @@ impl EditorView {
             EditorCommand::DeleteWordForward => {
                 let range = self.selection();
                 if !range.is_empty() {
+                    let range = self.range_to_remove(range);
                     self.apply_edit(range, "", false, ctx);
                     return;
                 }
@@ -3164,10 +3237,12 @@ impl EditorView {
             return;
         }
         let bytes = range.end.0 - range.start.0;
+        let was_word = self.selection_is_word();
         if bytes > COPY_ON_UI_BYTES {
             if self.copy_size_is_allowed(bytes) {
                 let snapshot = self.copy_snapshot();
                 self.start_copy(range, snapshot, false);
+                self.note_copied(None, false);
             }
             return;
         }
@@ -3178,14 +3253,16 @@ impl EditorView {
         {
             Ok(()) => {
                 self.cancel_copy();
-                if let Err(e) = self.clipboard.write(&text) {
-                    self.set_warning(e, false);
+                match self.clipboard.write(&text) {
+                    Ok(()) => self.note_copied(Some(&text), was_word),
+                    Err(e) => self.set_warning(e, false),
                 }
             }
             // The text is not in memory yet, so a thread reads it.
             Err(LookupError::NotYetKnown { .. } | LookupError::TooLong { .. }) => {
                 let snapshot = self.copy_snapshot();
                 self.start_copy(range, snapshot, false);
+                self.note_copied(None, false);
             }
             Err(e) => self.set_warning(format!("Copy failed: {e:?}"), false),
         }
@@ -4054,6 +4131,7 @@ impl EditorView {
             (origin.start, unit.end.max(origin.end))
         };
         self.set_selection(anchor, caret, affinity, false, ctx);
+        self.hooks.word_selection = self.drag_unit == DragUnit::Word;
     }
     fn line_span(&self, at: ByteOffset) -> Option<Range<ByteOffset>> {
         let position = self.source().try_byte_to_position(at).ok()?;
@@ -4095,6 +4173,7 @@ impl EditorView {
                 self.drag_unit = DragUnit::Word;
                 self.drag_origin = range.clone();
                 self.set_selection(range.start, range.end, Affinity::After, false, ctx);
+                self.hooks.word_selection = true;
             }
             3 => {
                 let range = self.line_span(byte).unwrap_or(byte..byte);
@@ -4136,8 +4215,12 @@ impl EditorView {
                 if self.can_edit() {
                     let mut buffer = [0; 4];
                     let text = c.encode_utf8(&mut buffer);
-                    let range = self.selection();
-                    self.apply_edit(range, text, true, ctx);
+                    if self.has_typing_filter() {
+                        self.type_filtered(text, ctx);
+                    } else {
+                        let range = self.selection();
+                        self.apply_edit(range, text, true, ctx);
+                    }
                 } else {
                     self.refused_edits += 1;
                 }
@@ -4245,7 +4328,7 @@ impl EditorView {
                 self.cancel_drag();
                 self.repaint_caret(self.caret, self.affinity, ctx);
                 // The user has left, so this is the idle moment to free history.
-                self.history.release_memory();
+                self.send_released_history();
                 Handled::Yes
             }
             _ => Handled::No,

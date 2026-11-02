@@ -453,6 +453,16 @@ fn hover_clears_on_leave_messages() {
 }
 
 #[test]
+fn a_pointer_that_leaves_tells_the_owner() {
+    let f = fixture(None);
+    f.events();
+    f.send(WM_MOUSELEAVE, 0, 0);
+    assert_eq!(f.events(), vec![ShellEvent::ContentPointerLeft]);
+    f.send(WM_NCMOUSELEAVE, 0, 0);
+    assert_eq!(f.events(), vec![ShellEvent::ContentPointerLeft]);
+}
+
+#[test]
 fn caption_press_acts_on_release_and_cancels_on_lost_capture() {
     let f = fixture(None);
     let w = f.width_dips();

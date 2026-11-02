@@ -125,17 +125,55 @@ pub(crate) fn from_text(text: &str) -> Tree {
         parts.push(leaf(&text[start..end]));
         start = end;
     }
-    fn build(p: &[Arc<Node>]) -> Tree {
-        match p.len() {
-            0 => None,
-            1 => Some(p[0].clone()),
-            n => Some(branch(
-                build(&p[..n / 2]).unwrap(),
-                build(&p[n / 2..]).unwrap(),
-            )),
+    build(&parts)
+}
+
+fn build(p: &[Arc<Node>]) -> Tree {
+    match p.len() {
+        0 => None,
+        1 => Some(p[0].clone()),
+        n => Some(branch(
+            build(&p[..n / 2]).unwrap(),
+            build(&p[n / 2..]).unwrap(),
+        )),
+    }
+}
+
+/// Makes a tree from text that arrives in parts, with no copy of the whole text.
+#[derive(Default)]
+pub(crate) struct TreeBuilder {
+    parts: Vec<Arc<Node>>,
+    pending: String,
+}
+
+impl TreeBuilder {
+    pub fn push_str(&mut self, mut text: &str) {
+        while !text.is_empty() {
+            let room = CHUNK - self.pending.len();
+            if text.len() < room {
+                self.pending.push_str(text);
+                return;
+            }
+            let mut end = room;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if self.pending.is_empty() {
+                self.parts.push(leaf(&text[..end]));
+            } else {
+                self.pending.push_str(&text[..end]);
+                self.parts.push(leaf(&self.pending));
+                self.pending.clear();
+            }
+            text = &text[end..];
         }
     }
-    build(&parts)
+    pub fn finish(mut self) -> Tree {
+        if !self.pending.is_empty() {
+            self.parts.push(leaf(&self.pending));
+        }
+        build(&self.parts)
+    }
 }
 
 fn last_leaf(mut n: &Node) -> (&str, Sum) {

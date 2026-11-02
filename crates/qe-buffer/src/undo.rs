@@ -3,8 +3,8 @@
 //! An edit records where the change is, how long the text now in the document
 //! is, and a tree holding the text it replaced. Undo swaps those two, so text
 //! is never copied and a typed run costs one record however long it is.
-use crate::PieceStore;
 use crate::tree::{CHUNK, Kind, Node, Tree, join, split};
+use crate::{BuiltText, PieceStore};
 use qe_api::{ByteOffset, EditError, TextChange, TrackedChange};
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -114,6 +114,10 @@ impl Trash {
     }
 }
 
+/// History that `UndoHistory::take_released` took out. Dropping this frees it, so it can
+/// go to a worker, and its size does not then matter to the thread that holds the view.
+pub struct ReleasedHistory(#[allow(dead_code)] Trash);
+
 /// Records edits to one `PieceStore` so that they can be undone.
 ///
 /// - **One writer.** Undo refuses to run after an edit it did not record. Direct
@@ -134,7 +138,9 @@ impl Trash {
 /// - **Key press cost.** Clearing redo or dropping old groups moves them to a list
 ///   in constant time. Each edit then frees the larger of 256 nodes and 4 nodes per
 ///   leaf of text it added. Every node was made by some edit, so the list cannot grow
-///   without limit even when `release_memory` is never called.
+///   without limit even when `release_memory` is never called. `replace_built` is the
+///   one exception: it frees only 256 nodes, because it must not take time that follows
+///   the text's size. So a caller of it must call `take_released` or `release_memory`.
 pub struct UndoHistory {
     undo: VecDeque<Group>,
     redo: VecDeque<Group>,
@@ -249,6 +255,11 @@ impl UndoHistory {
             self.trash.release(RELEASE_PER_EDIT);
         }
     }
+    /// Takes out all history that is waiting to be released, in constant time, for another
+    /// thread to free.
+    pub fn take_released(&mut self) -> ReleasedHistory {
+        ReleasedHistory(std::mem::take(&mut self.trash))
+    }
     /// True when released history is still waiting to be freed.
     pub fn has_memory_to_release(&self) -> bool {
         !self.trash.is_empty()
@@ -311,8 +322,7 @@ impl UndoHistory {
     ) -> Result<TrackedChange, EditError> {
         self.check_attached(store)?;
         store.check_range(&range)?;
-        let empty_range = range.start == range.end;
-        if empty_range && text.is_empty() {
+        if range.start == range.end && text.is_empty() {
             let start = store.utf16_at(range.start.0);
             return Ok(TrackedChange {
                 change: store.no_change(range),
@@ -324,9 +334,51 @@ impl UndoHistory {
             });
         }
         let (tracked, removed) = store.splice_text(range.clone(), text);
+        let inserted = text.len();
+        // Freeing in step with what this edit made keeps the list from growing.
+        let release = RELEASE_PER_EDIT.max(4 * (inserted / CHUNK + 1));
+        self.record(store, range, inserted, removed, typing, release);
+        Ok(tracked)
+    }
+    /// Like `replace_tracked` for one undo step of its own, with text a worker already made.
+    /// Its cost does not follow the size of the text, so it frees only the fewest nodes. The
+    /// rest of the release list waits for `take_released` or `release_memory`.
+    pub fn replace_built(
+        &mut self,
+        store: &mut PieceStore,
+        range: Range<ByteOffset>,
+        text: &BuiltText,
+    ) -> Result<TrackedChange, EditError> {
+        self.check_attached(store)?;
+        store.check_range(&range)?;
+        if range.start == range.end && text.is_empty() {
+            let start = store.utf16_at(range.start.0);
+            return Ok(TrackedChange {
+                change: store.no_change(range),
+                utf16: qe_api::Utf16Change {
+                    start,
+                    old_end: start,
+                    new_end: start,
+                },
+            });
+        }
+        let (tracked, removed) = store.splice_built(range.clone(), text);
+        self.record(store, range, text.len(), removed, false, RELEASE_PER_EDIT);
+        Ok(tracked)
+    }
+    /// Writes down an edit that the store has just made.
+    fn record(
+        &mut self,
+        store: &PieceStore,
+        range: Range<ByteOffset>,
+        inserted: usize,
+        removed: Tree,
+        typing: bool,
+        release: usize,
+    ) {
+        let empty_range = range.start == range.end;
         self.attached = Some(store.stamp());
         let state = self.fresh_state();
-        let inserted = text.len();
         let at_caret = typing && !self.undo.is_empty();
         let continues_insert = at_caret && empty_range && self.typing_end == Some(range.start.0);
         let continues_delete =
@@ -378,10 +430,7 @@ impl UndoHistory {
             self.trash.add_stack(std::mem::take(&mut self.redo), charge);
         }
         self.evict();
-        // Freeing in step with what this edit made keeps the list from growing.
-        self.trash
-            .release(RELEASE_PER_EDIT.max(4 * (inserted / CHUNK + 1)));
-        Ok(tracked)
+        self.trash.release(release);
     }
     /// A Backspace at the end of the newest edit. It takes back typed text first and
     /// then adds what it removed from before the edit.

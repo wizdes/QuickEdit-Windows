@@ -2222,6 +2222,9 @@ impl Shared {
                 }
                 self.strip_action(msg, |strip, ctx| strip.pointer_left(ctx));
                 self.bar_action(|bar, ctx| bar.pointer_left(ctx));
+                self.queue
+                    .borrow_mut()
+                    .push_back(ShellEvent::ContentPointerLeft);
                 // The same handler in Terminal: its `break` reaches `DefWindowProc`.
                 default()
             }

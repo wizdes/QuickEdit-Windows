@@ -54,7 +54,7 @@ Three threads share the store. Each file reader has its own handle, because read
 | Worker | Indexes the file 4 MiB at a time. Stops when the last live store goes away. |
 | Reader | Loads pages and runs file checks on request. Stops when the last store or snapshot goes away. |
 
-`open` reads the first 64 KiB and keeps it in memory, so the first screen never waits. `open` does touch the disk, so run it off the UI thread. A checkpoint about every 64 KiB holds running totals of bytes, UTF-16 units and line breaks. A lookup does a binary search on the checkpoints and then scans one block. A block spans at most 2 pages, so `line_range` reads at most 4. The line breaks of the 4 latest blocks stay in memory, so a frame of nearby lines scans once.
+`open` reads the first 64 KiB and keeps it in memory, so the first screen does not wait. If another app's lock holds that read back, `open` still succeeds, the page is not known, and `try_*` queries give `NotYetKnown` until a thread reads it. `open` does touch the disk, so run it off the UI thread. A checkpoint about every 64 KiB holds running totals of bytes, UTF-16 units and line breaks. A lookup does a binary search on the checkpoints and then scans one block. A block spans at most 2 pages, so `line_range` reads at most 4. The line breaks of the 4 latest blocks stay in memory, so a frame of nearby lines scans once.
 
 ### Which query to use
 
@@ -89,11 +89,13 @@ A failure stays until the file is opened again.
 
 A bad byte in the first 64 KiB makes `open` return an error, since that file is not UTF-8 text to show as is.
 
-**Locks are not failures at first.** A lock error (Windows error 33) or a sharing error (32) means "try again". A `try_*` query gives `NotYetKnown`, and a plain query keeps waiting. The worker retries every 50 ms. If the same lock lasts over 30 s, it becomes a failure, so that no plain query can wait for ever.
+**Locks are not failures at first.** A lock error (Windows error 33) or a sharing error (32) means "try again". A `try_*` query gives `NotYetKnown`, and a plain query keeps waiting. The worker and a waiting plain query retry about every 50 ms. Each range of the file has its own clock, so a read that works somewhere else does not hold back the clock of one that waits. If a lock holds one range back for over 30 s, it becomes a failure, so that no plain query can wait for ever. Only reads that someone asked for count: a range nobody has asked about for 1 s starts a new clock next time. A short plain read that waits also ends when the last live store goes away, and that ends only this read.
+
+**A lock wakes whoever is held back.** A `try_*` query that met a lock has nothing else to bring it back, so while a lock holds a page back, the reader runs `Notify` every 100 ms. A view asks again at each wake if it still needs that page, and the next wake depends on that ask. So the wakes stop when the lock ends or when nobody asks. No lock means no wake and no timer.
 
 ### Notify
 
-`open_with_notify` takes a callback that runs after the index grows, a page loads or the store fails. It runs on one of the store's threads, so it must only post a message and return.
+`open_with_notify` takes a callback that runs after the index grows, a page loads or the store fails, and every 100 ms while a lock holds back a page that someone still asks for. It runs on one of the store's threads, or on the thread of the query that found a failure, which can be the UI thread. So it must only post a message and return.
 
 - No call comes from the work that `open` does itself.
 - Calls can start as soon as the threads start, which can be just before `open` returns.
@@ -109,7 +111,7 @@ The live store's `revision` goes up each time the index grows. The index and the
 
 Two checks work together.
 
-**The file check** compares the file at the path and the handle we hold with what `open` saw: file id, volume, length, creation time, last write time and NTFS's change time. It runs on the reader or the worker, never on the caller.
+**The file check** compares the file at the path and the handle we hold with what `open` saw: file id, volume, length, creation time, last write time and NTFS's change time. It runs on the reader or the worker, except that a short `visit_chunks` runs it on its own thread. No `try_*` query runs it on the caller.
 
 - A `try_*` query asks for a check when 25 ms have passed since the last one, and does not wait. A query that comes before the answer can still give an answer from pages in memory.
 - A plain query waits for a check when one is due.
@@ -151,6 +153,8 @@ Invalid UTF-8 from such a rewrite never reaches a caller as text, since every ch
 ### Stopping
 
 The worker stops when the last live `MappedStore` for the file goes away. It checks between 4 MiB scans. The drop does not wait, so the file closes one scan later at most. A snapshot keeps the reader and its handle until the snapshot goes away too.
+
+The reader closes the handle of the short plain reads when it stops, because the last holder of the store can be the UI thread.
 
 If the OS refuses to start either thread, `open` returns the error and stops the thread that did start. `PieceStore::build_async` returns the error as well.
 

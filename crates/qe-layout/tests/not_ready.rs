@@ -15,6 +15,12 @@ struct Scripted {
     missing: Mutex<Range<usize>>,
     arrives_after: usize,
     lookups: AtomicUsize,
+    /// A store that claims every byte here is inside a character.
+    denied: Range<usize>,
+    denied_lookups: AtomicUsize,
+    /// How many times the `try_` form says "not yet" for a byte inside a character, as
+    /// it can when other threads push the page out right after the plain query.
+    pushed_out: AtomicUsize,
 }
 
 impl Scripted {
@@ -24,12 +30,29 @@ impl Scripted {
             missing: Mutex::new(missing),
             arrives_after,
             lookups: AtomicUsize::new(0),
+            denied: 0..0,
+            denied_lookups: AtomicUsize::new(0),
+            pushed_out: AtomicUsize::new(0),
         }
     }
     fn known(&self, range: Range<usize>) -> bool {
         let missing = self.missing.lock().unwrap();
         // A lookup at a byte needs the byte before it and the byte itself.
         range.end <= missing.start || range.start >= missing.end
+    }
+    fn answer(&self, byte: ByteOffset) -> Result<Utf16Offset, LookupError> {
+        if self.denied.contains(&byte.0) {
+            return Err(LookupError::OutOfRange);
+        }
+        if !self.known(byte.0..byte.0 + 1) {
+            return Err(LookupError::NotYetKnown {
+                indexed_up_to: ByteOffset(0),
+            });
+        }
+        self.text
+            .get(..byte.0)
+            .map(|s| Utf16Offset(s.encode_utf16().count()))
+            .ok_or(LookupError::OutOfRange)
     }
     fn lookups(&self) -> usize {
         self.lookups.load(Ordering::Relaxed)
@@ -51,10 +74,13 @@ impl TextSnapshot for Scripted {
     }
     fn byte_to_utf16(&self, byte: ByteOffset) -> Option<Utf16Offset> {
         let seen = self.lookups.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.denied.contains(&byte.0) {
+            self.denied_lookups.fetch_add(1, Ordering::Relaxed);
+        }
         if seen >= self.arrives_after {
             *self.missing.lock().unwrap() = 0..0;
         }
-        self.try_byte_to_utf16(byte).ok()
+        self.answer(byte).ok()
     }
     fn utf16_to_byte(&self, _: Utf16Offset) -> Option<ByteOffset> {
         None
@@ -87,15 +113,17 @@ impl TextSnapshot for Scripted {
         true
     }
     fn try_byte_to_utf16(&self, byte: ByteOffset) -> Result<Utf16Offset, LookupError> {
-        if !self.known(byte.0..byte.0 + 1) {
+        if !self.text.is_char_boundary(byte.0)
+            && self
+                .pushed_out
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+        {
             return Err(LookupError::NotYetKnown {
                 indexed_up_to: ByteOffset(0),
             });
         }
-        self.text
-            .get(..byte.0)
-            .map(|s| Utf16Offset(s.encode_utf16().count()))
-            .ok_or(LookupError::OutOfRange)
+        self.answer(byte)
     }
 }
 
@@ -124,6 +152,50 @@ fn a_window_not_in_memory_is_an_error_and_not_an_overflow() {
     ));
 }
 
+/// The search for an edge stops at the longest a UTF-8 character can be, even when a
+/// store denies each place. Past that it is a store in trouble, and the search must stay
+/// bounded on a line of any length.
+#[test]
+fn a_search_for_a_character_edge_looks_at_four_places() {
+    let engine = DirectWriteLayout::new().unwrap();
+    let mut store = Scripted::new("word ".repeat(14_000), 0..0, NEVER);
+    store.denied = 1500..60_000;
+    assert!(engine.segment_range(&store, LineIndex(0), 1).is_err());
+    assert_eq!(store.denied_lookups.load(Ordering::Relaxed), 4);
+}
+
+/// On a worker's snapshot the plain query waits for the page, so "not in memory" must not
+/// be an error there. A line that fails this way stays failed until its list is cleared.
+#[test]
+fn a_store_whose_plain_query_waits_always_gets_an_answer() {
+    let text = "word ".repeat(14_000);
+    let engine = DirectWriteLayout::new().unwrap();
+    for index in 0..3 {
+        // The page arrives on the first plain query, as it would for a store that waits.
+        let store = Scripted::new(text.clone(), all_of_the_edge_window(), 1);
+        assert_eq!(
+            engine.segment_range(&store, LineIndex(0), index).unwrap(),
+            truth(&text, index)
+        );
+    }
+}
+
+/// The plain query says "inside a character", then other threads push the page out, and
+/// the `try_` form says "not yet". One round of that must not fail the line.
+#[test]
+fn a_page_pushed_out_between_the_two_queries_is_not_an_error() {
+    let text = "語 x".repeat(14_000);
+    let engine = DirectWriteLayout::new().unwrap();
+    for index in 1..4 {
+        let store = Scripted::new(text.clone(), 0..0, NEVER);
+        store.pushed_out.store(1, Ordering::Relaxed);
+        assert_eq!(
+            engine.segment_range(&store, LineIndex(0), index).unwrap(),
+            truth(&text, index)
+        );
+    }
+}
+
 #[test]
 fn a_page_that_never_arrives_costs_a_few_lookups_whatever_the_line_length() {
     let engine = DirectWriteLayout::new().unwrap();
@@ -131,7 +203,7 @@ fn a_page_that_never_arrives_costs_a_few_lookups_whatever_the_line_length() {
         let store = Scripted::new("word ".repeat(bytes / 5), all_of_the_edge_window(), NEVER);
         assert!(engine.segment_range(&store, LineIndex(0), 1).is_err());
         assert!(
-            store.lookups() < 64,
+            store.lookups() < 16,
             "{} lookups on a line of {bytes} bytes",
             store.lookups()
         );

@@ -157,15 +157,24 @@ pub(crate) fn read(
 /// the first is a reason to look at the next byte. Taking the others for it moves a
 /// segment edge by however far a search got before a page arrived, or to the line's
 /// end if none did.
+///
+/// A store whose plain query waits can still say "not yet" to the `try_` form, if other
+/// threads pushed the page out of memory between the two calls. So "not yet" gets a
+/// second round, in which the plain query can wait for the page again. A store that
+/// never waits says the same both times, and that is the error.
 fn is_char_edge(text: &dyn TextSnapshot, at: usize) -> Result<bool, LayoutError> {
-    if text.byte_to_utf16(ByteOffset(at)).is_some() {
-        return Ok(true);
+    for _ in 0..2 {
+        if text.byte_to_utf16(ByteOffset(at)).is_some() {
+            return Ok(true);
+        }
+        match text.try_byte_to_utf16(ByteOffset(at)) {
+            Ok(_) => return Ok(true),
+            Err(LookupError::OutOfRange) => return Ok(false),
+            Err(LookupError::NotYetKnown { .. }) => {}
+            Err(_) => break,
+        }
     }
-    match text.try_byte_to_utf16(ByteOffset(at)) {
-        Ok(_) => Ok(true),
-        Err(LookupError::OutOfRange) => Ok(false),
-        Err(_) => Err(LayoutError::BadRange(ByteOffset(at)..ByteOffset(at))),
-    }
+    Err(LayoutError::BadRange(ByteOffset(at)..ByteOffset(at)))
 }
 
 /// UTF-8 has at most 3 bytes after a character's first byte, so a search for an edge

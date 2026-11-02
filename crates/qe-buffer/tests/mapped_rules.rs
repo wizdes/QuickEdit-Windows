@@ -834,6 +834,7 @@ fn a_very_long_first_line_paints_before_the_index_ends() {
     drop(text);
     let start = Instant::now();
     let store = MappedStore::open(&path).unwrap();
+    store.clear_disk_threads();
     let line = store.try_known_line(LineIndex(0)).unwrap();
     assert_eq!(line.range.start, ByteOffset(0));
     assert!(line.range.end.0 >= 60_000, "{:?}", line.range);
@@ -855,7 +856,24 @@ fn a_very_long_first_line_paints_before_the_index_ends() {
     };
     assert_eq!(store.try_position_to_byte(position), Ok(ByteOffset(300)));
     eprintln!("first screen on a very long first line: {painted:?}");
-    assert!(painted < Duration::from_millis(100), "{painted:?}");
+    // What this test proves is the work: the first screen came from memory, with no page
+    // load and no disk touched on this thread. That holds on a busy PC. The time does
+    // not: this takes about 2 ms, and a debug build next to a writer flushing 800 MB
+    // measured 233 ms. So the 100 ms budget counts in an optimized build only.
+    assert_eq!(
+        store.lookup_disk_reads(),
+        0,
+        "a page load for the first screen"
+    );
+    assert!(
+        !store.disk_threads().contains(&std::thread::current().id()),
+        "the first screen touched the disk on this thread"
+    );
+    if cfg!(debug_assertions) {
+        assert!(painted < Duration::from_secs(5), "a hang: {painted:?}");
+    } else {
+        assert!(painted < Duration::from_millis(100), "{painted:?}");
+    }
     assert!(wait_for(Duration::from_secs(120), || store.is_index_complete()));
     let done = store.try_known_line(LineIndex(0));
     assert!(

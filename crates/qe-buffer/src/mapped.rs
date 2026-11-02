@@ -44,6 +44,16 @@ const PLAIN_PATH_CHECK_US: u64 = 1000;
 /// How long another app's lock may last before the store gives up.
 const DEFAULT_LOCK_GIVE_UP: Duration = Duration::from_secs(30);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
+/// While a lock holds back a page, the reader wakes whoever asked this often, so that a
+/// view can ask again. Without a lock no such wake exists, so an idle store does no work.
+const LOCK_WAKE: Duration = Duration::from_millis(100);
+/// A range nobody has asked about for this long starts a new clock next time. The slowest
+/// asker is a view, which asks at each `LOCK_WAKE`.
+const LOCK_CLOCK_GAP_US: u64 = 1_000_000;
+/// The most ranges timed at once. The oldest goes first, which only restarts its clock.
+const LOCK_CLOCKS: usize = 64;
+/// The clock for a lock met by a file check and not by a read of a range.
+const LOCK_ON_FILE_CHECK: usize = usize::MAX;
 const WAITING_QUEUE: usize = 64;
 const SHARE_ALL: u32 = 1 | 2 | 4;
 const FILE_READ_ATTRIBUTES: u32 = 0x80;
@@ -67,9 +77,10 @@ impl From<LookupError> for Stop {
 
 type Query<T> = std::result::Result<T, Stop>;
 
-/// Runs after the index grows, a page loads or the store fails, on one of the
-/// store's own threads. It must only post a message and return. See `README.md`
-/// for when it starts and stops.
+/// Runs after the index grows, a page loads or the store fails, and while a lock holds
+/// back a page that someone still asks for. It runs on one of the store's own threads,
+/// or on the thread of the query that found a failure. It must only post a message and
+/// return. See `README.md` for when it starts and stops.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 /// Fills `buf` from `offset`. A short read loops. Zero bytes means the file ended.
@@ -104,10 +115,47 @@ fn is_lock_error(e: &io::Error) -> bool {
     )
 }
 
-/// `since` can be later than `now`, when another thread saw the same lock between
-/// this thread reading its clock and recording the time.
-fn lock_is_too_old(now: u64, since: u64, limit: u64) -> bool {
-    now.saturating_sub(since) > limit
+/// How long each range of the file has been held back by another app's lock, by the
+/// offset the read started at. Each range has its own clock, so that a read that works
+/// somewhere else cannot keep a read of a locked range waiting for ever. Times are passed
+/// in, and they can come out of order, because each thread reads the clock before it
+/// takes the lock on this list.
+#[derive(Default)]
+struct LockClocks(Vec<LockClock>);
+
+struct LockClock {
+    at: usize,
+    since: u64,
+    seen: u64,
+}
+
+impl LockClocks {
+    /// Records that a read at `at` met a lock. True when this range's lock is too old.
+    fn note(&mut self, at: usize, now: u64, limit: u64) -> bool {
+        self.0
+            .retain(|c| now.saturating_sub(c.seen) <= LOCK_CLOCK_GAP_US);
+        let index = match self.0.iter().position(|c| c.at == at) {
+            Some(index) => index,
+            None => {
+                if self.0.len() == LOCK_CLOCKS {
+                    self.0.remove(0);
+                }
+                self.0.push(LockClock {
+                    at,
+                    since: now,
+                    seen: now,
+                });
+                self.0.len() - 1
+            }
+        };
+        let clock = &mut self.0[index];
+        clock.seen = clock.seen.max(now);
+        now.saturating_sub(clock.since) > limit
+    }
+    /// A read at `at` worked, so its lock is over. Other ranges keep their clocks.
+    fn passed(&mut self, at: usize) {
+        self.0.retain(|c| c.at != at);
+    }
 }
 
 /// What the file looked like at open. `change` is NTFS's ChangeTime, which also
@@ -237,6 +285,15 @@ fn timed<T>(timer: &AtomicU64, work: impl FnOnce() -> T) -> T {
     value
 }
 
+/// How one step of the index went.
+enum Scan {
+    /// The bytes came from the file.
+    Read,
+    /// Another app's lock held them back, so nothing is known yet. Try again.
+    Locked,
+    Stop,
+}
+
 /// Work waiting for the reader thread.
 #[derive(Default)]
 struct ReaderQueue {
@@ -244,13 +301,15 @@ struct ReaderQueue {
     check_wanted: u64,
     check_done: u64,
     stop: bool,
+    /// The handle of the short plain reads, handed over to be closed on the reader.
+    closing: Option<File>,
+    /// The thread that closed it, for a test.
+    closed_on: Option<ThreadId>,
 }
 
 struct Inner {
     path: PathBuf,
     original: FileStamp,
-    /// For short plain chunk reads, on the caller's thread.
-    plain_file: File,
     size: usize,
     index: RwLock<Index>,
     indexed: AtomicUsize,
@@ -269,7 +328,7 @@ struct Inner {
     notify_on: AtomicBool,
     born: Instant,
     last_check_us: AtomicU64,
-    locked_since_us: AtomicU64,
+    lock_clocks: Mutex<LockClocks>,
     lock_give_up_us: AtomicU64,
     test_read_delay_ms: AtomicU64,
     disk_reads: AtomicU64,
@@ -329,19 +388,12 @@ impl Inner {
             threads.push(id);
         }
     }
-    /// Keeps track of how long another app's lock has lasted. Past the limit, it
-    /// counts as a failure, so that no plain query can wait for it for ever.
-    fn note_lock(&self, e: &io::Error) {
+    /// Keeps track of how long another app's lock has held back the read at `at`. Past
+    /// the limit, it counts as a failure, so that no plain query can wait for it for ever.
+    fn note_lock(&self, at: usize, e: &io::Error) {
         let now = self.now_us().max(1);
-        let since =
-            match self
-                .locked_since_us
-                .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => now,
-                Err(since) => since,
-            };
-        if lock_is_too_old(now, since, self.lock_give_up_us.load(Ordering::Relaxed)) {
+        let limit = self.lock_give_up_us.load(Ordering::Relaxed);
+        if self.lock_clocks.lock().unwrap().note(at, now, limit) {
             self.fail(format!("mapped file stayed locked: {e}"), 0);
         }
     }
@@ -350,14 +402,14 @@ impl Inner {
     /// file that shrank, was written to, was deleted or was replaced. What the path now
     /// names takes much longer to ask, so it asks only when `PLAIN_PATH_CHECK_US` has
     /// passed.
-    fn check_short_read(&self) -> Result<()> {
+    fn check_short_read(&self, file: &File) -> Result<()> {
         let due = self
             .now_us()
             .saturating_sub(self.last_check_us.load(Ordering::Relaxed))
             >= PLAIN_PATH_CHECK_US;
-        if due || !handle_still_matches(&self.plain_file, &self.original) {
+        if due || !handle_still_matches(file, &self.original) {
             // This names the reason, and it knows a lock from a change.
-            self.run_file_check(&self.plain_file)?;
+            self.run_file_check(file)?;
         }
         match self.current_failure() {
             Some(failure) if failure.valid_up_to.0 == 0 => Err(LookupError::Failed(failure)),
@@ -369,32 +421,36 @@ impl Inner {
     /// was built from. A short read costs much less than reading and hashing a whole
     /// page. A change elsewhere in the page is not this text, and it is found when
     /// something reads it.
-    fn matches_file(&self, start: usize, bytes: &[u8]) -> Result<()> {
+    fn matches_file(&self, file: &File, start: usize, bytes: &[u8]) -> Result<()> {
         self.note_disk_thread();
         let delay = self.test_read_delay_ms.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(Duration::from_millis(delay));
         }
         let mut now = vec![0; bytes.len()];
-        while let Err(e) = read_full(
-            |b, o| self.plain_file.seek_read(b, o),
-            &mut now,
-            start as u64,
-        ) {
+        while let Err(e) = read_full(|b, o| file.seek_read(b, o), &mut now, start as u64) {
             if !is_lock_error(&e) {
                 return Err(LookupError::Failed(
                     self.fail(format!("mapped file read failed: {e}"), 0),
                 ));
             }
-            self.note_lock(&e);
+            self.note_lock(start, &e);
             if let Some(failure) = self.current_failure()
                 && failure.valid_up_to.0 == 0
             {
                 return Err(LookupError::Failed(failure));
             }
+            // The tab closed, so nobody needs this read to wait out the lock. This ends
+            // this read only: the file itself is fine, so another snapshot may still use it.
+            if self.stop.load(Ordering::Acquire) {
+                return Err(LookupError::Failed(StoreFailure {
+                    message: "the file was closed while another app held a lock on it".to_string(),
+                    valid_up_to: ByteOffset(0),
+                }));
+            }
             std::thread::sleep(LOCK_RETRY);
         }
-        self.lock_passed();
+        self.lock_passed(start);
         if now != bytes {
             return Err(LookupError::Failed(self.fail(
                 format!("the file changed outside QuickEdit: bytes at {start} differ"),
@@ -413,10 +469,11 @@ impl Inner {
             .unwrap()
             .retain(|(at, _)| at / PAGE < first || at / PAGE > last);
     }
-    fn lock_passed(&self) {
-        self.locked_since_us.store(0, Ordering::Release);
+    fn lock_passed(&self, at: usize) {
+        self.lock_clocks.lock().unwrap().passed(at);
     }
-    /// Runs on the worker or the reader, with that thread's own handle.
+    /// Runs on the worker or the reader, or for a short plain read on the caller's own
+    /// thread, each with that thread's own handle.
     fn run_file_check(&self, file: &File) -> Result<()> {
         self.note_disk_thread();
         self.file_checks.fetch_add(1, Ordering::Relaxed);
@@ -429,9 +486,12 @@ impl Inner {
             Ok(())
         });
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.lock_passed(LOCK_ON_FILE_CHECK);
+                Ok(())
+            }
             Err(e) if is_lock_error(&e) => {
-                self.note_lock(&e);
+                self.note_lock(LOCK_ON_FILE_CHECK, &e);
                 Ok(())
             }
             Err(e) => Err(LookupError::Failed(
@@ -511,8 +571,9 @@ impl Inner {
             Err(old) => old == hash,
         }
     }
-    /// Loads one page on the reader thread. No lock is held during the read.
-    fn load_page(&self, file: &File, page_at: usize) {
+    /// Loads one page on the reader thread. No lock is held during the read. True when
+    /// another app's lock held the page back.
+    fn load_page(&self, file: &File, page_at: usize) -> bool {
         self.note_disk_thread();
         self.disk_reads.fetch_add(1, Ordering::Relaxed);
         let delay = self.test_read_delay_ms.load(Ordering::Relaxed);
@@ -522,23 +583,25 @@ impl Inner {
         let mut bytes = vec![0; PAGE.min(self.size - page_at)];
         if let Err(e) = read_full(|b, o| file.seek_read(b, o), &mut bytes, page_at as u64) {
             if is_lock_error(&e) {
-                // A waiting query asks again after its own short wait.
-                self.note_lock(&e);
-            } else {
-                self.fail(format!("mapped file read failed: {e}"), 0);
+                // A waiting query asks again after its own short wait. A view asks again
+                // when the reader's `LOCK_WAKE` wakes it.
+                self.note_lock(page_at, &e);
+                return true;
             }
-            return;
+            self.fail(format!("mapped file read failed: {e}"), 0);
+            return false;
         }
-        self.lock_passed();
+        self.lock_passed(page_at);
         if !self.verify_page(page_at, &bytes) {
             self.fail(
                 format!("the file changed outside QuickEdit: page at byte {page_at} differs"),
                 0,
             );
-            return;
+            return false;
         }
         self.add_page(page_at, Arc::from(bytes));
         self.signal();
+        false
     }
     fn add_page(&self, page_at: usize, bytes: Arc<[u8]>) {
         let mut pages = self.pages.lock().unwrap();
@@ -552,15 +615,38 @@ impl Inner {
     fn reader(self: Arc<Self>, file: File) {
         let guard = FailOnPanic(self);
         let inner = &guard.0;
+        // Set only while a lock is in the way. A view that was told "not yet" has nothing
+        // else to bring it back, because a held-back page gives no other wake. If the view
+        // still needs the page it asks again, and that sets this again. When the lock ends
+        // or nobody asks any more, this stays empty and the thread sleeps with no timer.
+        let mut wake_at: Option<Instant> = None;
         loop {
             let mut queue = inner.queue.lock().unwrap();
             while !queue.stop && queue.check_wanted == queue.check_done && queue.pages.is_empty() {
-                queue = inner.queue_wake.wait(queue).unwrap();
+                let Some(at) = wake_at else {
+                    queue = inner.queue_wake.wait(queue).unwrap();
+                    continue;
+                };
+                let left = at.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                queue = inner.queue_wake.wait_timeout(queue, left).unwrap().0;
             }
             if queue.stop {
+                let closing = queue.closing.take();
+                if closing.is_some() {
+                    queue.closed_on = Some(std::thread::current().id());
+                }
+                drop(queue);
+                drop(closing);
                 return;
             }
-            if queue.check_wanted != queue.check_done {
+            if wake_at.is_some_and(|at| at <= Instant::now()) {
+                wake_at = None;
+                drop(queue);
+                inner.signal();
+            } else if queue.check_wanted != queue.check_done {
                 let target = queue.check_wanted;
                 drop(queue);
                 let _ = inner.run_file_check(&file);
@@ -574,8 +660,8 @@ impl Inner {
                     .unwrap()
                     .iter()
                     .any(|(start, _)| *start == page_at);
-                if !cached {
-                    inner.load_page(&file, page_at);
+                if !cached && inner.load_page(&file, page_at) && wake_at.is_none() {
+                    wake_at = Some(Instant::now() + LOCK_WAKE);
                 }
             }
         }
@@ -652,11 +738,12 @@ impl Inner {
     /// Reads and indexes the next part of the file on the caller's thread: at open
     /// with `PAGE` and on the worker with `SCAN_BLOCK`. Reads start on a page edge, so
     /// each whole page gets its hash. No lock is held during the read or the scan; the
-    /// write lock covers only adding the finished blocks.
-    fn index_next(&self, file: &File, buffer: &mut Vec<u8>, max_bytes: usize) -> bool {
+    /// write lock covers only adding the finished blocks. On `Scan::Locked`, `buffer`
+    /// holds nothing that came from the file.
+    fn index_next(&self, file: &File, buffer: &mut Vec<u8>, max_bytes: usize) -> Scan {
         let start = self.indexed.load(Ordering::Acquire);
         if start >= self.size {
-            return true;
+            return Scan::Read;
         }
         let read_at = start / PAGE * PAGE;
         let skip = start - read_at;
@@ -669,16 +756,15 @@ impl Inner {
         });
         if let Err(e) = read {
             if is_lock_error(&e) {
-                self.note_lock(&e);
-                std::thread::sleep(LOCK_RETRY);
-                return !self.failed.load(Ordering::Acquire);
+                self.note_lock(read_at, &e);
+                return Scan::Locked;
             }
             self.fail(format!("mapped file read failed: {e}"), 0);
-            return false;
+            return Scan::Stop;
         }
-        self.lock_passed();
+        self.lock_passed(read_at);
         if timed(&self.timers.check, || self.run_file_check(file)).is_err() {
-            return false;
+            return Scan::Stop;
         }
         let bytes = &buffer[..want];
         let same = timed(&self.timers.hash, || {
@@ -693,7 +779,7 @@ impl Inner {
                 format!("the file changed outside QuickEdit: page at byte {page_at} differs"),
                 0,
             );
-            return false;
+            return Scan::Stop;
         }
         let at_eof = read_at + want == self.size;
         let body = &bytes[skip..];
@@ -720,10 +806,10 @@ impl Inner {
         self.publish(blocks);
         if let Some(at) = bad_at {
             self.fail(format!("invalid UTF-8 at byte {at}"), at);
-            return false;
+            return Scan::Stop;
         }
         self.signal();
-        true
+        Scan::Read
     }
     /// Adds finished blocks. Growing the Vec copies it, so that happens on the side,
     /// and the write lock is held only to swap and to add.
@@ -756,8 +842,10 @@ impl Inner {
         let inner = &guard.0;
         let mut buffer = Vec::with_capacity(SCAN_BLOCK);
         while inner.should_index() {
-            if !inner.index_next(&file, &mut buffer, SCAN_BLOCK) {
-                break;
+            match inner.index_next(&file, &mut buffer, SCAN_BLOCK) {
+                Scan::Read => {}
+                Scan::Locked => std::thread::sleep(LOCK_RETRY),
+                Scan::Stop => break,
             }
         }
     }
@@ -859,17 +947,32 @@ impl Drop for WorkerStop {
     }
 }
 
-/// Stops the reader when the last store or snapshot for a file goes away.
-struct ReaderStop(Arc<Inner>);
+/// Stops the reader when the last store or snapshot for a file goes away. It also holds
+/// the handle of the short plain reads. The last holder can be the window's thread, and
+/// closing a handle can take a while on a slow or filtered disk, so the reader closes it.
+struct ReaderStop {
+    inner: Arc<Inner>,
+    /// Always there until `drop`.
+    plain_file: Option<File>,
+}
 
-impl Drop for ReaderStop {
-    fn drop(&mut self) {
-        self.0.queue.lock().unwrap().stop = true;
-        self.0.queue_wake.notify_all();
+impl ReaderStop {
+    fn plain_file(&self) -> &File {
+        self.plain_file.as_ref().expect("taken only by drop")
     }
 }
 
-/// A read-only UTF-8 file. `open` reads the first 64 KiB, and two threads do all
+impl Drop for ReaderStop {
+    fn drop(&mut self) {
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.stop = true;
+        queue.closing = self.plain_file.take();
+        drop(queue);
+        self.inner.queue_wake.notify_all();
+    }
+}
+
+/// A read-only UTF-8 file. `open` tries to read the first 64 KiB, and two threads do all
 /// later disk work.
 ///
 /// **On the UI thread, use only the `try_` queries and `status`.** They read memory
@@ -937,7 +1040,6 @@ impl MappedStore {
         let inner = Arc::new(Inner {
             path,
             original,
-            plain_file,
             size,
             index: RwLock::new(Index {
                 blocks: Vec::with_capacity(block_room),
@@ -958,7 +1060,7 @@ impl MappedStore {
             notify_on: AtomicBool::new(false),
             born: Instant::now(),
             last_check_us: AtomicU64::new(0),
-            locked_since_us: AtomicU64::new(0),
+            lock_clocks: Mutex::new(LockClocks::default()),
             lock_give_up_us: AtomicU64::new(DEFAULT_LOCK_GIVE_UP.as_micros() as u64),
             test_read_delay_ms: AtomicU64::new(0),
             disk_reads: AtomicU64::new(0),
@@ -968,13 +1070,17 @@ impl MappedStore {
             notify,
         });
         let mut buffer = Vec::with_capacity(PAGE);
-        inner.index_next(&worker_file, &mut buffer, PAGE);
+        let first = inner.index_next(&worker_file, &mut buffer, PAGE);
         // A bad byte in the first page means this is not UTF-8 text to show as is.
         if let Some(failure) = inner.current_failure() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, failure.message));
         }
-        // The first page is in memory from the start, so a first screen never waits.
-        inner.add_page(0, Arc::from(&buffer[..]));
+        // The first page is in memory from the start, so a first screen never waits. If
+        // another app's lock held it back, the buffer holds no text, and the page is not
+        // known until a thread reads it.
+        if matches!(first, Scan::Read) {
+            inner.add_page(0, Arc::from(&buffer[..]));
+        }
         drop(buffer);
         inner.notify_on.store(true, Ordering::Release);
         let reader = inner.clone();
@@ -982,7 +1088,10 @@ impl MappedStore {
             "qe-buffer-read",
             Box::new(move || reader.reader(reader_file)),
         )?;
-        let reader_stop = Arc::new(ReaderStop(inner.clone()));
+        let reader_stop = Arc::new(ReaderStop {
+            inner: inner.clone(),
+            plain_file: Some(plain_file),
+        });
         let worker = inner.clone();
         spawn(
             "qe-buffer-index",
@@ -1346,15 +1455,16 @@ impl MappedStore {
     /// does not have it, and reads the file once.
     fn visit_short(&self, start: usize, end: usize, f: &mut dyn FnMut(&str) -> bool) -> Result<()> {
         // One byte past the end, to see that the end does not cut a character.
+        let file = self._reader_stop.plain_file();
         let bytes = self.fetch(start, (end + 1).min(self.inner.size))?;
-        self.inner.matches_file(start, &bytes)?;
+        self.inner.matches_file(file, start, &bytes)?;
         let inside = |b: Option<&u8>| b.is_some_and(|b| b & 0xC0 == 0x80);
         if (start != 0 && inside(bytes.first())) || inside(bytes.get(end - start)) {
             return Err(LookupError::OutOfRange);
         }
         // After the read, so that it also covers a change during the read. The text then
         // leaves at once, which is why a short read needs no second check.
-        self.inner.check_short_read()?;
+        self.inner.check_short_read(file)?;
         let bytes = &bytes[..end - start];
         let valid = match std::str::from_utf8(bytes) {
             Ok(text) => {
@@ -1721,9 +1831,64 @@ mod tests {
         // Thread A reads its clock at 10. Thread B records the lock at 12. A must not
         // subtract 12 from 10, which panics here and in a release build wraps to a huge
         // age and calls the file locked for good.
-        assert!(!lock_is_too_old(10, 12, 50));
-        assert!(!lock_is_too_old(60, 10, 50));
-        assert!(lock_is_too_old(61, 10, 50));
+        let mut clocks = LockClocks::default();
+        assert!(!clocks.note(0, 12, 50));
+        assert!(!clocks.note(0, 10, 50));
+        assert!(!clocks.note(0, 62, 50));
+        assert!(clocks.note(0, 63, 50));
+    }
+
+    #[test]
+    fn each_range_has_its_own_lock_clock() {
+        let mut clocks = LockClocks::default();
+        assert!(!clocks.note(PAGE, 100, 50));
+        assert!(!clocks.note(0, 100, 50));
+        // A read that works elsewhere leaves this range's clock running.
+        clocks.passed(0);
+        assert!(clocks.note(PAGE, 151, 50));
+        // A read that works here ends this range's lock, so a later lock starts over.
+        clocks.passed(PAGE);
+        assert!(!clocks.note(PAGE, 152, 50));
+        assert!(!clocks.note(PAGE, 202, 50));
+    }
+
+    #[test]
+    fn a_range_nobody_asked_about_starts_a_new_clock() {
+        let mut clocks = LockClocks::default();
+        assert!(!clocks.note(0, 10, 50));
+        assert!(!clocks.note(0, 11 + LOCK_CLOCK_GAP_US, 50));
+        assert!(clocks.note(0, 11 + LOCK_CLOCK_GAP_US + 51, 50));
+    }
+
+    #[test]
+    fn the_list_of_lock_clocks_stays_bounded() {
+        let mut clocks = LockClocks::default();
+        for at in 0..1000 {
+            clocks.note(at, 1, 50);
+        }
+        assert_eq!(clocks.0.len(), LOCK_CLOCKS);
+        assert_eq!(clocks.0[0].at, 1000 - LOCK_CLOCKS);
+    }
+
+    #[test]
+    fn the_reader_closes_the_handle_of_the_short_reads() {
+        let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("qe-unit-{}-closes.txt", std::process::id()));
+        std::fs::write(&path, "text").unwrap();
+        let store = MappedStore::open(&path).unwrap();
+        let inner = store.inner.clone();
+        drop(store);
+        let start = Instant::now();
+        while inner.queue.lock().unwrap().closed_on.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "it never closed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let queue = inner.queue.lock().unwrap();
+        assert_ne!(queue.closed_on, Some(std::thread::current().id()));
+        assert!(queue.closing.is_none(), "the handle was left in the queue");
+        drop(queue);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

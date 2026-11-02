@@ -217,33 +217,77 @@ fn a_long_read_always_checks_the_path_first() {
     fs::remove_file(path).unwrap();
 }
 
-/// Text that leaves is compared with the file, byte for byte. A change somewhere else
-/// in the same page is not that text, and it is caught when that part is read.
-#[test]
-fn a_read_compares_its_own_bytes_with_the_file() {
+/// Rewrites bytes and puts every time back, change time too, so that no file check can
+/// see it. Only the compare is left to catch this. `set_times` cannot restore the change
+/// time, so a test built on that passes with no compare at all.
+fn forge_rewrite(path: &PathBuf, at_byte: usize, new_bytes: &[u8]) {
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+    };
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let handle = HANDLE(file.as_raw_handle());
+    let mut basic = FILE_BASIC_INFO::default();
+    let size = size_of::<FILE_BASIC_INFO>() as u32;
+    // SAFETY: the handle is open and `basic` is a live value of the right size.
+    unsafe {
+        GetFileInformationByHandleEx(handle, FileBasicInfo, (&raw mut basic).cast(), size).unwrap();
+    }
+    file.seek(SeekFrom::Start(at_byte as u64)).unwrap();
+    file.write_all(new_bytes).unwrap();
+    file.sync_all().unwrap();
+    // SAFETY: the same as above; the call only reads from `basic`.
+    unsafe {
+        SetFileInformationByHandle(handle, FileBasicInfo, (&raw const basic).cast(), size).unwrap();
+    }
+}
+
+/// Text that leaves is compared with the file, byte for byte. The change is at the last
+/// byte of the read, so a compare of fewer bytes misses it.
+#[test]
+fn a_forged_rewrite_of_the_last_byte_of_a_read_is_caught_by_the_compare() {
     let path = temp("compare.txt");
     let text = lines(PAGE * 3);
     fs::write(&path, &text).unwrap();
     let store = open_complete(&path);
-    assert!(store.visit_chunks(at(PAGE, PAGE + 21), &mut |_| {}));
-    let times = fs::metadata(&path).unwrap();
-    let modified = times.modified().unwrap();
-    {
-        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(PAGE as u64 + 2100)).unwrap();
-        file.write_all(b"Z").unwrap();
-        file.sync_all().unwrap();
-        // Hide it from the file check as far as a plain writer can.
-        file.set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-    }
+    let (from, to) = (PAGE + 2100, PAGE + 2112);
+    assert!(store.visit_chunks(at(from, to), &mut |_| {}));
+    forge_rewrite(&path, to - 1, b"Z");
+    assert_eq!(
+        store.check_file(),
+        Ok(()),
+        "the file check must see nothing"
+    );
     let mut seen = String::new();
-    let ok = store.visit_chunks(at(PAGE + 2100 - 21, PAGE + 2100 + 21), &mut |s| {
-        seen.push_str(s);
-    });
-    assert!(!ok, "the changed byte was in this read");
-    assert!(!seen.contains('Z'), "changed text went out: {seen}");
+    assert!(!store.visit_chunks(at(from, to), &mut |s| seen.push_str(s)));
+    assert_eq!(seen, "", "changed text went out");
+    let failure = store.status().failure.unwrap();
+    assert!(failure.message.contains("differ"), "{}", failure.message);
+    assert_eq!(failure.valid_up_to, ByteOffset(0));
+    drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+/// The compare covers only the read's own bytes, on purpose. The forged change next to
+/// it is found when something reads it.
+#[test]
+fn a_forged_rewrite_next_to_a_read_waits_for_a_read_of_it() {
+    let path = temp("compare-next.txt");
+    let text = lines(PAGE * 3);
+    fs::write(&path, &text).unwrap();
+    let store = open_complete(&path);
+    let (from, to) = (PAGE + 2100, PAGE + 2112);
+    assert!(store.visit_chunks(at(from, to), &mut |_| {}));
+    forge_rewrite(&path, to + 2, b"Z");
+    assert!(store.visit_chunks(at(from, to), &mut |_| {}));
+    assert_eq!(store.error_state(), None);
+    assert!(!store.visit_chunks(at(to, to + 4), &mut |_| panic!("no text")));
     assert!(store.status().failure.is_some());
     drop(store);
     fs::remove_file(path).unwrap();

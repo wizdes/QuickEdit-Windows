@@ -2326,7 +2326,9 @@ impl EditorView {
         }
         let long = match self.engine.is_long_line(snapshot.as_ref(), line) {
             Ok(long) => long,
-            // The text is not in memory yet. The store's notify brings the view back.
+            // The text is not in memory yet. The store's notify brings the view back, when
+            // the page loads and, during another app's lock, every 100 ms so that this asks
+            // again. So no timer is needed here.
             Err(_) => return,
         };
         if long {

@@ -57,6 +57,8 @@ pub enum ShellEvent {
     ContentCaptureLost,
     /// A timer from `ShellHandle::set_timer` or `ViewRequest::RequestTimer` fired.
     Timer(u32),
+    /// Another thread called `ShellWaker::wake`. Several calls can arrive as one event.
+    Wake,
     /// A view asked to run a command, with `ViewRequest::Run`.
     RunCommand(CommandId),
     /// The window was destroyed. The owner quits the message loop after the last one.

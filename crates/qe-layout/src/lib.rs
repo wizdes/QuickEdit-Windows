@@ -226,6 +226,8 @@ pub struct DirectWriteLayout {
     wrap: bool,
     force_shaping: bool,
     tab_width: usize,
+    /// See `with_full_rows_at`. The cells on one wrapped row of a long line.
+    full_row_cells: Option<usize>,
 }
 
 /// Splits a font token such as "Segoe UI 9". A name that exists as written is a
@@ -292,6 +294,7 @@ impl DirectWriteLayout {
             wrap: true,
             force_shaping: false,
             tab_width: 8,
+            full_row_cells: None,
         })
     }
     pub fn with_wrap(mut self, value: bool) -> Self {
@@ -301,6 +304,24 @@ impl DirectWriteLayout {
     pub fn with_shaping(mut self, value: bool) -> Self {
         self.force_shaping = value;
         self
+    }
+    /// Makes a long line on the fast path wrap with no short rows at segment edges, for
+    /// a view of this width. Segment edges then depend on the width, so a view makes a new
+    /// engine when its width changes, and lays out again. See `segments.rs`.
+    pub fn with_full_rows_at(&self, width: Dip) -> Self {
+        let cells = if self.wrap {
+            wrap::columns_that_fit(self.font.advance, width.0, SEGMENT_BYTES * 2)
+        } else {
+            0
+        };
+        Self {
+            font: self.font.clone(),
+            choice: self.choice.clone(),
+            wrap: self.wrap,
+            force_shaping: self.force_shaping,
+            tab_width: self.tab_width,
+            full_row_cells: (cells > 0).then_some(cells),
+        }
     }
     pub fn with_tab_width(mut self, value: usize) -> Self {
         self.tab_width = value.max(1);
@@ -332,6 +353,9 @@ impl DirectWriteLayout {
     }
     pub(crate) fn font_uid(&self) -> u64 {
         self.font.uid
+    }
+    pub(crate) fn full_row_cells(&self) -> Option<usize> {
+        self.full_row_cells
     }
     pub(crate) fn wrap_enabled(&self) -> bool {
         self.wrap
@@ -487,6 +511,24 @@ impl DirectWriteLayout {
             return None;
         }
         Some(wrap::wrap_rows(s, &wrap::break_points(s), max_columns))
+    }
+    /// A long line's segment that is not its last, on the fast path, with its last rows
+    /// chosen so that the segment ends in a full row. `None` means the plain way applies.
+    pub(crate) fn fast_full_rows(
+        &self,
+        s: &str,
+        start: ByteOffset,
+        line: LineIndex,
+        width: Dip,
+    ) -> Option<LineLayout> {
+        let cells = self.full_row_cells?;
+        let bytes = s.as_bytes();
+        if !self.wrap || !self.takes_fast_path(bytes) || bytes.contains(&b'\t') {
+            return None;
+        }
+        let mut rows = self.fast_rows(bytes, width, 0)?;
+        wrap::fill_last_row(bytes, &wrap::break_points(bytes), cells, &mut rows);
+        Some(self.fast(bytes, &rows, start, line, 0, true))
     }
     fn fast_row(&self, s: &[u8], offset: usize, y: f64, cell: f64, lead: usize) -> LayoutRow {
         let mut stops = Vec::with_capacity(s.len() + 1);

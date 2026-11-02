@@ -50,6 +50,10 @@ const BLINK: Duration = Duration::from_millis(530);
 const WORK_TIMER_MS: u32 = 16;
 /// How long an arrow key waits for a mapped file's page to reach memory.
 const KEY_RETRY: Duration = Duration::from_millis(300);
+/// How long a Page key waits for its target. A press is not dropped for a slow disk.
+const PAGE_RETRY: Duration = Duration::from_secs(5);
+/// How long a Home or End waits for its line's layout.
+const DEFER_LIMIT: Duration = Duration::from_secs(2);
 /// How long after the last input history memory may be freed in one go.
 const IDLE_BEFORE_RELEASE: Duration = Duration::from_secs(2);
 /// The longest line the UI thread may lay out itself.
@@ -66,6 +70,8 @@ const CACHE_BYTES: usize = 32 << 20;
 /// README explains why a row alone is not enough.
 const INK_MARGIN: f32 = 4.0;
 const WARNING_STRIP: f32 = 24.0;
+/// How many edited lines keep showing their old layout.
+const MAX_GHOST_LINES: usize = 8;
 
 pub trait Clipboard {
     /// `Ok(None)` means the clipboard holds no text.
@@ -128,6 +134,8 @@ enum WorkerTask {
         u64,
     ),
     Drop(Arc<dyn TextSnapshot>),
+    /// A whole old document, with its history, to free away from the UI thread.
+    DropDocument(Box<dyn std::any::Any + Send>),
 }
 
 /// State the view and its workers share.
@@ -140,6 +148,18 @@ struct WorkerShared {
     skipped: AtomicU64,
     /// A test sets this to make one line's layout always fail.
     fail_line: AtomicUsize,
+    /// Old snapshots sent to a worker that it has not dropped yet.
+    drops_out: AtomicUsize,
+    wake: std::sync::Mutex<Option<qe_buffer::Notify>>,
+}
+impl WorkerShared {
+    fn wake_host(&self) {
+        if let Ok(slot) = self.wake.lock()
+            && let Some(wake) = slot.as_ref()
+        {
+            wake();
+        }
+    }
 }
 
 struct WorkerExit(Arc<WorkerShared>);
@@ -337,13 +357,29 @@ enum DragUnit {
 
 struct Warning {
     text: String,
-    /// A store failure stays. Other warnings clear on the next input.
+    /// A store failure stays until the store changes. Other warnings stay until the user
+    /// edits, because reading one must not depend on moving the mouse.
     sticky: bool,
 }
 
 struct CopyJob {
     results: Receiver<Result<String, String>>,
     cancel: Arc<AtomicBool>,
+    /// The edit already happened, so a failure must say where the text went.
+    is_cut: bool,
+}
+
+/// Room for text, or a sentence that says there is none. A failed allocation must not
+/// end the app, because other tabs may hold unsaved text.
+fn reserve_text(bytes: usize) -> Result<String, String> {
+    let mut text = String::new();
+    text.try_reserve_exact(bytes).map_err(|_| {
+        format!(
+            "There is not enough memory to copy this selection of {} MiB.",
+            bytes >> 20
+        )
+    })?;
+    Ok(text)
 }
 
 /// What a key or menu asks the editor to do.
@@ -410,7 +446,20 @@ pub struct EditorView {
     /// The x that a run of Up and Down keys keeps. Any other move or edit clears it.
     goal_x: Option<f64>,
     scroll: f64,
-    scroll_x: f32,
+    /// In the view's own state this is an `f64`, because an `f32` has steps of 64 DIP on
+    /// a 100 MB line. It becomes `f32` only as a distance from the view.
+    scroll_x: f64,
+    wheel_lines: u32,
+    /// Page keys that wait for their target, as a signed count of pages.
+    pending_pages: i32,
+    /// Input held back in order, behind a Home or End that waits for its line's layout.
+    deferred: std::collections::VecDeque<InputEvent>,
+    deferred_since: Instant,
+    /// A Paste that waits for the copy in progress.
+    pending_paste: bool,
+    loading: bool,
+    /// How far ink may reach past a row. Tall marks raise it.
+    ink_margin: f32,
     /// The widest text seen, which limits horizontal scrolling.
     widest: f64,
     /// An edit changed the widest line, so the limit may come down once its layout is in.
@@ -490,6 +539,8 @@ struct LineFrame<'a> {
     view_right: f32,
     /// The line's content end. A row that ends here holds the line ending.
     content_end: Option<ByteOffset>,
+    /// With wrap on, the next text sits on the next row, even past a segment's end.
+    wrap: bool,
 }
 
 fn paint_line_layout(list: &mut DisplayList, layout: &LineLayout, frame: &LineFrame) {
@@ -507,10 +558,13 @@ fn paint_line_layout(list: &mut DisplayList, layout: &LineLayout, frame: &LineFr
             let last = selection.end.min(row.range.end);
             let left = layout.caret_rect(first, Affinity::After);
             let right = layout.caret_rect(last, Affinity::Before);
-            if let (Some(a), Some(b)) = (left, right) {
+            if !row.visual_stops.is_empty() {
+                let reach_edge = selected_past_end && (hard_end || !last_row || frame.wrap);
+                paint_mixed_selection(list, row, frame, first..last, reach_edge);
+            } else if let (Some(a), Some(b)) = (left, right) {
                 let start = a.x.0.min(b.x.0);
                 let mut end = a.x.0.max(b.x.0);
-                if selected_past_end && (hard_end || !last_row) {
+                if selected_past_end && (hard_end || !last_row || frame.wrap) {
                     end = end.max(frame.view_right - x);
                 }
                 list.push(DrawCommand::FillRect {
@@ -554,6 +608,56 @@ fn paint_line_layout(list: &mut DisplayList, layout: &LineLayout, frame: &LineFr
                 height: rect.height,
             },
             color: frame.theme.text,
+        });
+    }
+}
+
+/// A row with right-to-left text. Selected text can sit in several places, so each
+/// cluster gets its own span, and touching spans join into one rectangle.
+fn paint_mixed_selection(
+    list: &mut DisplayList,
+    row: &qe_api::LayoutRow,
+    frame: &LineFrame,
+    selected: Range<ByteOffset>,
+    reach_edge: bool,
+) {
+    let mut spans: Vec<(f32, f32)> = row
+        .caret_stops
+        .windows(2)
+        .filter(|pair| pair[0].byte >= selected.start && pair[1].byte <= selected.end)
+        .map(|pair| {
+            let (a, b) = (pair[0].x.0, pair[1].x_before.0);
+            (a.min(b), a.max(b))
+        })
+        .collect();
+    if reach_edge {
+        let right = row
+            .caret_stops
+            .iter()
+            .map(|stop| stop.x.0.max(stop.x_before.0))
+            .fold(0.0, f32::max);
+        spans.push((right, (frame.view_right - frame.x).max(right)));
+    }
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut joined: Vec<(f32, f32)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 + 0.5 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    for (start, end) in joined {
+        list.push(DrawCommand::FillRect {
+            rect: Rect {
+                x: Dip(frame.x + start),
+                y: Dip(frame.y + row.y.0),
+                width: Dip((end - start).max(1.0)),
+                height: row.height,
+            },
+            color: qe_api::Color {
+                a: 64,
+                ..frame.theme.text
+            },
         });
     }
 }
@@ -630,7 +734,7 @@ impl EditorView {
     pub fn from_store(store: PieceStore) -> Result<Self, String> {
         let (engine, choice) = DirectWriteLayout::with_default_font().map_err(|e| e.to_string())?;
         let (row_height, cell_width, fast_font) = measure_font(&engine)?;
-        let engine = Arc::new(engine);
+        let engine = Arc::new(engine.with_full_rows_at(Dip(800.0)));
         let (tasks, task_rx) = mpsc::channel::<WorkerTask>();
         let (result_tx, results) = mpsc::channel();
         let (map_tx, map_results) = mpsc::channel();
@@ -642,6 +746,8 @@ impl EditorView {
             wanted_last: AtomicUsize::new(usize::MAX),
             skipped: AtomicU64::new(0),
             fail_line: AtomicUsize::new(usize::MAX),
+            drops_out: AtomicUsize::new(0),
+            wake: std::sync::Mutex::new(None),
         });
         let shared_rx = Arc::new(std::sync::Mutex::new(task_rx));
         for worker in 0..4 {
@@ -705,6 +811,13 @@ impl EditorView {
             goal_x: None,
             scroll: 0.0,
             scroll_x: 0.0,
+            wheel_lines: 3,
+            pending_pages: 0,
+            deferred: std::collections::VecDeque::new(),
+            deferred_since: now,
+            pending_paste: false,
+            loading: false,
+            ink_margin: INK_MARGIN,
             widest: 0.0,
             widest_dirty: false,
             reveal_pending: false,
@@ -746,6 +859,9 @@ impl EditorView {
     /// Takes the document that `FileLoad` finished. The view starts over on it. Work
     /// queued for the old text is dropped when it arrives.
     pub fn adopt(&mut self, loaded: LoadedFile) -> Result<(), String> {
+        if self.mapped.is_none() && !self.history.is_at_save_point(&self.store) {
+            return Err("This view has edits, so a file cannot replace them.".to_string());
+        }
         let (store, mapped, ending) = match loaded {
             LoadedFile::Editable { store, ending } => (store, None, ending),
             LoadedFile::ReadOnly(mapped) => (PieceStore::new(""), Some(mapped), "\n"),
@@ -762,11 +878,16 @@ impl EditorView {
             *line = None;
         }
         self.inflight.clear();
-        self.history = UndoHistory::for_store(&store);
+        self.send_away_document(store);
         // The old text's cache must not meet the new text's revisions.
         self.cache = RefCell::new(LineCache::new(CACHE_BYTES));
-        self.store = store;
         self.mapped = mapped;
+        self.loading = false;
+        self.warning = None;
+        self.warning_dirty = true;
+        self.pending_pages = 0;
+        self.deferred.clear();
+        self.pending_paste = false;
         self.preferred_ending = ending;
         self.heights = heights;
         self.long_maps.clear();
@@ -788,6 +909,18 @@ impl EditorView {
         // The next timer lays out the new text.
         self.pending = true;
         Ok(())
+    }
+    /// Puts a new store in place and frees the old one and its history on a worker, as
+    /// the qe-buffer README requires for big text.
+    fn send_away_document(&mut self, store: PieceStore) {
+        let history = UndoHistory::for_store(&store);
+        let old_history = std::mem::replace(&mut self.history, history);
+        let old_store = std::mem::replace(&mut self.store, store);
+        let document: Box<dyn std::any::Any + Send> = Box::new((old_store, old_history));
+        // A failed send gives the document back in the error, which frees it here.
+        if self.tasks.send(WorkerTask::DropDocument(document)).is_err() {
+            self.set_warning("The layout workers stopped.".to_string(), true);
+        }
     }
     fn source(&self) -> &dyn TextSnapshot {
         self.mapped
@@ -835,7 +968,7 @@ impl EditorView {
         self.scroll
     }
     pub fn horizontal_offset(&self) -> f32 {
-        self.scroll_x
+        self.scroll_x as f32
     }
     pub fn line_count(&self) -> usize {
         self.source().status().known_lines
@@ -874,6 +1007,45 @@ impl EditorView {
     pub fn layout_tasks_sent(&self) -> u64 {
         self.next_task
     }
+    /// A file is on its way. The view refuses edits until `adopt` or `end_load`, as the
+    /// Mac refuses edits during a reload.
+    pub fn begin_load(&mut self) {
+        self.loading = true;
+    }
+    /// The load failed or stopped, so the view takes edits again.
+    pub fn end_load(&mut self) {
+        self.loading = false;
+    }
+    /// What a worker calls when a result is ready, from its own thread. Without this a
+    /// result waits for the view's next timer.
+    pub fn set_wake(&mut self, wake: qe_buffer::Notify) {
+        if let Ok(mut slot) = self.shared.wake.lock() {
+            *slot = Some(wake);
+        }
+    }
+    /// What the host reads from `SPI_GETWHEELSCROLLLINES`. `u32::MAX` is its value for
+    /// one screen per notch.
+    pub fn set_wheel_lines(&mut self, lines: u32) {
+        self.wheel_lines = lines;
+    }
+    pub fn horizontal_offset_exact(&self) -> f64 {
+        self.scroll_x
+    }
+    /// True when the caret's line shows its current text, not its layout from before
+    /// an edit. A key's timer runs until this holds.
+    pub fn caret_is_laid_out(&self) -> bool {
+        let on_ghost = self
+            .caret_line
+            .is_some_and(|line| self.ghosts.keys().any(|(ghost, _)| *ghost == line));
+        !on_ghost
+            && self
+                .place(self.caret, self.affinity)
+                .is_some_and(|place| place.exact)
+    }
+    #[doc(hidden)]
+    pub fn test_workers_holding_snapshots(&self) -> usize {
+        self.shared.drops_out.load(Ordering::Acquire)
+    }
     #[doc(hidden)]
     pub fn test_height_map_lines(&self) -> usize {
         self.heights.len()
@@ -891,7 +1063,7 @@ impl EditorView {
     }
     /// The one check every text change passes.
     pub fn can_edit(&self) -> bool {
-        !self.prevent_editing && self.mapped.is_none()
+        !self.prevent_editing && self.mapped.is_none() && !self.loading
     }
     pub fn cancel_drag(&mut self) {
         self.dragging = false;
@@ -976,13 +1148,30 @@ impl EditorView {
             ctx.request_timer(wait);
         }
     }
-    fn touch(&mut self) {
+    /// Shows the caret and restarts its blink.
+    fn show_caret(&mut self) {
         let now = Instant::now();
-        self.retry_key = None;
         self.caret_dirty = !self.visible;
         self.visible = true;
         self.blink_due = now + BLINK;
         self.last_input = now;
+    }
+    /// A key or a click. The newest action wins over work that still waits.
+    fn touch(&mut self) {
+        self.show_caret();
+        self.retry_key = None;
+        self.pending_pages = 0;
+        if self.pending_paste {
+            self.pending_paste = false;
+            self.set_warning(
+                "Paste was dropped, because you went on working while a long Copy finished."
+                    .to_string(),
+                false,
+            );
+        }
+    }
+    /// An edit is the user acting on what a warning said.
+    fn clear_warning_after_edit(&mut self) {
         if self.warning.as_ref().is_some_and(|w| !w.sticky) {
             self.warning = None;
             self.warning_dirty = true;
@@ -1001,7 +1190,7 @@ impl EditorView {
             if enabled {
                 self.scroll_x = 0.0;
             }
-            self.engine = Arc::new(engine);
+            self.engine = Arc::new(engine.with_full_rows_at(self.bounds.width));
             self.restart_layout()?;
         }
         Ok(())
@@ -1033,7 +1222,7 @@ impl EditorView {
         let engine = make_engine(&font, self.wrap)?;
         (self.row_height, self.cell_width, self.fast_font) = measure_font(&engine)?;
         self.font = font;
-        self.engine = Arc::new(engine);
+        self.engine = Arc::new(engine.with_full_rows_at(self.bounds.width));
         self.restart_layout()
     }
     /// Forgets all measured sizes, and keeps the top line on screen.
@@ -1069,11 +1258,11 @@ impl EditorView {
     fn max_scroll(&self) -> f64 {
         (self.heights.total_height() - f64::from(self.bounds.height.0)).max(0.0)
     }
-    fn max_scroll_x(&self) -> f32 {
+    fn max_scroll_x(&self) -> f64 {
         if self.wrap {
             0.0
         } else {
-            (self.widest + 2.0 - f64::from(self.bounds.width.0)).max(0.0) as f32
+            (self.widest + 2.0 - f64::from(self.bounds.width.0)).max(0.0)
         }
     }
     fn clamp_scroll(&mut self) {
@@ -1084,8 +1273,12 @@ impl EditorView {
         let width_changed = self.wrap && bounds.width != self.bounds.width;
         let moved = bounds != self.bounds;
         self.bounds = bounds;
-        if width_changed && let Err(e) = self.restart_layout() {
-            self.set_warning(e, false);
+        if width_changed {
+            // A long line's segment edges follow the width.
+            self.engine = Arc::new(self.engine.with_full_rows_at(bounds.width));
+            if let Err(e) = self.restart_layout() {
+                self.set_warning(e, false);
+            }
         }
         if moved {
             self.clamp_scroll();
@@ -1097,7 +1290,7 @@ impl EditorView {
     }
     fn poll_inner(&mut self, ctx: &mut ViewContext) {
         self.drain_results(ctx);
-        self.poll_copy();
+        self.poll_copy(ctx);
         self.settle_widest(ctx);
         if self.caret_line.is_none() {
             self.refresh_caret_line();
@@ -1105,11 +1298,19 @@ impl EditorView {
                 self.repaint_caret(self.caret, self.affinity, ctx);
             }
         }
-        if let Some((vk, mods, first)) = self.retry_key.take()
-            && first.elapsed() < KEY_RETRY
-        {
-            self.move_key(vk, mods, first, ctx);
+        if let Some((vk, mods, first)) = self.retry_key.take() {
+            let limit = if matches!(vk, 0x21 | 0x22) {
+                PAGE_RETRY
+            } else {
+                KEY_RETRY
+            };
+            if first.elapsed() < limit {
+                self.move_key(vk, mods, first, ctx);
+            } else {
+                self.pending_pages = 0;
+            }
         }
+        self.run_deferred(ctx);
         self.schedule(ctx);
         if self.reveal_pending {
             self.reveal_caret(ctx);
@@ -1176,6 +1377,7 @@ impl EditorView {
             match done.outcome {
                 LayoutOutcome::Skipped => {}
                 LayoutOutcome::Done(Ok(layout)) => {
+                    self.note_ink(&layout);
                     let height = layout.height;
                     let extent = self.engine.segment_extent(&layout);
                     let width = self.widest_of(&layout);
@@ -1194,7 +1396,9 @@ impl EditorView {
                 }
                 LayoutOutcome::Done(Err(e)) => {
                     self.failed.insert((line, segment));
+                    self.ghosts.remove(&(line, segment.unwrap_or(WHOLE)));
                     self.set_warning(format!("Line {} could not be shown: {e}", line + 1), false);
+                    self.repaint_line(line, ctx);
                 }
             }
         }
@@ -1250,6 +1454,18 @@ impl EditorView {
             }
         }
     }
+    /// Marks with no advance of their own can stack far past a row, and only the layout
+    /// knows. The margin stays high once seen, which only costs a larger repaint.
+    fn note_ink(&mut self, layout: &LineLayout) {
+        for run in layout.rows.iter().flat_map(|row| &row.glyph_runs) {
+            let stacked =
+                run.advances.iter().any(|a| a.0 == 0.0) || run.offsets.iter().any(|o| o.y.0 != 0.0);
+            if stacked {
+                let reach = run.offsets.iter().map(|o| o.y.0.abs()).fold(0.0, f32::max);
+                self.ink_margin = self.ink_margin.max(run.font_em_size.0 * 1.5 + reach);
+            }
+        }
+    }
     fn widest_of(&self, layout: &LineLayout) -> f64 {
         if self.wrap {
             return 0.0;
@@ -1302,12 +1518,13 @@ impl EditorView {
         let along = if wrap {
             (self.scroll - line_top).max(0.0)
         } else {
-            f64::from(self.scroll_x)
+            self.scroll_x
         };
         let Some(map) = self.long_maps.get_mut(&line) else {
             self.repaint_line(line, ctx);
             return;
         };
+        let top_line = self.heights.scroll_to_line(self.scroll).0;
         let first = map.scroll_to_line(along);
         let before = map.line_to_scroll(first);
         if let Err(e) = map.set(LineIndex(segment), extent) {
@@ -1318,7 +1535,8 @@ impl EditorView {
         let total = map.total_height();
         let new_height = self.engine.long_line_height(map);
         if wrap {
-            if segment < first.0 {
+            // With the whole line above the view, `set_line_height` makes this correction.
+            if line == top_line && segment < first.0 {
                 self.scroll += after - before;
             }
             self.note_line_height(line, new_height, ctx);
@@ -1338,8 +1556,9 @@ impl EditorView {
     fn repaint_doc_y(&self, top: f64, bottom: f64, ctx: &mut ViewContext) {
         let view_top = f64::from(self.bounds.y.0);
         let view_bottom = view_top + f64::from(self.bounds.height.0);
-        let from = (top - self.scroll + view_top - f64::from(INK_MARGIN)).max(view_top);
-        let to = (bottom - self.scroll + view_top + f64::from(INK_MARGIN)).min(view_bottom);
+        let margin = f64::from(self.ink_margin);
+        let from = (top - self.scroll + view_top - margin).max(view_top);
+        let to = (bottom - self.scroll + view_top + margin).min(view_bottom);
         if to > from {
             ctx.invalidate(Rect {
                 x: self.bounds.x,
@@ -1371,10 +1590,14 @@ impl EditorView {
             return;
         };
         if !place.exact {
-            self.repaint_doc_y(place.y, place.y + f64::from(place.height), ctx);
+            // Its old layout may paint it on any row of the line, so repaint all of them.
+            match self.line_at(byte) {
+                Some(line) => self.repaint_line(line, ctx),
+                None => self.repaint_doc_y(place.y, place.y + f64::from(place.height), ctx),
+            }
             return;
         }
-        let x = place.x - f64::from(self.scroll_x) + f64::from(self.bounds.x.0) - 2.0;
+        let x = place.x - self.scroll_x + f64::from(self.bounds.x.0) - 2.0;
         let y = place.y - self.scroll + f64::from(self.bounds.y.0);
         let left = x.max(f64::from(self.bounds.x.0));
         let right = (x + 5.0).min(f64::from(self.bounds.x.0 + self.bounds.width.0));
@@ -1484,6 +1707,7 @@ impl EditorView {
             )
             .ok()?;
         *budget -= bytes;
+        self.note_ink(&layout);
         self.ghosts.remove(&(line, WHOLE));
         self.widest = self.widest.max(self.widest_of(&layout));
         self.note_line_height(line, layout.height, ctx);
@@ -1563,6 +1787,7 @@ impl EditorView {
             )
             .ok()?;
         *budget -= bytes;
+        self.note_ink(&layout);
         self.ghosts.remove(&(line, segment));
         let extent = self.engine.segment_extent(&layout);
         self.note_segment(line, segment, extent, layout.height, ctx);
@@ -1651,6 +1876,7 @@ impl EditorView {
             || !self.map_tasks.is_empty()
             || self.retry_key.is_some()
             || self.caret_line.is_none()
+            || !self.deferred.is_empty()
         {
             self.pending = true;
         }
@@ -1747,7 +1973,7 @@ impl EditorView {
             let along = if self.wrap {
                 (self.scroll - line_top).max(0.0)
             } else {
-                f64::from(self.scroll_x)
+                self.scroll_x
             };
             let start = map.scroll_to_line(along).0.saturating_sub(1);
             let limit = along
@@ -1916,10 +2142,10 @@ impl EditorView {
         if !self.wrap && place.x_known {
             let width = f64::from(self.bounds.width.0);
             self.widest = self.widest.max(place.x);
-            if place.x < f64::from(self.scroll_x) {
-                self.scroll_x = place.x as f32;
-            } else if place.x > f64::from(self.scroll_x) + width - 2.0 {
-                self.scroll_x = (place.x - width + 2.0).max(0.0) as f32;
+            if place.x < self.scroll_x {
+                self.scroll_x = place.x;
+            } else if place.x > self.scroll_x + width - 2.0 {
+                self.scroll_x = (place.x - width + 2.0).max(0.0);
             }
         }
         self.scroll = self.scroll.max(0.0);
@@ -1968,35 +2194,37 @@ impl EditorView {
         }
         answer
     }
-    /// What the screen should keep showing for this line until its new layout arrives.
-    fn keep_ghosts(&mut self, line: usize) {
-        let snapshot = self.snapshot();
+    /// What the screen should keep showing until the new layout arrives. `old` is the
+    /// text from before the change, which the cache still holds layouts of.
+    fn keep_ghosts(&mut self, old: &dyn TextSnapshot, change: &TextChange, lines: Range<usize>) {
         let width = self.width();
-        if self.long_maps.contains_key(&line) {
-            let segment = self
-                .engine
-                .segment_at(snapshot.as_ref(), self.caret, self.affinity)
-                .map_or(0, |(_, segment, _)| segment);
-            for near in segment.saturating_sub(1)..segment + 8 {
-                let layout = self.cache.borrow_mut().cached_segment(
-                    &self.engine,
-                    snapshot.as_ref(),
-                    LineIndex(line),
-                    near,
-                    width,
-                );
-                if let Some(layout) = layout {
-                    self.ghosts.insert((line, near), layout);
+        for line in lines {
+            if self.long_maps.contains_key(&line) {
+                let segment = self
+                    .engine
+                    .segment_at(old, change.replaced.start, Affinity::After)
+                    .map_or(0, |(_, segment, _)| segment);
+                for near in segment.saturating_sub(1)..segment + 8 {
+                    let layout = self.cache.borrow_mut().cached_segment(
+                        &self.engine,
+                        old,
+                        LineIndex(line),
+                        near,
+                        width,
+                    );
+                    if let Some(layout) = layout {
+                        self.ghosts.insert((line, near), layout);
+                    }
                 }
+                continue;
             }
-            return;
-        }
-        let layout =
-            self.cache
+            let layout = self
+                .cache
                 .borrow_mut()
-                .cached(&self.engine, snapshot.as_ref(), LineIndex(line), width);
-        if let Some(layout) = layout {
-            self.ghosts.insert((line, WHOLE), layout);
+                .cached(&self.engine, old, LineIndex(line), width);
+            if let Some(layout) = layout {
+                self.ghosts.insert((line, WHOLE), layout);
+            }
         }
     }
     /// Changes the text through the history, then applies the change everywhere.
@@ -2011,9 +2239,6 @@ impl EditorView {
             return;
         }
         let old = self.store.snapshot();
-        if let Ok(position) = self.source().try_byte_to_position(range.start) {
-            self.keep_ghosts(position.line.0);
-        }
         match self
             .history
             .replace_tracked(&mut self.store, range.clone(), value, typing)
@@ -2049,6 +2274,8 @@ impl EditorView {
         if !self.wrap && self.edit_touches_widest(old.as_ref(), first, old_last) {
             self.widest_dirty = true;
         }
+        let kept_lines = first..(old_last + 1).min(first + MAX_GHOST_LINES);
+        self.keep_ghosts(old.as_ref(), &change, kept_lines);
         self.cache.borrow_mut().invalidate(old.as_ref(), &change);
         // Text placed after a CR can join it into CRLF, which changes the line before.
         if first > 0 && change.replaced.start.0 > 0 {
@@ -2061,7 +2288,9 @@ impl EditorView {
                 first -= 1;
             }
         }
+        self.shared.drops_out.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = self.tasks.send(WorkerTask::Drop(old)) {
+            self.shared.drops_out.fetch_sub(1, Ordering::AcqRel);
             self.set_warning(format!("The layout workers stopped: {error}"), true);
         }
         let delta = change.line_count_delta;
@@ -2108,6 +2337,7 @@ impl EditorView {
             }
         }
         self.failed.clear();
+        self.clear_warning_after_edit();
         let limit = self.max_scroll();
         if self.scroll > limit {
             self.scroll = limit;
@@ -2239,8 +2469,8 @@ impl EditorView {
             self.ghosts = ghosts
                 .into_iter()
                 .filter_map(|((line, segment), layout)| {
-                    if line == first {
-                        Some(((first, segment), layout))
+                    if line == first || (delta == 0 && line >= first && line <= old_last) {
+                        Some(((line, segment), layout))
                     } else {
                         moved(line).map(|at| ((at, segment), layout))
                     }
@@ -2259,8 +2489,8 @@ impl EditorView {
             *line = line.and_then(moved);
         }
     }
-    fn start_copy(&mut self, range: Range<ByteOffset>) {
-        let bytes = range.end.0 - range.start.0;
+    /// True when a thread may read this much, and says the limit in words otherwise.
+    fn copy_size_is_allowed(&mut self, bytes: usize) -> bool {
         if bytes > self.copy_limit {
             self.set_warning(
                 format!(
@@ -2270,43 +2500,63 @@ impl EditorView {
                 ),
                 false,
             );
-            return;
+            return false;
         }
+        true
+    }
+    /// The newest clipboard action wins, so any write ends the copy in progress.
+    fn cancel_copy(&mut self) {
         if let Some(job) = self.copy_job.take() {
             job.cancel.store(true, Ordering::Release);
         }
-        let snapshot = self
-            .mapped
-            .as_ref()
-            .map_or_else(|| self.store.snapshot(), TextStore::snapshot);
+    }
+    fn start_copy(
+        &mut self,
+        range: Range<ByteOffset>,
+        snapshot: Arc<dyn TextSnapshot>,
+        is_cut: bool,
+    ) {
+        self.cancel_copy();
+        let bytes = range.end.0 - range.start.0;
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, results) = mpsc::channel();
         let flag = cancel.clone();
+        let shared = self.shared.clone();
         let spawned = thread::Builder::new()
             .name("qe-editor-copy".into())
             .spawn(move || {
-                let mut text = String::with_capacity(bytes);
-                let good = snapshot.visit_chunks_while(range, &mut |part| {
-                    text.push_str(part);
-                    !flag.load(Ordering::Acquire)
+                let answer = reserve_text(bytes).and_then(|mut text| {
+                    let good = snapshot.visit_chunks_while(range, &mut |part| {
+                        text.push_str(part);
+                        !flag.load(Ordering::Acquire)
+                    });
+                    if good {
+                        Ok(text)
+                    } else {
+                        Err("The selection could not be read from the file.".to_string())
+                    }
                 });
-                let answer = if good {
-                    Ok(text)
-                } else {
-                    Err("The selection could not be read from the file.".to_string())
-                };
                 // A failed send means the view is gone, so the text has no reader.
-                let _ = sender.send(answer);
+                if sender.send(answer).is_ok() {
+                    shared.wake_host();
+                }
             });
         match spawned {
-            Ok(_) => self.copy_job = Some(CopyJob { results, cancel }),
+            Ok(_) => {
+                self.copy_job = Some(CopyJob {
+                    results,
+                    cancel,
+                    is_cut,
+                });
+            }
             Err(e) => self.set_warning(format!("Copy could not start: {e}"), false),
         }
     }
-    fn poll_copy(&mut self) {
+    fn poll_copy(&mut self, ctx: &mut ViewContext) {
         let Some(job) = &self.copy_job else {
             return;
         };
+        let is_cut = job.is_cut;
         let answer = match job.results.try_recv() {
             Ok(answer) => answer,
             Err(mpsc::TryRecvError::Empty) => return,
@@ -2315,8 +2565,23 @@ impl EditorView {
             }
         };
         self.copy_job = None;
-        if let Err(e) = answer.and_then(|text| self.clipboard.write(&text)) {
-            self.set_warning(e, false);
+        match answer.and_then(|text| self.clipboard.write(&text)) {
+            Ok(()) => {
+                if std::mem::take(&mut self.pending_paste) {
+                    self.run_inner(EditorCommand::Paste, ctx);
+                }
+            }
+            Err(e) => {
+                self.pending_paste = false;
+                let text = if is_cut {
+                    format!(
+                        "Cut removed the text, but could not put it on the clipboard: {e}. Undo brings it back."
+                    )
+                } else {
+                    e
+                };
+                self.set_warning(text, false);
+            }
         }
     }
     /// Runs one command. Read-only states refuse every edit here, before anything
@@ -2343,6 +2608,16 @@ impl EditorView {
                 if range.is_empty() {
                     return;
                 }
+                let bytes = range.end.0 - range.start.0;
+                if bytes > COPY_ON_UI_BYTES {
+                    // The edit happens now. A snapshot keeps the text for the thread.
+                    if self.copy_size_is_allowed(bytes) {
+                        let snapshot = self.store.snapshot();
+                        self.apply_edit(range.clone(), "", false, ctx);
+                        self.start_copy(range, snapshot, true);
+                    }
+                    return;
+                }
                 let mut text = String::new();
                 if !self
                     .store
@@ -2351,10 +2626,15 @@ impl EditorView {
                     self.set_warning("Cut could not read the selection.".into(), false);
                     return;
                 }
+                self.cancel_copy();
                 match self.clipboard.write(&text) {
                     Ok(()) => self.apply_edit(range, "", false, ctx),
                     Err(e) => self.set_warning(e, false),
                 }
+            }
+            EditorCommand::Paste if self.copy_job.is_some() => {
+                // The user means what they just copied, which is still on its way.
+                self.pending_paste = true;
             }
             EditorCommand::Paste => match self.clipboard.read() {
                 Ok(Some(text)) if !text.is_empty() => {
@@ -2416,13 +2696,22 @@ impl EditorView {
             }
         }
     }
+    fn copy_snapshot(&self) -> Arc<dyn TextSnapshot> {
+        self.mapped
+            .as_ref()
+            .map_or_else(|| self.store.snapshot(), TextStore::snapshot)
+    }
     fn copy(&mut self) {
         let range = self.selection();
         if range.is_empty() {
             return;
         }
-        if range.end.0 - range.start.0 > COPY_ON_UI_BYTES {
-            self.start_copy(range);
+        let bytes = range.end.0 - range.start.0;
+        if bytes > COPY_ON_UI_BYTES {
+            if self.copy_size_is_allowed(bytes) {
+                let snapshot = self.copy_snapshot();
+                self.start_copy(range, snapshot, false);
+            }
             return;
         }
         let mut text = String::new();
@@ -2431,13 +2720,15 @@ impl EditorView {
             .try_visit_chunks(range.clone(), &mut |s| text.push_str(s))
         {
             Ok(()) => {
+                self.cancel_copy();
                 if let Err(e) = self.clipboard.write(&text) {
                     self.set_warning(e, false);
                 }
             }
             // The text is not in memory yet, so a thread reads it.
             Err(LookupError::NotYetKnown { .. } | LookupError::TooLong { .. }) => {
-                self.start_copy(range);
+                let snapshot = self.copy_snapshot();
+                self.start_copy(range, snapshot, false);
             }
             Err(e) => self.set_warning(format!("Copy failed: {e:?}"), false),
         }
@@ -2568,7 +2859,7 @@ impl EditorView {
         self.estimate_in(edges.start..edges.content_end, x, row)
     }
     fn hit(&mut self, at: Point, ctx: &mut ViewContext) -> Option<(ByteOffset, Affinity)> {
-        let x = f64::from(at.x.0 - self.bounds.x.0) + f64::from(self.scroll_x);
+        let x = f64::from(at.x.0 - self.bounds.x.0) + self.scroll_x;
         let y = f64::from(at.y.0 - self.bounds.y.0) + self.scroll;
         self.resolve(x, y, ctx)
     }
@@ -2817,9 +3108,15 @@ impl EditorView {
             self.goal_x = Some(x);
         }
     }
-    /// Moves the caret and the view by the rows that fit the view.
-    fn move_page(&mut self, down: bool, shift: bool, ctx: &mut ViewContext) {
-        let (base, affinity) = self.base_for_move(down, shift);
+    /// Moves the caret and the view by the rows that fit the view, for each page that
+    /// waits. The view moves only with a known target, so it never leaves the caret, and
+    /// presses made before the text arrived still count.
+    fn move_page(&mut self, shift: bool, ctx: &mut ViewContext) {
+        let pages = self.pending_pages;
+        if pages == 0 {
+            return;
+        }
+        let (base, affinity) = self.base_for_move(pages > 0, shift);
         let here = self.row_of(base, affinity, ctx);
         let Some(place) = self.place(base, affinity) else {
             return;
@@ -2827,23 +3124,89 @@ impl EditorView {
         let x = self.goal_x.or(here.map(|h| h.x)).unwrap_or(place.x);
         let row = f64::from(self.row_height);
         let page = (f64::from(self.bounds.height.0) / row).floor().max(1.0) * row;
-        let signed = if down { page } else { -page };
+        let signed = page * f64::from(pages);
         let middle = place.y + f64::from(place.height) / 2.0 + signed;
         let target = if middle < 0.0 {
             Some((ByteOffset(0), Affinity::After))
         } else {
             self.resolve(x, middle, ctx)
         };
+        let Some((byte, affinity)) = target else {
+            return;
+        };
+        self.pending_pages = 0;
         let before = self.scroll;
         self.scroll = (self.scroll + signed).clamp(0.0, self.max_scroll());
         if self.scroll != before {
             ctx.invalidate(self.bounds);
         }
-        if let Some((byte, affinity)) = target {
-            self.arrive(byte, affinity, shift, ctx);
-            self.goal_x = Some(x);
-        }
+        self.arrive(byte, affinity, shift, ctx);
+        self.goal_x = Some(x);
         self.schedule(ctx);
+    }
+    /// Home and End need the row, and only layout knows the row. An estimate could
+    /// select more than the row, so these keys wait, and later input waits behind them.
+    fn row_edge_must_wait(&mut self, vk: u16, mods: Modifiers, ctx: &mut ViewContext) -> bool {
+        if mods.ctrl || !matches!(vk, 0x23 | 0x24) || !self.wrap {
+            return false;
+        }
+        let (base, affinity) = self.base_for_move(vk == 0x23, mods.shift);
+        if self.row_of(base, affinity, ctx).is_some() {
+            return false;
+        }
+        let Some(line) = self.line_at(base) else {
+            return !self.source().status().complete;
+        };
+        !self.failed.iter().any(|(failed, _)| *failed == line)
+    }
+    /// Runs held input in order, as far as the first key that still waits.
+    fn run_deferred(&mut self, ctx: &mut ViewContext) {
+        while let Some(event) = self.deferred.front() {
+            let event = event.clone();
+            if let InputKind::KeyDown {
+                virtual_key,
+                modifiers,
+                ..
+            } = event.kind
+                && self.row_edge_must_wait(virtual_key, modifiers, ctx)
+            {
+                if self.deferred_since.elapsed() < DEFER_LIMIT {
+                    return;
+                }
+                self.deferred.pop_front();
+                self.set_warning(
+                    "Home or End was dropped, because this line's layout did not arrive."
+                        .to_string(),
+                    false,
+                );
+                self.deferred_since = Instant::now();
+                continue;
+            }
+            self.deferred.pop_front();
+            self.deferred_since = Instant::now();
+            let _ = self.handle_inner(&event, ctx);
+        }
+    }
+    /// True for input that must keep its order behind a waiting key.
+    fn keeps_order(event: &InputEvent) -> bool {
+        match &event.kind {
+            InputKind::KeyDown {
+                virtual_key,
+                modifiers,
+                ..
+            } => {
+                !modifiers.alt
+                    && !modifiers.win
+                    && (matches!(*virtual_key, 0x08 | 0x0d | 0x21..=0x28 | 0x2e)
+                        || (modifiers.ctrl
+                            && matches!(*virtual_key, 0x41 | 0x43 | 0x56 | 0x58 | 0x59 | 0x5a)))
+            }
+            InputKind::Char(c) => !c.is_control() || *c == '\t',
+            InputKind::MouseDown { .. }
+            | InputKind::MouseUp { .. }
+            | InputKind::MouseMove { .. } => true,
+            _ => false,
+        }
     }
     fn move_row_edge(&mut self, home: bool, shift: bool, ctx: &mut ViewContext) {
         let (base, affinity) = self.base_for_move(!home, shift);
@@ -2857,6 +3220,11 @@ impl EditorView {
                     .get(h.row)
                     .map(|r| if home { r.range.start } else { r.range.end })
             });
+        // With wrap on and no layout, the key has waited and the layout failed. Only the
+        // layout knows the row, and the whole line could be far more than a row.
+        if target.is_none() && wrap {
+            return;
+        }
         let target = target.or_else(|| {
             self.with_stops(|s| s.line_of(base.0))
                 .ok()
@@ -2949,7 +3317,28 @@ impl EditorView {
             return Handled::Yes;
         }
         if matches!(vk, 0x21..=0x28) {
+            if self.row_edge_must_wait(vk, mods, ctx) {
+                let key = InputKind::KeyDown {
+                    virtual_key: vk,
+                    modifiers: mods,
+                    repeat: false,
+                };
+                self.deferred.push_front(InputEvent {
+                    time_us: 0,
+                    kind: key,
+                });
+                self.deferred_since = Instant::now();
+                self.show_caret();
+                // The caret's line may be off screen, and then nothing would lay it out.
+                self.reveal_caret(ctx);
+                self.schedule(ctx);
+                return Handled::Yes;
+            }
+            let pages = self.pending_pages;
             self.touch();
+            if matches!(vk, 0x21 | 0x22) {
+                self.pending_pages = pages + if vk == 0x22 { 1 } else { -1 };
+            }
             self.move_key(vk, mods, Instant::now(), ctx);
             return Handled::Yes;
         }
@@ -2962,7 +3351,11 @@ impl EditorView {
         let before = (self.anchor, self.caret);
         self.run_move(vk, mods, ctx);
         let stuck = self.mapped.is_some() && before == (self.anchor, self.caret);
-        let wait = stuck && (!self.source().status().complete || self.move_needs_a_page(vk));
+        let wait = if matches!(vk, 0x21 | 0x22) {
+            self.pending_pages != 0
+        } else {
+            stuck && (!self.source().status().complete || self.move_needs_a_page(vk))
+        };
         self.retry_key = wait.then_some((vk, mods, first));
     }
     /// True when the store has not got the lines next to the caret in memory.
@@ -2994,7 +3387,7 @@ impl EditorView {
                 }
             }
             0x21 | 0x22 => {
-                self.move_page(vk == 0x22, mods.shift, ctx);
+                self.move_page(mods.shift, ctx);
             }
             0x24 | 0x23 => {
                 if mods.ctrl {
@@ -3041,10 +3434,11 @@ impl EditorView {
         if !self.wrap {
             let left = self.bounds.x.0;
             let right = left + self.bounds.width.0;
+            let step = f64::from(self.cell_width) * 2.0;
             if at.x.0 < left {
-                self.scroll_x = (self.scroll_x - self.cell_width * 2.0).max(0.0);
+                self.scroll_x = (self.scroll_x - step).max(0.0);
             } else if at.x.0 >= right {
-                self.scroll_x = (self.scroll_x + self.cell_width * 2.0).min(self.max_scroll_x());
+                self.scroll_x = (self.scroll_x + step).min(self.max_scroll_x());
             }
         }
         if self.scroll != old_y || self.scroll_x != old_x {
@@ -3112,7 +3506,7 @@ impl EditorView {
             2 => {
                 // A click on a character's right half lands on the stop after it, but
                 // the word is the one under the mouse.
-                let doc_x = f64::from(at.x.0 - self.bounds.x.0) + f64::from(self.scroll_x);
+                let doc_x = f64::from(at.x.0 - self.bounds.x.0) + self.scroll_x;
                 let look_back = self
                     .place(byte, affinity)
                     .is_some_and(|p| p.exact && doc_x < p.x);
@@ -3141,6 +3535,15 @@ impl EditorView {
                 }
             }
         }
+    }
+    /// Input takes its turn behind any key that still waits for layout.
+    fn handle_now(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
+        if !self.deferred.is_empty() && Self::keeps_order(event) {
+            self.deferred.push_back(event.clone());
+            self.pending = true;
+            return Handled::Yes;
+        }
+        self.handle_inner(event, ctx)
     }
     fn handle_inner(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
         match &event.kind {
@@ -3190,13 +3593,19 @@ impl EditorView {
             InputKind::Wheel {
                 delta_x, delta_y, ..
             } => {
+                // The shell gives whole notches, not Windows' units of 120.
                 if !self.wrap {
-                    self.scroll_x =
-                        (self.scroll_x + *delta_x * 24.0 / 120.0).clamp(0.0, self.max_scroll_x());
+                    let step = f64::from(*delta_x) * f64::from(self.cell_width) * 3.0;
+                    self.scroll_x = (self.scroll_x + step).clamp(0.0, self.max_scroll_x());
                 }
-                self.scroll = (self.scroll
-                    - f64::from(*delta_y) * f64::from(self.row_height) * 3.0 / 120.0)
-                    .clamp(0.0, self.max_scroll());
+                let row = f64::from(self.row_height);
+                let rows = if self.wheel_lines == u32::MAX {
+                    (f64::from(self.bounds.height.0) / row).floor().max(1.0)
+                } else {
+                    f64::from(self.wheel_lines)
+                };
+                self.scroll =
+                    (self.scroll - f64::from(*delta_y) * rows * row).clamp(0.0, self.max_scroll());
                 self.reveal_pending = false;
                 ctx.invalidate(self.bounds);
                 self.schedule(ctx);
@@ -3214,7 +3623,7 @@ impl EditorView {
                 Handled::Yes
             }
             InputKind::Focus => {
-                self.touch();
+                self.show_caret();
                 self.focused = true;
                 self.repaint_caret(self.caret, self.affinity, ctx);
                 Handled::Yes
@@ -3241,6 +3650,7 @@ impl EditorView {
             caret: None,
             view_right: frame.view_right,
             content_end: None,
+            wrap: frame.wrap,
         };
         paint_line_layout(list, ghost, &plain);
         if frame.caret.is_some()
@@ -3261,6 +3671,7 @@ impl EditorView {
 
 impl Drop for EditorView {
     fn drop(&mut self) {
+        self.send_away_document(PieceStore::new(""));
         self.shared.closing.store(true, Ordering::Release);
         if let Some(job) = &self.copy_job {
             job.cancel.store(true, Ordering::Release);
@@ -3302,6 +3713,8 @@ fn worker_loop(
                 } else {
                     LayoutOutcome::Done(ticket.layout(&engine, snapshot.as_ref()))
                 };
+                // Before the result: a view that sees it must find no snapshot left here.
+                drop(snapshot);
                 let done = LayoutResult {
                     id,
                     ticket,
@@ -3310,6 +3723,7 @@ fn worker_loop(
                 if results.send(done).is_err() {
                     return;
                 }
+                shared.wake_host();
             }
             WorkerTask::LongMap(id, line, width, snapshot, engine, generation) => {
                 let result = if shared.fail_line.load(Ordering::Acquire) == line.0 {
@@ -3317,6 +3731,7 @@ fn worker_loop(
                 } else {
                     engine.long_line_map(snapshot.as_ref(), line, width)
                 };
+                drop(snapshot);
                 let done = MapResult {
                     id,
                     generation,
@@ -3325,6 +3740,7 @@ fn worker_loop(
                 if maps.send(done).is_err() {
                     return;
                 }
+                shared.wake_host();
             }
             WorkerTask::KnownFirst(end, width, snapshot, engine, generation) => {
                 let mut result = Err("The known text has no UTF-8 edge.".to_string());
@@ -3351,18 +3767,24 @@ fn worker_loop(
                     generation,
                     result,
                 };
+                drop(snapshot);
                 if known.send(done).is_err() {
                     return;
                 }
+                shared.wake_host();
             }
-            WorkerTask::Drop(snapshot) => drop(snapshot),
+            WorkerTask::Drop(snapshot) => {
+                drop(snapshot);
+                shared.drops_out.fetch_sub(1, Ordering::AcqRel);
+            }
+            WorkerTask::DropDocument(document) => drop(document),
         }
     }
 }
 
 impl View for EditorView {
     fn handle(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
-        let handled = self.handle_inner(event, ctx);
+        let handled = self.handle_now(event, ctx);
         if handled == Handled::Yes {
             self.finish(Instant::now(), ctx);
         }
@@ -3380,7 +3802,7 @@ impl View for EditorView {
         let caret_line = self.caret_line;
         let view_bottom = self.scroll + f64::from(self.bounds.height.0);
         let view_right = self.bounds.x.0 + self.bounds.width.0;
-        let left = self.bounds.x.0 - self.scroll_x;
+        let left = self.bounds.x.0 - self.scroll_x as f32;
         let mut i = self.heights.scroll_to_line(self.scroll).0;
         let mut line_top = self.heights.line_to_scroll(LineIndex(i));
         while i < known_lines && line_top < view_bottom {
@@ -3409,12 +3831,13 @@ impl View for EditorView {
                 caret: on_caret_line.then_some((self.caret, self.affinity)),
                 view_right,
                 content_end,
+                wrap: self.wrap,
             };
             if let Some(map) = self.long_maps.get(&i) {
                 let along = if self.wrap {
                     (self.scroll - line_top).max(0.0)
                 } else {
-                    f64::from(self.scroll_x)
+                    self.scroll_x
                 };
                 let start = map.scroll_to_line(along).0;
                 let limit = along
@@ -3440,7 +3863,8 @@ impl View for EditorView {
                         frame.x = self.bounds.x.0;
                         frame.y = self.bounds.y.0 + (line_top + offset - self.scroll) as f32;
                     } else {
-                        frame.x = self.bounds.x.0 + offset as f32 - self.scroll_x;
+                        // A distance from the view, which an f32 holds exactly enough.
+                        frame.x = self.bounds.x.0 + (offset - self.scroll_x) as f32;
                     }
                     frame.caret =
                         (caret_segment == Some(segment)).then_some((self.caret, self.affinity));
@@ -3526,5 +3950,15 @@ impl View for EditorView {
             },
             children: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_failed_allocation_gives_a_message_and_not_an_abort() {
+        let message = super::reserve_text(usize::MAX / 2).unwrap_err();
+        assert!(message.contains("not enough memory"), "{message}");
+        assert!(super::reserve_text(16).is_ok());
     }
 }

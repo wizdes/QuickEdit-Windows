@@ -20,7 +20,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -510,9 +511,50 @@ impl State {
         problems
     }
 }
+/// The private message behind `ShellWaker`.
+const WM_SHELL_WAKE: u32 = WM_APP + 1;
+
+/// Wakes a window from any thread. The event handler gets `ShellEvent::Wake` on the
+/// window's own thread. It uses a posted message, so nothing the window does with its
+/// timers can replace it, and `SetTimer`'s rule about owning the window does not apply.
+#[derive(Clone)]
+pub struct ShellWaker {
+    hwnd: Arc<AtomicIsize>,
+    posted: Arc<AtomicBool>,
+}
+impl ShellWaker {
+    /// Returns false when the window has gone, or when Windows refused the message.
+    /// A wake that is already on its way covers this one too.
+    pub fn wake(&self) -> bool {
+        let raw = self.hwnd.load(Ordering::Acquire);
+        if raw == 0 {
+            return false;
+        }
+        if self.posted.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        // SAFETY: Windows checks the handle. The window clears it while it is destroyed.
+        let sent = unsafe {
+            PostMessageW(
+                Some(HWND(raw as *mut c_void)),
+                WM_SHELL_WAKE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if sent.is_err() {
+            self.posted.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+
 type ContentPainter = Box<dyn FnMut(&mut DisplayList, ContentFrame)>;
 type EventHandler = Box<dyn FnMut(&ShellHandle, ShellEvent)>;
 struct Shared {
+    /// What `ShellWaker` reads from other threads.
+    waker: ShellWaker,
     hwnd: Cell<HWND>,
     dpi: Cell<u32>,
     fake_dpi: Option<u32>,
@@ -1444,6 +1486,11 @@ impl Shared {
                 }
                 LRESULT(1)
             }
+            WM_SHELL_WAKE => {
+                self.waker.posted.store(false, Ordering::Release);
+                self.queue.borrow_mut().push_back(ShellEvent::Wake);
+                LRESULT(0)
+            }
             WM_TIMER => {
                 let id = w.0 as u32;
                 if id == VIEW_TIMER
@@ -1717,6 +1764,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
             (*raw).adopted.set(true);
             (*raw).hwnd.set(hwnd);
+            (*raw).waker.hwnd.store(hwnd.0 as isize, Ordering::Release);
             let dpi = (*raw).fake_dpi.unwrap_or_else(|| GetDpiForWindow(hwnd));
             (*raw).dpi.set(dpi);
             if let Some(()) = (*raw).with_state(msg, |s| s.strip.set_scale(dpi as f32 / 96.0)) {}
@@ -1735,6 +1783,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         let shared = Rc::from_raw(raw);
         if msg == WM_NCDESTROY {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            shared.waker.hwnd.store(0, Ordering::Release);
             shared.hwnd.set(HWND::default());
             // This drop ends the count that GWLP_USERDATA held.
             drop(Rc::from_raw(raw));
@@ -1762,6 +1811,11 @@ impl ShellHandle {
     }
     pub fn hwnd(&self) -> Result<*mut c_void, ShellError> {
         Ok(self.live()?.hwnd.get().0)
+    }
+    /// A way for any thread to wake this window. It stays safe to use after the window
+    /// has gone.
+    pub fn waker(&self) -> Result<ShellWaker, ShellError> {
+        Ok(self.live()?.waker.clone())
     }
     /// Reads or changes the strip, then repaints the row. The closure must not run a
     /// dialog or a message loop: messages sent meanwhile take the default path and
@@ -2010,6 +2064,10 @@ impl ShellWindow {
         }
         let t = ShellTokens::from_theme(&Theme::new(ThemeKind::Light));
         let shared = Rc::new(Shared {
+            waker: ShellWaker {
+                hwnd: Arc::new(AtomicIsize::new(0)),
+                posted: Arc::new(AtomicBool::new(false)),
+            },
             hwnd: Cell::new(HWND::default()),
             dpi: Cell::new(96),
             fake_dpi: config.fake_dpi,

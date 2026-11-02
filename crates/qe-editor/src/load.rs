@@ -43,6 +43,7 @@ pub struct LoadOptions {
     /// Opens the file read-only whatever its size.
     pub force_read_only: bool,
     /// A pause before each read, for tests of cancelling.
+    #[doc(hidden)]
     pub test_read_delay: Option<Duration>,
 }
 
@@ -81,7 +82,11 @@ impl FileLoad {
     /// The result, once. It never waits.
     pub fn poll(&mut self) -> Option<LoadResult> {
         match self.results.try_recv() {
-            Ok(result) => Some(result),
+            Ok(result) => {
+                // The one result has arrived. Nothing more can come.
+                self.thread = None;
+                Some(result)
+            }
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
                 if self.thread.is_some() {
@@ -139,7 +144,14 @@ fn load(path: &PathBuf, options: &LoadOptions, cancel: &AtomicBool, wake: Notify
         Ok(file) => file,
         Err(e) => return LoadResult::Failed(describe(path, e)),
     };
-    let mut bytes = Vec::with_capacity(size as usize + 1);
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size as usize + 1).is_err() {
+        return LoadResult::Failed(format!(
+            "Could not open {}: there is not enough memory for its {} MiB.",
+            path.display(),
+            size >> 20
+        ));
+    }
     loop {
         if cancel.load(Ordering::Acquire) {
             return LoadResult::Cancelled;

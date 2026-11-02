@@ -20,7 +20,9 @@ const WINDOW: usize = 64;
 /// The widest window tried. A cluster longer than this counts as ending at the window.
 const WIDEST_WINDOW: usize = 2048;
 /// How far back to look for the start of a run of regional indicators.
-const FLAG_LOOK_BACK: usize = 64 * 1024;
+const FLAG_LOOK_BACK: usize = 1024 * 1024;
+/// One read of that look-back. A mapped store gives at most 448 KiB in one read.
+const FLAG_READ: usize = 64 * 1024;
 const FLAG_BYTES: usize = 8;
 /// One read for word movement.
 const WORD_READ: usize = 64 * 1024;
@@ -166,14 +168,29 @@ impl<'a> Stops<'a> {
     /// How many bytes to skip from `from`, which is in a run of regional indicators,
     /// to reach the next flag edge.
     fn flag_skip(&self, line: &LineEdges, from: usize) -> Result<usize, LookupError> {
-        let start = self.edge_forward(from.saturating_sub(FLAG_LOOK_BACK).max(line.start), from)?;
-        let text = self.read(start..from)?;
-        let run: usize = text
-            .chars()
-            .rev()
-            .take_while(|c| is_regional(*c))
-            .map(char::len_utf8)
-            .sum();
+        // A run longer than the look-back pairs from where it stops, the same limit as
+        // the layout crate's. The read is that long only inside such a run of flags.
+        let limit = from.saturating_sub(FLAG_LOOK_BACK).max(line.start);
+        let mut run = 0;
+        let mut to = from;
+        while to > limit {
+            let start = self.edge_forward(to.saturating_sub(FLAG_READ).max(limit), to)?;
+            if start == to {
+                break;
+            }
+            let text = self.read(start..to)?;
+            let tail: usize = text
+                .chars()
+                .rev()
+                .take_while(|c| is_regional(*c))
+                .map(char::len_utf8)
+                .sum();
+            run += tail;
+            if tail < text.len() {
+                break;
+            }
+            to = start;
+        }
         Ok((FLAG_BYTES - run % FLAG_BYTES) % FLAG_BYTES)
     }
     pub fn is_stop(&self, at: usize) -> Result<bool, LookupError> {
@@ -253,6 +270,13 @@ impl<'a> Stops<'a> {
             reach *= 4;
         }
     }
+    /// `at` when it is a stop, otherwise the stop before it.
+    pub fn stop_at_or_before(&self, at: usize) -> Result<usize, LookupError> {
+        if self.is_stop(at)? {
+            return Ok(at);
+        }
+        Ok(self.before(at)?.unwrap_or(0))
+    }
     /// `at` when it is a stop, otherwise the next stop. An edit can leave a caret
     /// inside a cluster or between CR and LF, because it joins the text on its two
     /// sides. The caret stays with the text it followed, so it moves forward.
@@ -315,7 +339,7 @@ impl<'a> Stops<'a> {
         for _ in 0..WORD_READS {
             let (text, from) = self.read_before(pos)?;
             if let Some(found) = previous_word_start(&text) {
-                return self.snap(from + found);
+                return self.stop_at_or_before(from + found);
             }
             if from == 0 {
                 return Ok(0);
@@ -355,7 +379,7 @@ impl<'a> Stops<'a> {
                 last += 1;
             }
         }
-        let start = from + chars[first].0;
+        let start = self.stop_at_or_before(from + chars[first].0)?;
         let end = from + chars.get(last).map_or(text.len(), |(i, _)| *i);
         let end = self.snap(end)?.min(line.content_end);
         Ok(start..end)
@@ -370,11 +394,11 @@ fn is_mark(c: char) -> bool {
     matches!(c as u32,
         0x300..=0x36F | 0x483..=0x489 | 0x591..=0x5BD | 0x610..=0x61A | 0x64B..=0x65F
         | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D | 0x20D0..=0x20F0 | 0xFE00..=0xFE0F
-        | 0xFE20..=0xFE2F | 0xE0100..=0xE01EF)
+        | 0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0100..=0xE01EF)
 }
 
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || is_mark(c)
+    c.is_alphanumeric() || c == '_'
 }
 
 /// A mark that stays inside a word when the same kind of character is on both sides,
@@ -394,7 +418,13 @@ enum Class {
     Other,
 }
 
+/// A mark takes the class of the character it sits on, so a word does not start inside
+/// an emoji, and an accent on a space belongs to the space.
 fn class_at(chars: &[(usize, char)], i: usize) -> Class {
+    let mut i = i;
+    while i > 0 && is_mark(chars[i].1) {
+        i -= 1;
+    }
     let c = chars[i].1;
     if is_word(c) {
         return Class::Word;

@@ -871,7 +871,8 @@ fn t29_fuzz_view_matches_fresh_view() {
     }
 }
 #[test]
-fn t30_timing_big() {
+#[ignore = "it only prints timings"]
+fn measure_only_t30_timing_big() {
     let time = |e: &mut EditorView, label: &str| {
         let mut v = vec![];
         for i in 0..200 {
@@ -907,7 +908,8 @@ fn t30_timing_big() {
     eprintln!("enter {:.3} ms", s.elapsed().as_secs_f64() * 1000.0);
 }
 #[test]
-fn t31_poll_frees_whole_history_on_ui() {
+#[ignore = "it only prints timings"]
+fn measure_only_t31_poll_frees_whole_history_on_ui() {
     let big = "abcdefghij\n".repeat(9_000_000);
     let mut e = open("", 400.0, 400.0);
     e.set_clipboard(Box::new(MemoryClipboard(big)));
@@ -940,6 +942,7 @@ fn u01_tall_window_is_filled() {
             "window height {h}: lowest row baseline y {maxy}, blank below {}",
             h - maxy
         );
+        assert!(h - maxy < 20.0, "window {h} is blank below {maxy}");
     }
 }
 #[test]
@@ -963,6 +966,11 @@ fn u02_layout_above_moves_view() {
         a / 35,
         b / 35
     );
+    assert_eq!(
+        a / 35,
+        b / 35,
+        "the top line moved when layouts above arrived"
+    );
 }
 #[test]
 fn u03_short_after_long() {
@@ -977,6 +985,9 @@ fn u03_short_after_long() {
         runs(&e).len(),
         e.text()
     );
+    assert_eq!(e.text().as_deref(), Some("a"));
+    assert!(!runs(&e).is_empty(), "the letter must paint");
+    assert!(n0 > 1);
     let mut e = open(&t, 200.0, 170.0);
     ctrl(&mut e, END);
     settle(&mut e);
@@ -989,6 +1000,8 @@ fn u03_short_after_long() {
         },
     );
     eprintln!("shift home selection {:?}", e.selection());
+    let row = e.selection().end.0 - e.selection().start.0;
+    assert!(row > 0 && row < 100, "Shift+Home selected {row} bytes");
     settle(&mut e);
     key(&mut e, BS);
     settle(&mut e);
@@ -996,6 +1009,7 @@ fn u03_short_after_long() {
         "after shift+home + backspace, len {}",
         e.text().unwrap().len()
     );
+    assert_eq!(e.text().unwrap().len(), 100_000 - row);
 }
 #[test]
 fn u04_fuzz_no_undo() {
@@ -1050,6 +1064,10 @@ fn u04_fuzz_no_undo() {
             }
             settle(&mut e);
             let text = e.text().unwrap();
+            assert!(
+                text.is_char_boundary(e.caret().0),
+                "seed {seed0} step {step}"
+            );
             let fresh = open(&text, 90.0, 2400.0);
             if runs(&e) != runs(&fresh) {
                 panic!(

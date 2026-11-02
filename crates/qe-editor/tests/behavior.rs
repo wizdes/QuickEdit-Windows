@@ -54,6 +54,17 @@ fn settle(e: &mut EditorView) {
     }
     panic!("layout never settled");
 }
+/// Layout settled, and no worker still holds a snapshot of the text.
+fn settle_workers(e: &mut EditorView) {
+    settle(e);
+    for _ in 0..2500 {
+        if e.test_workers_holding_snapshots() == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("a worker kept its snapshot");
+}
 fn cold(text: &str, width: f32, height: f32) -> EditorView {
     let mut e = EditorView::from_text(text).unwrap();
     e.layout(rect(width, height), &measure());
@@ -1116,7 +1127,8 @@ fn warnings_repaint_and_clear() {
             .iter()
             .any(|c| matches!(c, DrawCommand::TextRun { .. }))
     );
-    let requests = key(&mut e, RIGHT);
+    // Root's decision R14: an edit clears it, and other input does not.
+    let requests = type_char(&mut e, 'b');
     assert_eq!(e.warning(), None);
     assert!(covers(&requests, 10.0), "the warning must leave the screen");
     assert!(
@@ -1659,7 +1671,9 @@ fn history_memory_is_freed_when_idle_and_not_on_each_poll() {
     ctrl(&mut e, 0x56);
     settle(&mut e);
     ctrl(&mut e, 0x5a);
-    settle(&mut e);
+    // A worker that still holds a snapshot would free the text itself, and then no list
+    // waits. How fast it gets there depends on the machine.
+    settle_workers(&mut e);
     type_char(&mut e, 'x');
     settle(&mut e);
     let waiting = e.memory_to_release_bytes();
@@ -1758,11 +1772,12 @@ fn a_layout_that_always_fails_stops_and_shows_a_warning() {
 #[test]
 fn queued_tasks_skip_lines_that_left_the_view() {
     let text = (0..200_000)
-        .map(|i| format!("日本語 {i}\n"))
+        .map(|i| format!("\u{65e5}\u{672c}\u{8a9e} {i}\n"))
         .collect::<String>();
     let mut e = cold(&text, 300.0, 800.0);
-    for step in 0..60 {
-        wheel(&mut e, -6000.0 * (step % 3 + 1) as f32);
+    // Each jump leaves the lines just queued far behind, faster than workers can run.
+    for _ in 0..60 {
+        wheel(&mut e, -400.0);
     }
     settle(&mut e);
     assert!(e.skipped_task_count() > 0, "nothing was skipped");
@@ -1791,15 +1806,26 @@ fn an_undo_group_with_several_changes_keeps_everything_right() {
     settle(&mut e);
     let after = e.text().unwrap();
     assert_ne!(after, body);
+    assert_eq!(e.test_height_map_lines(), e.line_count());
     assert_eq!(glyph_rows(&e), glyph_rows(&open(&after, 90.0, 1800.0)));
     ctrl(&mut e, 0x5a);
     settle(&mut e);
     assert_eq!(e.text().unwrap(), body);
+    assert_eq!(
+        e.test_height_map_lines(),
+        e.line_count(),
+        "undo of the group"
+    );
     assert_eq!(glyph_rows(&e), glyph_rows(&open(&body, 90.0, 1800.0)));
     assert_eq!(e.line_count(), 61);
     ctrl(&mut e, 0x59);
     settle(&mut e);
     assert_eq!(e.text().unwrap(), after);
+    assert_eq!(
+        e.test_height_map_lines(),
+        e.line_count(),
+        "redo of the group"
+    );
     assert_eq!(glyph_rows(&e), glyph_rows(&open(&after, 90.0, 1800.0)));
     let top_to_bottom = selection_rects(&e);
     assert!(top_to_bottom.is_empty());
@@ -2313,7 +2339,7 @@ fn typing_on_a_narrower_line_keeps_a_scroll_a_wider_line_earned() {
     let cell = measure().cell_width().0;
     // Scroll right past where the narrow line alone would allow.
     let target = 300.0 * cell - 100.0;
-    scroll_right(&mut e, target * 120.0 / 24.0);
+    scroll_right(&mut e, target / (3.0 * cell));
     assert!((e.horizontal_offset() - target).abs() < 2.0);
     // The caret goes to the narrow line's end, which is in view at this scroll.
     let end = wide.len() + 1 + filler.len() + narrow.len();
@@ -2551,6 +2577,930 @@ fn a_partial_repaint_leaves_the_same_pixels_as_a_full_paint() {
     }
 }
 
+// ---- Third round: review findings R1 to R14, X1 to X7, live run L1 to L4 ----
+
+#[test]
+fn r1_adopting_into_a_view_with_edits_refuses_and_changes_nothing() {
+    let mut e = EditorView::from_text("").unwrap();
+    type_char(&mut e, 'x');
+    let refused = e.adopt(LoadedFile::Editable {
+        store: PieceStore::new("disk data"),
+        ending: "\n",
+    });
+    assert!(refused.is_err());
+    assert_eq!(e.text().as_deref(), Some("x"));
+    ctrl(&mut e, 0x5a);
+    assert_eq!(e.text().as_deref(), Some(""), "the undo history survives");
+}
+
+#[test]
+fn r1_a_view_refuses_edits_while_its_file_loads() {
+    let mut e = open("", 300.0, 100.0);
+    e.begin_load();
+    assert!(!e.can_edit());
+    assert!(e.widgets().unwrap().states.read_only);
+    type_char(&mut e, 'x');
+    key(&mut e, ENTER);
+    e.set_clipboard(Box::new(MemoryClipboard("p".into())));
+    ctrl(&mut e, 0x56);
+    assert_eq!(e.text().as_deref(), Some(""));
+    assert!(e.refused_edits() >= 3);
+    // A failed load gives the view back.
+    e.end_load();
+    assert!(e.can_edit());
+    type_char(&mut e, 'y');
+    assert_eq!(e.text().as_deref(), Some("y"));
+    // A finished load ends the state too.
+    let mut e = open("", 300.0, 100.0);
+    e.begin_load();
+    e.adopt(LoadedFile::Editable {
+        store: PieceStore::new("disk"),
+        ending: "\n",
+    })
+    .unwrap();
+    assert!(e.can_edit());
+    type_char(&mut e, 'y');
+    assert_eq!(e.text().as_deref(), Some("ydisk"));
+}
+
+fn big_with_tail() -> (String, usize) {
+    let big = "b".repeat(2 << 20);
+    let text = format!("{big}\nsmall");
+    let len = big.len();
+    (text, len)
+}
+
+#[test]
+fn r2_a_later_cut_wins_over_a_slow_copy() {
+    let (text, big) = big_with_tail();
+    let mut e = open(&text, 300.0, 100.0);
+    let (clip, shared) = slot(None);
+    e.set_clipboard(Box::new(clip));
+    e.select(ByteOffset(0)..ByteOffset(big), &mut ViewContext::default());
+    ctrl(&mut e, 0x43);
+    e.select(
+        ByteOffset(big + 1)..ByteOffset(text.len()),
+        &mut ViewContext::default(),
+    );
+    ctrl(&mut e, 0x58);
+    std::thread::sleep(Duration::from_millis(100));
+    settle(&mut e);
+    assert_eq!(shared.borrow().as_deref(), Some("small"));
+}
+
+#[test]
+fn r2_a_later_small_copy_wins_over_a_slow_copy() {
+    let text = format!("small\n{}", "a".repeat(2 * 1024 * 1024));
+    let mut e = EditorView::from_text(&text).unwrap();
+    let (clip, shared) = slot(None);
+    e.set_clipboard(Box::new(clip));
+    ctrl(&mut e, 0x41);
+    ctrl(&mut e, 0x43);
+    e.select(ByteOffset(0)..ByteOffset(5), &mut ViewContext::default());
+    ctrl(&mut e, 0x43);
+    assert_eq!(shared.borrow().as_deref(), Some("small"));
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(2));
+        e.poll_layout(&mut ViewContext::default());
+    }
+    assert_eq!(shared.borrow().as_ref().map(String::len), Some(5));
+}
+
+#[test]
+fn r2_a_paste_during_a_copy_pastes_what_was_just_copied() {
+    let (text, big) = big_with_tail();
+    let mut e = open(&text, 300.0, 100.0);
+    let (clip, _shared) = slot(Some("older text"));
+    e.set_clipboard(Box::new(clip));
+    e.select(ByteOffset(0)..ByteOffset(big), &mut ViewContext::default());
+    ctrl(&mut e, 0x43);
+    e.select(
+        ByteOffset(text.len())..ByteOffset(text.len()),
+        &mut ViewContext::default(),
+    );
+    ctrl(&mut e, 0x56);
+    settle(&mut e);
+    assert_eq!(e.text().unwrap().len(), text.len() + big);
+    assert!(!e.text().unwrap().contains("older"));
+    // A key after the paste was queued drops it, and says so: the newest action wins.
+    let mut e = open(&text, 300.0, 100.0);
+    let (clip, _shared) = slot(Some("older text"));
+    e.set_clipboard(Box::new(clip));
+    e.select(ByteOffset(0)..ByteOffset(big), &mut ViewContext::default());
+    ctrl(&mut e, 0x43);
+    ctrl(&mut e, 0x56);
+    key(&mut e, END);
+    settle(&mut e);
+    assert_eq!(
+        e.text().unwrap().len(),
+        text.len(),
+        "the queued paste is gone"
+    );
+    assert!(
+        e.warning().is_some_and(|w| w.contains("Paste")),
+        "{:?}",
+        e.warning()
+    );
+}
+
+#[test]
+fn r3_home_with_no_layout_waits_so_timing_changes_nothing() {
+    let line = "\u{4e2d}\u{6587}".repeat(300);
+    let text = format!("{line}\nsecond");
+    let run = |cold_keys: bool| {
+        let mut e = open(&text, 300.0, 600.0);
+        e.select(
+            ByteOffset(900)..ByteOffset(900),
+            &mut ViewContext::default(),
+        );
+        type_char(&mut e, '\u{6587}');
+        if !cold_keys {
+            settle(&mut e);
+        }
+        shift(&mut e, HOME);
+        key(&mut e, BACKSPACE);
+        type_char(&mut e, 'z');
+        settle(&mut e);
+        (e.text().unwrap(), e.caret().0)
+    };
+    let warm = run(false);
+    let cold = run(true);
+    assert_eq!(warm.1, cold.1);
+    assert!(
+        warm.0 == cold.0,
+        "layout state changed what the keys removed"
+    );
+    assert!(text.len() + 4 - warm.0.len() < 100, "more than a row went");
+}
+
+#[test]
+fn r3_end_and_a_key_after_it_wait_too_and_keep_their_order() {
+    let line = "\u{4e2d}".repeat(400);
+    let mut e = cold(&line, 300.0, 600.0);
+    key(&mut e, END);
+    type_char(&mut e, 'a');
+    settle(&mut e);
+    let layout = measure().layout_line_for_test(&line, Dip(300.0));
+    let end_of_row = layout.rows[0].range.end.0;
+    assert_eq!(e.text().unwrap().find('a'), Some(end_of_row));
+}
+
+#[test]
+fn r3_home_on_a_line_whose_layout_failed_stays_put_and_says_why() {
+    let mut e = EditorView::from_text("\u{4e2d}\u{6587}\u{4e2d}").unwrap();
+    e.test_fail_layout_of_line(0);
+    e.layout(rect(300.0, 100.0), &measure());
+    settle(&mut e);
+    key(&mut e, RIGHT);
+    let at = e.caret();
+    shift(&mut e, HOME);
+    settle(&mut e);
+    assert_eq!(e.caret(), at);
+    assert!(e.selection().is_empty());
+    assert!(e.warning().is_some());
+}
+
+#[test]
+fn r4_r5_clusters_hold_under_double_clicks_and_word_keys() {
+    let tokens = [
+        "\u{1F1FA}\u{1F1F8}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+        "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+        "\u{2764}\u{FE0F}",
+        "\u{2714}\u{FE0F}",
+        "\u{1F44D}\u{1F3FD}",
+        "e\u{301}",
+        "e\u{301}\u{302}",
+        " \u{301}",
+        "e\u{93e}",
+    ];
+    for token in tokens {
+        for (before, after) in [("", " x"), ("hello ", ""), ("ok", ""), ("a ", " b")] {
+            let text = format!("{before}{token}{after}");
+            let inside = |at: usize| at > before.len() && at < before.len() + token.len();
+            for layout_ready in [true, false] {
+                let make = || {
+                    if layout_ready {
+                        open(&text, 800.0, 100.0)
+                    } else {
+                        EditorView::from_text(&text).unwrap()
+                    }
+                };
+                // Ctrl+Left and Ctrl+Backspace always move, and land on no cluster's inside.
+                let mut e = make();
+                ctrl(&mut e, END);
+                ctrl(&mut e, LEFT);
+                assert!(e.caret().0 < text.len(), "{text:?} Ctrl+Left stuck");
+                assert!(
+                    !inside(e.caret().0),
+                    "{text:?} Ctrl+Left at {}",
+                    e.caret().0
+                );
+                let mut e = make();
+                ctrl(&mut e, END);
+                ctrl(&mut e, BACKSPACE);
+                assert_ne!(e.text().unwrap(), text, "{text:?} Ctrl+Backspace stuck");
+                let mut e = make();
+                ctrl(&mut e, RIGHT);
+                assert!(
+                    !inside(e.caret().0),
+                    "{text:?} Ctrl+Right at {}",
+                    e.caret().0
+                );
+            }
+            // A double click anywhere selects no part of a cluster.
+            let mut e = open(&text, 800.0, 100.0);
+            let mut time = 1_000_000;
+            for x in 0..80 {
+                click(&mut e, x as f32, 4.0, time);
+                click(&mut e, x as f32, 4.0, time + 1000);
+                time += 10_000_000;
+                let got = e.selection();
+                assert!(!inside(got.start.0), "{text:?} x {x}: {got:?}");
+                assert!(!inside(got.end.0), "{text:?} x {x}: {got:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn r6_page_down_waits_for_its_target_and_several_presses_add_up() {
+    let path = temp_path("pages.txt");
+    let line = "0123456789 abcdefghijklmnopqrstuvwxyz\n";
+    std::fs::write(&path, line.repeat(600_000)).unwrap();
+    let _remove = Remove(path.clone());
+    let store = MappedStore::open(&path).unwrap();
+    let mut e = EditorView::from_mapped(store).unwrap();
+    e.layout(rect(800.0, 170.0), &measure());
+    let until = Instant::now() + Duration::from_secs(30);
+    while !e.store_status().complete && Instant::now() < until {
+        e.poll_layout(&mut ViewContext::default());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    settle(&mut e);
+    let row = f64::from(
+        measure().layout_line_for_test("x", Dip(100.0)).rows[0]
+            .height
+            .0,
+    );
+    let rows = (170.0 / row).floor() as usize;
+    // Far from where the store has pages. Nothing here is in memory.
+    let start_line = 300_000;
+    let start = start_line * line.len();
+    e.select(
+        ByteOffset(start)..ByteOffset(start),
+        &mut ViewContext::default(),
+    );
+    let wheel_to = row * start_line as f64;
+    let notches = wheel_to / (row * 3.0);
+    wheel(&mut e, -(notches as f32));
+    let before = e.scroll_offset();
+    for _ in 0..4 {
+        key(&mut e, PG_DOWN);
+        // The view stays with the caret: it moves only with a known target.
+        let moved_lines = (e.caret().0 - start) / line.len();
+        let moved_view = ((e.scroll_offset() - before) / row).round() as usize;
+        assert!(
+            moved_view <= moved_lines + rows,
+            "view moved {moved_view} rows with the caret at {moved_lines}"
+        );
+    }
+    let until = Instant::now() + Duration::from_secs(10);
+    while e.caret().0 != start + 4 * rows * line.len() && Instant::now() < until {
+        e.poll_layout(&mut ViewContext::default());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        (e.caret().0 - start) / line.len(),
+        4 * rows,
+        "4 presses must add up to 4 pages"
+    );
+}
+
+#[test]
+fn r7_cut_edits_at_once_and_its_text_reaches_the_clipboard_later() {
+    let body = "a\n".repeat(8 * 1024 * 1024);
+    let mut e = EditorView::from_text(&body).unwrap();
+    let (clip, shared) = slot(Some("old"));
+    e.set_clipboard(Box::new(clip));
+    ctrl(&mut e, 0x41);
+    ctrl(&mut e, 0x58);
+    assert_eq!(e.text().as_deref(), Some(""), "the edit happens at once");
+    assert_eq!(
+        shared.borrow().as_deref(),
+        Some("old"),
+        "the read is on a thread"
+    );
+    settle(&mut e);
+    assert_eq!(shared.borrow().as_ref().map(String::len), Some(body.len()));
+    // A small Cut stays direct and keeps the text if the clipboard refuses.
+    struct Refuse;
+    impl Clipboard for Refuse {
+        fn read(&mut self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn write(&mut self, _: &str) -> Result<(), String> {
+            Err("busy".into())
+        }
+    }
+    let mut e = open("abc", 300.0, 100.0);
+    e.set_clipboard(Box::new(Refuse));
+    ctrl(&mut e, 0x41);
+    ctrl(&mut e, 0x58);
+    assert_eq!(e.text().as_deref(), Some("abc"));
+    // A big Cut that the clipboard then refuses says that Undo has the text.
+    let body = "a\n".repeat(1024 * 1024);
+    let mut e = open(&body, 300.0, 100.0);
+    e.set_clipboard(Box::new(Refuse));
+    ctrl(&mut e, 0x41);
+    ctrl(&mut e, 0x58);
+    settle(&mut e);
+    assert!(
+        e.warning().is_some_and(|w| w.contains("Undo")),
+        "{:?}",
+        e.warning()
+    );
+    ctrl(&mut e, 0x5a);
+    assert_eq!(e.text().unwrap(), body);
+}
+
+#[test]
+fn r7_dropping_a_view_or_adopting_leaves_big_text_to_a_worker() {
+    let body = "0123456789012345678901234567890123456789012345678901234567890\n".repeat(1 << 20);
+    let direct = {
+        let store = PieceStore::new(&body);
+        let started = Instant::now();
+        drop(store);
+        started.elapsed()
+    };
+    let mut best_drop = Duration::MAX;
+    let mut best_adopt = Duration::MAX;
+    for _ in 0..3 {
+        let view = EditorView::from_text(&body).unwrap();
+        let started = Instant::now();
+        drop(view);
+        best_drop = best_drop.min(started.elapsed());
+        let mut view = EditorView::from_text(&body).unwrap();
+        let started = Instant::now();
+        view.adopt(LoadedFile::Editable {
+            store: PieceStore::new(""),
+            ending: "\n",
+        })
+        .unwrap();
+        best_adopt = best_adopt.min(started.elapsed());
+    }
+    eprintln!("dropping the store here {direct:?}; view drop {best_drop:?}; adopt {best_adopt:?}");
+    assert!(best_drop * 4 < direct, "{best_drop:?} against {direct:?}");
+    assert!(best_adopt * 4 < direct, "{best_adopt:?} against {direct:?}");
+}
+
+/// Which draw commands changed, and whether the repaint covers them.
+fn repaint_misses(wrap: bool, steps: u64) -> Vec<String> {
+    let draw = |e: &EditorView| -> Vec<(String, f32, f32, f32, f32)> {
+        list(e)
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::FillRect { rect, .. } => Some((
+                    format!("{c:?}"),
+                    rect.x.0,
+                    rect.y.0,
+                    rect.width.0,
+                    rect.height.0,
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    let text = format!(
+        "{}\n\u{4e2d}\u{6587} mixed line {}\r\nshort\n\n{}\n",
+        "word ".repeat(120),
+        "\u{e9}x ".repeat(60),
+        "tail text ".repeat(50)
+    )
+    .repeat(6);
+    let mut e = cold(&text, 400.0, 300.0);
+    focus(&mut e);
+    e.set_wrap(wrap).unwrap();
+    settle(&mut e);
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut misses = Vec::new();
+    for step in 0..steps {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let before = draw(&e);
+        let requests = match seed % 16 {
+            0 => type_char(&mut e, 'q'),
+            1 => type_char(&mut e, '\u{4e2d}'),
+            2 => key(&mut e, BACKSPACE),
+            3 => key(&mut e, ENTER),
+            4 => key(&mut e, LEFT),
+            5 => key(&mut e, RIGHT),
+            6 => key(&mut e, UP),
+            7 => key(&mut e, DOWN),
+            8 => shift(&mut e, DOWN),
+            9 => shift(&mut e, UP),
+            10 => shift(&mut e, END),
+            11 => key(&mut e, HOME),
+            12 => ctrl(&mut e, 0x5a),
+            13 => ctrl(&mut e, 0x59),
+            14 => {
+                std::thread::sleep(Duration::from_millis(3));
+                let mut ctx = ViewContext::default();
+                e.poll_layout(&mut ctx);
+                ctx.requests
+            }
+            _ => shift(&mut e, RIGHT),
+        };
+        let rects = invalidates(&requests);
+        let after = draw(&e);
+        let old: HashSet<&String> = before.iter().map(|x| &x.0).collect();
+        let new: HashSet<&String> = after.iter().map(|x| &x.0).collect();
+        let changed = before
+            .iter()
+            .filter(|x| !new.contains(&x.0))
+            .chain(after.iter().filter(|x| !old.contains(&x.0)));
+        for item in changed {
+            let (x0, y0) = (item.1.max(0.0), item.2.max(0.0));
+            let (x1, y1) = ((item.1 + item.3).min(400.0), (item.2 + item.4).min(300.0));
+            let covered = rects.iter().any(|r| {
+                x0 + 0.01 >= r.x.0
+                    && x1 - 0.01 <= r.x.0 + r.width.0
+                    && y0 + 0.01 >= r.y.0
+                    && y1 - 0.01 <= r.y.0 + r.height.0
+            });
+            if y1 > y0 && x1 > x0 && !covered {
+                misses.push(format!(
+                    "step {step}: {x0},{y0} to {x1},{y1} not in {rects:?}"
+                ));
+            }
+        }
+    }
+    misses
+}
+
+#[test]
+fn r9_every_changed_fill_is_inside_the_repaint() {
+    for wrap in [true, false] {
+        let misses = repaint_misses(wrap, 1500);
+        assert!(
+            misses.is_empty(),
+            "wrap {wrap}: {} misses, {:?}",
+            misses.len(),
+            misses.first()
+        );
+    }
+}
+
+#[test]
+fn r9_a_failed_layout_repaints_its_line() {
+    let mut e = open("\u{4e2d}\u{6587}\nsecond", 300.0, 200.0);
+    focus(&mut e);
+    e.test_fail_layout_of_line(0);
+    type_char(&mut e, '\u{4e2d}');
+    let mut ctx = ViewContext::default();
+    for _ in 0..500 {
+        e.poll_layout(&mut ctx);
+        if !e.pending_layout() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(e.warning().is_some());
+    assert!(covers(&ctx.requests, 8.0), "{:?}", ctx.requests);
+}
+
+#[test]
+fn r12_undo_keeps_a_shaped_line_on_screen_until_its_layout_arrives() {
+    let mut e = open("\u{4e2d}\u{6587}\u{5b57}\nsecond", 800.0, 600.0);
+    type_char(&mut e, '\u{4e2d}');
+    settle(&mut e);
+    let before = glyph_rows(&e).len();
+    ctrl(&mut e, 0x5a);
+    assert_eq!(glyph_rows(&e).len(), before, "undo blanked the line");
+    ctrl(&mut e, 0x59);
+    assert_eq!(glyph_rows(&e).len(), before, "redo blanked the line");
+}
+
+#[test]
+fn r10_a_worker_result_wakes_the_host_with_no_polling() {
+    let mut e = open("\u{4e2d}\u{6587}\nsecond", 800.0, 600.0);
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = woken.clone();
+    e.set_wake(Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }));
+    type_char(&mut e, '\u{4e2d}');
+    assert!(
+        !e.caret_is_laid_out(),
+        "the new character waits for its worker"
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    while woken.load(std::sync::atomic::Ordering::Acquire) == 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        woken.load(std::sync::atomic::Ordering::Acquire) > 0,
+        "no wake"
+    );
+    settle(&mut e);
+    assert!(e.caret_is_laid_out());
+}
+
+#[test]
+fn r11_x7_a_notch_and_the_caret_stay_exact_on_a_32_mib_unwrapped_line() {
+    let text = "a".repeat(32 * 1024 * 1024 + 73);
+    let mut e = EditorView::from_text(&text).unwrap();
+    e.set_wrap(false).unwrap();
+    e.layout(rect(400.0, 120.0), &measure());
+    settle(&mut e);
+    ctrl(&mut e, END);
+    settle(&mut e);
+    focus(&mut e);
+    let mut screen = Screen::new(400, 120);
+    let caret = caret_rect(&e).expect("the focused end caret is drawn");
+    assert!(
+        caret.x.0 >= 0.0 && caret.x.0 + caret.width.0 <= 400.0,
+        "the end caret is outside the view: {caret:?}"
+    );
+    screen.apply(&e, &[], "far horizontal paint");
+    let mut ctx = ViewContext::default();
+    e.on_timer_at(Instant::now() + Duration::from_secs(1), &mut ctx);
+    screen.apply(&e, &ctx.requests, "far horizontal blink");
+    // One notch moves by its own step, not by the step of an f32 at this size.
+    let before = e.horizontal_offset_exact();
+    send(
+        &mut e,
+        InputKind::Wheel {
+            at: point(1.0, 1.0),
+            delta_x: -1.0,
+            delta_y: 0.0,
+            modifiers: Modifiers::default(),
+        },
+        0,
+    );
+    let moved = before - e.horizontal_offset_exact();
+    let step = f64::from(measure().cell_width().0) * 3.0;
+    assert!(
+        (moved - step).abs() < 0.01,
+        "moved {moved}, one notch is {step}"
+    );
+}
+
+#[test]
+fn a_wheel_notch_moves_the_hosts_rows() {
+    let row = f64::from(
+        measure().layout_line_for_test("x", Dip(100.0)).rows[0]
+            .height
+            .0,
+    );
+    let mut e = open(&lines(200), 300.0, 100.0);
+    wheel(&mut e, -1.0);
+    assert!(
+        (e.scroll_offset() - 3.0 * row).abs() < 0.01,
+        "{}",
+        e.scroll_offset()
+    );
+    e.set_wheel_lines(5);
+    wheel(&mut e, -1.0);
+    assert!(
+        (e.scroll_offset() - 8.0 * row).abs() < 0.01,
+        "{}",
+        e.scroll_offset()
+    );
+    // SPI_GETWHEELSCROLLLINES gives WHEEL_PAGESCROLL for one screen per notch.
+    e.set_wheel_lines(u32::MAX);
+    let before = e.scroll_offset();
+    wheel(&mut e, -1.0);
+    let rows = (100.0 / row).floor();
+    assert!((e.scroll_offset() - before - rows * row).abs() < 0.01);
+}
+
+#[test]
+fn r14_a_warning_stays_until_the_user_edits() {
+    let mut e = open("", 300.0, 100.0);
+    e.show_warning("Could not open a.txt");
+    send(&mut e, InputKind::Focus, 0);
+    send(&mut e, InputKind::Blur, 0);
+    send(&mut e, InputKind::Focus, 0);
+    assert!(e.warning().is_some(), "focus cleared it");
+    key(&mut e, LEFT);
+    click(&mut e, 1.0, 1.0, 1_000_000);
+    wheel(&mut e, -1.0);
+    assert!(e.warning().is_some(), "non-edit input cleared it");
+    type_char(&mut e, 'x');
+    assert!(e.warning().is_none(), "an edit is the user acting on it");
+}
+
+#[test]
+fn r14_a_line_that_cannot_show_keeps_its_warning_while_it_stays_blank() {
+    let mut e = EditorView::from_text("ok\n\u{4e2d}\nok").unwrap();
+    e.test_fail_layout_of_line(1);
+    e.layout(rect(300.0, 100.0), &measure());
+    settle(&mut e);
+    assert!(e.warning().is_some());
+    focus(&mut e);
+    key(&mut e, RIGHT);
+    click(&mut e, 1.0, 1.0, 1_000_000);
+    settle(&mut e);
+    assert!(e.warning().is_some());
+}
+
+#[test]
+fn a_correction_below_a_long_line_moves_the_scroll_once() {
+    // A long line that its estimate gets wrong, because it changes its kind of text.
+    let long = format!("{}{}", "x".repeat(40_000), "\u{4e2d} ".repeat(20_000));
+    let text = format!("{long}\n{}", lines(400));
+    let mut e = cold(&text, 200.0, 170.0);
+    settle(&mut e);
+    // The view sits on plain lines, with the long line just above it.
+    let line_20 = long.len() + 1 + lines(20).len();
+    e.select(
+        ByteOffset(line_20)..ByteOffset(line_20),
+        &mut ViewContext::default(),
+    );
+    key(&mut e, RIGHT);
+    click(&mut e, 1.0, 1.0, 1_000_000);
+    let top_before = e.caret();
+    assert!(
+        top_before.0 > long.len(),
+        "the top must be below the long line"
+    );
+    settle(&mut e);
+    click(&mut e, 1.0, 1.0, 9_000_000);
+    assert_eq!(e.caret(), top_before, "the top row moved");
+}
+
+#[test]
+fn x2_history_waits_to_be_freed_on_any_machine() {
+    // A snapshot that outlives the view's own edit hands its share of the freeing to
+    // whoever drops it last. The test must first let the workers finish theirs.
+    for _ in 0..3 {
+        let big = "abcdefghij\n".repeat(400_000);
+        let mut e = open("", 400.0, 400.0);
+        focus(&mut e);
+        e.set_clipboard(Box::new(MemoryClipboard(big)));
+        ctrl(&mut e, 0x56);
+        settle(&mut e);
+        ctrl(&mut e, 0x5a);
+        settle_workers(&mut e);
+        type_char(&mut e, 'x');
+        assert!(e.memory_to_release_bytes() > 0);
+    }
+}
+
+#[test]
+fn x3_a_load_reports_its_result_once() {
+    let path = temp_path("poll-once.txt");
+    std::fs::write(&path, "body").unwrap();
+    let _remove = Remove(path.clone());
+    let mut load = FileLoad::start(&path, LoadOptions::default(), quiet()).unwrap();
+    assert!(matches!(wait_for_load(&mut load), LoadResult::Loaded(_)));
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(
+        load.poll().is_none(),
+        "poll after success reported a failure"
+    );
+}
+
+#[test]
+fn x4_select_all_covers_both_text_directions() {
+    for text in [
+        "abc \u{5d0}\u{5d1}\u{5d2}",
+        "\u{5d0}\u{5d1}\u{5d2} abc",
+        "ab \u{5d0}\u{5d1} cd \u{5d2}\u{5d3}",
+        "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}",
+    ] {
+        let mut e = open(text, 400.0, 100.0);
+        ctrl(&mut e, 0x41);
+        let display = list(&e);
+        let rects = selection_rects(&e);
+        assert!(!rects.is_empty());
+        for command in display.commands {
+            if let DrawCommand::GlyphRun {
+                at,
+                bidi_level,
+                advances,
+                ..
+            } = command
+            {
+                let width: f32 = advances.iter().map(|a| a.0).sum();
+                let (left, right) = if bidi_level % 2 == 0 {
+                    (at.x.0, at.x.0 + width)
+                } else {
+                    (at.x.0 - width, at.x.0)
+                };
+                let inside = |x: f32| {
+                    rects.iter().any(|(rx, _, w, _)| {
+                        *rx as f32 / 10.0 <= x + 0.2 && (*rx + *w) as f32 / 10.0 >= x - 0.2
+                    })
+                };
+                assert!(
+                    inside(left) && inside(right),
+                    "{text:?} run {left}..{right}, {rects:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn x4_part_of_a_mixed_row_highlights_only_the_selected_text() {
+    let text = "ab \u{5d0}\u{5d1}\u{5d2} cd";
+    let mut e = open(text, 400.0, 100.0);
+    // From inside the Hebrew word to inside the last Latin word: two separate pieces.
+    let from = 3 + 2;
+    let to = text.len() - 1;
+    e.select(
+        ByteOffset(from)..ByteOffset(to),
+        &mut ViewContext::default(),
+    );
+    let rects = selection_rects(&e);
+    let cell = measure().cell_width().0;
+    let total: i32 = rects.iter().map(|r| r.2).sum();
+    let selected_cells = (text[from..to].chars().count()) as f32;
+    assert!(rects.len() >= 2, "{rects:?}");
+    assert!(
+        (total as f32 / 10.0 - selected_cells * cell).abs() < cell * 1.5,
+        "{rects:?} for {selected_cells} cells"
+    );
+}
+
+#[test]
+fn x5_tall_marks_leave_no_stale_ink() {
+    for font in ["Consolas", "Segoe UI", "Arial"] {
+        for count in [4, 12, 40] {
+            let text = format!("first\nsecond\na{}\nlast\nmore", "\u{301}".repeat(count));
+            let mut e = EditorView::from_text(&text).unwrap();
+            e.set_font(font, 24.0).unwrap();
+            e.layout(rect(400.0, 400.0), &measure());
+            settle(&mut e);
+            let mut screen = Screen::new(400, 400);
+            screen.apply(&e, &[], "before edit");
+            let start = "first\nsecond\n".len();
+            let end = start + 1 + count * 2;
+            e.select(
+                ByteOffset(end)..ByteOffset(end),
+                &mut ViewContext::default(),
+            );
+            let mut ctx = ViewContext::default();
+            e.replace_range(ByteOffset(start)..ByteOffset(end), "b", &mut ctx);
+            for _ in 0..500 {
+                e.poll_layout(&mut ctx);
+                if !e.pending_layout() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            screen.apply(&e, &ctx.requests, &format!("font {font} count {count}"));
+        }
+    }
+}
+
+#[test]
+fn x6_flag_pairs_hold_on_very_long_runs() {
+    for count in [16_417, 16_418, 100_001] {
+        let text = "\u{1f1e6}".repeat(count);
+        let mut e = EditorView::from_text(&text).unwrap();
+        ctrl(&mut e, END);
+        key(&mut e, LEFT);
+        let one = if count % 2 == 1 { 4 } else { 8 };
+        assert_eq!(e.caret().0, text.len() - one, "{count} indicators");
+        key(&mut e, LEFT);
+        assert_eq!(e.caret().0, text.len() - one - 8, "{count} indicators");
+        let mut e = EditorView::from_text(&text).unwrap();
+        e.select(
+            ByteOffset(8000)..ByteOffset(8000),
+            &mut ViewContext::default(),
+        );
+        key(&mut e, RIGHT);
+        assert_eq!(e.caret().0, 8008);
+    }
+}
+
+#[test]
+fn a_long_combining_cluster_moves_as_one() {
+    for count in [20, 40, 100, 400] {
+        let text = format!("a{}z", "\u{301}".repeat(count));
+        let mut e = EditorView::from_text(&text).unwrap();
+        key(&mut e, RIGHT);
+        assert_eq!(e.caret().0, 1 + count * 2, "Right split {count} marks");
+        key(&mut e, LEFT);
+        assert_eq!(e.caret().0, 0, "Left split {count} marks");
+    }
+}
+
+fn row_widths(e: &EditorView) -> Vec<(i32, f32)> {
+    // Each row's right edge in cells, by the row's y.
+    let mut rows: std::collections::BTreeMap<i32, f32> = Default::default();
+    for command in list(e).commands {
+        if let DrawCommand::GlyphRun { at, advances, .. } = command {
+            let width: f32 = advances.iter().map(|a| a.0).sum();
+            let row = (at.y.0 * 10.0) as i32;
+            let entry = rows.entry(row).or_insert(0.0);
+            *entry = entry.max(at.x.0 + width);
+        }
+    }
+    rows.into_iter().collect()
+}
+
+#[test]
+fn l4_a_long_plain_line_has_no_short_rows() {
+    let cell = measure().cell_width().0;
+    for (name, text, slack) in [
+        (
+            "prose",
+            "The quick brown fox jumps over the lazy dog. ".repeat(3000),
+            14.0_f32,
+        ),
+        ("no spaces", "x".repeat(120_000), 1.0),
+        (
+            "long words",
+            format!("{} ", "abcdefghijklmnopqrstuvwxyz0123456789").repeat(4000),
+            // Rows hold whole words of 36. An odd count leaves one row with one word.
+            68.0,
+        ),
+    ] {
+        let width = 820.0;
+        let mut e = open(&text, width, 3000.0);
+        let check = |e: &EditorView, at: &str| {
+            let rows = row_widths(e);
+            assert!(rows.len() > 150, "{name} {at}: {} rows", rows.len());
+            for (i, (y, right)) in rows.iter().enumerate() {
+                let is_last = i + 1 == rows.len();
+                assert!(
+                    is_last || *right >= width - slack * cell - cell,
+                    "{name} {at}: row {i} at y {y} ends at {right} of {width}"
+                );
+            }
+        };
+        check(&e, "top");
+        wheel(&mut e, -2000.0);
+        settle(&mut e);
+        check(&e, "scrolled");
+    }
+}
+
+#[test]
+fn l4_a_selection_across_a_segment_edge_reaches_the_right_edge() {
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(3000);
+    let mut e = open(&text, 820.0, 1000.0);
+    e.select(
+        ByteOffset(100)..ByteOffset(6000),
+        &mut ViewContext::default(),
+    );
+    settle(&mut e);
+    let rects = selection_rects(&e);
+    assert!(rects.len() > 40);
+    // All but the last row reach the right edge, with no notch at a segment's end.
+    for rect in &rects[..rects.len() - 1] {
+        assert_eq!((rect.0 + rect.2) / 10, 820, "{rect:?}");
+    }
+}
+
+#[test]
+fn l4_typing_in_a_long_line_keeps_its_rows_and_loses_nothing() {
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(3000);
+    let mut e = open(&text, 820.0, 800.0);
+    focus(&mut e);
+    let start = 3000;
+    e.select(
+        ByteOffset(start)..ByteOffset(start),
+        &mut ViewContext::default(),
+    );
+    let mut model = text.clone();
+    for i in 0..30 {
+        type_char(&mut e, 'y');
+        model.insert(start + i, 'y');
+    }
+    settle(&mut e);
+    assert_eq!(e.text().unwrap(), model);
+    assert_eq!(e.caret().0, start + 30);
+    assert!(caret_rect(&e).is_some());
+    let fresh = open(&model, 820.0, 800.0);
+    assert_eq!(glyph_rows(&e), glyph_rows(&fresh));
+    // Every byte can be reached by arrows across a segment edge, with no skip.
+    let mut e = open(&text, 820.0, 200.0);
+    e.select(
+        ByteOffset(2030)..ByteOffset(2030),
+        &mut ViewContext::default(),
+    );
+    settle(&mut e);
+    for at in 2031..2100 {
+        key(&mut e, RIGHT);
+        assert_eq!(e.caret().0, at);
+    }
+    // Up and Down cross the edge one row at a time.
+    let mut last = e.caret().0;
+    for _ in 0..60 {
+        key(&mut e, DOWN);
+        let now = e.caret().0;
+        assert!(now > last && now - last < 110, "{last} to {now}");
+        last = now;
+    }
+}
+
 // ---- The seeded model ----
 
 /// One caret stop of the model's text.
@@ -2575,20 +3525,62 @@ fn stops_of(text: &str) -> Vec<usize> {
     stops
 }
 
+/// The plain model, with undo steps by the rule in the qe-buffer README: typed text and
+/// Backspace at the caret continue one step, and any caret move ends it.
 struct Model {
     text: String,
     anchor: usize,
     caret: usize,
+    undo: Vec<String>,
+    redo: Vec<String>,
+    typing_end: Option<usize>,
 }
 impl Model {
     fn range(&self) -> std::ops::Range<usize> {
         self.anchor.min(self.caret)..self.anchor.max(self.caret)
     }
-    fn replace(&mut self, value: &str) {
+    fn replace(&mut self, value: &str, typing: bool) {
         let range = self.range();
+        let continues = typing
+            && !self.undo.is_empty()
+            && ((range.is_empty() && self.typing_end == Some(range.start))
+                || (!range.is_empty() && value.is_empty() && self.typing_end == Some(range.end)));
+        if !continues {
+            self.undo.push(self.text.clone());
+        }
+        self.redo.clear();
         self.text.replace_range(range.clone(), value);
         self.caret = range.start + value.len();
         self.anchor = self.caret;
+        self.typing_end = typing.then_some(self.caret);
+    }
+    /// The caret moved, unless it landed where it was.
+    fn moved_to(&mut self, caret: usize, anchor: usize) {
+        if caret != self.caret {
+            self.typing_end = None;
+        }
+        self.caret = caret;
+        self.anchor = anchor;
+    }
+    fn undo(&mut self) -> bool {
+        match self.undo.pop() {
+            Some(text) => {
+                self.redo.push(std::mem::replace(&mut self.text, text));
+                self.typing_end = None;
+                true
+            }
+            None => false,
+        }
+    }
+    fn redo(&mut self) -> bool {
+        match self.redo.pop() {
+            Some(text) => {
+                self.undo.push(std::mem::replace(&mut self.text, text));
+                self.typing_end = None;
+                true
+            }
+            None => false,
+        }
     }
     /// Undo may keep a selection, when it has nothing to undo. Other moves collapse it.
     fn take_selection_of(&mut self, e: &EditorView) {
@@ -2625,9 +3617,11 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
         text: String::new(),
         anchor: 0,
         caret: 0,
+        undo: Vec::new(),
+        redo: Vec::new(),
+        typing_end: None,
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    seen.insert(String::new());
+    let (mut undone, mut redone) = (0, 0);
     let mut seed = seed0.wrapping_mul(0x9E37_79B9);
     let mut compared = 0;
     for step in 0..steps {
@@ -2640,22 +3634,23 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 let token = ["a", " ", "e\u{301}", "日", "😀", "🇺🇸", "👩‍👩‍👧"][pick % 7];
                 // A token of several characters arrives as one paste, as an input method does.
                 let mut chars = token.chars();
-                if token.chars().count() == 1 {
+                let typed = token.chars().count() == 1;
+                if typed {
                     type_char(&mut e, chars.next().unwrap());
                 } else {
                     let mut local = ViewContext::default();
                     let range = e.selection();
                     e.replace_range(range, token, &mut local);
                 }
-                model.replace(token);
+                model.replace(token, typed);
             }
             5 => {
                 key(&mut e, ENTER);
-                model.replace("\n");
+                model.replace("\n", true);
             }
             6 => {
                 ctrl(&mut e, 0x56);
-                model.replace("p\r\nq");
+                model.replace("p\r\nq", false);
             }
             7 => {
                 key(&mut e, LEFT);
@@ -2665,8 +3660,7 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 } else {
                     range.start
                 };
-                model.caret = to;
-                model.anchor = to;
+                model.moved_to(to, to);
             }
             8 => {
                 key(&mut e, RIGHT);
@@ -2676,8 +3670,7 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 } else {
                     range.end
                 };
-                model.caret = to;
-                model.anchor = to;
+                model.moved_to(to, to);
             }
             9 => {
                 shift(&mut e, if pick.is_multiple_of(2) { LEFT } else { RIGHT });
@@ -2686,17 +3679,18 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 } else {
                     model.stop_after(model.caret).unwrap_or(model.caret)
                 };
-                model.caret = to;
+                let anchor = model.anchor;
+                model.moved_to(to, anchor);
             }
             10 => {
                 key(&mut e, BACKSPACE);
                 if model.range().is_empty() {
                     if let Some(to) = model.stop_before(model.caret) {
                         model.anchor = to;
-                        model.replace("");
+                        model.replace("", true);
                     }
                 } else {
-                    model.replace("");
+                    model.replace("", true);
                 }
             }
             11 => {
@@ -2704,34 +3698,39 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 if model.range().is_empty() {
                     if let Some(to) = model.stop_after(model.caret) {
                         model.anchor = to;
-                        model.replace("");
+                        model.replace("", false);
                     }
                 } else {
-                    model.replace("");
+                    model.replace("", false);
                 }
             }
             12 | 13 => {
                 // Vertical moves: the plain model says only that the caret lands on a stop.
                 key(&mut e, if op == 12 { UP } else { DOWN });
-                model.caret = e.caret().0;
-                model.anchor = model.caret;
+                let caret = e.caret().0;
+                model.moved_to(caret, caret);
             }
             14 => {
                 ctrl(&mut e, 0x5a);
-                let text = e.text().unwrap();
-                assert!(seen.contains(&text), "{context}: undo made new text");
-                model.text = text;
+                undone += usize::from(model.undo());
                 model.take_selection_of(&e);
             }
             _ => {
+                // Redo has work only right after an undo, so this op makes sure of one.
+                if model.redo.is_empty() {
+                    ctrl(&mut e, 0x5a);
+                    undone += usize::from(model.undo());
+                    assert_eq!(
+                        e.text().unwrap(),
+                        model.text,
+                        "{context}: the undo before redo"
+                    );
+                }
                 ctrl(&mut e, 0x59);
-                let text = e.text().unwrap();
-                assert!(seen.contains(&text), "{context}: redo made new text");
-                model.text = text;
+                redone += usize::from(model.redo());
                 model.take_selection_of(&e);
             }
         }
-        seen.insert(model.text.clone());
         let text = e.text().unwrap();
         assert_eq!(text, model.text, "{context}");
         assert_eq!(e.caret().0, model.caret, "{context}: text {text:?}");
@@ -2763,6 +3762,11 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
             }
         }
     }
+    // The run must really have walked the history.
+    assert!(
+        undone > 3 && redone > 0,
+        "undo ran {undone} times and redo {redone}"
+    );
     compared
 }
 
@@ -2925,5 +3929,52 @@ fn release_budget_key_work_p99_under_2_ms_on_one_megabyte() {
         best = best.min(samples[(samples.len() * 99).div_ceil(100) - 1]);
     }
     eprintln!("key work p99 on 1 MB, best of 3 runs: {best:.3} ms");
+    assert!(best < 2.0, "p99 {best:.3} ms");
+}
+
+/// A key's work up to the end of the renderer's frame, which is all but the present call:
+/// that needs a window, so the example's `--bench-keys` measures it. Best of 3 runs, so
+/// that one bad run on a loaded PC does not fail this. Only 1 MB: 512 MiB is too heavy for
+/// a test, and the bench measures it.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_budget_key_through_the_renderer_p99_under_2_ms_on_one_megabyte() {
+    let text = "The quick brown fox jumps over the lazy dog. 0123456789 abcdefghijklmnop qrst\n"
+        .repeat(13_000);
+    let mut e = open(&text, 800.0, 600.0);
+    focus(&mut e);
+    let mut renderer = BitmapRenderer::new(800, 600).unwrap();
+    let measure = measure();
+    let theme = Theme::new(ThemeKind::Light);
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let mut samples = Vec::new();
+        for i in 0..400 {
+            let started = Instant::now();
+            let requests = if i % 2 == 0 {
+                type_char(&mut e, 'q')
+            } else {
+                key(&mut e, BACKSPACE)
+            };
+            let mut list = DisplayList::default();
+            e.draw(&mut list, &theme, &measure);
+            for command in &list.commands {
+                if let DrawCommand::GlyphRun { font_id, .. } = command {
+                    renderer.register_font_face(*font_id, &qe_layout::font_face(*font_id).unwrap());
+                }
+            }
+            for rect in invalidates(&requests) {
+                renderer.invalidate(rect);
+            }
+            renderer.begin_frame().unwrap();
+            renderer.draw(&list).unwrap();
+            renderer.end_frame().unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            e.poll_layout(&mut ViewContext::default());
+        }
+        samples.sort_by(f64::total_cmp);
+        best = best.min(samples[(samples.len() * 99).div_ceil(100) - 1]);
+    }
+    eprintln!("key through the renderer p99 on 1 MB, best of 3 runs: {best:.3} ms");
     assert!(best < 2.0, "p99 {best:.3} ms");
 }

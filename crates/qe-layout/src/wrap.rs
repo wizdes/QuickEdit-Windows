@@ -117,6 +117,100 @@ pub(crate) fn wrap_rows(bytes: &[u8], breaks: &[bool], max_columns: usize) -> Ve
     rows
 }
 
+/// Cells a row of these bytes takes. Spaces may hang past the edge, so they do not count.
+fn cells_without_hanging_spaces(bytes: &[u8], start: usize, end: usize) -> usize {
+    let mut last = end;
+    while last > start && bytes[last - 1] == b' ' {
+        last -= 1;
+    }
+    last - start
+}
+
+/// How many rows at a segment's end `fill_last_row` may choose again. Each gives up a
+/// word or less, so this many rows hide any short row and the work stays bounded.
+const ROWS_TO_REFILL: usize = 12;
+/// A last row this close to full reads as a natural one, and costs nothing to keep.
+const CLOSE_ENOUGH_CELLS: usize = 8;
+/// What a row cut in the middle of a word costs, against one that ends at a break.
+const CUT_WORD_COST: u64 = 1 << 20;
+
+/// A long line is cut into segments, and each is wrapped alone. Wrapped greedily, a
+/// segment ends in a short row, which looks like a line break in the middle of a
+/// paragraph.
+///
+/// So the last rows of the segment are chosen together, to share out the space that the
+/// short row had, and the segment ends in a full row. A wrong-looking row needs more space
+/// than any one word, so this minimizes the sum of each row's empty cells, squared. The
+/// result depends only on this segment's bytes, so the work is bounded on a line of any
+/// length: about `ROWS_TO_REFILL` rows times the cells on a row.
+pub(crate) fn fill_last_row(
+    bytes: &[u8],
+    breaks: &[bool],
+    max_columns: usize,
+    rows_end: &mut Vec<usize>,
+) {
+    if rows_end.len() < 2 || max_columns == 0 {
+        return;
+    }
+    let last = rows_end.len() - 1;
+    let short = cells_without_hanging_spaces(bytes, rows_end[last - 1], rows_end[last]);
+    if short + CLOSE_ENOUGH_CELLS >= max_columns {
+        return;
+    }
+    let kept = rows_end.len().saturating_sub(ROWS_TO_REFILL);
+    let begin = if kept == 0 { 0 } else { rows_end[kept - 1] };
+    let end = bytes.len();
+    let room = end - begin;
+    // For each byte from `begin`, the lowest cost of rows that end there, and the row
+    // start that gave it.
+    let mut cost = vec![u64::MAX; room + 1];
+    let mut from = vec![0_usize; room + 1];
+    cost[0] = 0;
+    for start in 0..room {
+        if cost[start] == u64::MAX {
+            continue;
+        }
+        let mut found_break = false;
+        let mut stop = start + 1;
+        while stop <= room {
+            let used = cells_without_hanging_spaces(bytes, begin + start, begin + stop);
+            if used > max_columns {
+                break;
+            }
+            if stop == room || breaks[begin + stop - 1] {
+                found_break = true;
+                let empty = (max_columns - used) as u64;
+                let total = cost[start] + empty * empty;
+                if total < cost[stop] {
+                    cost[stop] = total;
+                    from[stop] = start;
+                }
+            }
+            stop += 1;
+        }
+        if !found_break {
+            // One word fills the row, so the row cuts it, as the plain wrap does.
+            let cut = (start + max_columns).min(room);
+            let total = cost[start] + CUT_WORD_COST;
+            if total < cost[cut] {
+                cost[cut] = total;
+                from[cut] = start;
+            }
+        }
+    }
+    if cost[room] == u64::MAX {
+        return;
+    }
+    let mut ends = Vec::new();
+    let mut at = room;
+    while at > 0 {
+        ends.push(begin + at);
+        at = from[at];
+    }
+    rows_end.truncate(kept);
+    rows_end.extend(ends.into_iter().rev());
+}
+
 #[cfg(test)]
 mod tests {
     use super::break_points;

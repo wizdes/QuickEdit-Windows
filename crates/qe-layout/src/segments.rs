@@ -216,6 +216,15 @@ struct LinePlan {
 }
 
 impl DirectWriteLayout {
+    /// The nominal size of one segment here. A row is cut mid-word only where a word
+    /// fills it, and such rows fall on multiples of the row's cells from the line's start.
+    /// A nominal edge on such a multiple lets text with no spaces wrap with no short row.
+    fn segment_bytes(&self) -> usize {
+        match self.full_row_cells() {
+            Some(cells) if cells <= SEGMENT_BYTES => SEGMENT_BYTES / cells * cells,
+            _ => SEGMENT_BYTES,
+        }
+    }
     /// Only the bytes of a line can tell if it may stay whole between the two limits.
     /// That read is bounded by `LONG_LINE_BYTES`.
     fn plan(&self, text: &dyn TextSnapshot, line: LineIndex) -> Result<LinePlan, LayoutError> {
@@ -234,10 +243,11 @@ impl DirectWriteLayout {
             });
         let mut count = 1;
         if !whole {
-            count = bytes.div_ceil(SEGMENT_BYTES);
+            let size = self.segment_bytes();
+            count = bytes.div_ceil(size);
             // Snapping can carry the second last edge right to the end of the line.
             // No empty segment follows it.
-            let last = content.start.0 + (count - 1) * SEGMENT_BYTES;
+            let last = content.start.0 + (count - 1) * size;
             if count > 1 && snap(text, &content, last)? >= content.end.0 {
                 count -= 1;
             }
@@ -274,11 +284,12 @@ impl DirectWriteLayout {
             return Ok(plan.content.clone());
         }
         let base = plan.content.start.0;
-        let start = snap(text, &plan.content, base + index * SEGMENT_BYTES)?;
+        let size = self.segment_bytes();
+        let start = snap(text, &plan.content, base + index * size)?;
         let end = if index + 1 == plan.count {
             plan.content.end.0
         } else {
-            snap(text, &plan.content, base + (index + 1) * SEGMENT_BYTES)?
+            snap(text, &plan.content, base + (index + 1) * size)?
         };
         Ok(ByteOffset(start)..ByteOffset(end))
     }
@@ -312,7 +323,7 @@ impl DirectWriteLayout {
             .0
             .min(plan.content.end.0)
             .saturating_sub(plan.content.start.0);
-        let mut index = (at / SEGMENT_BYTES).min(plan.count - 1);
+        let mut index = (at / self.segment_bytes()).min(plan.count - 1);
         let mut range = self.range_in_plan(text, &plan, line, index)?;
         if byte < range.start && index > 0 {
             index -= 1;
@@ -338,6 +349,11 @@ impl DirectWriteLayout {
         let plan = self.plan(text, line)?;
         let range = self.range_in_plan(text, &plan, line, index)?;
         let s = read(text, range.clone())?;
+        if index + 1 < plan.count
+            && let Some(layout) = self.fast_full_rows(&s, range.start, line, width)
+        {
+            return Ok(layout);
+        }
         let column = if s.contains('\t') {
             self.column_before(text, line, range.start)?
         } else {

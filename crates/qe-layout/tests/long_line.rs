@@ -860,3 +860,110 @@ fn correcting_a_segment_above_keeps_the_view_still() {
         assert!((scroll - map.line_to_scroll(top_segment) - 12.5).abs() < 1e-6);
     }
 }
+
+/// With `with_full_rows_at`, a long line wraps with no short row where segments meet.
+#[test]
+fn full_rows_leave_no_short_row_at_a_segment_edge() {
+    let width = Dip(820.0);
+    let engine = DirectWriteLayout::new().unwrap().with_full_rows_at(width);
+    let cell = engine.cell_width().0;
+    let cells = (width.0 / cell).floor() as usize;
+    for (name, text, slack) in [
+        (
+            "prose",
+            "The quick brown fox jumps over the lazy dog. ".repeat(3000),
+            14,
+        ),
+        ("no spaces", "x".repeat(120_000), 0),
+        (
+            "long words",
+            format!("{} ", "abcdefghijklmnopqrstuvwxyz0123456789").repeat(4000),
+            // Rows hold whole words of 36. An odd count leaves one row with one word.
+            68,
+        ),
+    ] {
+        let store = LongLine::new(&text, text.len());
+        assert!(engine.is_long_line(&store, LineIndex(0)).unwrap());
+        let count = engine.segment_count(&store, LineIndex(0)).unwrap();
+        assert!(count > 10);
+        let mut next_start = ByteOffset(0);
+        for index in 0..count {
+            let layout = engine
+                .layout_segment(&store, LineIndex(0), index, width)
+                .unwrap();
+            for (at, row) in layout.rows.iter().enumerate() {
+                assert_eq!(
+                    row.range.start, next_start,
+                    "{name} segment {index} row {at}"
+                );
+                next_start = row.range.end;
+                let used = text[row.range.start.0..row.range.end.0].trim_end().len();
+                let last_of_line = index + 1 == count && at + 1 == layout.rows.len();
+                assert!(
+                    last_of_line || used + slack >= cells,
+                    "{name} segment {index} row {at} holds {used} of {cells}"
+                );
+                assert!(
+                    used <= cells,
+                    "{name} segment {index} row {at} holds {used}"
+                );
+            }
+        }
+        assert_eq!(next_start.0, text.len(), "{name}: every byte is in one row");
+    }
+}
+
+/// The result depends on the segment's text and the width alone, so any segment lays
+/// out in the same time and to the same rows, whatever came before it.
+#[test]
+fn full_rows_do_not_depend_on_which_segment_came_first() {
+    let width = Dip(620.0);
+    let engine = DirectWriteLayout::new().unwrap().with_full_rows_at(width);
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(3000);
+    let store = LongLine::new(&text, text.len());
+    let far = engine.segment_count(&store, LineIndex(0)).unwrap() - 2;
+    let first = engine
+        .layout_segment(&store, LineIndex(0), far, width)
+        .unwrap();
+    let _ = engine
+        .layout_segment(&store, LineIndex(0), 0, width)
+        .unwrap();
+    let again = engine
+        .layout_segment(&store, LineIndex(0), far, width)
+        .unwrap();
+    assert_eq!(first, again);
+}
+
+/// The plain engine keeps its edges, so a caller who never asks sees no change.
+#[test]
+fn full_rows_are_only_for_who_asks() {
+    let plain = DirectWriteLayout::new().unwrap();
+    let store = LongLine::new("x", 100_000);
+    let range = plain.segment_range(&store, LineIndex(0), 1).unwrap();
+    assert_eq!(range.start.0, qe_layout::SEGMENT_BYTES);
+}
+
+/// Choosing the last rows again stays inside the budget for one segment, and it does not
+/// depend on the length of the line.
+#[test]
+fn full_rows_stay_inside_the_segment_budget() {
+    let _guard = one_at_a_time();
+    let width = Dip(820.0);
+    let engine = DirectWriteLayout::new().unwrap().with_full_rows_at(width);
+    let store = LongLine::new("The quick brown fox jumps over the lazy dog. ", MB100);
+    let count = engine.segment_count(&store, LineIndex(0)).unwrap();
+    let mut worst = 0.0_f64;
+    for index in [0, 1, count / 2, count - 2] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let started = Instant::now();
+            engine
+                .layout_segment(&store, LineIndex(0), index, width)
+                .unwrap();
+            best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        worst = worst.max(best);
+    }
+    eprintln!("a segment with its rows chosen again: {worst:.3} ms at worst");
+    assert!(worst < SEGMENT_LIMIT_MS, "{worst} ms");
+}

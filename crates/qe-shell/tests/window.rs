@@ -1879,3 +1879,44 @@ fn the_real_renderer_refresh_runs_on_a_hidden_window() {
         "{problems:?}"
     );
 }
+
+/// Any thread can wake a window, a timer cannot replace the wake, and a wake after the
+/// window has gone does nothing.
+#[test]
+fn a_waker_reaches_the_owner_from_another_thread() {
+    let f = fixture(None);
+    let waker = f.window.handle().waker().unwrap();
+    f.window.take_events().unwrap();
+    // A long timer asked for after the wake, as a view's blink is, must not replace it.
+    let from_thread = waker.clone();
+    std::thread::spawn(move || {
+        assert!(from_thread.wake());
+        // A second wake before the first is served adds no second message.
+        assert!(from_thread.wake());
+    })
+    .join()
+    .unwrap();
+    f.window
+        .apply_requests(vec![ViewRequest::RequestTimer(60_000)])
+        .unwrap();
+    let hwnd = f.hwnd();
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            DispatchMessageW(&msg);
+        }
+    }
+    let events = f.window.take_events().unwrap();
+    let wakes = events.iter().filter(|e| **e == ShellEvent::Wake).count();
+    assert_eq!(wakes, 1, "{events:?}");
+    // The next wake after that one is a new message.
+    assert!(waker.wake());
+    while unsafe { PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            DispatchMessageW(&msg);
+        }
+    }
+    assert!(f.window.take_events().unwrap().contains(&ShellEvent::Wake));
+    f.window.destroy().unwrap();
+    assert!(!waker.wake(), "a window that has gone cannot wake");
+}

@@ -140,8 +140,10 @@ fn check_random_steps(dpi: u32, theme: ThemeKind, seed: u64, wrap_lines: bool) {
             write_png(&folder.join("repaint-full.png"), b.width, b.height, &b.bgra);
             let first = a
                 .bgra
-                .chunks_exact(4)
-                .zip(b.bgra.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.bgra.as_chunks::<4>().0)
                 .position(|(x, y)| x != y)
                 .unwrap_or(0);
             panic!(

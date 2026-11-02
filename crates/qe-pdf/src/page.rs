@@ -5,7 +5,8 @@
 //! footers wait for the end, when the page count is known, as extra content streams.
 use crate::cff::Segment;
 use crate::fonts::{
-    ColorLayer, FontSet, GlyphText, PdfFont, build_subset, face_facts, glyph_outline,
+    ColorLayer, FontSet, GlyphText, MOST_MAP_UNITS, PdfFont, build_subset, face_facts,
+    glyph_outline, map_pieces,
 };
 use crate::text::glyph_texts;
 use crate::writer::{CATALOG_ID, PAGES_ID, PdfFile, RESOURCES_ID};
@@ -14,6 +15,7 @@ use qe_api::testing::StringStore;
 use qe_api::{Dip, LayoutGlyphRun, LayoutRow, LineIndex, TextSnapshot};
 use qe_layout::DirectWriteLayout;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
@@ -75,6 +77,14 @@ pub struct PageBuilder {
     // Kept here so that a run costs no allocation.
     text_buffer: String,
     clip: String,
+    /// A font and em size for text in a row that has no glyphs at all, such as a lone tab.
+    plain_font: (u32, f32),
+}
+
+/// One part of a row, in the store's order.
+enum RowPart {
+    Run(usize),
+    Gap(Range<usize>),
 }
 
 fn number(out: &mut Vec<u8>, value: f64) {
@@ -118,7 +128,7 @@ fn hex16(out: &mut Vec<u8>, value: u16) {
 }
 
 impl PageBuilder {
-    pub fn new(options: &PdfOptions, scale: f32) -> Self {
+    pub fn new(options: &PdfOptions, scale: f32, plain_font: (u32, f32)) -> Self {
         let text_height = options.paper_height - 2.0 * options.margin;
         let text_width = options.paper_width - 2.0 * options.margin;
         let margin = options.margin;
@@ -138,6 +148,7 @@ impl PageBuilder {
             color_glyphs: 0,
             text_buffer: String::new(),
             clip: format!("q {margin} {margin} {text_width} {text_height} re W n\nBT\n"),
+            plain_font,
         }
     }
     pub fn page_index(&self) -> usize {
@@ -165,16 +176,99 @@ impl PageBuilder {
         let scale = self.dip_scale;
         let margin = f64::from(self.margin);
         let paper_height = f64::from(self.paper.1);
-        for run in &row.glyph_runs {
-            let baseline = self.used + f64::from(run.origin.y.0) - f64::from(row.y.0);
-            let at = (
-                margin + f64::from(run.origin.x.0) * scale,
-                paper_height - margin - baseline * scale,
-            );
+        let origin = |builder: &Self, x: f32, y: f64| {
+            (
+                margin + f64::from(x) * scale,
+                paper_height - margin - (builder.used + y) * scale,
+            )
+        };
+        // The common row is one run that holds all of its text, and needs no list.
+        if let [run] = row.glyph_runs.as_slice()
+            && run.range == row.range
+            && !run.glyph_ids.is_empty()
+        {
+            let y = f64::from(run.origin.y.0) - f64::from(row.y.0);
+            let at = origin(self, run.origin.x.0, y);
             self.place_run(run, row, source, fonts, file, at, scale)?;
+            self.used += height;
+            return Ok(closed);
+        }
+        // Layout gives a tab no run, and may give no glyph to a character it does not draw.
+        // Those are the row's gaps. They go in the file in the store's order, as blanks.
+        let parts = row_parts(row);
+        let baseline = row
+            .glyph_runs
+            .iter()
+            .find(|run| !run.glyph_ids.is_empty())
+            .map_or(height * 0.8, |run| {
+                f64::from(run.origin.y.0) - f64::from(row.y.0)
+            });
+        let mut last_font = None;
+        for part in &parts {
+            match part {
+                RowPart::Run(index) => {
+                    let run = &row.glyph_runs[*index];
+                    let y = f64::from(run.origin.y.0) - f64::from(row.y.0);
+                    let at = origin(self, run.origin.x.0, y);
+                    self.place_run(run, row, source, fonts, file, at, scale)?;
+                    last_font = Some((run.font_id, run.font_em_size.0));
+                }
+                RowPart::Gap(gap) => {
+                    let (font_id, em) = last_font
+                        .or_else(|| {
+                            row.glyph_runs
+                                .iter()
+                                .find(|run| !run.glyph_ids.is_empty())
+                                .map(|run| (run.font_id, run.font_em_size.0))
+                        })
+                        .unwrap_or(self.plain_font);
+                    let (x, width) = gap_place(row, gap);
+                    let at = origin(self, x, baseline);
+                    self.place_gap(gap, source, fonts, (font_id, em), at, width)?;
+                }
+            }
         }
         self.used += height;
         Ok(closed)
+    }
+
+    /// Puts a gap's text in the file at its place, with nothing to see.
+    #[allow(clippy::too_many_arguments)]
+    fn place_gap(
+        &mut self,
+        gap: &Range<usize>,
+        source: &dyn TextSnapshot,
+        fonts: &mut FontSet,
+        (font_id, em): (u32, f32),
+        at: (f64, f64),
+        width: f32,
+    ) -> Result<(), PdfError> {
+        let mut text = String::new();
+        let range = qe_api::ByteOffset(gap.start)..qe_api::ByteOffset(gap.end);
+        if !source.visit_chunks(range, &mut |part| text.push_str(part)) {
+            return Err(PdfError::Read(
+                "The text could not be read while the PDF was being written, so no PDF was \
+                 written."
+                    .into(),
+            ));
+        }
+        let size = (f64::from(em) * self.dip_scale) as f32;
+        let per_em = 1000.0 / em.max(0.001);
+        for piece in map_pieces(&text) {
+            let (font, cid) = fonts
+                .blank_cid(font_id, piece, width * per_em)
+                .map_err(PdfError::Font)?;
+            self.place_blank(font, cid, size, at);
+        }
+        Ok(())
+    }
+
+    fn place_blank(&mut self, font: usize, cid: u16, size: f32, at: (f64, f64)) {
+        self.set_font(font, size);
+        self.move_text(at.0, at.1);
+        self.content.push(b'<');
+        hex16(&mut self.content, cid);
+        self.content.extend_from_slice(b"> Tj\n");
     }
 
     fn start_content(&mut self) {
@@ -287,7 +381,11 @@ impl PageBuilder {
         // Plain left-to-right text with no offsets goes in one TJ. Everything else is
         // placed glyph by glyph, which also suits marks and Arabic.
         let right_to_left = run.bidi_level & 1 == 1;
+        // A piece of text too long for one map entry goes on in blanks after its glyph.
         let plain = !right_to_left
+            && !shared
+                .iter()
+                .any(|piece| piece.is_empty() || piece.len() > MOST_MAP_UNITS)
             && run.offsets.iter().all(|o| o.x.0 == 0.0 && o.y.0 == 0.0)
             && !fonts.has_color(run.font_id).map_err(PdfError::Font)?;
         let mut pen = at.0;
@@ -296,12 +394,19 @@ impl PageBuilder {
             let advance = f64::from(run.advances[index].0);
             let width = (advance * per_em) as f32;
             let glyph = run.glyph_ids[index];
+            // A glyph that stands for no text, such as the second part of a split letter, has
+            // no map entry to give. A reader then makes up text from its number, so this
+            // glyph goes in the file as a shape, which no reader takes for text.
+            let textless = !direct && shared.get(index).is_none_or(String::is_empty);
             let (font, cid) = if direct {
                 let character = char::from(text.as_bytes()[index]);
                 fonts.cid_for_char(run.font_id, glyph, character, width)
+            } else if textless {
+                Ok((0, 0))
             } else {
                 let piece = shared.get(index).map_or("", String::as_str);
-                fonts.cid_for_text(run.font_id, glyph, piece, width)
+                let head = map_pieces(piece).first().copied().unwrap_or("");
+                fonts.cid_for_text(run.font_id, glyph, head, width)
             }
             .map_err(PdfError::Font)?;
             if plain {
@@ -335,6 +440,18 @@ impl PageBuilder {
                 x
             };
             let glyph_y = at.1 + f64::from(offset.y.0) * scale;
+            if textless {
+                fonts
+                    .check_glyph_of(run.font_id, glyph)
+                    .map_err(PdfError::Font)?;
+                let layers = fonts
+                    .color_layers(run.font_id, glyph)
+                    .map_err(PdfError::Font)?
+                    .filter(|layers| !layers.is_empty())
+                    .unwrap_or_else(|| Arc::from([ColorLayer { glyph, color: None }]));
+                self.draw_form(run.font_id, glyph, layers, file, size, (glyph_x, glyph_y));
+                continue;
+            }
             self.set_font(font, size);
             let layers = fonts
                 .color_layers(run.font_id, glyph)
@@ -352,18 +469,16 @@ impl PageBuilder {
                     // Invisible text for selection and search, and colored shapes to see.
                     self.content.extend_from_slice(b"3 Tr <");
                     hex16(&mut self.content, cid);
-                    self.content.extend_from_slice(b"> Tj 0 Tr\nET\nq ");
-                    let form = self.form_for(run.font_id, glyph, layers, file);
-                    let per_unit = f64::from(size) / 1000.0;
-                    number6(&mut self.content, per_unit);
-                    self.content.extend_from_slice(b" 0 0 ");
-                    number6(&mut self.content, per_unit);
-                    self.content.push(b' ');
-                    number(&mut self.content, glyph_x);
-                    self.content.push(b' ');
-                    number(&mut self.content, glyph_y);
-                    self.content
-                        .extend_from_slice(format!(" cm /X{form} Do Q\nBT\n").as_bytes());
+                    self.content.extend_from_slice(b"> Tj 0 Tr\n");
+                    self.draw_form(run.font_id, glyph, layers, file, size, (glyph_x, glyph_y));
+                }
+            }
+            if !direct && let Some(piece) = shared.get(index) {
+                for rest in map_pieces(piece).into_iter().skip(1) {
+                    let (font, cid) = fonts
+                        .blank_cid(run.font_id, rest, 0.0)
+                        .map_err(PdfError::Font)?;
+                    self.place_blank(font, cid, size, (glyph_x, glyph_y));
                 }
             }
         }
@@ -373,7 +488,31 @@ impl PageBuilder {
         Ok(())
     }
 
-    /// The form that draws a color glyph's layers, one form for each glyph used.
+    /// Draws a glyph's shapes at a place, in the middle of a text block.
+    fn draw_form(
+        &mut self,
+        font_id: u32,
+        glyph: u16,
+        layers: Arc<[ColorLayer]>,
+        file: &mut PdfFile,
+        size: f32,
+        at: (f64, f64),
+    ) {
+        let form = self.form_for(font_id, glyph, layers, file);
+        let per_unit = f64::from(size) / 1000.0;
+        self.content.extend_from_slice(b"ET\nq ");
+        number6(&mut self.content, per_unit);
+        self.content.extend_from_slice(b" 0 0 ");
+        number6(&mut self.content, per_unit);
+        self.content.push(b' ');
+        number(&mut self.content, at.0);
+        self.content.push(b' ');
+        number(&mut self.content, at.1);
+        self.content
+            .extend_from_slice(format!(" cm /X{form} Do Q\nBT\n").as_bytes());
+    }
+
+    /// The form that draws a glyph's layers, one form for each glyph used.
     fn form_for(
         &mut self,
         font_id: u32,
@@ -411,9 +550,9 @@ impl PageBuilder {
             return Err(PdfError::Cancelled);
         }
         let mut resources = String::from("<< /Font <<");
-        self.write_forms(fonts, file)?;
+        self.write_forms(fonts, file, cancel)?;
         for (index, font) in fonts.fonts.iter().enumerate() {
-            let id = write_font(index, font, file)?;
+            let id = write_font(index, font, file, cancel)?;
             resources.push_str(&format!(" /F{index} {id} 0 R"));
         }
         resources.push_str(" >>");
@@ -507,8 +646,16 @@ impl PageBuilder {
         Ok(())
     }
 
-    fn write_forms(&mut self, fonts: &mut FontSet, file: &mut PdfFile) -> Result<(), PdfError> {
+    fn write_forms(
+        &mut self,
+        fonts: &mut FontSet,
+        file: &mut PdfFile,
+        cancel: &AtomicBool,
+    ) -> Result<(), PdfError> {
         for (id, font_id, layers) in &self.forms {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PdfError::Cancelled);
+            }
             let face = fonts.face_of(*font_id).map_err(PdfError::Font)?;
             let mut out = Vec::new();
             let mut bbox = [0f64, 0.0, 0.0, 0.0];
@@ -609,27 +756,87 @@ fn row_width(row: &LayoutRow) -> f32 {
 }
 
 /// The name, cut at its tail with an ellipsis if it is too wide, as the Mac's is.
+///
+/// The tail is the end of the text in the store's order, which is not the row's right side
+/// in right-to-left text, and shaping can change widths at a cut. So each try is measured
+/// whole, and the longest one that fits wins. A page too narrow for even the ellipsis
+/// prints no name, because the name must never run into the date.
 fn fit_title(engine: &DirectWriteLayout, title: &str, width: f32) -> Result<LaidOutText, PdfError> {
     let whole = lay_out_text(engine, title)?;
-    if row_width(&whole.row) * POINTS_PER_DIP <= width {
+    let fits = |text: &LaidOutText| row_width(&text.row) * POINTS_PER_DIP <= width;
+    if fits(&whole) {
         return Ok(whole);
     }
-    let ellipsis = lay_out_text(engine, "\u{2026}")?;
-    let room = width / POINTS_PER_DIP - row_width(&ellipsis.row);
-    let cut = whole
+    let name = whole.store.as_str();
+    let mut cuts: Vec<usize> = whole
         .row
         .caret_stops
         .iter()
-        .filter(|stop| stop.x.0 <= room)
         .map(|stop| stop.byte.0)
-        .max()
-        .unwrap_or(0);
-    let kept = whole.store.as_str().get(..cut).unwrap_or("");
-    lay_out_text(engine, &format!("{kept}\u{2026}"))
+        .filter(|&byte| byte < name.len() && name.is_char_boundary(byte))
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let attempt = |cut: usize| {
+        let kept = name.get(..cut).unwrap_or("");
+        lay_out_text(engine, &format!("{kept}\u{2026}"))
+    };
+    let (mut low, mut high) = (0, cuts.len());
+    let mut best = None;
+    while low < high {
+        let middle = (low + high) / 2;
+        let text = attempt(cuts[middle])?;
+        if fits(&text) {
+            best = Some(text);
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    match best {
+        Some(text) => Ok(text),
+        None => lay_out_text(engine, ""),
+    }
+}
+
+/// A row's runs and gaps, sorted by where their text starts. A run with no glyphs counts
+/// as a gap, so that its text still reaches the file.
+fn row_parts(row: &LayoutRow) -> Vec<RowPart> {
+    let mut runs: Vec<usize> = (0..row.glyph_runs.len())
+        .filter(|&index| !row.glyph_runs[index].glyph_ids.is_empty())
+        .collect();
+    runs.sort_by_key(|&index| row.glyph_runs[index].range.start);
+    let mut parts = Vec::with_capacity(runs.len() * 2 + 1);
+    let mut at = row.range.start.0;
+    for index in runs {
+        let range = &row.glyph_runs[index].range;
+        if range.start.0 > at {
+            parts.push(RowPart::Gap(at..range.start.0));
+        }
+        at = at.max(range.end.0);
+        parts.push(RowPart::Run(index));
+    }
+    if row.range.end.0 > at {
+        parts.push(RowPart::Gap(at..row.range.end.0));
+    }
+    parts
+}
+
+/// Where a gap starts on its row, and how wide it is, in dips.
+fn gap_place(row: &LayoutRow, gap: &Range<usize>) -> (f32, f32) {
+    let stop_at = |byte: usize| row.caret_stops.iter().find(|stop| stop.byte.0 == byte);
+    let start = stop_at(gap.start).map_or(0.0, |stop| stop.x.0);
+    let end = stop_at(gap.end).map_or(start, |stop| stop.x_before.0);
+    (start, (end - start).abs())
 }
 
 /// Writes one font's objects, and returns the id of the font that pages name.
-fn write_font(index: usize, font: &PdfFont, file: &mut PdfFile) -> Result<usize, PdfError> {
+fn write_font(
+    index: usize,
+    font: &PdfFont,
+    file: &mut PdfFile,
+    cancel: &AtomicBool,
+) -> Result<usize, PdfError> {
     // A subset's name starts with six capital letters and a plus.
     let mut tag = String::new();
     let mut rest = index;
@@ -638,7 +845,7 @@ fn write_font(index: usize, font: &PdfFont, file: &mut PdfFile) -> Result<usize,
         rest /= 26;
     }
     let name = format!("{tag}+{}", font.postscript_name);
-    let built = build_subset(font, &name).map_err(PdfError::Font)?;
+    let built = build_subset(font, &name, cancel)?;
     let facts = face_facts(&font.face);
 
     let file_id = file.new_id();
@@ -683,11 +890,10 @@ fn write_font(index: usize, font: &PdfFont, file: &mut PdfFile) -> Result<usize,
     Ok(id)
 }
 
-/// The ToUnicode map: each CID's text in UTF-16. A glyph that stands for no text, such as
-/// the second glyph of a split letter, has no entry.
+/// The ToUnicode map: each CID's text in UTF-16. Every CID that a page draws has text, and
+/// only the unused `.notdef` has no entry.
 fn to_unicode(font: &PdfFont) -> String {
-    // PDF allows at most 512 bytes for one entry, and at most 100 entries in a block.
-    const MOST_UNITS: usize = 256;
+    // PDF allows at most 100 entries in a block. `map_pieces` keeps each entry short.
     let mut entries = Vec::with_capacity(font.cids.len());
     let mut buffer = [0u8; 4];
     for (cid, entry) in font.cids.iter().enumerate() {
@@ -699,7 +905,7 @@ fn to_unicode(font: &PdfFont) -> String {
             continue;
         }
         let mut units = String::new();
-        for unit in text.encode_utf16().take(MOST_UNITS) {
+        for unit in text.encode_utf16() {
             units.push_str(&format!("{unit:04X}"));
         }
         entries.push(format!("<{cid:04X}> <{units}>"));

@@ -14,6 +14,7 @@ mod writer;
 
 use fonts::FontSet;
 use page::{HeaderText, PageBuilder};
+use qe_api::testing::StringStore;
 use qe_api::{ByteOffset, Dip, LayoutRow, LineIndex, TextSnapshot};
 use qe_layout::DirectWriteLayout;
 use std::{
@@ -22,8 +23,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
 use writer::PdfFile;
@@ -32,6 +35,14 @@ use writer::PdfFile;
 pub(crate) const DIPS_PER_POINT: f32 = 96.0 / 72.0;
 /// PDF readers commonly stop at this many objects (PDF 1.7, Annex C).
 const MOST_OBJECTS: usize = 8_388_607;
+/// A PDF's table of objects has 10 digits for each place in the file.
+const MOST_BYTES: u64 = 9_999_999_999;
+/// How often a worker that waits for a whole text wakes the host, which then offers it.
+const WAKE_EVERY: Duration = Duration::from_millis(100);
+/// How often that worker reads cancel.
+const WAIT_STEP: Duration = Duration::from_millis(50);
+/// The share of the progress bar that the wait for the whole text takes.
+const WAIT_SHARE: f64 = 0.1;
 
 /// What to export. The sizes are in points unless a name says dips.
 #[derive(Clone, Debug)]
@@ -56,6 +67,23 @@ pub struct PdfOptions {
     pub date: String,
     /// Keeps each row's first byte in the summary, for tests that compare line breaks.
     pub keep_rows: bool,
+    /// What a PDF can hold. Only a test changes these.
+    pub limits: PdfLimits,
+}
+
+/// What a PDF can hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdfLimits {
+    pub most_objects: usize,
+    pub most_bytes: u64,
+}
+impl Default for PdfLimits {
+    fn default() -> Self {
+        Self {
+            most_objects: MOST_OBJECTS,
+            most_bytes: MOST_BYTES,
+        }
+    }
 }
 
 impl Default for PdfOptions {
@@ -74,6 +102,7 @@ impl Default for PdfOptions {
             title: String::new(),
             date: String::new(),
             keep_rows: false,
+            limits: PdfLimits::default(),
         }
     }
 }
@@ -96,8 +125,10 @@ pub enum PdfError {
     Check(String),
     /// The document needs more pages than a PDF can hold.
     TooLong(String),
-    /// The text could not be read.
+    /// The text could not be read, or its file failed.
     Read(String),
+    /// The text given is only part of the document, so nothing was written.
+    NotComplete(String),
 }
 impl fmt::Display for PdfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -107,7 +138,8 @@ impl fmt::Display for PdfError {
             | Self::Font(message)
             | Self::Write(message)
             | Self::TooLong(message)
-            | Self::Read(message) => write!(f, "{message}"),
+            | Self::Read(message)
+            | Self::NotComplete(message) => write!(f, "{message}"),
             Self::Layout { line, message } => {
                 write!(f, "Line {} could not be laid out: {message}", line + 1)
             }
@@ -179,6 +211,90 @@ pub fn wrap_width_and_scale(options: &PdfOptions) -> (f32, f32) {
     }
 }
 
+fn too_long(limits: &PdfLimits, needs: &str) -> PdfError {
+    PdfError::TooLong(format!(
+        "This document is too long for a PDF: it needs {needs}, and a PDF holds at most {} \
+         objects and {} bytes. No PDF was written.",
+        limits.most_objects, limits.most_bytes
+    ))
+}
+
+fn not_complete() -> PdfError {
+    PdfError::NotComplete(
+        "QuickEdit has not finished reading this file, so no PDF was written. Export it \
+         again once the file has been read."
+            .into(),
+    )
+}
+
+fn read_failed(message: &str) -> PdfError {
+    PdfError::Read(format!(
+        "The file could not be read to its end, so no PDF was written: {message}"
+    ))
+}
+
+/// A whole document, or an error. A mapped file's snapshot holds what was known when it was
+/// taken, so an export of one taken during the index would end early with no warning. Each
+/// line of such a snapshot can look whole, so only the status can say.
+fn check_whole(source: &dyn TextSnapshot) -> Result<(), PdfError> {
+    let status = source.status();
+    if let Some(failure) = &status.failure {
+        return Err(read_failed(&failure.message));
+    }
+    if !status.complete {
+        return Err(not_complete());
+    }
+    let last = LineIndex(source.line_count().saturating_sub(1));
+    match source.line_range(last) {
+        Some(range) if range.end == source.len_bytes() => Ok(()),
+        _ => Err(not_complete()),
+    }
+}
+
+fn make_engine(options: &PdfOptions, width: f32) -> Result<DirectWriteLayout, PdfError> {
+    Ok(DirectWriteLayout::with_font(
+        &options.font_family,
+        options.font_points,
+        DWRITE_FONT_WEIGHT_NORMAL,
+    )
+    .map_err(|e| PdfError::Font(format!("The PDF's font could not be used: {e}")))?
+    .with_wrap(true)
+    .with_tab_width(options.tab_width)
+    .with_full_rows_at(Dip(width)))
+}
+
+/// The options' own font and em size, and its row height, from one laid-out letter.
+fn plain_row(engine: &DirectWriteLayout, width: f32) -> Result<((u32, f32), f32), PdfError> {
+    let store = StringStore::new("x");
+    let layout = engine
+        .try_layout_line(&store, LineIndex(0), Dip(width))
+        .map_err(|e| PdfError::Font(format!("The PDF's font could not be used: {e}")))?;
+    layout
+        .rows
+        .first()
+        .and_then(|row| Some((row.glyph_runs.first()?, row.height.0)))
+        .map(|(run, height)| ((run.font_id, run.font_em_size.0), height))
+        .ok_or_else(|| PdfError::Font("The PDF's font laid out no letter.".into()))
+}
+
+/// Finds a document too long for a PDF before anything is written. Each line takes at least
+/// one row, each page holds so many rows, and each page takes two or three objects. So
+/// this never refuses a file that would have fit. The checks during the write catch the rest.
+fn check_fits(source: &dyn TextSnapshot, options: &PdfOptions) -> Result<(), PdfError> {
+    let (width, scale) = wrap_width_and_scale(options);
+    let engine = make_engine(options, width)?;
+    let (_, height) = plain_row(&engine, width)?;
+    let page = f64::from(options.paper_height - 2.0 * options.margin) * f64::from(DIPS_PER_POINT)
+        / f64::from(scale);
+    let rows = (page / f64::from(height.max(0.001))).floor().max(1.0) as usize;
+    let pages = source.line_count().div_ceil(rows);
+    let each = if options.header_and_footer { 3 } else { 2 };
+    if pages.saturating_mul(each) > options.limits.most_objects {
+        return Err(too_long(&options.limits, &format!("{pages} pages")));
+    }
+    Ok(())
+}
+
 /// Writes the whole PDF to `file`. Runs on a worker. `progress` gets 0 to 1 and never goes
 /// back. Cancel is read before each line and each segment of a long line.
 fn write_document(
@@ -188,19 +304,10 @@ fn write_document(
     progress: &mut dyn FnMut(f64),
     file: &mut PdfFile,
 ) -> Result<PdfSummary, PdfError> {
-    check_options(options)?;
     let (width, scale) = wrap_width_and_scale(options);
-    let engine = DirectWriteLayout::with_font(
-        &options.font_family,
-        options.font_points,
-        DWRITE_FONT_WEIGHT_NORMAL,
-    )
-    .map_err(|e| PdfError::Font(format!("The PDF's font could not be used: {e}")))?
-    .with_wrap(true)
-    .with_tab_width(options.tab_width)
-    .with_full_rows_at(Dip(width));
-
-    let mut builder = PageBuilder::new(options, scale);
+    let engine = make_engine(options, width)?;
+    let (plain_font, _) = plain_row(&engine, width)?;
+    let mut builder = PageBuilder::new(options, scale, plain_font);
     let mut fonts = FontSet::default();
     let lines = source.line_count().max(1);
     let total = source.len_bytes().0.max(1) as f64;
@@ -224,6 +331,7 @@ fn write_document(
                 .map_err(layout_error)?;
             for row in &layout.rows {
                 if builder.place_row(row, source, &mut fonts, file)? {
+                    check_size(file, &options.limits)?;
                     progress_for(row, total, progress);
                 }
                 if options.keep_rows {
@@ -237,12 +345,7 @@ fn write_document(
     }
     summary.pages = builder.finish_pages(&mut fonts, file, HeaderText::of(options), cancel)?;
     summary.color_glyphs = builder.color_glyphs();
-    if file.object_count() > MOST_OBJECTS {
-        return Err(PdfError::TooLong(format!(
-            "This document needs {} pages, which is more than a PDF can hold.",
-            summary.pages
-        )));
-    }
+    check_size(file, &options.limits)?;
     summary.fonts = fonts
         .fonts
         .iter()
@@ -253,6 +356,23 @@ fn write_document(
         .collect();
     progress(1.0);
     Ok(summary)
+}
+
+/// Stops as soon as the file is past what a PDF can hold.
+fn check_size(file: &PdfFile, limits: &PdfLimits) -> Result<(), PdfError> {
+    if file.object_count() > limits.most_objects {
+        return Err(too_long(
+            limits,
+            &format!("more than {} objects", limits.most_objects),
+        ));
+    }
+    if file.bytes_written() > limits.most_bytes {
+        return Err(too_long(
+            limits,
+            &format!("more than {} bytes", limits.most_bytes),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs once for each finished page.
@@ -266,6 +386,9 @@ static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
 /// Exports to `path` on the calling thread, which must not be the UI thread for anything
 /// but a short text. A temp file beside the target becomes the target only after a check
 /// passes, so a failure or a cancel leaves no file, and any old file as it was.
+///
+/// `source` must be the whole document. A mapped file's snapshot taken during its index is
+/// refused with `NotComplete`. `export_worker` waits for a whole one.
 pub fn export_to_file(
     source: &dyn TextSnapshot,
     options: &PdfOptions,
@@ -273,17 +396,19 @@ pub fn export_to_file(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f64),
 ) -> Result<PdfSummary, PdfError> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| PdfError::Write("The PDF's path has no file name.".into()))?
-        .to_string_lossy()
-        .into_owned();
+    check_options(options)?;
+    check_whole(source)?;
+    check_fits(source, options)?;
+    if path.file_name().is_none() {
+        return Err(PdfError::Write("The PDF's path has no file name.".into()));
+    }
     let parent = match path.parent() {
         Some(folder) if !folder.as_os_str().is_empty() => folder.to_path_buf(),
         _ => PathBuf::from("."),
     };
     let number = TEMP_NUMBER.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".{name}.qe-{}-{number}.tmp", std::process::id()));
+    // This name owes nothing to the target's, so a long target name still has room.
+    let temp = parent.join(format!(".qe-pdf-{}-{number}.tmp", std::process::id()));
     let result = write_and_replace(source, options, &temp, path, cancel, progress);
     if result.is_err()
         && temp.exists()
@@ -310,7 +435,19 @@ fn write_and_replace(
     let mut file = PdfFile::create(temp)?;
     let mut summary = write_document(source, options, cancel, progress, &mut file)?;
     summary.bytes = file.finish(options, summary.pages)?;
-    writer::verify_on_disk(temp, summary.pages)?;
+    if summary.bytes > options.limits.most_bytes {
+        return Err(too_long(
+            &options.limits,
+            &format!("{} bytes", summary.bytes),
+        ));
+    }
+    // The move below needs the file closed.
+    drop(file);
+    writer::verify_on_disk(temp, summary.pages, cancel)?;
+    // A store can fail after the export began, and reads then give what they can.
+    if let Some(failure) = source.status().failure {
+        return Err(read_failed(&failure.message));
+    }
     // Once more right before the move, so that a late cancel never replaces the old file.
     if cancel.load(Ordering::Relaxed) {
         return Err(PdfError::Cancelled);
@@ -325,14 +462,18 @@ fn write_and_replace(
     Ok(summary)
 }
 
-/// A running export. Dropping it does not stop it, so call `cancel` first.
+/// A running export. Dropping it does not stop a write, so call `cancel` first. A worker
+/// that still waits for a whole text ends with `NotComplete` when the job is dropped.
 pub struct PdfJob {
     cancel: Arc<AtomicBool>,
     fraction: Arc<AtomicU32>,
+    wants: Arc<AtomicBool>,
+    offers: Sender<Arc<dyn TextSnapshot>>,
     handle: JoinHandle<Result<PdfSummary, PdfError>>,
 }
 impl PdfJob {
-    /// Stops at the next check, within one line of layout. It leaves no file behind.
+    /// Stops at the next check: within one line of layout, one glyph of a font, or the wait
+    /// for a whole text. It leaves no file behind.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -340,21 +481,79 @@ impl PdfJob {
     pub fn fraction(&self) -> f64 {
         f64::from(self.fraction.load(Ordering::Relaxed)) / 1_000_000.0
     }
+    /// True while the worker waits for a file's index, so a host can say "Reading the file".
+    /// On each wake, a host then calls `offer_snapshot(editor.worker_snapshot())`.
+    pub fn wants_snapshot(&self) -> bool {
+        self.wants.load(Ordering::Acquire)
+    }
+    /// Gives the waiting worker a newer snapshot. A partial one only moves the progress bar.
+    /// This reads the snapshot's status and nothing more, so the UI thread can call it.
+    pub fn offer_snapshot(&self, snapshot: Arc<dyn TextSnapshot>) {
+        let status = snapshot.status();
+        if status.complete || status.failure.is_some() {
+            // A worker that has gone needs nothing, and `join` gives its result.
+            let _ = self.offers.send(snapshot);
+        } else {
+            let known = status.known_bytes.0 as f64 / snapshot.len_bytes().0.max(1) as f64;
+            self.fraction
+                .fetch_max(to_fraction(known * WAIT_SHARE), Ordering::Relaxed);
+        }
+    }
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
     /// Waits for the end. Call it after `is_finished` says true, or off the UI thread.
     pub fn join(self) -> Result<PdfSummary, PdfError> {
+        // With no more offers coming, a worker that still waits ends now.
+        drop(self.offers);
         self.handle
             .join()
             .map_err(|_| PdfError::Write("The PDF export stopped unexpectedly.".into()))?
     }
 }
 
-/// Starts an export on its own thread, from `EditorView::worker_snapshot()`. `wake` runs
-/// on the worker when it ends, and the host then calls `join`. The Mac shows its progress
-/// sheet only when a write still runs after 1 second, and reads the fraction 10 times a
-/// second while it shows.
+fn to_fraction(value: f64) -> u32 {
+    (value.clamp(0.0, 1.0) * 1_000_000.0) as u32
+}
+
+/// Waits until the source is whole, by asking the host for newer snapshots. The host holds
+/// the editor, and it answers on the UI thread, which never waits for this worker.
+fn wait_for_whole(
+    mut source: Arc<dyn TextSnapshot>,
+    offers: &mpsc::Receiver<Arc<dyn TextSnapshot>>,
+    wants: &AtomicBool,
+    cancel: &AtomicBool,
+    wake: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<Arc<dyn TextSnapshot>, PdfError> {
+    let mut last_wake: Option<Instant> = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PdfError::Cancelled);
+        }
+        let status = source.status();
+        if status.failure.is_some() || status.complete {
+            return Ok(source);
+        }
+        wants.store(true, Ordering::Release);
+        if last_wake.is_none_or(|at| at.elapsed() >= WAKE_EVERY) {
+            last_wake = Some(Instant::now());
+            if let Some(wake) = wake {
+                wake();
+            }
+        }
+        match offers.recv_timeout(WAIT_STEP) {
+            Ok(newer) => source = newer,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(not_complete()),
+        }
+    }
+}
+
+/// Starts an export on its own thread, from `EditorView::worker_snapshot()`. `wake` runs on
+/// the worker when it ends, and about 10 times a second while it waits for a mapped file's
+/// index. On each wake the host calls `offer_snapshot` if `wants_snapshot` says so, and
+/// `join` if `is_finished` says so. The Mac shows its progress sheet only when a write
+/// still runs after 1 second, and reads the fraction 10 times a second while it shows.
 pub fn export_worker(
     source: Arc<dyn TextSnapshot>,
     options: PdfOptions,
@@ -363,15 +562,23 @@ pub fn export_worker(
 ) -> Result<PdfJob, PdfError> {
     let cancel = Arc::new(AtomicBool::new(false));
     let fraction = Arc::new(AtomicU32::new(0));
-    let (stop, shown) = (cancel.clone(), fraction.clone());
+    let wants = Arc::new(AtomicBool::new(false));
+    let (offers, inbox) = mpsc::channel();
+    let (stop, shown, asking) = (cancel.clone(), fraction.clone(), wants.clone());
     let handle = std::thread::Builder::new()
         .name("qe-pdf-export".into())
         .spawn(move || {
+            let waited = !source.status().complete;
+            let whole = wait_for_whole(source, &inbox, &asking, &stop, wake.as_deref());
+            asking.store(false, Ordering::Release);
+            let start = if waited { WAIT_SHARE } else { 0.0 };
             let mut report = |value: f64| {
-                let value = (value.clamp(0.0, 1.0) * 1_000_000.0) as u32;
+                let value = to_fraction(start + value * (1.0 - start));
                 shown.fetch_max(value, Ordering::Relaxed);
             };
-            let result = export_to_file(source.as_ref(), &options, &path, &stop, &mut report);
+            let result = whole.and_then(|source| {
+                export_to_file(source.as_ref(), &options, &path, &stop, &mut report)
+            });
             if let Some(wake) = wake {
                 wake();
             }
@@ -381,6 +588,8 @@ pub fn export_worker(
     Ok(PdfJob {
         cancel,
         fraction,
+        wants,
+        offers,
         handle,
     })
 }

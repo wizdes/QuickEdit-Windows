@@ -267,6 +267,15 @@ impl MapWorker {
             .send(job)
             .map_err(|_| "The document map's worker has stopped.".to_string())
     }
+    /// Stops the job now running, at its next line. Its result is never read.
+    pub fn abandon(&mut self, number: u64) {
+        self.newest.store(number, Ordering::Release);
+    }
+    /// The job the worker may work on. A running job with any other number stops at its
+    /// next line.
+    pub fn newest_job(&self) -> u64 {
+        self.newest.load(Ordering::Acquire)
+    }
     /// The newest finished rows, if any, with no waiting.
     pub fn take(&mut self) -> Option<Finished> {
         let mut newest = None;
@@ -327,5 +336,28 @@ fn read_start_of_line(job: &Job, range: std::ops::Range<ByteOffset>, scan: &mut 
         if good || end == range.start.0 {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_stops_once_a_newer_number_is_set() {
+        let job = Job {
+            snapshot: Arc::new(qe_api::testing::StringStore::new(
+                "one
+two
+",
+            )),
+            first_line: 0,
+            count: 5,
+            tab_width: 8,
+            columns: 49,
+            number: 3,
+        };
+        assert!(read_rows(&job, &AtomicU64::new(3)).is_some());
+        assert!(read_rows(&job, &AtomicU64::new(4)).is_none());
     }
 }

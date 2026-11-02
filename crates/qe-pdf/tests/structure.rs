@@ -349,7 +349,12 @@ fn crlf_empty_lines_and_an_empty_document() {
 #[test]
 fn tabs_move_the_next_run_and_mixed_text_keeps_its_characters() {
     let out = plain("a\tb");
-    let glyphs = &out.report.pages[0].glyphs;
+    // The tab itself is in the file too, as text with nothing to see.
+    let glyphs: Vec<_> = out.report.pages[0]
+        .glyphs
+        .iter()
+        .filter(|glyph| glyph.text != "\t")
+        .collect();
     assert_eq!(glyphs.len(), 2);
     assert!(glyphs[1].x - glyphs[0].x > 30.0);
     let mixed = plain("\u{e9}\tb\u{4e2d}");
@@ -761,28 +766,26 @@ fn the_checker_catches_broken_files() {
     assert!(check_pdf(b"").is_err());
 }
 
-// ---- A real outside reader, when this PC has one ----
+// ---- A real outside reader. Cargo lists this as ignored, so it never passes with no reader ----
 
-fn pdftotext(path: &std::path::Path) -> Option<String> {
+fn pdftotext(path: &std::path::Path) -> String {
     let output = Command::new("pdftotext")
         .args(["-enc", "UTF-8", "-layout"])
         .arg(path)
         .arg("-")
-        .output();
-    let Ok(output) = output else {
-        eprintln!("pdftotext is not on this PC, so this check did not run");
-        return None;
-    };
+        .output()
+        .expect("this test needs pdftotext on PATH");
     assert!(
         output.status.success(),
         "pdftotext rejected the file: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
-fn pdftotext_reads_every_script_when_it_is_present() {
+#[ignore = "needs pdftotext on PATH: run with -- --ignored"]
+fn pdftotext_reads_every_script() {
     let cases = [
         ("hello world", "hello world"),
         (
@@ -793,22 +796,20 @@ fn pdftotext_reads_every_script_when_it_is_present() {
     ];
     for (text, want) in cases {
         let out = plain(text);
-        let Some(found) = pdftotext(&out.path) else {
-            return;
-        };
+        let found = pdftotext(&out.path);
         assert!(found.contains(want), "{want:?} not in {found:?}");
     }
     // It reads the Arabic letters. Readers differ in the order they print them, so this
     // compares the letters and not their order.
     let arabic = "\u{645}\u{631}\u{62d}\u{628}\u{627}";
     let out = plain(arabic);
-    let found = pdftotext(&out.path).unwrap();
+    let found = pdftotext(&out.path);
     for letter in arabic.chars() {
         assert!(found.contains(letter), "{letter:?} not in {found:?}");
     }
     // It reads a mark with its letter.
     let out = plain("e\u{301}x");
-    let found = pdftotext(&out.path).unwrap();
+    let found = pdftotext(&out.path);
     assert!(
         found.contains('x') && (found.contains('\u{301}') || found.contains('\u{e9}')),
         "{found:?}"
@@ -816,7 +817,7 @@ fn pdftotext_reads_every_script_when_it_is_present() {
     // It finds as many pages as the checker.
     let text: String = (0..300).map(|n| format!("row {n}\n")).collect();
     let out = plain(&text);
-    let found = pdftotext(&out.path).unwrap();
+    let found = pdftotext(&out.path);
     assert_eq!(found.matches('\u{c}').count(), out.report.pages.len());
     assert!(found.contains("row 299"));
     let _ = &out.folder;

@@ -4,6 +4,7 @@
 //! each page's text commands. Tests use it, and so can a host's diagnostics. Bad input
 //! gives an error, never a panic.
 use crate::deflate::inflate;
+use crate::fonts::MOST_MAP_UNITS;
 use std::collections::HashMap;
 
 /// A parsed PDF value.
@@ -45,9 +46,14 @@ impl Value {
     }
 }
 
+/// How deep arrays and dictionaries may nest. This writer uses 4 levels, and a damaged file
+/// must not run the stack out.
+const MOST_NESTING: usize = 32;
+
 struct Parser<'a> {
     data: &'a [u8],
     at: usize,
+    depth: usize,
 }
 impl Parser<'_> {
     fn skip_space(&mut self) {
@@ -76,6 +82,15 @@ impl Parser<'_> {
         std::str::from_utf8(&self.data[start..self.at]).unwrap_or("")
     }
     fn value(&mut self) -> Result<Value, String> {
+        if self.depth >= MOST_NESTING {
+            return Err("arrays and dictionaries nest too deep".into());
+        }
+        self.depth += 1;
+        let value = self.value_here();
+        self.depth -= 1;
+        value
+    }
+    fn value_here(&mut self) -> Result<Value, String> {
         self.skip_space();
         let byte = *self
             .data
@@ -283,9 +298,10 @@ impl File<'_> {
         let mut parser = Parser {
             data: self.bytes,
             at: offset,
+            depth: 0,
         };
         let header = format!("{id} 0 obj");
-        if self.bytes.get(offset..offset + header.len()) != Some(header.as_bytes()) {
+        if self.bytes.get(offset..offset.saturating_add(header.len())) != Some(header.as_bytes()) {
             return Err(format!("object {id} is not at its offset {offset}"));
         }
         parser.at += header.len();
@@ -298,12 +314,12 @@ impl File<'_> {
                 .and_then(Value::number)
                 .ok_or_else(|| format!("stream {id} has no /Length"))?
                 as usize;
+            let end = start.saturating_add(length);
             let data = self
                 .bytes
-                .get(start..start + length)
+                .get(start..end)
                 .ok_or_else(|| format!("stream {id} runs past the file"))?;
-            let end = start + length;
-            if self.bytes.get(end..end + 10) != Some(b"\nendstream") {
+            if self.bytes.get(end..end.saturating_add(10)) != Some(b"\nendstream") {
                 return Err(format!("stream {id} has a wrong /Length"));
             }
             Ok((value, Some(data)))
@@ -347,12 +363,13 @@ pub fn check_pdf(bytes: &[u8]) -> Result<Report, String> {
         .and_then(|rest| rest.lines().next())
         .and_then(|value| value.parse().ok())
         .ok_or("startxref is missing")?;
-    if bytes.get(xref..xref + 5) != Some(b"xref\n") {
+    if bytes.get(xref..xref.saturating_add(5)) != Some(b"xref\n") {
         return Err(format!("startxref {xref} does not point at the table"));
     }
     let mut parser = Parser {
         data: bytes,
         at: xref + 5,
+        depth: 0,
     };
     let first: usize = parser
         .word()
@@ -365,8 +382,14 @@ pub fn check_pdf(bytes: &[u8]) -> Result<Report, String> {
         return Err("the table's first line is wrong".into());
     }
     let table = parser.at;
-    if bytes.get(table..table + 20) != Some(b"0000000000 65535 f \n") {
+    if bytes.get(table..table.saturating_add(20)) != Some(b"0000000000 65535 f \n") {
         return Err("the table's free entry is wrong".into());
+    }
+    // The file must hold every entry its table claims, before any room is made for them.
+    if count > bytes.len().saturating_sub(table) / 20 {
+        return Err(format!(
+            "the table claims {count} objects, and the file is too short for them"
+        ));
     }
     let mut offsets = vec![0usize; count];
     for (id, slot) in offsets.iter_mut().enumerate().skip(1) {
@@ -377,11 +400,15 @@ pub fn check_pdf(bytes: &[u8]) -> Result<Report, String> {
         if !text.ends_with(" 00000 n \n") {
             return Err(format!("the entry for object {id} is wrong: {text:?}"));
         }
-        *slot = text[..10].parse().map_err(|_| "a table offset is bad")?;
+        *slot = text
+            .get(..10)
+            .and_then(|digits| digits.parse().ok())
+            .ok_or("a table offset is bad")?;
     }
     let mut parser = Parser {
         data: bytes,
         at: table + count * 20,
+        depth: 0,
     };
     if parser.word() != "trailer" {
         return Err("the trailer is not after the table".into());
@@ -538,7 +565,7 @@ fn load_font(
         let first = first.number().ok_or("a /W start is not a number")? as usize;
         for (at, width) in list.iter().enumerate() {
             report.widths.insert(
-                (first + at) as u16,
+                first.saturating_add(at) as u16,
                 width.number().ok_or("a /W value is not a number")?,
             );
         }
@@ -569,12 +596,21 @@ fn read_to_unicode(map: &[u8]) -> Result<HashMap<u16, String>, String> {
             let code = code.trim_matches(['<', '>']);
             let code = u16::from_str_radix(code, 16).map_err(|_| "a bfchar code is bad")?;
             let value = value.trim_matches(['<', '>']);
+            if value.len() / 4 > MOST_MAP_UNITS {
+                return Err(format!(
+                    "a ToUnicode entry has {} units, and this writer makes at most \
+                     {MOST_MAP_UNITS}, so its text may have been cut",
+                    value.len() / 4
+                ));
+            }
             let mut units = Vec::with_capacity(value.len() / 4);
             for start in (0..value.len()).step_by(4) {
                 let unit = value.get(start..start + 4).ok_or("a bfchar value is bad")?;
                 units.push(u16::from_str_radix(unit, 16).map_err(|_| "a bfchar value is bad")?);
             }
-            out.insert(code, String::from_utf16_lossy(&units));
+            let value =
+                String::from_utf16(&units).map_err(|_| "a ToUnicode entry splits a character")?;
+            out.insert(code, value);
         }
     }
     Ok(out)
@@ -663,6 +699,11 @@ fn read_dict(data: &[u8]) -> Result<HashMap<u16, Vec<i32>>, String> {
     Ok(out)
 }
 
+/// A CFF dictionary holds signed numbers, and a damaged one can hold a negative place.
+fn cff_offset(value: i32) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("CFF has the negative place or size {value}"))
+}
+
 fn read_cff(data: &[u8]) -> Result<FontReport, String> {
     if data.first() != Some(&1) {
         return Err("the program is not CFF version 1".into());
@@ -682,12 +723,12 @@ fn read_cff(data: &[u8]) -> Result<FontReport, String> {
         .get(&17)
         .and_then(|v| v.first())
         .ok_or("CFF has no CharStrings")?;
-    let (chars, _) = read_index(data, *chars_at as usize)?;
+    let (chars, _) = read_index(data, cff_offset(*chars_at)?)?;
     let count = top
         .get(&1234)
         .and_then(|v| v.first())
         .ok_or("CFF has no CIDCount")?;
-    if *count as usize != chars.len() {
+    if cff_offset(*count)? != chars.len() {
         return Err(format!(
             "CIDCount says {count}, and CharStrings has {}",
             chars.len()
@@ -697,22 +738,29 @@ fn read_cff(data: &[u8]) -> Result<FontReport, String> {
         .get(&1236)
         .and_then(|v| v.first())
         .ok_or("CFF has no FDArray")?;
-    let (array, _) = read_index(data, *array_at as usize)?;
+    let (array, _) = read_index(data, cff_offset(*array_at)?)?;
     let &(start, end) = array.first().ok_or("CFF's FDArray is empty")?;
     let font_dict = read_dict(data.get(start..end).ok_or("CFF is cut off")?)?;
     let private = font_dict.get(&18).ok_or("CFF has no Private DICT")?;
     let (size, offset) = (
-        *private.first().ok_or("a bad Private entry")? as usize,
-        *private.get(1).ok_or("a bad Private entry")? as usize,
+        cff_offset(*private.first().ok_or("a bad Private entry")?)?,
+        cff_offset(*private.get(1).ok_or("a bad Private entry")?)?,
     );
     read_dict(
-        data.get(offset..offset + size)
+        data.get(offset..offset.saturating_add(size))
             .ok_or("CFF's Private DICT runs past the font")?,
     )?;
-    let select_at = *top
-        .get(&1237)
-        .and_then(|v| v.first())
-        .ok_or("CFF has no FDSelect")? as usize;
+    let charset_at = cff_offset(
+        *top.get(&15)
+            .and_then(|v| v.first())
+            .ok_or("CFF has no charset")?,
+    )?;
+    check_charset(data, charset_at, chars.len())?;
+    let select_at = cff_offset(
+        *top.get(&1237)
+            .and_then(|v| v.first())
+            .ok_or("CFF has no FDSelect")?,
+    )?;
     if data.get(select_at) != Some(&3) {
         return Err("CFF's FDSelect is not format 3".into());
     }
@@ -728,6 +776,35 @@ fn read_cff(data: &[u8]) -> Result<FontReport, String> {
         is_cid_cff,
         ..FontReport::default()
     })
+}
+
+/// A charset names every glyph after `.notdef` once, so its ranges add up to that count.
+fn check_charset(data: &[u8], at: usize, glyphs: usize) -> Result<(), String> {
+    if data.get(at) != Some(&2) {
+        return Err("CFF's charset is not format 2".into());
+    }
+    let (mut at, mut named) = (at + 1, 0);
+    while named + 1 < glyphs {
+        let left = data.get(at + 2..at + 4).ok_or("CFF's charset is cut off")?;
+        named += usize::from(u16::from_be_bytes([left[0], left[1]])) + 1;
+        at += 4;
+    }
+    if named + 1 != glyphs.max(1) {
+        return Err(format!(
+            "CFF's charset names {named} glyphs, and the font has {}",
+            glyphs.saturating_sub(1)
+        ));
+    }
+    // A font of only `.notdef` must have no range, so FDSelect must come next.
+    if glyphs <= 1 && data.get(at) != Some(&3) {
+        return Err("CFF's charset names a glyph that a font of only .notdef does not have".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn read_cff_for_test(data: &[u8]) -> Result<usize, String> {
+    read_cff(data).map(|report| report.glyph_count)
 }
 
 /// A charstring must end in `endchar`, keep to the stack limit, and use only the path
@@ -780,6 +857,15 @@ fn check_charstring(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// A reader makes up text for a drawn CID with no entry, so this checker refuses one instead
+/// of treating it as no text.
+fn text_of_cid(name: &str, font: &FontReport, cid: u16) -> Result<String, String> {
+    font.to_unicode
+        .get(&cid)
+        .cloned()
+        .ok_or_else(|| format!("{name} draws CID {cid}, which has no text"))
+}
+
 fn read_content(
     file: &File<'_>,
     content: &[u8],
@@ -791,6 +877,7 @@ fn read_content(
     let mut parser = Parser {
         data: content,
         at: 0,
+        depth: 0,
     };
     let mut stack: Vec<Value> = Vec::new();
     let (mut font_id, mut size, mut mode) = (None::<usize>, 0.0f64, 0.0f64);
@@ -888,7 +975,7 @@ fn read_content(
                                     y,
                                     size,
                                     invisible: mode == 3.0,
-                                    text: font.to_unicode.get(&cid).cloned().unwrap_or_default(),
+                                    text: text_of_cid(name, font, cid)?,
                                 });
                                 x += width / 1000.0 * size;
                             }
@@ -922,4 +1009,74 @@ fn read_content(
         return Err("BT has no ET".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    fn map(entry: &str) -> String {
+        format!(
+            "begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfchar\n<0001> <{entry}>\nendbfchar\nendcmap\n"
+        )
+    }
+
+    #[test]
+    fn a_map_entry_as_long_as_the_old_cut_is_refused() {
+        // The old writer cut long text at 256 units with no warning.
+        let problem = read_to_unicode(map(&"FE0F".repeat(256)).as_bytes()).unwrap_err();
+        assert!(problem.contains("cut"), "{problem}");
+        assert!(read_to_unicode(map(&"FE0F".repeat(MOST_MAP_UNITS)).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_font_damaged_at_any_byte_gives_an_error_or_a_report_and_no_panic() {
+        let glyph = crate::cff::charstring(&[crate::cff::Figure {
+            start: (10.0, 20.0),
+            segments: vec![crate::cff::Segment::Line((30.0, 40.0))],
+        }]);
+        let empty = crate::cff::charstring(&[]);
+        let font = crate::cff::build("Test", &[&empty, &glyph], [0, 0, 40, 40]).unwrap();
+        assert!(read_cff(&font).is_ok());
+        for at in 0..font.len() {
+            for value in [0x00, 0x7F, 0x80, 0xFF] {
+                let mut bad = font.clone();
+                bad[at] = value;
+                // Either answer is fine here. This fails if the read panics.
+                let _ = read_cff(&bad);
+            }
+        }
+    }
+
+    #[test]
+    fn a_drawn_glyph_with_no_text_is_refused() {
+        let mut font = FontReport::default();
+        font.to_unicode.insert(1, "a".into());
+        assert_eq!(text_of_cid("F", &font, 1).unwrap(), "a");
+        assert!(text_of_cid("F", &font, 2).unwrap_err().contains("no text"));
+    }
+
+    #[test]
+    fn a_negative_private_size_is_an_error() {
+        assert!(cff_offset(-1).is_err());
+        assert_eq!(cff_offset(7), Ok(7));
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_and_keeps_the_stack() {
+        let deep = "[".repeat(1_000_000);
+        let mut parser = Parser {
+            data: deep.as_bytes(),
+            at: 0,
+            depth: 0,
+        };
+        let problem = parser.value().unwrap_err();
+        assert!(problem.contains("nest"), "{problem}");
+    }
+
+    #[test]
+    fn a_map_entry_that_splits_a_character_is_refused() {
+        let problem = read_to_unicode(map("0061D83D").as_bytes()).unwrap_err();
+        assert!(problem.contains("splits"), "{problem}");
+    }
 }

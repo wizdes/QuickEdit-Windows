@@ -43,9 +43,61 @@ struct FaceRegistry {
 }
 static FACES: OnceLock<Mutex<FaceRegistry>> = OnceLock::new();
 
-/// Names a face by what it is, never by when it loaded.
+/// The parts of a font file's `head` table that name its data: its revision, the checksum of
+/// the whole file, and the date it was made. Reading them costs one table lookup, and they
+/// are the same on every machine and in any load order. A font with no such table gets "none".
+fn head_facts(head: Option<&[u8]>) -> String {
+    let part = |range: std::ops::Range<usize>| head.and_then(|bytes| bytes.get(range));
+    match (part(4..12), part(28..36)) {
+        (Some(revision_and_sum), Some(modified)) => {
+            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            format!("{}{}", hex(revision_and_sum), hex(modified))
+        }
+        _ => "none".into(),
+    }
+}
+
+/// Reads the font file's `head` table for `head_facts`.
+fn face_data_facts(face: &IDWriteFontFace) -> String {
+    let (mut data, mut size, mut context, mut exists) =
+        (std::ptr::null_mut(), 0u32, std::ptr::null_mut(), BOOL(0));
+    let tag = u32::from_le_bytes(*b"head");
+    let read =
+        unsafe { face.TryGetFontTable(tag, &mut data, &mut size, &mut context, &mut exists) };
+    if read.is_err() || !exists.as_bool() || data.is_null() {
+        return head_facts(None);
+    }
+    let facts = head_facts(Some(unsafe {
+        std::slice::from_raw_parts(data.cast::<u8>(), size as usize)
+    }));
+    unsafe { face.ReleaseFontTable(context) };
+    facts
+}
+
+/// A variable font's axis values, which pick one instance from one file. Two weights of a
+/// file have the same `head` table, so without these they would share one id and draw alike.
+fn axis_facts(face: &IDWriteFontFace) -> String {
+    let Ok(face) = face.cast::<IDWriteFontFace5>() else {
+        return String::new();
+    };
+    let count = unsafe { face.GetFontAxisValueCount() } as usize;
+    let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); count];
+    if count == 0 || unsafe { face.GetFontAxisValues(&mut values) }.is_err() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|axis| format!("{:x}={}", axis.axisTag.0, axis.value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Names a face by what it is, never by when it loaded: by the data of its font file, its
+/// place in that file, its variable-font instance, and what is simulated on it.
 fn face_key(face: &IDWriteFontFace) -> Result<String, LayoutError> {
     let simulations = unsafe { face.GetSimulations().0 };
+    let data = format!("{}|{}", axis_facts(face), face_data_facts(face));
+    let number = unsafe { face.GetIndex() };
     let mut collection = None;
     unsafe {
         factory()?
@@ -54,13 +106,13 @@ fn face_key(face: &IDWriteFontFace) -> Result<String, LayoutError> {
     }
     let collection = collection.ok_or(LayoutError::NoFontCollection)?;
     // A face outside the system collection has no family name to give. Its shape still
-    // says what it is, and that does not depend on load order either.
+    // and data say what it is, and those do not depend on load order either.
     let Ok(font) = (unsafe { collection.GetFontFromFontFace(face) }) else {
         let mut metrics = DWRITE_FONT_METRICS::default();
         unsafe { face.GetMetrics(&mut metrics) };
         let glyphs = unsafe { face.GetGlyphCount() };
         return Ok(format!(
-            "unnamed|{glyphs}|{}|{}|{simulations}",
+            "unnamed|{glyphs}|{}|{}|{simulations}|{number}|{data}",
             metrics.designUnitsPerEm, metrics.ascent
         ));
     };
@@ -90,10 +142,11 @@ fn face_key(face: &IDWriteFontFace) -> Result<String, LayoutError> {
     let (weight, stretch, style) =
         unsafe { (font.GetWeight().0, font.GetStretch().0, font.GetStyle().0) };
     // Windows and Windows Terminal each install a font with this same name and style, with
-    // different glyphs. The glyph count keeps them apart, or a run would draw the wrong letters.
+    // different glyphs. The file's own data keeps them apart, or a run would draw the wrong
+    // letters. The glyph count alone would miss two files that happen to have the same count.
     let glyphs = unsafe { face.GetGlyphCount() };
     Ok(format!(
-        "{}|{weight}|{stretch}|{style}|{simulations}|{glyphs}",
+        "{}|{weight}|{stretch}|{style}|{simulations}|{glyphs}|{number}|{data}",
         String::from_utf16_lossy(&name)
     ))
 }
@@ -108,9 +161,10 @@ fn stable_id(key: &str) -> u32 {
     hash.max(1)
 }
 
-/// The face's id. It comes from the face's family, weight, stretch, style and
-/// simulations, so the stable display text does not depend on which font or which
-/// thread loaded first. Two different faces with the same hash would take ids in load
+/// The face's id. It comes from the face's family, weight, stretch, style, simulations,
+/// glyph count, place in its file, axis values and the file's `head` facts, so it names the font's real
+/// data, and the stable display text does not depend on which font or which thread loaded
+/// first. Two different faces with the same hash would take ids in load
 /// order, which is the one case that still depends on order. With a few dozen faces in
 /// use, that chance is about one in ten million.
 pub(crate) fn register_face(face: &IDWriteFontFace) -> Result<u32, LayoutError> {
@@ -388,4 +442,122 @@ pub(crate) fn no_ligatures() -> Result<IDWriteTypography, LayoutError> {
         *cell.borrow_mut() = Some(typography.clone());
         Ok(typography)
     })
+}
+
+#[cfg(test)]
+mod face_key_tests {
+    use super::*;
+
+    fn head(fill: u8) -> Vec<u8> {
+        vec![fill; 54]
+    }
+
+    #[test]
+    fn the_key_changes_with_the_files_revision_checksum_or_date() {
+        let base = head_facts(Some(&head(1)));
+        for at in [4, 8, 28, 35] {
+            let mut other = head(1);
+            other[at] = 2;
+            assert_ne!(head_facts(Some(&other)), base, "byte {at}");
+        }
+        // Other bytes of the table say nothing about which file this is.
+        let mut same = head(1);
+        same[0] = 9;
+        same[40] = 9;
+        assert_eq!(head_facts(Some(&same)), base);
+    }
+
+    #[test]
+    fn a_font_with_a_missing_or_short_table_still_has_a_key() {
+        assert_eq!(head_facts(None), "none");
+        assert_eq!(head_facts(Some(&[0; 20])), "none");
+    }
+
+    #[test]
+    fn a_face_gets_the_same_key_each_time_it_is_asked() {
+        let mut collection = None;
+        unsafe {
+            factory()
+                .unwrap()
+                .GetSystemFontCollection(&mut collection, false)
+                .unwrap();
+        }
+        let collection = collection.unwrap();
+        let family = unsafe { collection.GetFontFamily(0).unwrap() };
+        let font = unsafe {
+            family
+                .GetFirstMatchingFont(
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                )
+                .unwrap()
+        };
+        let face = unsafe { font.CreateFontFace().unwrap() };
+        let key = face_key(&face).unwrap();
+        assert_eq!(key, face_key(&face).unwrap());
+        let data = face_data_facts(&face);
+        assert_ne!(data, "none");
+        assert!(key.ends_with(&data), "{key}");
+    }
+
+    #[test]
+    fn two_weights_of_one_variable_font_get_two_ids() {
+        let mut collection = None;
+        unsafe {
+            factory()
+                .unwrap()
+                .GetSystemFontCollection(&mut collection, false)
+                .unwrap();
+        }
+        let collection = collection.unwrap();
+        let (mut index, mut exists) = (0, BOOL(0));
+        unsafe {
+            collection
+                .FindFamilyName(
+                    PCWSTR(wide("Cascadia Mono").as_ptr()),
+                    &mut index,
+                    &mut exists,
+                )
+                .unwrap();
+        }
+        assert!(exists.as_bool(), "Windows 11 includes Cascadia Mono");
+        let font = unsafe {
+            collection
+                .GetFontFamily(index)
+                .unwrap()
+                .GetFirstMatchingFont(
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                )
+                .unwrap()
+        };
+        let face: IDWriteFontFace5 = unsafe { font.CreateFontFace().unwrap() }.cast().unwrap();
+        let resource = unsafe { face.GetFontResource().unwrap() };
+        let instance = |weight: f32| -> IDWriteFontFace {
+            let axis = DWRITE_FONT_AXIS_VALUE {
+                axisTag: DWRITE_FONT_AXIS_TAG(u32::from_le_bytes(*b"wght")),
+                value: weight,
+            };
+            unsafe {
+                resource
+                    .CreateFontFace(DWRITE_FONT_SIMULATIONS_NONE, &[axis])
+                    .unwrap()
+                    .cast()
+                    .unwrap()
+            }
+        };
+        let (light, heavy) = (instance(325.0), instance(375.0));
+        let (light_id, heavy_id) = (
+            register_face(&light).unwrap(),
+            register_face(&heavy).unwrap(),
+        );
+        assert_ne!(light_id, heavy_id);
+        // Each id gives back its own instance, so a run draws with the weight it asked for.
+        let weight_of = |id: u32| axis_facts(&font_face(id).unwrap());
+        assert_eq!(weight_of(light_id), axis_facts(&light));
+        assert_eq!(weight_of(heavy_id), axis_facts(&heavy));
+        assert_ne!(axis_facts(&light), axis_facts(&heavy));
+    }
 }

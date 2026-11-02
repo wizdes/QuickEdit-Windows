@@ -35,7 +35,8 @@ fn document(bytes: usize) -> String {
     text
 }
 
-/// One key from input to pixels: the frame's handling, the display list and the paint.
+/// One key from input to pixels: the frame's handling, the display list and the paint. With
+/// the map on, a key that hides it fails, because the number would then not be about the map.
 fn key_times(text: &str, map_on: bool) -> Vec<Duration> {
     let mut scene = Scene::from_text(text, 1200.0, 900.0);
     let mut ctx = ViewContext::default();
@@ -60,6 +61,11 @@ fn key_times(text: &str, map_on: bool) -> Vec<Duration> {
         }
         paint(&mut paper, &list, &mut seen);
         times.push(start.elapsed());
+        assert_eq!(
+            scene.frame.map_area().width.0 > 0.0,
+            map_on,
+            "the map changed at key {n}, so this run does not measure what it says"
+        );
         // The time between keys of a fast typist, and the work that falls in it.
         scene.clock.set(scene.clock.get() + 0.03);
         let mut ctx = ViewContext::default();
@@ -78,6 +84,7 @@ fn key_times(text: &str, map_on: bool) -> Vec<Duration> {
 }
 
 fn report(name: &str, mut times: Vec<Duration>) -> Duration {
+    println!("{name}: first key {:?}", times[0]);
     times.sort();
     let at = |share: f64| times[((times.len() - 1) as f64 * share) as usize];
     println!(
@@ -92,7 +99,11 @@ fn report(name: &str, mut times: Vec<Duration>) -> Duration {
 #[test]
 #[ignore = "by hand, in release: see the README"]
 fn a_key_with_the_map_on_and_off() {
-    for (name, bytes) in [("1 MB", 1_000_000usize), ("50 MiB", 50 * 1024 * 1024)] {
+    // 400 keys below the 50 MiB line, so that the map stays on for all of them.
+    for (name, bytes) in [
+        ("1 MB", 1_000_000usize),
+        ("4 KiB under 50 MiB", 50 * 1024 * 1024 - 4096),
+    ] {
         let text = document(bytes);
         // Off first, then on, then off again, so that warming up favors neither.
         let off = report(&format!("{name}, map off"), key_times(&text, false));
@@ -104,6 +115,31 @@ fn a_key_with_the_map_on_and_off() {
             on.saturating_sub(off)
         );
     }
+}
+
+/// The one key that crosses the line and hides the map. It moves the text's margins, so it
+/// costs more than a steady key, and it happens once in a document's life.
+#[test]
+#[ignore = "by hand, in release: see the README"]
+fn the_key_that_crosses_50_mib() {
+    let text = document(50 * 1024 * 1024);
+    let mut scene = Scene::from_text(&text, 1200.0, 900.0);
+    drop(text);
+    scene.settle(&mut Vec::new());
+    assert!(scene.frame.map_area().width.0 > 0.0);
+    let mut paper = renderer(1200.0, 900.0, 96);
+    let mut seen = HashSet::new();
+    paint(&mut paper, &scene.list(ThemeKind::Light), &mut seen);
+    let mut repaint = Vec::new();
+    let start = Instant::now();
+    scene.send(InputKind::Char('a'), &mut repaint);
+    let list = scene.list(ThemeKind::Light);
+    for rect in &repaint {
+        paper.invalidate(*rect);
+    }
+    paint(&mut paper, &list, &mut seen);
+    println!("the key that crosses 50 MiB: {:?}", start.elapsed());
+    assert_eq!(scene.frame.map_area().width.0, 0.0, "the map did not go");
 }
 
 #[test]

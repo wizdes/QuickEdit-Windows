@@ -44,9 +44,14 @@ struct Pen {
 }
 impl Pen {
     fn delta(&mut self, to: (f32, f32)) -> (i32, i32) {
-        let to = (to.0.round() as i32, to.1.round() as i32);
-        let delta = (to.0 - self.at.0, to.1 - self.at.1);
-        self.at = to;
+        // One move holds at most an i16, as `push_number` writes it. The pen records where
+        // the move really ends, so a clamped move does not shift the rest of the glyph.
+        let limit = |value: i32| value.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+        let delta = (
+            limit(to.0.round() as i32 - self.at.0),
+            limit(to.1.round() as i32 - self.at.1),
+        );
+        self.at = (self.at.0 + delta.0, self.at.1 + delta.1);
         delta
     }
 }
@@ -178,10 +183,13 @@ pub fn build(name: &str, glyphs: &[&[u8]], bbox: [i32; 4]) -> Result<Vec<u8>, St
     write_index(&mut global, &[]);
 
     // Charset format 2: every CID from 1 is named in order, with SIDs that stand for CIDs.
+    // A font with only `.notdef` names nothing, so it has no range.
     let mut charset = vec![2u8];
-    charset.extend_from_slice(&1u16.to_be_bytes());
-    let left = (glyphs.len() as u16).saturating_sub(2);
-    charset.extend_from_slice(&left.to_be_bytes());
+    if glyphs.len() > 1 {
+        charset.extend_from_slice(&1u16.to_be_bytes());
+        let left = (glyphs.len() as u16).saturating_sub(2);
+        charset.extend_from_slice(&left.to_be_bytes());
+    }
 
     // FDSelect format 3: all glyphs use font dictionary 0.
     let mut select = vec![3u8];
@@ -244,4 +252,56 @@ pub fn build(name: &str, glyphs: &[&[u8]], bbox: [i32; 4]) -> Result<Vec<u8>, St
     out.extend_from_slice(&array);
     out.extend_from_slice(&private);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers of a charstring, with no operators.
+    fn numbers(data: &[u8]) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < data.len() {
+            let byte = data[at];
+            at += 1;
+            match byte {
+                28 => {
+                    out.push(i32::from(i16::from_be_bytes([data[at], data[at + 1]])));
+                    at += 2;
+                }
+                32..=246 => out.push(i32::from(byte) - 139),
+                247..=250 => {
+                    out.push((i32::from(byte) - 247) * 256 + i32::from(data[at]) + 108);
+                    at += 1;
+                }
+                251..=254 => {
+                    out.push(-(i32::from(byte) - 251) * 256 - i32::from(data[at]) - 108);
+                    at += 1;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_move_too_long_for_one_number_does_not_shift_the_rest() {
+        let figure = Figure {
+            start: (40_000.0, 0.0),
+            segments: vec![Segment::Line((40_000.0, 100.0))],
+        };
+        // The first move stops at 32,767, and the next one makes up the rest of the way.
+        assert_eq!(numbers(&charstring(&[figure])), vec![32_767, 0, 7_233, 100]);
+    }
+
+    #[test]
+    fn a_font_with_only_notdef_has_no_charset_range() {
+        let empty = charstring(&[]);
+        let font = build("X", &[&empty], [0, 0, 0, 0]).unwrap();
+        let report = crate::check::read_cff_for_test(&font).unwrap();
+        assert_eq!(report, 1);
+        let two = build("X", &[&empty, &empty], [0, 0, 0, 0]).unwrap();
+        assert_eq!(crate::check::read_cff_for_test(&two).unwrap(), 2);
+    }
 }

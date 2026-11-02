@@ -36,7 +36,7 @@ fn source_text() -> String {
             2 => text.push_str(&format!(
                 "{indent}// a comment that runs for a while and then some more words\n"
             )),
-            3 => text.push_str("\n"),
+            3 => text.push('\n'),
             4 => text.push_str(&format!(
                 "{indent}\u{628}\u{628}\u{628} \u{4e2d}\u{6587} e\u{301}\n"
             )),

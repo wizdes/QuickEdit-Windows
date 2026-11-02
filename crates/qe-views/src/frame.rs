@@ -67,12 +67,46 @@ struct NumberMetrics {
     baseline: f32,
 }
 
+/// Who owns a pressed button until its release. The map and the text own a drag. `Side`
+/// is a press that does nothing: in the gutter, as the Mac's ruler takes no clicks, or a
+/// second button during a drag in the map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PressOwner {
     None,
     Text,
     Map,
-    Gutter,
+    Side,
+}
+
+/// One owner for each mouse button, because two buttons can be down at once.
+#[derive(Clone, Copy, Debug)]
+struct Presses([PressOwner; 5]);
+impl Presses {
+    fn slot(button: MouseButton) -> usize {
+        match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::X1 => 3,
+            MouseButton::X2 => 4,
+        }
+    }
+    fn set(&mut self, button: MouseButton, owner: PressOwner) {
+        self.0[Self::slot(button)] = owner;
+    }
+    fn take(&mut self, button: MouseButton) -> PressOwner {
+        std::mem::replace(&mut self.0[Self::slot(button)], PressOwner::None)
+    }
+    fn any(&self, owner: PressOwner) -> bool {
+        self.0.contains(&owner)
+    }
+    /// Who a move goes to. A drag in the map holds the pointer, so it comes first.
+    fn move_owner(&self) -> PressOwner {
+        [PressOwner::Map, PressOwner::Text, PressOwner::Side]
+            .into_iter()
+            .find(|owner| self.any(*owner))
+            .unwrap_or(PressOwner::None)
+    }
 }
 
 /// See the crate's README for the calls a host makes.
@@ -105,6 +139,9 @@ pub struct ViewFrame {
     job_done: u64,
     wake: Option<Wake>,
     problem: Option<String>,
+    /// The lines the last job read, and how many lines the index knew then. A job that
+    /// could not reach its lines is sent again only when the index knows more.
+    last_job: Option<(std::ops::Range<usize>, usize)>,
 
     fade: Fade,
     near: bool,
@@ -112,7 +149,7 @@ pub struct ViewFrame {
     /// How far down its travel the pointer holds the box, during a drag. Heights learned
     /// from new layouts move the scroll limit, and the box must stay under the pointer.
     drag_fraction: Option<f64>,
-    press: PressOwner,
+    press: Presses,
 
     seen_revision: u64,
     seen_document: u64,
@@ -157,11 +194,12 @@ impl ViewFrame {
             job_done: 0,
             wake: None,
             problem: None,
+            last_job: None,
             fade: Fade::default(),
             near: false,
             drag_offset: None,
             drag_fraction: None,
-            press: PressOwner::None,
+            press: Presses([PressOwner::None; 5]),
             seen_revision: u64::MAX,
             seen_document: u64::MAX,
             seen_lines: usize::MAX,
@@ -198,8 +236,21 @@ impl ViewFrame {
         self.map_stale |= width != self.tab_width;
         self.tab_width = width.max(1);
     }
-    pub fn set_paper(&mut self, paper: Paper) {
+    /// A new paper size. With Wrap to Page on, the text wraps again at the new width at once.
+    pub fn set_paper(
+        &mut self,
+        paper: Paper,
+        editor: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) {
         self.paper = paper;
+        if self.page_wrap {
+            editor.set_page_wrap(self.page_hook(), ctx);
+            self.force_read = true;
+            ctx.invalidate(self.bounds);
+            self.sync(editor, measure, ctx);
+        }
     }
     pub fn set_line_numbers(
         &mut self,
@@ -363,6 +414,10 @@ impl ViewFrame {
     pub fn map_job_running(&self) -> bool {
         self.job_done != self.job_number
     }
+    /// The job the map's worker may work on, so a test can see that it was told to stop.
+    pub fn map_worker_newest_job(&self) -> u64 {
+        self.worker.as_ref().map_or(0, MapWorker::newest_job)
+    }
     /// A problem that stopped the map, in plain words.
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
@@ -415,17 +470,18 @@ impl ViewFrame {
     pub fn pointer_left(&mut self, ctx: &mut ViewContext) {
         self.set_near(false, ctx);
     }
-    /// Another window took the mouse during a drag in the map.
-    pub fn capture_lost(&mut self, ctx: &mut ViewContext) {
-        if self.press == PressOwner::Map {
-            self.press = PressOwner::None;
+    /// Another window took the mouse during a drag, in the map or in the text.
+    pub fn capture_lost(&mut self, editor: &mut EditorView, ctx: &mut ViewContext) {
+        if self.press.any(PressOwner::Text) {
+            editor.cancel_drag();
+        }
+        if self.press.any(PressOwner::Map) {
             self.drag_offset = None;
             self.drag_fraction = None;
             self.near = false;
             self.aim_fade(ctx);
-        } else if self.press != PressOwner::None {
-            self.press = PressOwner::None;
         }
+        self.press = Presses([PressOwner::None; 5]);
     }
 
     /// Call this after any timer or wake, with `editor.poll_layout` before it, and after
@@ -530,12 +586,12 @@ impl ViewFrame {
             InputKind::MouseMove { at } => {
                 let at = *at;
                 self.set_near(self.in_hover_area(at), ctx);
-                match self.press {
+                match self.press.move_owner() {
                     PressOwner::Map => {
                         self.drag_to(editor, at.y.0, ctx);
                         Handled::Yes
                     }
-                    PressOwner::Gutter => Handled::Yes,
+                    PressOwner::Side => Handled::Yes,
                     PressOwner::Text => editor.handle(event, ctx),
                     PressOwner::None => {
                         if self.in_side_part(at) {
@@ -548,28 +604,32 @@ impl ViewFrame {
                 }
             }
             InputKind::MouseDown { at, button, .. } => {
-                let at = *at;
-                if contains(self.map_area(), at) {
-                    if *button == MouseButton::Left {
-                        self.press = PressOwner::Map;
+                let (at, button) = (*at, *button);
+                if self.press.any(PressOwner::Map) {
+                    // A second button during a drag in the map does nothing.
+                    self.press.set(button, PressOwner::Side);
+                    Handled::Yes
+                } else if contains(self.map_area(), at) {
+                    if button == MouseButton::Left {
+                        self.press.set(button, PressOwner::Map);
                         ctx.capture_mouse(true);
                         self.press_map(editor, at.y.0, ctx);
+                    } else {
+                        self.press.set(button, PressOwner::Side);
                     }
                     Handled::Yes
                 } else if contains(self.gutter_area(), at) {
                     // The Mac's ruler takes no clicks, and a click there selects nothing.
-                    self.press = PressOwner::Gutter;
+                    self.press.set(button, PressOwner::Side);
                     Handled::Yes
                 } else {
-                    self.press = PressOwner::Text;
+                    self.press.set(button, PressOwner::Text);
                     editor.handle(event, ctx)
                 }
             }
-            InputKind::MouseUp { at, .. } => {
+            InputKind::MouseUp { at, button, .. } => {
                 let at = *at;
-                let owner = self.press;
-                self.press = PressOwner::None;
-                match owner {
+                match self.press.take(*button) {
                     PressOwner::Map => {
                         ctx.capture_mouse(false);
                         // Where the pointer is first, so a drag that ended outside the
@@ -580,7 +640,7 @@ impl ViewFrame {
                         self.aim_fade(ctx);
                         Handled::Yes
                     }
-                    PressOwner::Gutter => Handled::Yes,
+                    PressOwner::Side => Handled::Yes,
                     PressOwner::Text | PressOwner::None => editor.handle(event, ctx),
                 }
             }
@@ -738,6 +798,14 @@ impl ViewFrame {
             self.gutter_due = None;
         }
         if map_went {
+            // The job now running can never be shown. It must not hold a timer or do more
+            // work, so the frame stops waiting for it and tells the worker to stop.
+            self.job_number += 1;
+            self.job_done = self.job_number;
+            if let Some(worker) = &mut self.worker {
+                worker.abandon(self.job_number);
+            }
+            self.last_job = None;
             self.rows = MapRows::default();
             self.geometry = None;
             self.map_due = None;
@@ -772,9 +840,11 @@ impl ViewFrame {
                     for tracked in &changes {
                         text_changed = true;
                         lines_changed |= tracked.change.line_count_delta != 0;
-                        // An edit past the rows the map holds cannot change them.
+                        // An edit past the rows the map holds cannot change them. A job
+                        // that is running may be reading any rows, so those can change.
                         if tracked.change.replaced.start.0 <= self.rows.end_byte
                             || self.rows.row_ends.is_empty()
+                            || self.map_job_running()
                         {
                             self.map_stale = true;
                         }
@@ -832,7 +902,7 @@ impl ViewFrame {
         let (Some(first_row), Some(last_row)) = (visible.rows.first(), visible.rows.last()) else {
             // No layout yet: the map keeps what it has, or shows only its background.
             if self.geometry.is_none() {
-                self.send_job_if_needed(editor, 0..rows + 1, ctx);
+                self.send_job_if_needed(editor, status, 0..rows + 1, ctx);
             }
             return;
         };
@@ -845,12 +915,19 @@ impl ViewFrame {
         let count = status.known_lines.max(last + 1);
         let scrollable = count.saturating_sub(on_screen);
         let max = editor.max_scroll_position();
-        let fraction = match self.drag_fraction {
-            Some(held) => held,
-            None if max > 0.0 => (editor.scroll_offset() / max).clamp(0.0, 1.0),
+        let by_scroll = |fraction: f64| fraction * scrollable as f64;
+        let first_line = match self.drag_fraction {
+            Some(held) => by_scroll(held),
+            // The rows say which line is really at the top. A share of the document's height
+            // is not the same share of its lines once lines wrap to different heights.
+            None if visible.complete => {
+                first_line_on_screen(visible, self.bounds.y.0).min(scrollable as f64)
+            }
+            // Until the rows are known, the scroll position is the best guide there is.
+            None if max > 0.0 => by_scroll((editor.scroll_offset() / max).clamp(0.0, 1.0)),
             None => 0.0,
         };
-        let geometry = MapGeometry::new(fraction * scrollable as f64, on_screen, count, rows);
+        let geometry = MapGeometry::new(first_line, on_screen, count, rows);
         let lines = geometry.lines_shown();
         if self.geometry != Some(geometry) {
             let rows_moved = self
@@ -866,17 +943,30 @@ impl ViewFrame {
                 self.invalidate_box(ctx);
             }
         }
-        self.send_job_if_needed(editor, lines, ctx);
+        self.send_job_if_needed(editor, status, lines, ctx);
     }
 
     fn send_job_if_needed(
         &mut self,
         editor: &EditorView,
+        status: &StoreStatus,
         lines: std::ops::Range<usize>,
         ctx: &mut ViewContext,
     ) {
-        if !self.map_stale && (self.rows.covers(&lines) || self.map_job_running()) {
-            return;
+        if !self.map_stale {
+            if self.rows.covers(&lines) || self.map_job_running() {
+                return;
+            }
+            // Rows that are not known yet stay unknown until the index knows more. Without
+            // this, each wake from a finished job starts the next job, forever if the
+            // index has failed. Growth comes through `map_due`, at most 10 times a second.
+            if let Some((asked, known)) = &self.last_job
+                && asked.start <= lines.start
+                && lines.end <= asked.end
+                && *known == status.known_lines
+            {
+                return;
+            }
         }
         if self.worker.is_none() {
             match MapWorker::start(self.wake.clone()) {
@@ -890,6 +980,7 @@ impl ViewFrame {
         let first_line = lines.start.saturating_sub(MAP_SLACK_ROWS);
         let count = (lines.end - first_line + MAP_SLACK_ROWS).min(MAP_MOST_ROWS);
         self.job_number += 1;
+        self.last_job = Some((first_line..first_line + count, status.known_lines));
         let job = Job {
             snapshot: editor.worker_snapshot(),
             first_line,
@@ -1110,6 +1201,20 @@ impl ViewFrame {
         }
         list.push(DrawCommand::PopClip);
     }
+}
+
+/// The line at the view's top, with how much of it has scrolled away. A line that wraps
+/// counts as whole until its last row has gone, because the map has one row for each line.
+fn first_line_on_screen(visible: &VisibleRows, top: f32) -> f64 {
+    let Some(first) = visible.rows.first() else {
+        return 0.0;
+    };
+    let line = first.line.0 as f64;
+    let wraps = first.continuation || visible.rows.get(1).is_some_and(|next| next.continuation);
+    if wraps || first.height.0 <= 0.0 {
+        return line;
+    }
+    line + f64::from(((top - first.y.0) / first.height.0).clamp(0.0, 1.0))
 }
 
 fn contains(rect: Rect, at: Point) -> bool {

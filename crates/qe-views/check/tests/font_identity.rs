@@ -18,7 +18,9 @@ fn dark_pixels(list: &DisplayList) -> usize {
     let bitmap = paper.bitmap().unwrap();
     bitmap
         .bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[1] < 128)
         .count()
 }

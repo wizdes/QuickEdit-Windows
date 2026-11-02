@@ -5,6 +5,7 @@ use crate::{PdfError, PdfOptions};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const CATALOG_ID: usize = 1;
 pub const PAGES_ID: usize = 2;
@@ -52,6 +53,10 @@ impl PdfFile {
     }
     pub fn object_count(&self) -> usize {
         self.offsets.len()
+    }
+    /// The bytes written so far.
+    pub fn bytes_written(&self) -> u64 {
+        self.at
     }
     pub fn object(&mut self, id: usize, body: &[u8]) -> Result<(), PdfError> {
         self.mark(id)?;
@@ -135,7 +140,7 @@ fn read_at(file: &mut File, at: u64, buffer: &mut [u8]) -> Result<usize, PdfErro
 /// The check before a temp file becomes the PDF: it ends properly, the table of objects
 /// points at every object, and the page tree has the pages that were written. It reads
 /// a small piece per object, so it does not hold the file in memory.
-pub fn verify_on_disk(path: &Path, pages: usize) -> Result<(), PdfError> {
+pub fn verify_on_disk(path: &Path, pages: usize, cancel: &AtomicBool) -> Result<(), PdfError> {
     let mut file = File::open(path).map_err(problem)?;
     let size = file.metadata().map_err(problem)?.len();
     let bad = |what: &str| PdfError::Check(what.to_string());
@@ -167,6 +172,10 @@ pub fn verify_on_disk(path: &Path, pages: usize) -> Result<(), PdfError> {
         .ok_or_else(|| bad("its table has no size"))?;
     let table = xref + 5 + count_line.len() as u64 + 1;
     for id in 1..count {
+        // Each entry is two disk reads, and a big file has millions.
+        if id.is_multiple_of(4096) && cancel.load(Ordering::Relaxed) {
+            return Err(PdfError::Cancelled);
+        }
         let mut entry = [0u8; 20];
         read_at(&mut file, table + id as u64 * 20, &mut entry)?;
         let offset: u64 = std::str::from_utf8(&entry[..10])

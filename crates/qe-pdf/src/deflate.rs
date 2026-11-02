@@ -189,7 +189,12 @@ impl Compressor {
 /// Reads what `compress` writes, and any other zlib stream with fixed or dynamic codes.
 /// The structure checker uses it. Bad input gives an error, never a panic.
 pub fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
-    let body = input.get(2..).ok_or("the zlib header is cut off")?;
+    let (&[method, flags], body) = input
+        .split_first_chunk::<2>()
+        .ok_or("the zlib header is cut off")?;
+    if method & 0x0F != 8 || !(u32::from(method) * 256 + u32::from(flags)).is_multiple_of(31) {
+        return Err("the zlib header is bad".into());
+    }
     let mut reader = BitReader {
         data: body,
         at: 0,
@@ -203,9 +208,11 @@ pub fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
             0 => {
                 reader.held = 0;
                 reader.count = 0;
-                let length = usize::from(reader.byte()?) | (usize::from(reader.byte()?) << 8);
-                reader.byte()?;
-                reader.byte()?;
+                let length = u16::from(reader.byte()?) | (u16::from(reader.byte()?) << 8);
+                let other = u16::from(reader.byte()?) | (u16::from(reader.byte()?) << 8);
+                if length != !other {
+                    return Err("a stored deflate block has a bad length".into());
+                }
                 for _ in 0..length {
                     out.push(reader.byte()?);
                 }
@@ -225,6 +232,16 @@ pub fn inflate(input: &[u8]) -> Result<Vec<u8>, String> {
             _ => return Err("a deflate block has a bad type".into()),
         }
         if last {
+            // The reader loads a byte only when it needs one, so the unused bits of the
+            // last byte are all that it holds, and the checksum starts at `at`.
+            let stored = reader
+                .data
+                .get(reader.at..)
+                .and_then(<[u8]>::first_chunk::<4>)
+                .ok_or("the checksum of a compressed stream is missing")?;
+            if u32::from_be_bytes(*stored) != adler32(&out) {
+                return Err("the checksum of a compressed stream is wrong".into());
+            }
             return Ok(out);
         }
     }
@@ -376,6 +393,46 @@ fn inflate_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `zlib.compress(b"hello hello hello hello\n")` from Python's own zlib.
+    const FROM_ZLIB: [u8; 17] = [
+        120, 156, 203, 72, 205, 201, 201, 87, 200, 64, 39, 185, 0, 112, 190, 8, 187,
+    ];
+    /// `zlib.compress(b"abc", 0)`, one stored block.
+    const STORED: [u8; 14] = [120, 1, 1, 3, 0, 252, 255, 97, 98, 99, 2, 77, 1, 39];
+
+    #[test]
+    fn another_programs_zlib_stream_reads_back() {
+        assert_eq!(inflate(&FROM_ZLIB).unwrap(), b"hello hello hello hello\n");
+        assert_eq!(inflate(&STORED).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn the_checksum_matches_a_known_value() {
+        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
+        assert_eq!(adler32(b""), 1);
+        // The compressor's own trailer holds that checksum, in the order zlib wants.
+        let packed = Compressor::default().compress(b"Wikipedia");
+        assert_eq!(packed[packed.len() - 4..], 0x11E6_0398u32.to_be_bytes());
+    }
+
+    #[test]
+    fn any_damage_to_header_length_or_checksum_is_refused() {
+        for at in [0, 1] {
+            let mut bad = FROM_ZLIB;
+            bad[at] ^= 1;
+            assert!(inflate(&bad).unwrap_err().contains("header"));
+        }
+        let mut bad = STORED;
+        bad[5] ^= 1;
+        assert!(inflate(&bad).unwrap_err().contains("length"));
+        for at in FROM_ZLIB.len() - 4..FROM_ZLIB.len() {
+            let mut bad = FROM_ZLIB;
+            bad[at] ^= 1;
+            assert!(inflate(&bad).unwrap_err().contains("checksum"));
+        }
+        assert!(inflate(&FROM_ZLIB[..FROM_ZLIB.len() - 1]).is_err());
+    }
 
     #[test]
     fn round_trips_text_and_noise_and_every_match_length() {

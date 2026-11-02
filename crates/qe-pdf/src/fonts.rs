@@ -4,12 +4,13 @@
 //! variable font's instance and a simulated bold all take one path, and the file holds
 //! what the screen shows. A glyph with no outline that a font stores only as a picture
 //! is named in an error.
+use crate::PdfError;
 use crate::cff::{self, Figure, Segment};
 use qe_api::Color;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{DWRITE_E_NOCOLOR, E_NOINTERFACE, E_POINTER, S_OK};
 use windows::Win32::Graphics::Direct2D::Common::ID2D1SimplifiedGeometrySink;
@@ -30,6 +31,28 @@ use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 /// A font's PDF object holds at most this many CIDs. A document that needs more starts
 /// another PDF font for the same face.
 const MOST_CIDS: usize = 65_000;
+/// The most UTF-16 units one CID's map entry holds. PDF allows 256 (512 bytes), but Poppler
+/// reads a map one token at a time into 256 bytes, so it warned about entries of 200 units
+/// and dropped them. 60 units fit its 63. `check_pdf` refuses a file with a longer entry.
+pub const MOST_MAP_UNITS: usize = 60;
+
+/// Cuts text into pieces that each fit one map entry, between characters.
+pub fn map_pieces(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let (mut start, mut units) = (0, 0);
+    for (at, character) in text.char_indices() {
+        let wide = character.len_utf16();
+        if units + wide > MOST_MAP_UNITS {
+            pieces.push(&text[start..at]);
+            (start, units) = (at, 0);
+        }
+        units += wide;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
+}
 
 /// What one glyph's text is. It decides the CID, because a CID has one ToUnicode entry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,6 +66,8 @@ pub struct Cid {
     pub text: GlyphText,
     /// In 1/1000 em, from the first time this CID was used.
     pub width: f32,
+    /// True when this CID draws nothing and only carries text, such as a tab.
+    pub blank: bool,
 }
 
 /// One layer of a color glyph.
@@ -61,6 +86,7 @@ pub struct PdfFont {
     pub cids: Vec<Cid>,
     single: HashMap<(u16, char), u16>,
     many: HashMap<(u16, Box<str>), u16>,
+    blanks: HashMap<Box<str>, u16>,
 }
 
 impl PdfFont {
@@ -73,9 +99,11 @@ impl PdfFont {
                 glyph: 0,
                 text: GlyphText::Many("".into()),
                 width: 0.0,
+                blank: true,
             }],
             single: HashMap::new(),
             many: HashMap::new(),
+            blanks: HashMap::new(),
         }
     }
     fn is_full(&self) -> bool {
@@ -134,6 +162,7 @@ impl FontSet {
             glyph,
             text: GlyphText::One(text),
             width,
+            blank: false,
         });
         font.single.insert((glyph, text), cid);
         Ok((index, cid))
@@ -162,9 +191,40 @@ impl FontSet {
             glyph,
             text: GlyphText::Many(text.into()),
             width,
+            blank: false,
         });
         font.many.insert((glyph, text.into()), cid);
         Ok((index, cid))
+    }
+
+    /// A CID with an empty shape that stands for this text: a tab, a character that layout
+    /// gives no glyph, or the end of a cluster too long for one map entry.
+    pub fn blank_cid(
+        &mut self,
+        font_id: u32,
+        text: &str,
+        width: f32,
+    ) -> Result<(usize, u16), String> {
+        let index = self.font_for(font_id)?;
+        let font = &mut self.fonts[index];
+        if let Some(&cid) = font.blanks.get(text) {
+            return Ok((index, cid));
+        }
+        let cid = font.cids.len() as u16;
+        font.cids.push(Cid {
+            glyph: 0,
+            text: GlyphText::Many(text.into()),
+            width,
+            blank: true,
+        });
+        font.blanks.insert(text.into(), cid);
+        Ok((index, cid))
+    }
+
+    /// The picture check, for a glyph that is drawn as a shape and so gets no CID.
+    pub fn check_glyph_of(&mut self, font_id: u32, glyph: u16) -> Result<(), String> {
+        let index = self.font_for(font_id)?;
+        self.check_glyph(index, glyph)
     }
 
     /// A glyph that exists only as a picture has no outline to embed, and would come out
@@ -484,22 +544,30 @@ pub struct BuiltFont {
     pub bbox: [i32; 4],
 }
 
-pub fn build_subset(font: &PdfFont, name: &str) -> Result<BuiltFont, String> {
+/// Cancel is read before each glyph, because a font with many glyphs takes a long time.
+pub fn build_subset(
+    font: &PdfFont,
+    name: &str,
+    cancel: &AtomicBool,
+) -> Result<BuiltFont, PdfError> {
     // Most CIDs share a glyph with no other, but a glyph can have several texts.
     let mut made: HashMap<u16, Arc<[u8]>> = HashMap::new();
     let mut strings: Vec<Arc<[u8]>> = Vec::with_capacity(font.cids.len());
     let mut bbox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
     let empty: Arc<[u8]> = Arc::from(cff::charstring(&[]));
-    for (cid, entry) in font.cids.iter().enumerate() {
-        if cid == 0 {
+    for entry in &font.cids {
+        if entry.blank {
             strings.push(empty.clone());
             continue;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PdfError::Cancelled);
         }
         if let Some(found) = made.get(&entry.glyph) {
             strings.push(found.clone());
             continue;
         }
-        let figures = glyph_outline(&font.face, entry.glyph)?;
+        let figures = glyph_outline(&font.face, entry.glyph).map_err(PdfError::Font)?;
         grow_box(&mut bbox, &figures);
         let string: Arc<[u8]> = Arc::from(cff::charstring(&figures));
         made.insert(entry.glyph, string.clone());
@@ -510,7 +578,7 @@ pub fn build_subset(font: &PdfFont, name: &str) -> Result<BuiltFont, String> {
     }
     let slices: Vec<&[u8]> = strings.iter().map(|s| &**s).collect();
     Ok(BuiltFont {
-        file: cff::build(name, &slices, bbox)?,
+        file: cff::build(name, &slices, bbox).map_err(PdfError::Font)?,
         bbox,
     })
 }
@@ -581,12 +649,17 @@ fn be16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
 }
 
-/// A font's license can forbid embedding. OS/2 `fsType` bit 1 says restricted, and bit 9
-/// says outlines may not go in a document.
+/// A font's license can forbid what a PDF needs. In OS/2 `fsType`, the low bits equal to 2
+/// say restricted, bit 8 says no subsetting (every font here is a subset), and bit 9 says
+/// outlines may not go in a document.
+fn embedding_forbidden(bits: u16) -> bool {
+    bits & 0x000F == 0x0002 || bits & 0x0100 != 0 || bits & 0x0200 != 0
+}
+
 fn check_embedding_allowed(face: &IDWriteFontFace, name: &str) -> Result<(), String> {
     let kind = with_table(face, tag(b"OS/2"), |table| be16(table, 8)).flatten();
     match kind {
-        Some(bits) if bits & 0x000F == 0x0002 || bits & 0x0200 != 0 => Err(format!(
+        Some(bits) if embedding_forbidden(bits) => Err(format!(
             "The license of the font {name} does not allow it to be embedded in a PDF. \
              Choose another font and export again."
         )),
@@ -631,4 +704,75 @@ fn read_postscript_name(table: &[u8]) -> Option<String> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qe_api::testing::StringStore;
+    use qe_api::{Dip, LineIndex};
+    use qe_layout::DirectWriteLayout;
+    use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
+
+    fn font_with_glyphs() -> FontSet {
+        let engine =
+            DirectWriteLayout::with_font("Cascadia Mono", 10.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap();
+        let layout = engine
+            .try_layout_line(&StringStore::new("abc"), LineIndex(0), Dip(500.0))
+            .unwrap();
+        let run = &layout.rows[0].glyph_runs[0];
+        let mut set = FontSet::default();
+        for glyph in &run.glyph_ids {
+            set.cid_for_text(run.font_id, *glyph, "x", 500.0).unwrap();
+        }
+        set
+    }
+
+    #[test]
+    fn a_license_bit_that_forbids_a_subset_stops_the_export() {
+        assert!(!embedding_forbidden(0));
+        assert!(!embedding_forbidden(0x0008));
+        assert!(embedding_forbidden(0x0002));
+        assert!(embedding_forbidden(0x0100));
+        assert!(embedding_forbidden(0x0200));
+    }
+
+    #[test]
+    fn font_building_stops_on_cancel() {
+        let set = font_with_glyphs();
+        let result = build_subset(&set.fonts[0], "Test", &AtomicBool::new(true));
+        assert!(matches!(result, Err(PdfError::Cancelled)));
+        assert!(build_subset(&set.fonts[0], "Test", &AtomicBool::new(false)).is_ok());
+    }
+
+    #[test]
+    fn a_blank_cid_has_an_empty_shape_and_is_kept_once() {
+        let mut set = font_with_glyphs();
+        let font_id = set.fonts[0].font_id;
+        let (font, first) = set.blank_cid(font_id, "\t", 300.0).unwrap();
+        assert_eq!(set.blank_cid(font_id, "\t", 900.0).unwrap(), (font, first));
+        assert_ne!(set.blank_cid(font_id, "\u{200b}", 0.0).unwrap().1, first);
+        assert!(set.fonts[font].cids[usize::from(first)].blank);
+    }
+
+    #[test]
+    fn long_text_is_cut_between_characters_and_lost_nowhere() {
+        for text in [
+            "\u{1f468}".repeat(150),
+            "a".repeat(MOST_MAP_UNITS + 1),
+            "\u{fe0f}".repeat(405),
+            "a".repeat(MOST_MAP_UNITS - 1) + "\u{1f468}" + "b",
+            String::new(),
+        ] {
+            let pieces = map_pieces(&text);
+            assert_eq!(pieces.concat(), text);
+            assert!(
+                pieces
+                    .iter()
+                    .all(|p| p.encode_utf16().count() <= MOST_MAP_UNITS)
+            );
+        }
+        assert_eq!(map_pieces(&"a".repeat(MOST_MAP_UNITS)).len(), 1);
+        assert_eq!(map_pieces(&"a".repeat(MOST_MAP_UNITS + 1)).len(), 2);
+    }
 }

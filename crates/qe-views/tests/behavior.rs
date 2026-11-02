@@ -476,7 +476,7 @@ fn a_lost_mouse_ends_the_drag() {
     let x = rig.map_left() + 30.0;
     rig.down(x, 1.0);
     let mut ctx = ViewContext::default();
-    rig.frame.capture_lost(&mut ctx);
+    rig.frame.capture_lost(&mut rig.editor, &mut ctx);
     let scroll = rig.editor.scroll_offset();
     rig.hover(x, 300.0);
     assert_eq!(rig.editor.scroll_offset(), scroll);
@@ -1188,4 +1188,22 @@ fn the_frame_asks_for_the_soonest_timer_when_the_editor_asked_for_one_too() {
         Some(&16),
         "the last request wins in the shell"
     );
+}
+
+#[test]
+fn numbers_that_would_overlap_are_skipped() {
+    let row = |line: usize| qe_editor::VisibleRow {
+        line: qe_api::LineIndex(line),
+        first_byte: qe_api::ByteOffset(line),
+        y: Dip(line as f32 * 5.0),
+        height: Dip(5.0),
+        continuation: false,
+    };
+    let rows: Vec<_> = (0..6).map(row).collect();
+    let numbers: Vec<usize> = qe_views::gutter_labels(&rows, 16.0, 7.0)
+        .iter()
+        .map(|label| label.number)
+        .collect();
+    // Ink 7 dips tall on rows 5 dips tall leaves a number on every second row.
+    assert_eq!(numbers, vec![1, 3, 5]);
 }

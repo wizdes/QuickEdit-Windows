@@ -365,6 +365,15 @@ pub fn read(store: &ITextStoreACP, start: i32, end: i32) -> String {
     String::from_utf16_lossy(&buffer[..got as usize])
 }
 
+/// A new layout that has not finished, so that a key has something to wait for.
+pub fn lay_out_without_waiting(view: &mut EditorView, width: f32, height: f32) {
+    View::layout(
+        view,
+        area(width, height),
+        &DirectWriteLayout::new().unwrap(),
+    );
+}
+
 /// Makes `View` usable in tests that lay a view out again.
 pub fn lay_out(view: &mut EditorView, width: f32, height: f32) {
     View::layout(

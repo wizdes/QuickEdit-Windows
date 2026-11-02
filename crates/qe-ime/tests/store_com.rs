@@ -10,7 +10,7 @@ mod support;
 use qe_api::{ByteOffset, InputEvent, InputKind, Modifiers, View, ViewContext};
 use qe_buffer::{MappedStore, PieceStore};
 use qe_editor::{EditorView, LoadedFile};
-use qe_ime::TextStoreHandle;
+use qe_ime::{ImeHost, SharedViewHost, TextStoreHandle};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -448,7 +448,11 @@ fn set_text_uses_utf16_positions_and_says_what_changed() {
     assert_eq!(d.fixture.text(), "a\u{1f600}\u{1f431}b");
     assert_eq!(d.read_all(), "a\u{1f600}\u{1f431}b");
     let caret = d.locked(READ, get_selection);
-    assert_eq!((caret.acpStart, caret.acpEnd), (5, 5));
+    assert_eq!(
+        (caret.acpStart, caret.acpEnd),
+        (0, 0),
+        "the caret is not at the edit, so it stays"
+    );
     d.fixture.no_problems();
 }
 
@@ -1523,4 +1527,223 @@ fn text_past_the_right_side_of_the_view_has_an_all_zero_rectangle() {
     assert_eq!(far.0, HRESULT(0));
     assert_eq!(far.1, RECT::default());
     assert!(far.2);
+}
+
+// ---- Third review ----
+
+#[test]
+fn a_write_before_the_caret_moves_the_caret_with_its_text() {
+    let d = Direct::new(laid_out("0123456789"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .select(b(8)..b(8), &mut ViewContext::default());
+    d.handle.sync();
+    let caret = d.locked(WRITE, |store| unsafe {
+        store.SetText(0, 0, 1, &units("Jay")).unwrap();
+        get_selection(store)
+    });
+    assert_eq!((caret.acpStart, caret.acpEnd), (10, 10));
+    assert_eq!(d.fixture.view.borrow().selection(), b(10)..b(10));
+}
+
+#[test]
+fn a_write_after_the_caret_leaves_the_caret_where_it_was() {
+    let d = Direct::new(laid_out("0123456789"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .select(b(2)..b(2), &mut ViewContext::default());
+    d.handle.sync();
+    d.locked(WRITE, |store| unsafe {
+        store.SetText(0, 6, 7, &units("W")).unwrap();
+    });
+    assert_eq!(d.fixture.view.borrow().selection(), b(2)..b(2));
+    assert_eq!(d.fixture.text(), "012345W789");
+}
+
+#[test]
+fn a_write_before_a_selection_keeps_it_and_its_active_end() {
+    let d = Direct::new(laid_out("0123456789"));
+    d.locked(WRITE, |store| unsafe {
+        store.SetSelection(&[selection(4, 6, true)]).unwrap();
+        store.SetText(0, 0, 1, &units("JJ")).unwrap();
+    });
+    let v = d.fixture.view.borrow();
+    assert_eq!(v.selection(), b(5)..b(7));
+    assert_eq!(v.caret(), b(5));
+}
+
+#[test]
+fn a_write_over_the_caret_puts_it_after_the_new_text() {
+    let d = Direct::new(laid_out("0123456789"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .select(b(3)..b(3), &mut ViewContext::default());
+    d.handle.sync();
+    d.locked(WRITE, |store| unsafe {
+        store.SetText(0, 2, 5, &units("Q")).unwrap();
+    });
+    assert_eq!(d.fixture.view.borrow().selection(), b(3)..b(3));
+}
+
+#[test]
+fn a_write_at_the_caret_puts_it_after_the_new_text() {
+    let d = Direct::new(laid_out("0123"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .select(b(2)..b(2), &mut ViewContext::default());
+    d.handle.sync();
+    d.locked(WRITE, |store| unsafe {
+        store.SetText(0, 2, 2, &units("QQ")).unwrap();
+    });
+    assert_eq!(d.fixture.view.borrow().selection(), b(4)..b(4));
+}
+
+#[test]
+fn a_write_that_starts_at_the_caret_leaves_it_in_front() {
+    let d = Direct::new(laid_out("0123"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .select(b(1)..b(1), &mut ViewContext::default());
+    d.handle.sync();
+    d.locked(WRITE, |store| unsafe {
+        store.SetText(0, 1, 3, &units("Q")).unwrap();
+    });
+    assert_eq!(d.fixture.view.borrow().selection(), b(1)..b(1));
+}
+
+#[test]
+fn a_lock_waits_while_the_sink_has_not_heard_of_a_change() {
+    let d = Direct::new(laid_out("abc"));
+    d.fixture
+        .view
+        .borrow_mut()
+        .replace_range(b(0)..b(0), "zz", &mut ViewContext::default());
+    let ran: Rc<Cell<bool>> = Rc::default();
+    let seen = ran.clone();
+    *d.sink.on_lock.borrow_mut() = Some(Box::new(move |_| {
+        seen.set(true);
+        Ok(())
+    }));
+    assert_eq!(unsafe { d.store.RequestLock(WRITE) }.unwrap(), TS_S_ASYNC);
+    d.sink.fail_text.set(1);
+    d.handle.sync();
+    assert!(!ran.get(), "TSF has not heard, so its positions are old");
+    assert!(d.handle.lock_is_waiting());
+    assert!(!d.fixture.problems.borrow().is_empty(), "the failure shows");
+    d.handle.sync();
+    assert!(ran.get());
+}
+
+#[test]
+fn a_write_inside_cr_lf_is_refused_and_a_query_moves_out_of_it() {
+    let d = Direct::new(laid_out("a\r\nb"));
+    let answer = d.locked(WRITE, |store| {
+        code(unsafe { store.SetText(0, 2, 2, &units("Z")) })
+    });
+    assert_eq!(answer, TS_E_INVALIDPOS);
+    assert_eq!(d.fixture.text(), "a\r\nb");
+    let (mut start, mut end) = (0, 0);
+    unsafe { d.store.QueryInsert(2, 2, 1, &mut start, &mut end) }.unwrap();
+    assert_eq!((start, end), (1, 3));
+    let chosen = d.locked(WRITE, |store| unsafe {
+        store.SetSelection(&[selection(2, 2, false)]).unwrap();
+        get_selection(store)
+    });
+    assert_eq!((chosen.acpStart, chosen.acpEnd), (1, 3));
+}
+
+/// A host whose window has gone: it can give no screen place.
+struct NoScreen(Rc<SharedViewHost>);
+impl ImeHost for NoScreen {
+    fn with_view(&self, f: &mut dyn FnMut(&mut EditorView, &mut ViewContext)) -> bool {
+        self.0.with_view(f)
+    }
+    fn to_screen(&self, _: qe_api::Rect) -> Option<RECT> {
+        None
+    }
+    fn to_window(&self, point: POINT) -> Option<qe_api::Point> {
+        self.0.to_window(point)
+    }
+    fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self.0.hwnd()
+    }
+    fn problem(&self, message: String) {
+        self.0.problem(message);
+    }
+}
+
+#[test]
+fn a_screen_area_with_no_place_yet_tells_tsf_when_the_layout_comes() {
+    let fixture = support::Fixture::new(laid_out("abc"));
+    let handle = TextStoreHandle::new(Rc::new(NoScreen(fixture.host.clone())));
+    let sink = ComObject::new(support::FakeSink {
+        heard: RefCell::default(),
+        on_lock: RefCell::default(),
+        lock_flags: RefCell::default(),
+        fail_text: Cell::new(0),
+    });
+    let as_sink: ITextStoreACPSink = sink.to_interface();
+    let store = handle.text_store();
+    unsafe { store.AdviseSink(&ITextStoreACPSink::IID, &as_sink, 0x1f) }.unwrap();
+    assert_eq!(code(unsafe { store.GetScreenExt(0) }), TS_E_NOLAYOUT);
+    handle.layout_changed();
+    assert_eq!(sink.heard.borrow().as_slice(), &[Heard::Layout]);
+}
+
+#[test]
+fn a_sync_with_a_key_waiting_does_not_ask_for_another_sync() {
+    let (mut v, _remove) = mapped_view("no-spin.txt");
+    let mut ctx = ViewContext::default();
+    v.layout(
+        area(600.0, 300.0),
+        &qe_layout::DirectWriteLayout::new().unwrap(),
+    );
+    v.handle(
+        &InputEvent {
+            time_us: 0,
+            kind: InputKind::KeyDown {
+                virtual_key: 0x23,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+                repeat: false,
+            },
+        },
+        &mut ctx,
+    );
+    assert!(
+        v.queued_input_count() > 0,
+        "this test needs a key that waits"
+    );
+    let d = Direct::new(v);
+    assert_eq!(unsafe { d.store.RequestLock(WRITE) }.unwrap(), TS_S_ASYNC);
+    let asked = d.fixture.busy.get();
+    for _ in 0..5 {
+        d.handle.sync();
+    }
+    assert_eq!(
+        d.fixture.busy.get(),
+        asked,
+        "a host that wakes at once would spin"
+    );
+    assert!(d.handle.lock_is_waiting());
+}
+
+#[test]
+fn a_sync_with_the_view_in_use_asks_once_for_another_sync() {
+    let d = Direct::new(laid_out("abc"));
+    {
+        let _in_use = d.fixture.view.borrow_mut();
+        assert_eq!(unsafe { d.store.RequestLock(READ) }.unwrap(), TS_S_ASYNC);
+        assert_eq!(d.fixture.busy.get(), 1);
+    }
+    d.handle.sync();
+    assert!(!d.handle.lock_is_waiting());
+    assert_eq!(d.fixture.busy.get(), 1);
 }

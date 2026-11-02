@@ -996,6 +996,10 @@ impl EditorView {
     /// Takes the document that `FileLoad` finished. The view starts over on it. Work
     /// queued for the old text is dropped when it arrives.
     pub fn adopt(&mut self, loaded: LoadedFile) -> Result<(), String> {
+        // Composing text never goes without a message. It becomes an edit, so a composition
+        // with any text in it is refused as unsaved edits are, with the text safe. The host's
+        // `TsfDocument::sync` after this call tells TSF.
+        self.commit_composition_first(&mut ViewContext::default());
         if self.mapped.is_none() && !self.is_at_save_point() {
             return Err("This view has edits, so a file cannot replace them.".to_string());
         }

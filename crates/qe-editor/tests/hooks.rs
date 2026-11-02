@@ -2385,18 +2385,6 @@ fn select_directed_keeps_the_caret_at_the_end_asked_for() {
 }
 
 #[test]
-fn a_new_document_says_its_composition_was_dropped() {
-    let mut e = open("ab", 600.0, 200.0);
-    ime(&mut e, "x", 1);
-    e.adopt(LoadedFile::Editable {
-        store: PieceStore::new("new"),
-        ending: "\n",
-    })
-    .unwrap();
-    assert_eq!(e.take_composition_end(), Some(CompositionEnd::Cancelled));
-}
-
-#[test]
 fn a_point_on_a_later_row_of_a_composition_that_wraps_is_on_the_composition() {
     let mut e = open("ab\ncdef", 120.0, 400.0);
     e.run_host(HostCommand::Wrap(true), &mut ctx());
@@ -2435,4 +2423,33 @@ fn a_point_on_a_composition_in_a_long_line_answers_from_what_shows() {
         hit.byte <= ByteOffset(1),
         "just past the composition: {hit:?}"
     );
+}
+
+#[test]
+fn adopt_during_a_composition_commits_the_text_and_then_refuses() {
+    let mut e = open("abc", 600.0, 200.0);
+    ime(&mut e, "typed", 5);
+    let answer = e.adopt(LoadedFile::Editable {
+        store: qe_buffer::PieceStore::new("other doc"),
+        ending: "\n",
+    });
+    assert!(answer.is_err());
+    assert_eq!(e.text().unwrap(), "typedabc");
+    assert!(e.composition().is_none());
+    assert!(matches!(
+        e.take_composition_end(),
+        Some(qe_editor::CompositionEnd::Committed { .. })
+    ));
+}
+
+#[test]
+fn adopt_during_an_empty_composition_goes_ahead() {
+    let mut e = open("abc", 600.0, 200.0);
+    ime(&mut e, "", 0);
+    e.adopt(LoadedFile::Editable {
+        store: qe_buffer::PieceStore::new("other doc"),
+        ending: "\n",
+    })
+    .unwrap();
+    assert_eq!(e.text().unwrap(), "other doc");
 }

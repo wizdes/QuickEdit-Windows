@@ -81,7 +81,8 @@ pub trait ImeHost {
     fn problem(&self, message: String);
     /// Something has to wait for a clean stack: the view was in use, or TSF has to hear of a
     /// change, which must not happen inside `RequestLock`. Ask for a `sync` once the stack has
-    /// unwound, for example with the shell's wake. No timer is needed.
+    /// unwound, for example with the shell's wake. No timer is needed. A key that waits in the
+    /// view does not ask for this, because the host calls `sync` after the key runs anyway.
     fn sync_needed(&self) {}
     /// False when the window is hidden or minimized, so that no text shows.
     fn is_shown(&self) -> bool {
@@ -315,13 +316,21 @@ impl TsfThread {
                 context.ok_or_else(|| ImeError("TSF gave no context for this window.".into()))?;
             doc.Push(&context)
                 .map_err(|e| failed("pushing the context", e))?;
+            let edit_sink = context
+                .cast::<ITfSource>()
+                .and_then(|source| {
+                    source.AdviseSink(&ITfTextEditSink::IID, &store.text_edit_sink())
+                })
+                .map_err(|e| {
+                    // TSF holds the store through the context, so the context must leave.
+                    if let Err(pop) = doc.Pop(TF_POPF_ALL) {
+                        store.report(format!("TSF kept this tab's document: {pop}"));
+                    }
+                    failed("listening for the end of edits", e)
+                })?;
+            // Last: until here the store holds no reference to the context, so a failure above
+            // leaves no cycle between them.
             store.set_context(&context);
-            let source: ITfSource = context
-                .cast()
-                .map_err(|e| failed("asking for the context's source", e))?;
-            let edit_sink = source
-                .AdviseSink(&ITfTextEditSink::IID, &store.text_edit_sink())
-                .map_err(|e| failed("listening for the end of edits", e))?;
             Ok(TsfDocument {
                 doc,
                 context,

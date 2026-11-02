@@ -1495,3 +1495,353 @@ fn a_closed_document_refuses_focus_and_keeps_nothing_owed() {
     assert_eq!(tsf.fixture.text(), "ab");
     assert!(tsf.doc.focus().is_err());
 }
+
+// ---- Third review: the view ended the composition first ----
+
+fn caret_to(tsf: &Tsf, byte: usize) {
+    tsf.fixture.view.borrow_mut().select(
+        ByteOffset(byte)..ByteOffset(byte),
+        &mut ViewContext::default(),
+    );
+}
+
+/// `x` composing in front of `abc`.
+fn composing_x(tsf: &Tsf) {
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+}
+
+fn finished_as(tsf: &Tsf, text: &str) {
+    assert_eq!(tsf.fixture.text(), text);
+    assert_eq!(tsf.read_text(), text, "TSF's copy");
+    assert!(!tsf.doc.store().is_composing());
+    assert!(
+        tsf.fixture.view.borrow().composition().is_none(),
+        "no ghost"
+    );
+    assert_eq!(tsf.terminated.get(), 1);
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn complete_after_the_view_committed_does_not_add_the_text_twice() {
+    let tsf = Tsf::new(laid_out("abc"));
+    composing_x(&tsf);
+    caret_to(&tsf, 2);
+    tsf.doc.complete_composition();
+    finished_as(&tsf, "xabc");
+}
+
+#[test]
+fn close_after_the_view_committed_does_not_add_the_text_twice() {
+    let mut tsf = Tsf::new(laid_out("abc"));
+    composing_x(&tsf);
+    caret_to(&tsf, 2);
+    tsf.doc.close();
+    assert_eq!(tsf.fixture.text(), "xabc");
+    assert!(tsf.fixture.view.borrow().composition().is_none());
+    assert_eq!(tsf.terminated.get(), 1);
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn complete_after_esc_in_the_view_does_not_bring_the_text_back() {
+    let tsf = Tsf::new(laid_out("abc"));
+    composing_x(&tsf);
+    esc(&mut tsf.fixture.view.borrow_mut());
+    tsf.doc.complete_composition();
+    finished_as(&tsf, "abc");
+}
+
+#[test]
+fn an_owed_complete_after_the_view_committed_does_not_add_the_text_twice() {
+    let (tsf, shut) = Tsf::gated(laid_out("abc"));
+    composing_x(&tsf);
+    shut.set(true);
+    tsf.doc.complete_composition();
+    caret_to(&tsf, 2);
+    shut.set(false);
+    tsf.doc.sync();
+    finished_as(&tsf, "xabc");
+}
+
+#[test]
+fn an_owed_complete_after_undo_does_not_bring_the_text_back() {
+    let (tsf, shut) = Tsf::gated(laid_out("abc"));
+    composing_x(&tsf);
+    shut.set(true);
+    tsf.doc.complete_composition();
+    tsf.fixture
+        .view
+        .borrow_mut()
+        .run(EditorCommand::Undo, &mut ViewContext::default());
+    shut.set(false);
+    tsf.doc.sync();
+    finished_as(&tsf, "abc");
+}
+
+#[test]
+fn an_owed_cancel_after_the_view_committed_keeps_the_text_once() {
+    let (tsf, shut) = Tsf::gated(laid_out("abc"));
+    composing_x(&tsf);
+    shut.set(true);
+    tsf.doc.cancel_composition();
+    caret_to(&tsf, 2);
+    shut.set(false);
+    tsf.doc.sync();
+    finished_as(&tsf, "xabc");
+}
+
+#[test]
+fn tsf_ending_it_while_busy_and_then_the_view_committing_adds_the_text_once() {
+    let (tsf, shut) = Tsf::gated(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let composition = held.borrow().as_ref().unwrap().0.clone();
+    let shut_now = shut.clone();
+    tsf.write(move |ec| unsafe {
+        shut_now.set(true);
+        composition.EndComposition(ec)
+    });
+    caret_to(&tsf, 2);
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(tsf.fixture.text(), "xabc");
+    assert_eq!(tsf.read_text(), "xabc");
+    assert!(!tsf.doc.store().is_composing());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_waiting_key_owes_the_complete_and_a_commit_from_running_it_adds_the_text_once() {
+    let tsf = Tsf::new(laid_out(&"\u{4e2d}\u{6587} text\n".repeat(200)));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    {
+        let mut v = tsf.fixture.view.borrow_mut();
+        v.test_pause_workers(true);
+        support::lay_out_without_waiting(&mut v, 300.0, 200.0);
+        let mut ctx = ViewContext::default();
+        v.handle(
+            &InputEvent {
+                time_us: 0,
+                kind: InputKind::KeyDown {
+                    virtual_key: 0x23, // End, which waits for the new layout.
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                },
+            },
+            &mut ctx,
+        );
+        assert!(
+            v.queued_input_count() > 0,
+            "this test needs a key that waits"
+        );
+    }
+    tsf.doc.complete_composition();
+    assert!(tsf.doc.store().is_composing(), "the key goes first");
+    {
+        let mut v = tsf.fixture.view.borrow_mut();
+        v.test_pause_workers(false);
+        settle(&mut v);
+        v.flush_input(&mut ViewContext::default());
+    }
+    tsf.doc.sync();
+    let text = tsf.fixture.text();
+    assert_eq!(text.matches('x').count(), 201, "one x and the 200 in text");
+    assert!(text.starts_with('x'));
+    assert!(!tsf.doc.store().is_composing());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn opening_a_file_during_a_composition_commits_the_text_and_refuses() {
+    let tsf = Tsf::new(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "typed");
+    let answer = tsf
+        .fixture
+        .view
+        .borrow_mut()
+        .adopt(qe_editor::LoadedFile::Editable {
+            store: qe_buffer::PieceStore::new("other doc"),
+            ending: "\n",
+        });
+    assert!(answer.is_err(), "the host must hear");
+    tsf.doc.sync();
+    assert_eq!(tsf.fixture.text(), "typedabc");
+    assert_eq!(tsf.read_text(), "typedabc");
+    assert!(!tsf.doc.store().is_composing());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_write_inside_a_composition_away_from_its_cursor_leaves_the_cursor_with_its_text() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "wxyz");
+    let (range, context) = (held.borrow().as_ref().unwrap().1.clone(), tsf.context());
+    tsf.write(move |ec| unsafe {
+        let head = range.Clone()?;
+        head.Collapse(ec, TF_ANCHOR_START)?;
+        let mut moved = 0;
+        head.ShiftStart(ec, 1, &mut moved, std::ptr::null())?;
+        head.Collapse(ec, TF_ANCHOR_START)?;
+        let selection = TF_SELECTION {
+            range: std::mem::ManuallyDrop::new(Some(head)),
+            style: TF_SELECTIONSTYLE {
+                ase: windows::Win32::UI::TextServices::TF_AE_END,
+                fInterimChar: BOOL(0),
+            },
+        };
+        let answer = context.SetSelection(ec, std::slice::from_ref(&selection));
+        drop(std::mem::ManuallyDrop::into_inner(selection.range));
+        answer?;
+        let tail = range.Clone()?;
+        tail.ShiftStart(ec, 3, &mut moved, std::ptr::null())?;
+        tail.SetText(ec, 0, &units("ZZ"))
+    });
+    assert_eq!(tsf.read_text(), "wxyZZab");
+    assert_eq!(
+        tsf.fixture
+            .view
+            .borrow()
+            .composition()
+            .map(|c| c.cursor_utf16),
+        Some(1),
+        "the cursor stays after the w"
+    );
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_composition_cannot_start_between_cr_and_lf() {
+    let tsf = Tsf::new(laid_out("a\r\nb"));
+    let context = tsf.context();
+    let answer = tsf.session(TF_ES_SYNC.0 | TF_ES_READWRITE.0, move |ec| unsafe {
+        let range = context.GetStart(ec)?;
+        range.cast::<ITfRangeACP>()?.SetExtent(2, 0)?;
+        let composing: ITfContextComposition = context.cast()?;
+        let sink: ITfCompositionSink = CompositionSink(Rc::default()).into();
+        composing.StartComposition(ec, &range, &sink).map(|_| ())
+    });
+    // A refused start gives no composition, which the crate's wrapper sees as an error with
+    // code 0, so the session's answer says nothing here.
+    let _ = answer;
+    assert!(!tsf.doc.store().is_composing(), "the start is refused");
+    assert_eq!(tsf.fixture.text(), "a\r\nb");
+}
+
+// ---- Third review: answers with a composition running ----
+
+#[test]
+fn the_end_of_the_document_counts_the_composition() {
+    let tsf = Tsf::new(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "xy");
+    let store = tsf.doc.store().text_store();
+    let end: Rc<Cell<i32>> = Rc::default();
+    let out = end.clone();
+    tsf.read_session(move |_| unsafe {
+        out.set(store.GetEndACP()?);
+        Ok(())
+    });
+    assert_eq!(end.get(), 5);
+    tsf.doc.cancel_composition();
+}
+
+#[test]
+fn a_point_on_a_composition_that_does_not_start_at_zero_counts_what_is_before_it() {
+    let tsf = Tsf::new(laid_out("abcd"));
+    caret_to(&tsf, 2);
+    tsf.doc.sync();
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "wwww");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    let third = text_rect(&tsf, 4, 5);
+    let at: Rc<Cell<i32>> = Rc::default();
+    let (out, context) = (at.clone(), tsf.context());
+    tsf.read_session(move |ec| unsafe {
+        let view = context.GetActiveView()?;
+        let hit = view.GetRangeFromPoint(
+            ec,
+            &POINT {
+                x: third.left + 1,
+                y: third.top + 2,
+            },
+            GXFPF_NEAREST,
+        )?;
+        let (mut start, mut count) = (0, 0);
+        hit.cast::<ITfRangeACP>()?
+            .GetExtent(&mut start, &mut count)?;
+        out.set(start);
+        Ok(())
+    });
+    assert_eq!(at.get(), 4);
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_cancel_over_selected_text_tells_tsf_the_right_new_end() {
+    let tsf = Tsf::new(laid_out("abcdef"));
+    tsf.fixture
+        .view
+        .borrow_mut()
+        .select(ByteOffset(1)..ByteOffset(3), &mut ViewContext::default());
+    tsf.doc.sync();
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "wxyz");
+    assert_eq!(tsf.read_text(), "awxyzdef");
+    // A range that TSF moves as it hears of changes.
+    let tail: Rc<RefCell<Option<ITfRange>>> = Rc::default();
+    let (slot, context) = (tail.clone(), tsf.context());
+    tsf.read_session(move |ec| unsafe {
+        let range = context.GetStart(ec)?;
+        range.cast::<ITfRangeACP>()?.SetExtent(6, 2)?;
+        *slot.borrow_mut() = Some(range);
+        Ok(())
+    });
+    tsf.doc.cancel_composition();
+    assert_eq!(tsf.fixture.text(), "abcdef");
+    let range = tail.borrow().clone().unwrap();
+    let extent: Rc<Cell<(i32, i32)>> = Rc::default();
+    let out = extent.clone();
+    tsf.read_session(move |_| unsafe {
+        let (mut start, mut count) = (0, 0);
+        range
+            .cast::<ITfRangeACP>()?
+            .GetExtent(&mut start, &mut count)?;
+        out.set((start, count));
+        Ok(())
+    });
+    assert_eq!(extent.get(), (4, 2), "`ef` is still `ef` for TSF");
+}
+
+#[test]
+fn text_the_view_never_heard_of_still_goes_in_when_the_view_commits() {
+    let (tsf, shut) = Tsf::gated(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let range = held.borrow().as_ref().unwrap().1.clone();
+    let shut_now = shut.clone();
+    tsf.write(move |ec| unsafe {
+        range.SetText(ec, 0, &units("xy"))?;
+        shut_now.set(true);
+        Ok(())
+    });
+    // The view shows only `x`, and it commits that.
+    caret_to(&tsf, 2);
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(tsf.fixture.text(), "xyabc", "the y must not be lost");
+    assert_eq!(tsf.read_text(), "xyabc");
+    assert!(!tsf.doc.store().is_composing());
+    assert!(
+        tsf.fixture.view.borrow().composition().is_none(),
+        "no ghost"
+    );
+    tsf.fixture.no_problems();
+}

@@ -78,7 +78,7 @@ impl Overlay {
             side.extend_from_slice(after);
         }
     }
-    /// Replaces TSF positions inside the span, and puts the selection after the new text.
+    /// Replaces TSF positions inside the span. The selection stays with its text.
     pub(crate) fn replace(&mut self, range: Range<usize>, new: &[u16]) {
         let start = range
             .start
@@ -89,9 +89,11 @@ impl Overlay {
             .saturating_sub(self.base.start)
             .clamp(start, self.text.len());
         self.text.splice(start..end, new.iter().copied());
-        let at = self.base.start + start + new.len();
-        self.selection = at..at;
-        self.active_start = false;
+        let replaced = self.base.start + start..self.base.start + end;
+        self.selection = selection_after_write(&self.selection, &replaced, new.len());
+        if self.selection.is_empty() {
+            self.active_start = false;
+        }
     }
     /// The composition's cursor, for `ime_update`.
     pub(crate) fn cursor(&self) -> usize {
@@ -102,6 +104,30 @@ impl Overlay {
         };
         at.saturating_sub(self.base.start).min(self.text.len())
     }
+}
+
+/// Where a selection goes when a write replaces `range` with `new_len` units. A selection
+/// away from the write stays with its text. One that is the write's own range lands after the
+/// new text, and so does a place inside it.
+pub(crate) fn selection_after_write(
+    selection: &Range<usize>,
+    range: &Range<usize>,
+    new_len: usize,
+) -> Range<usize> {
+    let new_end = range.start + new_len;
+    if selection == range {
+        return new_end..new_end;
+    }
+    let place = |at: usize| {
+        if at <= range.start {
+            at
+        } else if at >= range.end {
+            at - range.end + new_end
+        } else {
+            new_end
+        }
+    };
+    place(selection.start)..place(selection.end)
 }
 
 #[cfg(test)]

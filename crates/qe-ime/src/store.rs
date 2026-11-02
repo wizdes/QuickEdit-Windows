@@ -14,7 +14,7 @@
 //! `ImeHost::sync_needed` asks for a `sync` from a clean stack, and that `sync` finishes it.
 use crate::{
     ImeHost,
-    overlay::{Overlay, Place},
+    overlay::{Overlay, Place, selection_after_write},
 };
 use qe_api::{ByteOffset, LookupError, Rect, Utf16Offset, ViewContext};
 use qe_editor::{ChangesSince, CompositionClause, CompositionEnd, EditorView, GeometryError};
@@ -99,6 +99,8 @@ struct State {
     finished: bool,
     /// The overlay changed since the editor last heard.
     dirty: bool,
+    /// How many units of the overlay's place the editor's composition text fills.
+    pushed_units: usize,
     /// Clauses read from TSF, for the editor when the lock ends.
     clauses: Option<Vec<CompositionClause>>,
     /// The last revision TSF knows.
@@ -361,6 +363,12 @@ impl StoreObject {
         self.with(|v, _| kind != WRITE || v.queued_input_count() == 0)
             .unwrap_or(false)
     }
+    /// True when the view is in use further up the stack. That ends when the stack unwinds, so
+    /// a wake can help. A waiting key is another matter: a wake finds it still waiting, and a
+    /// host that woke at once would spin. The key's own end brings the host's `sync`.
+    fn view_is_busy(&self) -> bool {
+        self.with(|_, _| ()).is_err()
+    }
 
     // ---- Locks ----
 
@@ -390,7 +398,7 @@ impl StoreObject {
                 s.pending |= kind;
                 s.counts.async_queued += 1;
             }
-            if !held {
+            if !held && (self.view_is_busy() || self.has_untold_changes()) {
                 self.host.sync_needed();
             }
             return Ok(TS_S_ASYNC);
@@ -529,7 +537,14 @@ impl StoreObject {
             let kind = if kind & WRITE == WRITE { WRITE } else { READ };
             if !self.can_grant(kind) {
                 self.state.borrow_mut().pending = kind;
-                self.host.sync_needed();
+                if self.view_is_busy() {
+                    self.host.sync_needed();
+                }
+                break;
+            }
+            // TSF hears first. A sink that refused keeps the lock waiting for the next `sync`.
+            if self.has_untold_changes() {
+                self.state.borrow_mut().pending = kind;
                 break;
             }
             // `grant` shows any failure, and no caller waits for this answer.
@@ -566,10 +581,11 @@ impl StoreObject {
         self.notifying.set(false);
     }
     fn notify_now(&self) {
+        // What the view ended comes first, so that nothing below writes text it has dealt with.
+        self.end_composition_the_editor_ended();
         self.push_overlay();
         self.run_owed();
         self.tell_dropped();
-        self.end_composition_the_editor_ended();
         // While TSF has a composition, its positions are not the editor's. Changes wait.
         {
             let s = self.state.borrow();
@@ -831,11 +847,49 @@ impl StoreObject {
     /// The editor committed the text itself, with a click, a key or an edit. TSF's copy of
     /// the text is right already, so it only has to hear that the composition ended.
     fn editor_committed(&self, revision: u64) {
+        // The view can commit only what it heard. Text from TSF that it has not heard yet still
+        // goes in, in place of what it committed.
+        let unheard = {
+            let s = self.state.borrow();
+            s.overlay
+                .as_ref()
+                .filter(|_| s.dirty)
+                .map(|o| (o.base.start..o.base.start + s.pushed_units, o.text.clone()))
+        };
         drop(self.take_overlay());
         {
             let mut s = self.state.borrow_mut();
             s.own.push(revision);
             s.canceling = true;
+        }
+        if let Some((place, text)) = unheard {
+            let new = String::from_utf16_lossy(&text);
+            let revised = self.with(|v, c| {
+                let (Ok(a), Ok(b)) = (
+                    v.utf16_to_byte(Utf16Offset(place.start)),
+                    v.utf16_to_byte(Utf16Offset(place.end)),
+                ) else {
+                    return None;
+                };
+                let caret = v.selection();
+                v.replace_range(a..b, &new, c);
+                let shift = new.len() as isize - (b.0 - a.0) as isize;
+                let moved = |at: ByteOffset| ByteOffset(at.0.saturating_add_signed(shift));
+                v.select(moved(caret.start)..moved(caret.end), c);
+                Some((v.revision(), selection_units(v)))
+            });
+            match revised {
+                Ok(Some((own, selection))) => {
+                    let mut s = self.state.borrow_mut();
+                    s.own.push(own);
+                    if let Some(selection) = selection {
+                        s.last_selection = selection;
+                    }
+                }
+                _ => self.host.problem(format!(
+                    "The place for this input is not in memory, so it was not added: {new}"
+                )),
+            }
         }
         self.count(|c| c.ime_commits += 1);
         self.terminate_in_tsf();
@@ -887,7 +941,9 @@ impl StoreObject {
         // TSF ends a composition under a sync write lock, so that lock must be possible.
         if !self.can_grant(WRITE) {
             self.state.borrow_mut().owe_cancel = true;
-            self.host.sync_needed();
+            if self.view_is_busy() {
+                self.host.sync_needed();
+            }
             return;
         }
         // The host's call comes after the editor's own end, which may have been a commit.
@@ -931,8 +987,30 @@ impl StoreObject {
         }
         if !self.can_grant(WRITE) {
             self.state.borrow_mut().owe_complete = true;
-            self.host.sync_needed();
+            if self.view_is_busy() {
+                self.host.sync_needed();
+            }
             return;
+        }
+        // The view may have ended it first, with a click or with Esc. Then its text has gone
+        // where the user sent it, and writing it now would add it twice or bring it back.
+        match self.editor_ending() {
+            Ok(Some(Some(CompositionEnd::Committed { revision }))) => {
+                self.editor_committed(revision);
+                self.notify();
+                return;
+            }
+            Ok(Some(_)) => {
+                self.cancel_composition();
+                self.notify();
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.state.borrow_mut().owe_complete = true;
+                self.host.sync_needed();
+                return;
+            }
         }
         self.terminate_in_tsf();
         // TSF did not call back: the text still goes to the editor.
@@ -988,6 +1066,10 @@ impl StoreObject {
             return;
         };
         let done = self.with(|v, c| {
+            // The view ended this composition itself, so its text is not ours to write.
+            if v.composition().is_none() {
+                return Commit::ViewEnded(v.take_composition_end());
+            }
             let start = v.utf16_to_byte(Utf16Offset(overlay.base.start));
             let end = v.utf16_to_byte(Utf16Offset(overlay.base.end));
             let (Ok(start), Ok(end)) = (start, end) else {
@@ -1038,6 +1120,12 @@ impl StoreObject {
         };
         let overlay = self.take_overlay().unwrap_or(overlay);
         match done {
+            Commit::ViewEnded(Some(CompositionEnd::Committed { revision })) => {
+                let mut s = self.state.borrow_mut();
+                s.own.push(revision);
+                s.counts.ime_commits += 1;
+            }
+            Commit::ViewEnded(_) => self.state.borrow_mut().dropped = Some(overlay),
             Commit::Done {
                 before,
                 after,
@@ -1090,6 +1178,7 @@ impl StoreObject {
         };
         if let Some((text, cursor)) = update {
             if self.with(|v, c| v.ime_update(&text, cursor, c)).is_ok() {
+                self.state.borrow_mut().pushed_units = text.encode_utf16().count();
                 self.count(|c| c.ime_updates += 1);
             } else {
                 self.state.borrow_mut().dirty = true;
@@ -1221,7 +1310,21 @@ impl StoreObject {
             Some((Place::Before(at) | Place::After(at), _)) => at,
             None => position,
         };
+        // With a composition here, its text is what sits next to this place.
+        let at_span = self
+            .state
+            .borrow()
+            .overlay
+            .as_ref()
+            .is_some_and(|o| at == o.base.start || at == o.base.end);
         match self.with_or_err(|v, _| v.utf16_to_byte(Utf16Offset(at)))? {
+            // A line ending is one thing to the user. Text between CR and LF would split it.
+            Ok(_) if !at_span && at > 0 => {
+                let pair = self
+                    .with_or_err(|v, _| read_editor(v, at - 1..at + 1))?
+                    .is_ok_and(|units| units == [0x0d, 0x0a]);
+                Ok(!pair)
+            }
             Ok(_) => Ok(true),
             Err(LookupError::OutOfRange) => Ok(false),
             Err(other) => fail(plain(&other)),
@@ -1296,7 +1399,25 @@ impl StoreObject {
         let bytes = self.editor_bytes(&range)?;
         let (before, after, selection) = self.with_or_err(|v, c| {
             let before = v.revision();
+            let old = selection_units(v);
+            let at_start = v.caret() == v.selection().start && !v.selection().is_empty();
             v.replace_range(bytes.clone(), &new, c);
+            // The caret stays with its text, wherever the write was.
+            if let Some(old) = old
+                && v.revision() != before
+            {
+                let moved = selection_after_write(&old, &range, text.len());
+                if let (Ok(a), Ok(b)) = (
+                    v.utf16_to_byte(Utf16Offset(moved.start)),
+                    v.utf16_to_byte(Utf16Offset(moved.end)),
+                ) {
+                    if at_start {
+                        v.select_directed(b, a, c);
+                    } else {
+                        v.select(a..b, c);
+                    }
+                }
+            }
             (before, v.revision(), selection_units(v))
         })?;
         let mut s = self.state.borrow_mut();
@@ -1356,6 +1477,20 @@ impl StoreObject {
         self.state.borrow_mut().owe_layout = true;
         fail(TS_E_NOLAYOUT)
     }
+    /// `editor_bytes` for a question about places. Text not in memory yet has no layout yet,
+    /// and that is `TS_E_NOLAYOUT` here, where `GetText` would have to say `TS_E_INVALIDPOS`.
+    fn geometry_bytes(&self, range: &Range<usize>) -> Result<Range<ByteOffset>> {
+        let (start, end) = self.with_or_err(|v, _| {
+            (
+                v.utf16_to_byte(Utf16Offset(range.start)),
+                v.utf16_to_byte(Utf16Offset(range.end)),
+            )
+        })?;
+        match (start, end) {
+            (Ok(start), Ok(end)) => Ok(start..end),
+            (Err(e), _) | (_, Err(e)) => self.geometry_error(&GeometryError::Lookup(e)),
+        }
+    }
     fn geometry_error<T>(&self, error: &GeometryError) -> Result<T> {
         match error {
             GeometryError::NotLaidOut
@@ -1404,7 +1539,7 @@ impl StoreObject {
         let (Some(start), Some(end)) = (to_editor(range.start), to_editor(range.end)) else {
             return Ok(false);
         };
-        let bytes = self.editor_bytes(&(start..end))?;
+        let bytes = self.geometry_bytes(&(start..end))?;
         self.with_or_err(|v, _| {
             !v.pending_layout()
                 && v.visible_range()
@@ -1451,7 +1586,7 @@ impl StoreObject {
     }
     /// The box of a range in the editor's own positions.
     fn editor_rect(&self, range: Range<usize>) -> Result<(Rect, bool)> {
-        let bytes = self.editor_bytes(&range)?;
+        let bytes = self.geometry_bytes(&range)?;
         let (rects, area) =
             self.with_or_err(|v, _| (v.range_rects(bytes.clone()), v.text_area()))?;
         let rects = match rects {
@@ -1554,6 +1689,7 @@ enum Step {
     Each(Vec<One>),
 }
 enum Commit {
+    ViewEnded(Option<CompositionEnd>),
     Done {
         before: u64,
         after: u64,
@@ -2081,9 +2217,10 @@ impl ITextStoreACP_Impl for StoreObject_Impl {
         if !laid_out {
             return self.no_layout();
         }
-        self.host
-            .to_screen(area)
-            .ok_or_else(|| Error::from_hresult(TS_E_NOLAYOUT))
+        match self.host.to_screen(area) {
+            Some(rect) => Ok(rect),
+            None => self.no_layout(),
+        }
     }
     fn GetWnd(&self, vcview: u32) -> Result<HWND> {
         if vcview != VIEW_COOKIE {
@@ -2129,6 +2266,9 @@ impl ITfContextOwnerCompositionSink_Impl for StoreObject_Impl {
         if base.len() > MAX_SPAN_UNITS {
             return Ok(BOOL(0));
         }
+        if !self.on_edge(base.start)? || !self.on_edge(base.end)? {
+            return Ok(BOOL(0));
+        }
         let Ok(bytes) = self.editor_bytes(&base) else {
             return Ok(BOOL(0));
         };
@@ -2145,6 +2285,7 @@ impl ITfContextOwnerCompositionSink_Impl for StoreObject_Impl {
             return Ok(BOOL(0));
         };
         let mut s = self.state.borrow_mut();
+        s.pushed_units = original.len();
         s.overlay = Some(Overlay::new(base, original));
         s.composing = Some(identity);
         Ok(BOOL(1))

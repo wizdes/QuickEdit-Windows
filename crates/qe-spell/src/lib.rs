@@ -159,6 +159,8 @@ pub struct SpellPoll {
     pub marks_changed: bool,
     /// The answer to [`SpellService::find_next`], when it has come.
     pub found: Option<FindResult>,
+    /// One thing failed, and spelling stays on. Show this to the user.
+    pub problem: Option<String>,
 }
 
 /// How a [`SpellService::find_next`] ended. Each call gets exactly one of these.
@@ -301,7 +303,7 @@ impl SpellService {
     }
     /// Fills the lists to their limits, as a very long session would, to measure an edit.
     #[doc(hidden)]
-    pub fn fill_lists_for_test(&mut self, view: &EditorView) {
+    pub fn fill_lists_for_test(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
         self.catch_up(view);
         for at in 0..MAX_MARKS {
             self.marks.push(Misspelling {
@@ -313,6 +315,7 @@ impl SpellService {
         for at in 0..MAX_CHECKED_RANGES {
             self.checked.add(1_000 + at * 64..1_000 + at * 64 + 32);
         }
+        self.show_marks(view, ctx);
     }
     pub fn marks(&self) -> &[Misspelling] {
         &self.marks
@@ -414,6 +417,13 @@ impl SpellService {
                         self.counts.answers_dropped += 1;
                     }
                 }
+                Answer::Problem(message) => out.problem = Some(message),
+                Answer::AddFailed { word, message } => {
+                    // The word is not in the dictionary after all, so a new check marks it.
+                    self.ignored.remove(&word);
+                    self.checked.clear();
+                    out.problem = Some(message);
+                }
                 Answer::Failed(message) => {
                     self.in_flight = false;
                     self.finding = false;
@@ -464,7 +474,31 @@ impl SpellService {
     /// `select(menu.range)` too.
     pub fn menu_at_point(&mut self, view: &EditorView, at: Point) -> Option<FixMenu> {
         let hit = view.byte_at_point(at).ok()?;
-        self.menu_at(view, hit.byte)
+        self.catch_up(view);
+        // The hit is the nearest caret place, so the right half of a word's last letter gives
+        // the word's end. The word's own rectangles say whether the point is on it.
+        let first = self.marks.partition_point(|m| m.range.end < hit.byte);
+        let mark = self
+            .marks
+            .get(first)
+            .filter(|m| m.range.start <= hit.byte)?;
+        let start = mark.range.start;
+        let on_word = view
+            .range_rects(mark.range.clone())
+            .ok()?
+            .iter()
+            .any(|part| {
+                let r = part.rect;
+                at.x.0 >= r.x.0
+                    && at.x.0 < r.x.0 + r.width.0
+                    && at.y.0 >= r.y.0
+                    && at.y.0 < r.y.0 + r.height.0
+            });
+        if on_word {
+            self.menu_at(view, start)
+        } else {
+            None
+        }
     }
     /// Replaces the word with a suggestion, as one edit and one undo step.
     pub fn apply_fix(
@@ -668,6 +702,10 @@ impl SpellService {
         }
     }
     fn turn_off(&mut self, view: &mut EditorView, off: SpellOff, ctx: &mut ViewContext) {
+        // A new document that came while spelling was off starts clean all the same.
+        if view.document_number() != self.document {
+            self.forget_all(view);
+        }
         if self.off != Some(off) {
             self.off = Some(off);
             self.latest.check.fetch_add(1, Ordering::Relaxed);
@@ -676,7 +714,6 @@ impl SpellService {
         // Every time, because a mark can arrive with no change of reason.
         self.clear_marks(view, ctx);
         self.revision = view.revision();
-        self.document = view.document_number();
     }
     /// Keeps the marks' list short on a very misspelled file that has been scrolled through.
     fn prune(&mut self, window: &Range<usize>, view: &mut EditorView, ctx: &mut ViewContext) {

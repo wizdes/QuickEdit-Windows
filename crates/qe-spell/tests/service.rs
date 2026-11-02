@@ -2,7 +2,7 @@
 //! to the checker. `real_checker.rs` has the same paths with Windows' checker.
 mod support;
 
-use qe_api::{ByteOffset, ViewContext};
+use qe_api::{ByteOffset, Dip, Point, ViewContext};
 use qe_buffer::{MappedStore, PieceStore};
 use qe_editor::{EditorCommand, EditorView, LoadedFile};
 use qe_spell::{
@@ -1136,34 +1136,218 @@ fn checked_ranges_are_cut_back_after_a_long_scroll_with_few_marks() {
     assert!(most <= 5, "{most} separate ranges");
 }
 
+// ---- Third review ----
+
 #[test]
-fn an_edit_with_full_lists_stays_under_the_key_budget_in_release() {
-    let mut view = laid_out(&"plain words here\n".repeat(50_000));
+fn an_ignored_word_ends_with_its_document_even_when_spelling_was_off_at_the_time() {
+    let mut view = laid_out("speling");
     let (mut service, _log) = fake_service(&view, &["speling"]);
     let mut c = ctx();
-    service.fill_lists_for_test(&view);
-    const KEYS: u32 = 200;
-    let mut worst = Duration::ZERO;
-    let mut total = Duration::ZERO;
-    for at in 0..KEYS as usize {
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    let menu = service.menu_at(&view, b(0)).unwrap();
+    service.ignore(&mut view, &menu, &mut c).unwrap();
+    view.set_prevent_editing(true);
+    assert_eq!(
+        service.refresh(&mut view, &mut c),
+        SpellState::Off(SpellOff::ReadOnly)
+    );
+    view.adopt(LoadedFile::Editable {
+        store: PieceStore::new("speling again"),
+        ending: "\n",
+    })
+    .unwrap();
+    assert_eq!(
+        service.refresh(&mut view, &mut c),
+        SpellState::Off(SpellOff::ReadOnly)
+    );
+    view.set_prevent_editing(false);
+    support::settle(&mut view);
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    assert_eq!(marks(&view), vec![(0, 7)], "a new document starts clean");
+}
+
+#[test]
+fn a_click_anywhere_on_the_last_letter_gives_the_fix_menu() {
+    let mut view = laid_out("speling and more");
+    let (mut service, _log) = fake_service(&view, &["speling"]);
+    let mut c = ctx();
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    let letter = view.range_rects(b(6)..b(7)).unwrap()[0].rect;
+    for part in [0.1_f32, 0.4, 0.6, 0.9] {
+        let at = Point {
+            x: Dip(letter.x.0 + letter.width.0 * part),
+            y: Dip(letter.y.0 + 2.0),
+        };
+        let menu = service.menu_at_point(&view, at);
+        assert!(menu.is_some(), "no menu at {part} of the letter");
+    }
+}
+
+#[test]
+fn a_click_on_the_space_after_a_word_gives_no_fix_menu() {
+    let mut view = laid_out("speling and more");
+    let (mut service, _log) = fake_service(&view, &["speling"]);
+    let mut c = ctx();
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    let space = view.range_rects(b(7)..b(8)).unwrap()[0].rect;
+    let at = Point {
+        x: Dip(space.x.0 + space.width.0 * 0.3),
+        y: Dip(space.y.0 + 2.0),
+    };
+    assert_eq!(service.menu_at_point(&view, at), None);
+}
+
+fn address_then_word(path_bytes: usize) -> String {
+    format!("see http://{}speling and more", "a/".repeat(path_bytes / 2))
+}
+
+#[test]
+fn a_word_in_a_long_address_gets_no_mark_after_an_edit_next_to_it() {
+    for path_bytes in [320, 6_000] {
+        let text = address_then_word(path_bytes);
+        let mut view = laid_out(&text);
+        let (mut service, _log) = fake_service(&view, &["speling", "spelingx"]);
+        let mut c = ctx();
+        service.refresh(&mut view, &mut c);
+        finish(&mut service, &mut view, &mut c);
+        assert_eq!(marks(&view), vec![], "a full check at {path_bytes}");
+        let after = text.find(" and").unwrap();
+        view.replace_range(b(after)..b(after), "x", &mut c);
+        support::settle(&mut view);
+        service.refresh(&mut view, &mut c);
+        finish(&mut service, &mut view, &mut c);
+        assert_eq!(marks(&view), vec![], "after an edit at {path_bytes}");
+    }
+}
+
+#[test]
+fn a_word_at_the_end_of_a_long_token_that_is_no_address_is_still_checked_after_an_edit() {
+    let text = format!("see {}speling and more", "a/".repeat(160));
+    let mut view = laid_out(&text);
+    let (mut service, _log) = fake_service(&view, &["speling", "spelingx"]);
+    let mut c = ctx();
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    let after = text.find(" and").unwrap();
+    assert_eq!(marks(&view), vec![(after - 7, after)]);
+    view.replace_range(b(after)..b(after), "x", &mut c);
+    support::settle(&mut view);
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    assert_eq!(marks(&view), vec![(after - 7, after + 1)]);
+}
+
+#[test]
+fn a_word_that_fails_to_get_suggestions_keeps_its_mark_and_spelling_stays_on() {
+    let mut view = laid_out("speling here");
+    let (mut service, log) = fake_service(&view, &["speling", "teh"]);
+    log.fail_suggest
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut c = ctx();
+    service.refresh(&mut view, &mut c);
+    let problem = wait_problem(&mut service, &mut view);
+    assert!(problem.contains("suggestions"), "{problem}");
+    finish(&mut service, &mut view, &mut c);
+    assert_eq!(marks(&view), vec![(0, 7)]);
+    assert_eq!(
+        service.menu_at(&view, b(0)).unwrap().items()[0],
+        FixItem::NoSuggestions
+    );
+    log.fail_suggest
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    view.replace_range(b(12)..b(12), " teh", &mut c);
+    support::settle(&mut view);
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    assert_eq!(marks(&view), vec![(0, 7), (13, 16)], "spelling still runs");
+    assert_eq!(service.refresh(&mut view, &mut c), SpellState::Done);
+}
+
+#[test]
+fn a_failed_add_says_so_brings_the_mark_back_and_spelling_stays_on() {
+    let mut view = laid_out("speling here");
+    let (mut service, log) = fake_service(&view, &["speling"]);
+    log.fail_add
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut c = ctx();
+    service.refresh(&mut view, &mut c);
+    finish(&mut service, &mut view, &mut c);
+    let menu = service.menu_at(&view, b(0)).unwrap();
+    service.add_to_dictionary(&mut view, &menu, &mut c).unwrap();
+    assert_eq!(marks(&view), vec![]);
+    let problem = wait_problem(&mut service, &mut view);
+    assert!(problem.contains("speling"), "{problem}");
+    finish(&mut service, &mut view, &mut c);
+    assert_eq!(marks(&view), vec![(0, 7)], "the word is still not known");
+}
+
+fn wait_problem(service: &mut SpellService, view: &mut EditorView) -> String {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut c = ctx();
+    loop {
+        if let Some(problem) = service.poll(view, &mut c).unwrap().problem {
+            return problem;
+        }
+        assert!(Instant::now() < until, "no problem came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_key_with_full_lists_stays_under_the_key_budget_in_release() {
+    let mut view = laid_out(&"plain words here\n".repeat(50_000));
+    let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = woken.clone();
+    let log = Arc::new(support::FakeLog::default());
+    let checker = support::FakeChecker {
+        bad: ["speling".to_owned()].into_iter().collect(),
+        log,
+    };
+    let mut service = SpellService::start_with(
+        &view,
+        Box::new(move || Ok(Box::new(checker) as Box<dyn Checker>)),
+        Arc::new(move || flag.store(true, std::sync::atomic::Ordering::Release)),
+    );
+    let mut c = ctx();
+    service.fill_lists_for_test(&mut view, &mut c);
+    assert_eq!(marks(&view).len(), 20_000, "the list the view keeps too");
+    let mut keys = Vec::new();
+    for at in 0..200 {
         view.replace_range(b(at)..b(at), "x", &mut c);
         c.requests.clear();
+        // What the host does on a key: a refresh, then a poll when the worker wakes it.
+        let mut spent = Duration::ZERO;
         let timer = Instant::now();
         service.refresh(&mut view, &mut c);
-        let spent = timer.elapsed();
-        worst = worst.max(spent);
-        total += spent;
-        finish(&mut service, &mut view, &mut c);
+        service.poll(&mut view, &mut c).unwrap();
+        spent += timer.elapsed();
+        let until = Instant::now() + Duration::from_secs(30);
+        while service.is_working() {
+            if woken.swap(false, std::sync::atomic::Ordering::Acquire) {
+                let timer = Instant::now();
+                service.poll(&mut view, &mut c).unwrap();
+                spent += timer.elapsed();
+            } else {
+                std::thread::yield_now();
+            }
+            assert!(Instant::now() < until, "the worker did not finish");
+        }
+        keys.push(spent);
     }
+    keys.sort();
+    let (mean, p99) = (
+        keys.iter().sum::<Duration>() / keys.len() as u32,
+        keys[keys.len() * 99 / 100],
+    );
     println!(
-        "MEASURE full lists: mean={:?} worst={worst:?} keys={KEYS}",
-        total / KEYS
+        "MEASURE full lists, whole key: mean={mean:?} p99={p99:?} worst={:?}",
+        keys[199]
     );
     if !cfg!(debug_assertions) {
-        assert!(
-            total / KEYS < Duration::from_millis(2),
-            "mean {:?}",
-            total / KEYS
-        );
+        assert!(p99 < Duration::from_millis(2), "p99 {p99:?}");
     }
 }

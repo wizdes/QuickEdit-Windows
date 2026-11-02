@@ -17,7 +17,7 @@ use windows::Win32::System::Com::{
 };
 
 /// How far a range looks for the ends of the words at its edges.
-const MARGIN_BYTES: usize = 128;
+const MARGIN_BYTES: usize = 2048;
 /// One call to the checker takes about this much text.
 const CHUNK_BYTES: usize = 16 * 1024;
 const SUGGESTION_CACHE: usize = 1024;
@@ -56,6 +56,13 @@ pub(crate) enum Answer {
         generation: u64,
         found: Option<Misspelling>,
     },
+    /// The word stays unknown, and spelling goes on.
+    AddFailed {
+        word: String,
+        message: String,
+    },
+    /// One thing went wrong, and spelling goes on. The host shows this.
+    Problem(String),
     Failed(String),
 }
 
@@ -134,6 +141,9 @@ fn serve(
     let mut memory = Memory::default();
     let mut scan: Option<Scan> = None;
     loop {
+        if let Some(message) = memory.problem.take() {
+            say(Answer::Problem(message));
+        }
         // With a search running, a command must not wait for the search to end.
         let command = if scan.is_some() {
             match jobs.try_recv() {
@@ -191,13 +201,12 @@ fn serve(
                     }
                 }
             }
-            Command::Add(word) => {
-                if let Err(message) = checker.add(&word) {
-                    say(Answer::Failed(message));
-                    return;
+            Command::Add(word) => match checker.add(&word) {
+                Ok(()) => {
+                    memory.cache.remove(&word);
                 }
-                memory.cache.remove(&word);
-            }
+                Err(message) => say(Answer::AddFailed { word, message }),
+            },
             Command::Ignore(word) => {
                 memory.ignored.insert(word);
             }
@@ -227,6 +236,10 @@ struct Memory {
     cache: HashMap<String, Vec<String>>,
     /// Words ignored in this document.
     ignored: HashSet<String>,
+    /// A failure for the next answer to carry.
+    problem: Option<String>,
+    /// Suggestions have failed once, so the host has heard.
+    suggest_failed: bool,
 }
 /// What a job covered, and the errors in it.
 type Covered = (Vec<Range<usize>>, Vec<Misspelling>);
@@ -302,9 +315,18 @@ fn check_range(
     let base = read_start + start;
     let body_end = base + body.len();
     let mut errors = errors_in(checker, memory, body, base)?;
-    // A word cut by the margin is not a whole word, so its answer means nothing.
+    // The margin cut the token at this side, so its whole is not known. It may not be a whole
+    // word, and it may be a web address whose `://` the margin cut off.
+    let first_token_end = base + body.find(char::is_whitespace).unwrap_or(body.len());
+    let last_token_start = base
+        + body
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
     errors.retain(|e| {
-        !(cut_left && e.range.start.0 == base) && !(cut_right && e.range.end.0 == body_end)
+        !(cut_left && e.range.start.0 < first_token_end)
+            && !(cut_right && e.range.end.0 > last_token_start)
     });
     Ok((base.min(range.start)..body_end.max(range.end), errors))
 }
@@ -352,14 +374,22 @@ fn errors_in(
             Some(list) => list,
             None => match memory.cache.get(word) {
                 Some(list) => list.clone(),
-                None => {
-                    let list = checker.suggest(word, MAX_SUGGESTIONS)?;
-                    if memory.cache.len() >= SUGGESTION_CACHE {
-                        memory.cache.clear();
+                None => match checker.suggest(word, MAX_SUGGESTIONS) {
+                    Ok(list) => {
+                        if memory.cache.len() >= SUGGESTION_CACHE {
+                            memory.cache.clear();
+                        }
+                        memory.cache.insert(word.to_owned(), list.clone());
+                        list
                     }
-                    memory.cache.insert(word.to_owned(), list.clone());
-                    list
-                }
+                    // The word is still wrong, and the menu says it has no suggestions.
+                    Err(message) => {
+                        if !std::mem::replace(&mut memory.suggest_failed, true) {
+                            memory.problem = Some(message);
+                        }
+                        Vec::new()
+                    }
+                },
             },
         };
         out.push(Misspelling {

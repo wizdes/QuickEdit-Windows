@@ -71,6 +71,8 @@ pub struct FakeLog {
     pub dropped: std::sync::atomic::AtomicBool,
     /// How many checks have begun, counted before each waits at the gate.
     pub entered: AtomicUsize,
+    pub fail_suggest: std::sync::atomic::AtomicBool,
+    pub fail_add: std::sync::atomic::AtomicBool,
     /// While true, `check` waits. It shows that the UI thread does not wait with it.
     pub gate: Mutex<bool>,
     pub gate_changed: Condvar,
@@ -158,10 +160,18 @@ impl Checker for FakeChecker {
         Ok(out)
     }
     fn suggest(&mut self, word: &str, most: usize) -> Result<Vec<String>, String> {
+        if self.log.fail_suggest.load(Ordering::Relaxed) {
+            return Err("Windows gave no suggestions: the fake failed.".into());
+        }
         self.log.suggested.fetch_add(1, Ordering::Relaxed);
         Ok((0..8).map(|i| format!("{word}-{i}")).take(most).collect())
     }
     fn add(&mut self, word: &str) -> Result<(), String> {
+        if self.log.fail_add.load(Ordering::Relaxed) {
+            return Err(format!(
+                "Could not add \"{word}\" to the dictionary: the fake failed."
+            ));
+        }
         self.log.added.lock().unwrap().push(word.to_owned());
         Ok(())
     }

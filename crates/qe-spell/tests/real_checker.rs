@@ -16,7 +16,7 @@ use support::{area, finish, laid_out, marks, no_wake, settle};
 use windows::Win32::{
     Foundation::HMODULE,
     System::{
-        Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
+        Com::{COINIT_MULTITHREADED, CoGetApartmentType, CoInitializeEx, CoUninitialize},
         ProcessStatus::{EnumProcessModules, GetModuleBaseNameW},
         Threading::GetCurrentProcess,
     },
@@ -315,7 +315,15 @@ fn real_marks_from_a_big_document_stay_under_the_key_budget_in_release() {
     }
     let text = "plain words and a speling here\n".repeat(200_000);
     let mut view = laid_out(&text);
-    let mut service = real_service(&view);
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = woken.clone();
+    let mut service = SpellService::start(
+        &view,
+        true,
+        Some("en-US".into()),
+        std::sync::Arc::new(move || flag.store(true, std::sync::atomic::Ordering::Release)),
+    )
+    .unwrap();
     let mut ctx = ViewContext::default();
     let first_refresh = Instant::now();
     service.refresh(&mut view, &mut ctx);
@@ -323,43 +331,67 @@ fn real_marks_from_a_big_document_stay_under_the_key_budget_in_release() {
     let first_check = Instant::now();
     finish(&mut service, &mut view, &mut ctx);
     let check_time = first_check.elapsed();
-    let mut worst = Duration::ZERO;
-    let mut total = Duration::ZERO;
+    // Scrolling through the document gathers marks, and the work of a key grows with them.
+    let mut scroll = 0.0;
+    while service.marks().len() < 5_000 {
+        scroll += 300.0;
+        view.set_scroll_position(scroll, &mut ctx);
+        settle(&mut view);
+        service.refresh(&mut view, &mut ctx);
+        finish(&mut service, &mut view, &mut ctx);
+    }
+    let marks_held = service.marks().len();
+    view.set_scroll_position(0.0, &mut ctx);
+    settle(&mut view);
+    service.refresh(&mut view, &mut ctx);
+    finish(&mut service, &mut view, &mut ctx);
+    let asked_before = service.counts().bytes_asked;
+    woken.store(false, std::sync::atomic::Ordering::Release);
+    let mut keys = Vec::new();
     const KEYS: usize = 200;
     for at in 0..KEYS {
         view.replace_range(ByteOffset(at)..ByteOffset(at), "x", &mut ctx);
+        ctx.requests.clear();
+        let mut spent = Duration::ZERO;
         let key = Instant::now();
         service.refresh(&mut view, &mut ctx);
         service.poll(&mut view, &mut ctx).unwrap();
-        let spent = key.elapsed();
-        worst = worst.max(spent);
-        total += spent;
+        spent += key.elapsed();
+        // The answer's own poll is where the marks are set, so it counts as this key's work.
+        let until = Instant::now() + Duration::from_secs(30);
+        while service.is_working() {
+            if woken.swap(false, std::sync::atomic::Ordering::Acquire) {
+                let poll = Instant::now();
+                service.poll(&mut view, &mut ctx).unwrap();
+                spent += poll.elapsed();
+            } else {
+                std::thread::yield_now();
+            }
+            assert!(Instant::now() < until, "the worker did not finish");
+        }
+        keys.push(spent);
         ctx.requests.clear();
     }
     finish(&mut service, &mut view, &mut ctx);
+    keys.sort();
+    let mean = keys.iter().sum::<Duration>() / KEYS as u32;
+    let p99 = keys[KEYS * 99 / 100];
     println!(
-        "MEASURE document={} MB first refresh={:?}, first check on the worker={:?}, marks={}, \
-         spelling calls on a key: mean={:?}, worst={:?}, keys={KEYS}, bytes asked in all={}",
+        "MEASURE document={} MB first refresh={:?}, first check on the worker={:?}, marks held={marks_held}, \
+         spelling calls on a key: mean={mean:?}, p99={p99:?}, worst={:?}, keys={KEYS}, bytes asked in all={}",
         text.len() / 1_000_000,
         refresh_time,
         check_time,
-        service.marks().len(),
-        total / KEYS as u32,
-        worst,
-        service.counts().bytes_asked,
+        keys[KEYS - 1],
+        service.counts().bytes_asked - asked_before,
     );
-    // The plan's budget for a key's spelling work is under 2 ms. A debug build is many times
-    // slower, and says nothing about the budget, so only a release build is held to it.
+    // The plan's budget for a key is p99 under 2 ms. A debug build says nothing about it.
     if !cfg!(debug_assertions) {
-        assert!(
-            total / (KEYS as u32) < Duration::from_millis(2),
-            "the mean key cost {:?}",
-            total / KEYS as u32
-        );
+        assert!(p99 < Duration::from_millis(2), "p99 {p99:?}");
     }
     // Each key may ask only for its own word. A whole-document check would be 6 MB.
     assert!(
-        service.counts().bytes_asked < 200_000,
+        service.counts().bytes_asked - asked_before < 200_000,
         "{:?}",
         service.counts()
     );
@@ -557,4 +589,61 @@ fn the_real_checker_refuses_text_with_no_end_mark() {
     .join()
     .unwrap();
     assert!(answer.is_err());
+}
+
+// ---- The apartment stays up ----
+
+const MTA_CHILD: &str = "QE_SPELL_MTA_CHILD";
+
+/// True when this process has a multithreaded apartment. A thread with no COM of its own gets
+/// the answer "implicit MTA" then, and "not initialized" when there is none.
+fn apartment_is_up() -> bool {
+    let (mut kind, mut qualifier) = (Default::default(), Default::default());
+    unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }.is_ok()
+}
+
+#[test]
+fn mta_child_body() {
+    if std::env::var(MTA_CHILD).is_err() {
+        return;
+    }
+    assert!(
+        !apartment_is_up(),
+        "this check needs a process with no apartment yet"
+    );
+    let view = EditorView::from_text("speling").unwrap();
+    let (service, log) = support::fake_service(&view, &["speling"]);
+    drop(service);
+    let until = Instant::now() + Duration::from_secs(30);
+    while !log.dropped.load(std::sync::atomic::Ordering::Relaxed) {
+        assert!(Instant::now() < until, "the worker never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The worker leaves the apartment just after it lets go of the checker.
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        assert!(apartment_is_up(), "the last worker took the apartment down");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    println!("MTA_CHILD_DONE");
+}
+
+#[test]
+fn the_apartment_stays_up_when_the_last_worker_leaves() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mta_child_body",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MTA_CHILD, "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success() && text.contains("MTA_CHILD_DONE"),
+        "{text}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

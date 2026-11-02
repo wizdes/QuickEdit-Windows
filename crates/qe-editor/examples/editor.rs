@@ -7,12 +7,16 @@
 //! `--timings` prints what the plan's budgets ask for:
 //! - `input to present` runs from the moment a key arrives to the end of the present
 //!   call of the first frame that shows the new text. On a line that a worker lays out,
-//!   that is a later frame than the first.
+//!   that is a later frame than the first. A key that waits behind a layout or in the
+//!   editor's queue counts too, with its wait, and the count of such keys is printed.
 //! - `input to first frame` ends at the next frame, whatever it shows.
 //! - Both count only keys that produced a frame. The others are counted apart.
-//! - `first text frame` is the first frame that holds real text, and `full first screen`
-//!   is the first frame whose text reaches the text area's bottom. A document with no
-//!   text prints `first frame` instead.
+//! - `first text frame` and `full first screen` measure a load, so they print only when
+//!   a file was asked for. `first text frame` is the first frame that holds real text,
+//!   and `full first screen` is the first frame whose text reaches the text area's
+//!   bottom. A window with no file, or a file with no text, prints `first frame`.
+//! - `from process creation` starts at the time Windows gives from GetProcessTimes, so
+//!   it holds the loading of the program and its libraries.
 //!
 //! `--bench-keys N` runs in a hidden window, sends WM_PAINT itself, and prints the same
 //! numbers, so no window appears on screen. Windows' own copy to a hidden window draws
@@ -22,7 +26,7 @@ use qe_api::{
     PixelRect, Rect, RenderError, Renderer, View, ViewContext, ViewRequest,
 };
 use qe_buffer::Notify;
-use qe_editor::{Clipboard, EditorView, FileLoad, LoadOptions, LoadResult};
+use qe_editor::{Clipboard, ClipboardPreparer, EditorView, FileLoad, LoadOptions, LoadResult};
 use qe_layout::DirectWriteLayout;
 use qe_render::BitmapRenderer;
 use qe_shell::{
@@ -36,7 +40,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, WPARAM};
+use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_GETWHEELSCROLLLINES,
@@ -50,6 +56,10 @@ editor [options] [file]
   --hidden-smoke     hidden window; checks that the file's text reaches a frame
   --hidden-loop      hidden window; real message loop until the file has loaded
   --bench-keys N     hidden window; sends N keys and prints the timers
+  --bench-wrap       with --bench-keys: long lines wrap
+  --bench-middle     with --bench-keys: the keys go to the middle of the text
+  --bench-no-pause   with --bench-keys: the next key does not wait for the last one's frame
+  --bench-end-first  with --bench-keys: Ctrl+End and Home go first, so that keys wait behind them
   --timings          prints the timers when the window closes
   --force-mapped     opens the file read-only, whatever its size
   --help             prints this and opens nothing";
@@ -61,6 +71,57 @@ impl Clipboard for SystemClipboard {
     }
     fn write(&mut self, value: &str) -> Result<(), String> {
         self.0.write_text(value)
+    }
+    fn preparer(&self) -> Option<ClipboardPreparer> {
+        Some(Arc::new(|text| {
+            let prepared = qe_ui::prepare_clipboard_text(text)?;
+            Ok(Box::new(prepared) as Box<dyn std::any::Any + Send>)
+        }))
+    }
+    fn write_prepared(&mut self, prepared: Box<dyn std::any::Any + Send>) -> Result<(), String> {
+        let prepared = prepared
+            .downcast::<qe_ui::PreparedClipboardText>()
+            .map_err(|_| "the copied text was prepared for another clipboard".to_string())?;
+        self.0.write_prepared(*prepared)
+    }
+}
+
+fn file_time_100ns(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+/// The moment Windows created this process, on the clock the timers use.
+fn process_creation() -> Result<Instant, String> {
+    let empty = FILETIME::default();
+    let (mut created, mut exited, mut kernel, mut user) = (empty, empty, empty, empty);
+    // SAFETY: the pseudo handle needs no closing, and the four values live through the call.
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map_err(|e| format!("could not read the process creation time: {e}"))?;
+    // SAFETY: a plain query.
+    let now = file_time_100ns(unsafe { GetSystemTimeAsFileTime() });
+    let age = now.saturating_sub(file_time_100ns(created));
+    Instant::now()
+        .checked_sub(Duration::from_nanos(age.saturating_mul(100)))
+        .ok_or_else(|| "the process creation time is out of range".to_string())
+}
+/// When a key really came, if Windows held it for longer than its clock's 16 ms grain.
+fn input_time(time_us: u64, handled: Instant) -> Instant {
+    // SAFETY: a plain query.
+    let now_ms = unsafe { GetTickCount() };
+    let behind = now_ms.wrapping_sub((time_us / 1000) as u32);
+    if (17..60_000).contains(&behind) {
+        handled
+            .checked_sub(Duration::from_millis(u64::from(behind)))
+            .unwrap_or(handled)
+    } else {
+        handled
     }
 }
 
@@ -74,6 +135,8 @@ struct Timing {
     to_new_text: RefCell<Vec<f64>>,
     to_first_frame: RefCell<Vec<f64>>,
     keys_with_no_frame: Cell<u64>,
+    /// Keys that had to wait behind a layout or in the editor's queue.
+    keys_that_waited: Cell<u64>,
     /// The frame being painted shows the text as it is now.
     frame_is_current: Cell<bool>,
     /// The frame being painted holds real text.
@@ -109,8 +172,13 @@ impl Timing {
             self.full_screen_presented.set(Some(now));
         }
     }
-    fn note_key(&self, started: Instant, repaint: bool) {
-        if repaint {
+    /// `queued`: the key has not run yet, or it has run but keys ahead of later ones wait.
+    /// Its frame comes after that wait, so it counts as waiting for its frame.
+    fn note_key(&self, started: Instant, repaint: bool, queued: bool) {
+        if queued {
+            self.keys_that_waited.set(self.keys_that_waited.get() + 1);
+        }
+        if repaint || queued {
             self.keys_waiting.borrow_mut().push(started);
             self.keys_before_frame.borrow_mut().push(started);
         } else {
@@ -143,6 +211,7 @@ impl Timing {
             self.keys_with_no_frame.get(),
             self.keys_waiting.borrow().len(),
         );
+        eprintln!("keys that waited, {label}: {}", self.keys_that_waited.get());
         if let Some(text) = summary(&self.to_new_text) {
             eprintln!("input to present, {label}: {text}");
         }
@@ -150,23 +219,34 @@ impl Timing {
             eprintln!("input to first frame, {label}: {text}");
         }
     }
-    fn report_first_frame(&self, process_start: Instant, load_start: Instant) {
+    /// `has_file` says a load ran. With none, text on screen is only what the user typed,
+    /// and a time for it would say nothing about the program.
+    fn report_first_frame(&self, process_start: Instant, load_start: Instant, has_file: bool) {
+        let from_process = |at: Instant| (at - process_start).as_secs_f64() * 1000.0;
         let times = |at: Instant| {
             format!(
-                "{:.3} ms from process start, {:.3} ms from load start",
-                (at - process_start).as_secs_f64() * 1000.0,
+                "{:.3} ms from process creation, {:.3} ms from load start",
+                from_process(at),
                 (at - load_start).as_secs_f64() * 1000.0,
             )
         };
-        if let Some(at) = self.first_text_presented.get() {
-            eprintln!("first text frame: {}", times(at));
-            if let Some(full) = self.full_screen_presented.get() {
-                eprintln!("full first screen: {}", times(full));
-            } else {
-                eprintln!("full first screen: the text did not fill the text area");
+        match self.first_text_presented.get() {
+            Some(at) if has_file => {
+                eprintln!("first text frame: {}", times(at));
+                if let Some(full) = self.full_screen_presented.get() {
+                    eprintln!("full first screen: {}", times(full));
+                } else {
+                    eprintln!("full first screen: the text did not fill the text area");
+                }
             }
-        } else if let Some(at) = self.first_frame_presented.get() {
-            eprintln!("first frame: {}; it holds no text", times(at));
+            _ => {
+                if let Some(at) = self.first_frame_presented.get() {
+                    eprintln!(
+                        "first frame: {:.3} ms from process creation",
+                        from_process(at)
+                    );
+                }
+            }
         }
     }
 }
@@ -243,6 +323,10 @@ struct Args {
     timings: bool,
     force_read_only: bool,
     bench_keys: usize,
+    bench_wrap: bool,
+    bench_middle: bool,
+    bench_no_pause: bool,
+    bench_end_first: bool,
     /// Runs the real message loop in a hidden window until the file has loaded.
     hidden_loop: bool,
     help: bool,
@@ -254,6 +338,10 @@ fn parse_args() -> Result<Args, String> {
         timings: false,
         force_read_only: false,
         bench_keys: 0,
+        bench_wrap: false,
+        bench_middle: false,
+        bench_no_pause: false,
+        bench_end_first: false,
         hidden_loop: false,
         help: false,
     };
@@ -265,6 +353,10 @@ fn parse_args() -> Result<Args, String> {
             Some("--timings") => args.timings = true,
             Some("--force-mapped") => args.force_read_only = true,
             Some("--hidden-loop") => args.hidden_loop = true,
+            Some("--bench-wrap") => args.bench_wrap = true,
+            Some("--bench-middle") => args.bench_middle = true,
+            Some("--bench-no-pause") => args.bench_no_pause = true,
+            Some("--bench-end-first") => args.bench_end_first = true,
             Some("--bench-keys") => {
                 args.bench_keys = items
                     .next()
@@ -279,6 +371,12 @@ fn parse_args() -> Result<Args, String> {
             }
             _ => args.file = Some(item),
         }
+    }
+    let bench_option =
+        args.bench_wrap || args.bench_middle || args.bench_no_pause || args.bench_end_first;
+    if bench_option && args.bench_keys == 0 {
+        // Alone, these would open a window on screen.
+        return Err(format!("this option needs --bench-keys\n{HELP}"));
     }
     Ok(args)
 }
@@ -372,11 +470,11 @@ fn run_hidden(run: Hidden) -> Result<(), String> {
     if args.file.is_some() && timing.first_text_presented.get().is_none() {
         return Err("hidden editor smoke drew no file text".into());
     }
-    if args.timings {
-        timing.report_first_frame(process_start, load_start);
-    }
     if args.bench_keys > 0 {
         run_key_bench(args, window, editor, timing)?;
+    }
+    if args.timings {
+        timing.report_first_frame(process_start, load_start, args.file.is_some());
     }
     if args.timings && !editor.borrow().can_edit() {
         let limit = Instant::now() + Duration::from_secs(60);
@@ -423,14 +521,69 @@ fn run_key_bench(
     handle
         .apply_requests(std::mem::take(&mut ctx.requests))
         .map_err(|e| e.to_string())?;
+    let pump = |ctx: &mut ViewContext| -> Result<(), String> {
+        editor.borrow_mut().poll_layout(ctx);
+        let more = ctx
+            .requests
+            .iter()
+            .any(|r| matches!(r, ViewRequest::Invalidate(_)));
+        handle
+            .apply_requests(std::mem::take(&mut ctx.requests))
+            .map_err(|e| e.to_string())?;
+        if more {
+            paint_now(&handle)?;
+        }
+        Ok(())
+    };
+    if args.bench_wrap {
+        editor.borrow_mut().set_wrap(true)?;
+        editor
+            .borrow_mut()
+            .layout(window.content_rect().map_err(|e| e.to_string())?, &measure);
+    }
+    if args.bench_middle {
+        // A file still being indexed would give the middle of what is known so far.
+        let limit = Instant::now() + Duration::from_secs(60);
+        while !editor.borrow().store_status().complete && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let middle = editor.borrow().store_status().known_bytes.0 / 2;
+        editor.borrow_mut().select(
+            qe_api::ByteOffset(middle)..qe_api::ByteOffset(middle),
+            &mut ctx,
+        );
+        // The way there is not key work: it lays out the place the keys go to.
+        let limit = Instant::now() + Duration::from_secs(10);
+        pump(&mut ctx)?;
+        while editor.borrow().pending_layout() && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+            pump(&mut ctx)?;
+        }
+        eprintln!("the keys go to byte {}", editor.borrow().caret().0);
+    }
+    let mut first_keys = Vec::new();
+    if args.bench_end_first {
+        first_keys.push(InputKind::KeyDown {
+            virtual_key: 0x23,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+        first_keys.push(key(0x24));
+    }
     let mut handled = Vec::with_capacity(args.bench_keys);
     for i in 0..args.bench_keys {
-        let kind = match (can_edit, i % 2 == 0) {
-            (true, true) => InputKind::Char('q'),
-            (true, false) => key(0x08),
-            (false, true) => key(0x28),
-            (false, false) => key(0x26),
-        };
+        let kind = first_keys
+            .get(i)
+            .cloned()
+            .unwrap_or(match (can_edit, i % 2 == 0) {
+                (true, true) => InputKind::Char('q'),
+                (true, false) => key(0x08),
+                (false, true) => key(0x28),
+                (false, false) => key(0x26),
+            });
         let event = InputEvent {
             time_us: i as u64,
             kind,
@@ -442,28 +595,28 @@ fn run_key_bench(
             .requests
             .iter()
             .any(|r| matches!(r, ViewRequest::Invalidate(_)));
-        timing.note_key(started, repaint);
+        let queued = editor.borrow().queued_input_count() > 0;
+        timing.note_key(started, repaint, queued);
         handle
             .apply_requests(std::mem::take(&mut ctx.requests))
             .map_err(|e| e.to_string())?;
+        // The first keys arrive together, as a person's fast keys do: no result can come
+        // in between them, so a key that needs one has to wait.
+        if i < first_keys.len() {
+            continue;
+        }
         if repaint {
             paint_now(&handle)?;
+        }
+        if args.bench_no_pause {
+            pump(&mut ctx)?;
+            continue;
         }
         // A key on a shaped line ends when its worker's result is on screen.
         let limit = Instant::now() + Duration::from_secs(1);
         while !timing.keys_waiting.borrow().is_empty() && Instant::now() < limit {
             std::thread::sleep(Duration::from_micros(100));
-            editor.borrow_mut().poll_layout(&mut ctx);
-            let more = ctx
-                .requests
-                .iter()
-                .any(|r| matches!(r, ViewRequest::Invalidate(_)));
-            handle
-                .apply_requests(std::mem::take(&mut ctx.requests))
-                .map_err(|e| e.to_string())?;
-            if more {
-                paint_now(&handle)?;
-            }
+            pump(&mut ctx)?;
         }
         // Workers run while a person's fingers move. Their results are not key work.
         std::thread::sleep(Duration::from_millis(3));
@@ -472,6 +625,12 @@ fn run_key_bench(
             .apply_requests(std::mem::take(&mut ctx.requests))
             .map_err(|e| e.to_string())?;
         paint_now(&handle)?;
+    }
+    // Keys sent with no pause may still wait for their frame.
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !timing.keys_waiting.borrow().is_empty() && Instant::now() < limit {
+        std::thread::sleep(Duration::from_micros(100));
+        pump(&mut ctx)?;
     }
     handled.sort_by(f64::total_cmp);
     eprintln!(
@@ -488,7 +647,7 @@ fn run_key_bench(
 }
 
 fn main() -> Result<(), String> {
-    let process_start = Instant::now();
+    let process_start = process_creation()?;
     let args = parse_args()?;
     if args.help {
         println!("{HELP}");
@@ -584,9 +743,10 @@ fn main() -> Result<(), String> {
         if rows.last().is_some_and(|y| *y as f32 + 40.0 >= bottom) {
             paint_timing.frame_is_full.set(true);
         }
-        paint_timing
-            .frame_is_current
-            .set(paint_editor.borrow().caret_is_laid_out());
+        paint_timing.frame_is_current.set(
+            paint_editor.borrow().caret_is_laid_out()
+                && paint_editor.borrow().queued_input_count() == 0,
+        );
     });
 
     let load_start = Instant::now();
@@ -609,6 +769,7 @@ fn main() -> Result<(), String> {
     let timings = args.timings;
     let hidden = args.hidden;
     let hidden_loop = args.hidden_loop;
+    let has_file = args.file.is_some();
     window.set_event_handler(move |handle, event| {
         // Destroying a window sends it a last focus change and other events, and they
         // arrive here after it has gone. They have nothing left to act on.
@@ -618,7 +779,7 @@ fn main() -> Result<(), String> {
         let result = match event {
             ShellEvent::ContentInput(input) => {
                 let is_key = matches!(input.kind, InputKind::KeyDown { .. } | InputKind::Char(_));
-                let started = Instant::now();
+                let started = input_time(input.time_us, Instant::now());
                 let mut ctx = ViewContext::default();
                 event_editor.borrow_mut().handle(&input, &mut ctx);
                 if timings && is_key {
@@ -626,7 +787,8 @@ fn main() -> Result<(), String> {
                         .requests
                         .iter()
                         .any(|r| matches!(r, ViewRequest::Invalidate(_)));
-                    event_timing.note_key(started, repaint);
+                    let queued = event_editor.borrow().queued_input_count() > 0;
+                    event_timing.note_key(started, repaint, queued);
                 }
                 if input.kind == InputKind::Blur {
                     let _ = handle.kill_timer(VIEW_TIMER);
@@ -682,9 +844,10 @@ fn main() -> Result<(), String> {
             ShellEvent::WindowDestroyed => {
                 // Closing cancels a load that is still running.
                 *event_load.borrow_mut() = None;
-                if timings {
+                // A hidden run has printed its own numbers.
+                if timings && !hidden {
                     event_timing.report_keys("this window");
-                    event_timing.report_first_frame(process_start, load_start);
+                    event_timing.report_first_frame(process_start, load_start, has_file);
                 }
                 quit_message_loop(0);
                 Ok(())

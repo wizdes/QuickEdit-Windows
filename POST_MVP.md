@@ -6,3 +6,10 @@
 - The trial programs in spikes/ fail clippy with warnings denied (collapsible if, manual C string, chunks_exact). They are throwaway; decide at M15 whether to fix or remove them.
 
 - Five kinds of test give different answers in the `agent` account than in the signed-in account: two qe-codec link tests stop on error 448, three qe-render window tests get access-denied or invalid-handle errors, qe-shell's DPI setup gets 0x80070005, and a qe-shell image test finds the plus sign's left edge at 20 where it expects 19 (seen in the M9 review at 206fa52). Check each one and make it skip with its reason, or fix the cause. The plus sign one has no known cause yet.
+
+- qe-buffer: add `UndoHistory::take_release_list`, so waiting history is freed on a worker. Today Blur and idle free it on the UI thread: 97 MiB took 11.6 ms.
+- qe-buffer: add `PieceStore::try_new`, using `try_reserve` for each leaf. Today the load checks for room first, but another program can take that memory, and the app then aborts and other tabs lose unsaved text.
+- Paste decodes and inserts on the UI thread: 247 ms to decode 100 MiB and 1,252 ms for 512 MiB, plus `store.splice_text`. It needs a way to build the tree on a worker.
+- Word keys stop at a gap over 256 KiB, so a very long gap can take several key presses. Check this against the Mac.
+- `qe-editor` test `p12_a_dropped_page_key_says_so` failed once in a mutation run, and the cause was not found. It then passed 36 parallel runs and 6 full suite runs.
+- Not compared on a Mac: undo selecting the restored text, the fourth click, Backspace on a cluster, double-click and word keys on emoji.

@@ -409,6 +409,94 @@ fn real_clipboard_round_trip_when_asked() {
     assert_eq!(board.read_text().unwrap().as_deref(), Some("héllo 😀"));
 }
 
+/// Replaces the user's clipboard, so it runs only on request, like the test above.
+#[test]
+fn real_clipboard_keeps_text_after_a_zero_when_asked() {
+    if std::env::var_os("QE_UI_TEST_REAL_CLIPBOARD").is_none() {
+        println!("not run: set QE_UI_TEST_REAL_CLIPBOARD=1 to let it replace the clipboard");
+        return;
+    }
+    let board = SystemClipboard;
+    board.write_text("before\0after").unwrap();
+    assert_eq!(board.read_text().unwrap().as_deref(), Some("before\0after"));
+    // A later plain write leaves no old full text behind.
+    board.write_text("plain").unwrap();
+    assert_eq!(board.read_text().unwrap().as_deref(), Some("plain"));
+}
+
+// These look at the memory a clipboard write would use. None of them opens the clipboard.
+#[test]
+fn prepared_text_holds_all_of_the_text_and_its_end_zero() {
+    let prepared = prepare_clipboard_text("héllo 😀").unwrap();
+    let (text, full) = prepared.test_read();
+    assert_eq!(text.unwrap(), "héllo 😀");
+    assert!(full.is_none(), "text with no zero needs no second format");
+    let empty = prepare_clipboard_text("").unwrap();
+    assert_eq!(empty.test_read().0.unwrap(), "");
+}
+#[test]
+fn prepared_text_with_a_zero_keeps_a_full_copy_beside_the_normal_one() {
+    for value in ["before\0after 😀", "\0", "a\0", "\0\0b", "\0é"] {
+        let prepared = prepare_clipboard_text(value).unwrap();
+        let (text, full) = prepared.test_read();
+        let cut_short = value.split('\0').next().unwrap();
+        assert_eq!(text.unwrap(), cut_short, "other programs stop at the zero");
+        assert_eq!(full.unwrap().unwrap(), value, "this editor gets it all");
+    }
+}
+#[test]
+fn prepared_text_can_be_made_on_another_thread_and_dropped_there() {
+    let prepared = std::thread::spawn(|| prepare_clipboard_text("a\0b").unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(prepared.test_read().1.unwrap().unwrap(), "a\0b");
+    std::thread::spawn(move || drop(prepared)).join().unwrap();
+}
+#[test]
+fn a_full_text_block_whose_count_does_not_fit_is_refused() {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    // SAFETY: blocks this test owns and fills.
+    unsafe {
+        let small = GlobalAlloc(GMEM_MOVEABLE, 4).unwrap();
+        let error = read_full_text_block(small).unwrap_err();
+        assert!(error.contains("damaged"), "{error}");
+        let _ = GlobalFree(Some(small));
+        let memory = GlobalAlloc(GMEM_MOVEABLE, 16).unwrap();
+        (GlobalLock(memory) as *mut u64).write_unaligned(1_000);
+        let _ = GlobalUnlock(memory);
+        let error = read_full_text_block(memory).unwrap_err();
+        assert!(error.contains("damaged"), "{error}");
+        let _ = GlobalFree(Some(memory));
+    }
+}
+#[test]
+fn clipboard_memory_failures_use_plain_words() {
+    let error = reserve_text(usize::MAX).unwrap_err();
+    assert!(error.contains("not enough memory"), "{error}");
+    let error = decode_units(&[0xd800]).unwrap_err();
+    assert!(error.contains("not valid Unicode"), "{error}");
+}
+/// Prints what a big clipboard write and read cost, with no clipboard. Run it by hand:
+/// `cargo test -p qe-ui --release --locked --test native clipboard_costs -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn clipboard_costs_in_memory() {
+    for mib in [1usize, 100, 512] {
+        let text = "x".repeat(mib << 20);
+        let start = std::time::Instant::now();
+        let prepared = prepare_clipboard_text(&text).unwrap();
+        let prepare = start.elapsed();
+        let start = std::time::Instant::now();
+        let back = prepared.test_read().0.unwrap();
+        let read = start.elapsed();
+        assert_eq!(back.len(), text.len());
+        println!(
+            "{mib} MiB: prepare off the UI thread {prepare:?}, decode on the UI thread at Paste {read:?}"
+        );
+    }
+}
+
 // Item 3: one popup for each level, on hidden windows, with the real capture path.
 fn capture_holder() -> HWND {
     // SAFETY: a plain query.

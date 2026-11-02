@@ -73,10 +73,22 @@ const WARNING_STRIP: f32 = 24.0;
 /// How many edited lines keep showing their old layout.
 const MAX_GHOST_LINES: usize = 8;
 
+/// The slow first step of a clipboard write, safe to run on another thread.
+pub type ClipboardPreparer =
+    Arc<dyn Fn(&str) -> Result<Box<dyn std::any::Any + Send>, String> + Send + Sync>;
+
 pub trait Clipboard {
     /// `Ok(None)` means the clipboard holds no text.
     fn read(&mut self) -> Result<Option<String>, String>;
     fn write(&mut self, value: &str) -> Result<(), String>;
+    /// A clipboard whose write has a slow part offers it here. A big Copy then runs it
+    /// on the copy's thread and calls `write_prepared` on the UI thread.
+    fn preparer(&self) -> Option<ClipboardPreparer> {
+        None
+    }
+    fn write_prepared(&mut self, _prepared: Box<dyn std::any::Any + Send>) -> Result<(), String> {
+        Err("This clipboard has no prepared writes.".to_string())
+    }
 }
 #[derive(Default)]
 pub struct MemoryClipboard(pub String);
@@ -148,6 +160,7 @@ struct WorkerShared {
     skipped: AtomicU64,
     /// A test sets this to make one line's layout always fail.
     fail_line: AtomicUsize,
+    test_paused: AtomicBool,
     /// Old snapshots sent to a worker that it has not dropped yet.
     drops_out: AtomicUsize,
     wake: std::sync::Mutex<Option<qe_buffer::Notify>>,
@@ -355,6 +368,13 @@ enum DragUnit {
     Line,
 }
 
+/// Input that takes its turn behind a key that waits.
+#[derive(Clone)]
+enum Queued {
+    Event(InputEvent),
+    Command(EditorCommand),
+}
+
 struct Warning {
     text: String,
     /// A store failure stays until the store changes. Other warnings stay until the user
@@ -362,9 +382,14 @@ struct Warning {
     sticky: bool,
 }
 
+/// What a copy's thread hands to the UI thread.
+enum CopyOutput {
+    Text(String),
+    Prepared(Box<dyn std::any::Any + Send>),
+}
+
 struct CopyJob {
-    results: Receiver<Result<String, String>>,
-    cancel: Arc<AtomicBool>,
+    results: Receiver<Result<CopyOutput, String>>,
     /// The edit already happened, so a failure must say where the text went.
     is_cut: bool,
 }
@@ -452,8 +477,18 @@ pub struct EditorView {
     wheel_lines: u32,
     /// Page keys that wait for their target, as a signed count of pages.
     pending_pages: i32,
-    /// Input held back in order, behind a Home or End that waits for its line's layout.
-    deferred: std::collections::VecDeque<InputEvent>,
+    /// Input held back in order, behind a key that waits for layout or for the index.
+    deferred: std::collections::VecDeque<Queued>,
+    /// The text that was at the top of the view before a new width, wrap or font, and
+    /// when that change happened. The view goes back to it as layouts arrive.
+    pending_anchor: Option<(ByteOffset, Instant)>,
+    /// The caret was on screen before that change, so it must be on screen after it.
+    keep_caret_visible: bool,
+    /// The width the current layouts are for. A minimized window has width 0, and
+    /// nothing is laid out for that.
+    laid_width: Dip,
+    /// When drag scrolling may next move. It follows a clock and not the events.
+    drag_due: Instant,
     deferred_since: Instant,
     /// A Paste that waits for the copy in progress.
     pending_paste: bool,
@@ -712,10 +747,12 @@ fn merge_changes(changes: &[TextChange]) -> Option<TextChange> {
     })
 }
 
-fn is_plain_ascii(bytes: &[u8]) -> bool {
+/// Text the layout crate lays out with no system call. It wraps only text with no tabs,
+/// so a wrapped line with tabs is shaped, which belongs on a worker.
+fn lays_out_with_no_system_call(bytes: &[u8], wrap: bool) -> bool {
     bytes
         .iter()
-        .all(|b| *b == b'\t' || (0x20..0x7F).contains(b))
+        .all(|b| (0x20..0x7F).contains(b) || (*b == b'\t' && !wrap))
 }
 
 fn snapshot_of(store: &PieceStore, mapped: &Option<MappedStore>) -> Arc<dyn TextSnapshot> {
@@ -746,6 +783,7 @@ impl EditorView {
             wanted_last: AtomicUsize::new(usize::MAX),
             skipped: AtomicU64::new(0),
             fail_line: AtomicUsize::new(usize::MAX),
+            test_paused: AtomicBool::new(false),
             drops_out: AtomicUsize::new(0),
             wake: std::sync::Mutex::new(None),
         });
@@ -814,6 +852,10 @@ impl EditorView {
             wheel_lines: 3,
             pending_pages: 0,
             deferred: std::collections::VecDeque::new(),
+            pending_anchor: None,
+            keep_caret_visible: false,
+            laid_width: Dip(800.0),
+            drag_due: now,
             deferred_since: now,
             pending_paste: false,
             loading: false,
@@ -888,6 +930,9 @@ impl EditorView {
         self.pending_pages = 0;
         self.deferred.clear();
         self.pending_paste = false;
+        self.pending_anchor = None;
+        self.cancel_drag();
+        self.cancel_copy();
         self.preferred_ending = ending;
         self.heights = heights;
         self.long_maps.clear();
@@ -983,8 +1028,8 @@ impl EditorView {
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_ref().map(|w| w.text.as_str())
     }
-    /// Shows a message from the host, such as a file that failed to open. The next
-    /// input clears it.
+    /// Shows a message from the host, such as a file that failed to open. The next edit
+    /// or Esc clears it.
     pub fn show_warning(&mut self, text: impl Into<String>) {
         self.set_warning(text.into(), false);
     }
@@ -1031,20 +1076,52 @@ impl EditorView {
     pub fn horizontal_offset_exact(&self) -> f64 {
         self.scroll_x
     }
-    /// True when the caret's line shows its current text, not its layout from before
-    /// an edit. A key's timer runs until this holds.
+    /// True when the screen shows the text as it is now at the caret: its line is off
+    /// screen, or its layout has arrived. It is true once layout work has settled. A
+    /// host's key timer reads this.
     pub fn caret_is_laid_out(&self) -> bool {
-        let on_ghost = self
-            .caret_line
-            .is_some_and(|line| self.ghosts.keys().any(|(ghost, _)| *ghost == line));
-        !on_ghost
-            && self
-                .place(self.caret, self.affinity)
-                .is_some_and(|place| place.exact)
+        let Some(line) = self.caret_line else {
+            return false;
+        };
+        let Some(place) = self.place(self.caret, self.affinity) else {
+            return false;
+        };
+        if self.ghost_covers_caret(line) {
+            return false;
+        }
+        let view = f64::from(self.bounds.height.0);
+        let off_screen =
+            place.y + f64::from(place.height) <= self.scroll || place.y >= self.scroll + view;
+        place.exact || off_screen
+    }
+    fn ghost_covers_caret(&self, line: usize) -> bool {
+        if self.long_maps.contains_key(&line) {
+            let snapshot = self.snapshot();
+            let segment = self
+                .engine
+                .segment_at(snapshot.as_ref(), self.caret, self.affinity)
+                .map_or(0, |(_, segment, _)| segment);
+            self.ghosts.contains_key(&(line, segment))
+        } else {
+            self.ghosts.contains_key(&(line, WHOLE))
+        }
     }
     #[doc(hidden)]
     pub fn test_workers_holding_snapshots(&self) -> usize {
         self.shared.drops_out.load(Ordering::Acquire)
+    }
+    /// A worker starts no task while this holds, so a test can hold results back.
+    #[doc(hidden)]
+    pub fn test_pause_workers(&mut self, paused: bool) {
+        self.shared.test_paused.store(paused, Ordering::Release);
+    }
+    /// Input that waits behind a key. A host's key timer runs until this is 0.
+    pub fn queued_input_count(&self) -> usize {
+        self.deferred.len()
+    }
+    #[doc(hidden)]
+    pub fn test_total_height(&self) -> f64 {
+        self.heights.total_height()
     }
     #[doc(hidden)]
     pub fn test_height_map_lines(&self) -> usize {
@@ -1090,7 +1167,17 @@ impl EditorView {
     }
     /// Selects a range with no move of the view.
     pub fn select(&mut self, range: Range<ByteOffset>, ctx: &mut ViewContext) {
-        self.set_selection(range.start, range.end, Affinity::After, false, ctx);
+        // A range from before the text changed comes back inside it, on character edges.
+        let known = self.source().status().known_bytes.0;
+        let start = range.start.0.min(known);
+        let end = range.end.0.min(known);
+        let start = self
+            .with_stops(|s| s.edge_backward(start, 0))
+            .map_or(ByteOffset(start), ByteOffset);
+        let end = self
+            .with_stops(|s| s.edge_backward(end, 0))
+            .map_or(ByteOffset(end), ByteOffset);
+        self.set_selection(start, end, Affinity::After, false, ctx);
         self.finish(Instant::now(), ctx);
     }
     pub fn on_timer(&mut self, ctx: &mut ViewContext) {
@@ -1100,9 +1187,9 @@ impl EditorView {
     /// and worker polling share it, so only the clock decides when the caret blinks.
     pub fn on_timer_at(&mut self, now: Instant, ctx: &mut ViewContext) {
         if self.pending || self.mapped.is_some() || self.copy_job.is_some() {
-            self.poll_inner(ctx);
+            self.poll_inner(now, ctx);
         }
-        self.drag_step(ctx);
+        self.drag_step(now, ctx);
         if self.focused && self.selection().is_empty() && now >= self.blink_due {
             self.visible = !self.visible;
             self.blink_due = now + BLINK;
@@ -1161,6 +1248,8 @@ impl EditorView {
         self.show_caret();
         self.retry_key = None;
         self.pending_pages = 0;
+        self.pending_anchor = None;
+        self.keep_caret_visible = false;
         if self.pending_paste {
             self.pending_paste = false;
             self.set_warning(
@@ -1186,6 +1275,7 @@ impl EditorView {
     pub fn set_wrap(&mut self, enabled: bool) -> Result<(), String> {
         if enabled != self.wrap {
             let engine = make_engine(&self.font, enabled)?;
+            self.remember_view();
             self.wrap = enabled;
             if enabled {
                 self.scroll_x = 0.0;
@@ -1203,7 +1293,7 @@ impl EditorView {
     }
     fn after_restart(&mut self, ctx: &mut ViewContext) {
         ctx.invalidate(self.bounds);
-        self.poll_inner(ctx);
+        self.poll_inner(Instant::now(), ctx);
         self.finish(Instant::now(), ctx);
     }
     /// `set_font`, and asks for the repaint and the layout that it needs.
@@ -1220,6 +1310,7 @@ impl EditorView {
     pub fn set_font(&mut self, family: &str, points: f32) -> Result<(), String> {
         let font = Some((family.to_string(), points));
         let engine = make_engine(&font, self.wrap)?;
+        self.remember_view();
         (self.row_height, self.cell_width, self.fast_font) = measure_font(&engine)?;
         self.font = font;
         self.engine = Arc::new(engine.with_full_rows_at(self.bounds.width));
@@ -1248,9 +1339,104 @@ impl EditorView {
         self.pending = true;
         Ok(())
     }
+    /// Remembers what the view shows, before a change of width, wrap or font makes the
+    /// layouts that know it useless. A change while the view still heads for its text
+    /// keeps heading for that text.
+    fn remember_view(&mut self) {
+        if self.pending_anchor.is_none() {
+            let anchor = self.byte_at_top();
+            self.pending_anchor = Some((anchor, Instant::now()));
+            self.keep_caret_visible = self.caret_is_on_screen();
+        } else if let Some((_, since)) = &mut self.pending_anchor {
+            *since = Instant::now();
+        }
+    }
+    /// The first byte of the row at the top of the view.
+    fn byte_at_top(&self) -> ByteOffset {
+        let line = self.heights.scroll_to_line(self.scroll);
+        let line_top = self.heights.line_to_scroll(line);
+        let local = (self.scroll - line_top).max(0.0);
+        let snapshot = self.snapshot();
+        let row_start = |layout: &LineLayout, y: f64| {
+            let at = layout
+                .rows
+                .partition_point(|r| f64::from(r.y.0 + r.height.0) <= y)
+                .min(layout.rows.len() - 1);
+            layout.rows[at].range.start
+        };
+        if let Some(map) = self.long_maps.get(&line.0) {
+            if !self.wrap {
+                return self
+                    .source()
+                    .try_line_range(line)
+                    .map_or(self.caret, |r| r.start);
+            }
+            let segment = map.scroll_to_line(local);
+            let start = map.line_to_scroll(segment);
+            let layout = self.cache.borrow_mut().cached_segment(
+                &self.engine,
+                snapshot.as_ref(),
+                line,
+                segment.0,
+                self.width(),
+            );
+            return match layout {
+                Some(layout) => row_start(&layout, local - start),
+                None => self
+                    .engine
+                    .segment_range(snapshot.as_ref(), line, segment.0)
+                    .map_or(self.caret, |r| r.start),
+            };
+        }
+        let layout =
+            self.cache
+                .borrow_mut()
+                .cached(&self.engine, snapshot.as_ref(), line, self.width());
+        match layout {
+            Some(layout) => row_start(&layout, local),
+            None => self
+                .source()
+                .try_line_range(line)
+                .map_or(self.caret, |r| r.start),
+        }
+    }
+    fn caret_line_failed(&self) -> bool {
+        self.caret_line
+            .is_some_and(|caret| self.failed.iter().any(|(line, _)| *line == caret))
+    }
+    fn caret_is_on_screen(&self) -> bool {
+        let view = f64::from(self.bounds.height.0);
+        self.place(self.caret, self.affinity).is_some_and(|place| {
+            place.y + f64::from(place.height) > self.scroll && place.y < self.scroll + view
+        })
+    }
+    /// Takes the view back to the text it showed before a new width, wrap or font. Each
+    /// new layout refines this, until the anchor's own row has its real place.
+    fn apply_anchor(&mut self, now: Instant, ctx: &mut ViewContext) {
+        let Some((anchor, since)) = self.pending_anchor else {
+            return;
+        };
+        let Some(place) = self.place(anchor, Affinity::After) else {
+            if now.saturating_duration_since(since) >= DEFER_LIMIT {
+                self.pending_anchor = None;
+            }
+            return;
+        };
+        let before = self.scroll;
+        self.scroll = place.y.clamp(0.0, self.max_scroll());
+        if self.scroll != before {
+            ctx.invalidate(self.bounds);
+        }
+        if place.exact || now.saturating_duration_since(since) >= DEFER_LIMIT {
+            self.pending_anchor = None;
+            if std::mem::take(&mut self.keep_caret_visible) {
+                self.reveal_pending = true;
+            }
+        }
+    }
     fn width(&self) -> Dip {
         if self.wrap {
-            self.bounds.width
+            self.laid_width
         } else {
             Dip(1_000_000.0)
         }
@@ -1270,9 +1456,18 @@ impl EditorView {
         self.scroll_x = self.scroll_x.clamp(0.0, self.max_scroll_x());
     }
     fn set_bounds(&mut self, bounds: Rect) {
-        let width_changed = self.wrap && bounds.width != self.bounds.width;
+        // A minimized window shows nothing, so nothing is measured or moved for it.
+        if bounds.width.0 <= 0.0 || bounds.height.0 <= 0.0 {
+            self.bounds = bounds;
+            return;
+        }
+        let width_changed = self.wrap && bounds.width != self.laid_width;
         let moved = bounds != self.bounds;
+        if width_changed {
+            self.remember_view();
+        }
         self.bounds = bounds;
+        self.laid_width = bounds.width;
         if width_changed {
             // A long line's segment edges follow the width.
             self.engine = Arc::new(self.engine.with_full_rows_at(bounds.width));
@@ -1285,10 +1480,10 @@ impl EditorView {
         }
     }
     pub fn poll_layout(&mut self, ctx: &mut ViewContext) {
-        self.poll_inner(ctx);
+        self.poll_inner(Instant::now(), ctx);
         self.finish(Instant::now(), ctx);
     }
-    fn poll_inner(&mut self, ctx: &mut ViewContext) {
+    fn poll_inner(&mut self, now: Instant, ctx: &mut ViewContext) {
         self.drain_results(ctx);
         self.poll_copy(ctx);
         self.settle_widest(ctx);
@@ -1304,15 +1499,22 @@ impl EditorView {
             } else {
                 KEY_RETRY
             };
-            if first.elapsed() < limit {
+            if now.saturating_duration_since(first) < limit {
                 self.move_key(vk, mods, first, ctx);
-            } else {
+            } else if self.pending_pages != 0 {
                 self.pending_pages = 0;
+                self.set_warning(
+                    "Page Up or Page Down was dropped, because this part of the file did not \
+                     arrive."
+                        .to_string(),
+                    false,
+                );
             }
         }
-        self.run_deferred(ctx);
+        self.run_deferred(now, ctx);
+        self.apply_anchor(now, ctx);
         self.schedule(ctx);
-        if self.reveal_pending {
+        if self.pending_anchor.is_none() && self.reveal_pending {
             self.reveal_caret(ctx);
         }
     }
@@ -1686,10 +1888,11 @@ impl EditorView {
             return None;
         }
         let ending = self.source().try_line_ending_len(LineIndex(line)).ok()?;
+        let wrap = self.wrap;
         let mut plain = true;
         self.source()
             .try_visit_chunks(range.start..ByteOffset(range.end.0 - ending), &mut |s| {
-                plain = plain && is_plain_ascii(s.as_bytes());
+                plain = plain && lays_out_with_no_system_call(s.as_bytes(), wrap);
             })
             .ok()?;
         if !plain {
@@ -1766,10 +1969,11 @@ impl EditorView {
         if bytes > *budget {
             return None;
         }
+        let wrap = self.wrap;
         let mut plain = true;
         snapshot
             .try_visit_chunks(range, &mut |s| {
-                plain = plain && is_plain_ascii(s.as_bytes())
+                plain = plain && lays_out_with_no_system_call(s.as_bytes(), wrap)
             })
             .ok()?;
         if !plain {
@@ -1864,6 +2068,13 @@ impl EditorView {
         for i in visible_first..visible_end {
             self.schedule_line(i, true, &snapshot, &worker_snapshot, &mut budget, ctx);
         }
+        // A waiting key needs its line laid out, wherever the view went meanwhile.
+        if (!self.deferred.is_empty() || self.reveal_pending)
+            && let Some(line) = self.caret_line
+            && !(visible_first..visible_end).contains(&line)
+        {
+            self.schedule_line(line, true, &snapshot, &worker_snapshot, &mut budget, ctx);
+        }
         if visible_only {
             self.pending = true;
         } else {
@@ -1877,6 +2088,8 @@ impl EditorView {
             || self.retry_key.is_some()
             || self.caret_line.is_none()
             || !self.deferred.is_empty()
+            || self.pending_anchor.is_some()
+            || (self.reveal_pending && !self.caret_line_failed() && status.failure.is_none())
         {
             self.pending = true;
         }
@@ -1991,6 +2204,9 @@ impl EditorView {
             }
             (start, end.max(start + 1).min(map.len()))
         };
+        // Only segments near the view get laid out again, so older ghosts would stay.
+        self.ghosts
+            .retain(|(line, segment), _| *line != i || (*segment >= start && *segment < end));
         for segment in start..end {
             self.schedule_segment(i, segment, visible, snapshot, worker_snapshot, budget, ctx);
         }
@@ -2504,10 +2720,15 @@ impl EditorView {
         }
         true
     }
-    /// The newest clipboard action wins, so any write ends the copy in progress.
+    /// The newest clipboard action wins, so any write ends the copy in progress. Its
+    /// thread finishes its read and finds nobody listening. Its text may be big, so a
+    /// worker frees what it hands over.
     fn cancel_copy(&mut self) {
         if let Some(job) = self.copy_job.take() {
-            job.cancel.store(true, Ordering::Release);
+            let results: Box<dyn std::any::Any + Send> = Box::new(job.results);
+            if self.tasks.send(WorkerTask::DropDocument(results)).is_err() {
+                self.set_warning("The layout workers stopped.".to_string(), true);
+            }
         }
     }
     fn start_copy(
@@ -2518,22 +2739,19 @@ impl EditorView {
     ) {
         self.cancel_copy();
         let bytes = range.end.0 - range.start.0;
-        let cancel = Arc::new(AtomicBool::new(false));
         let (sender, results) = mpsc::channel();
-        let flag = cancel.clone();
         let shared = self.shared.clone();
+        let preparer = self.clipboard.preparer();
         let spawned = thread::Builder::new()
             .name("qe-editor-copy".into())
             .spawn(move || {
                 let answer = reserve_text(bytes).and_then(|mut text| {
-                    let good = snapshot.visit_chunks_while(range, &mut |part| {
-                        text.push_str(part);
-                        !flag.load(Ordering::Acquire)
-                    });
-                    if good {
-                        Ok(text)
-                    } else {
-                        Err("The selection could not be read from the file.".to_string())
+                    if !snapshot.visit_chunks(range, &mut |part| text.push_str(part)) {
+                        return Err("The selection could not be read from the file.".to_string());
+                    }
+                    match &preparer {
+                        Some(prepare) => prepare(&text).map(CopyOutput::Prepared),
+                        None => Ok(CopyOutput::Text(text)),
                     }
                 });
                 // A failed send means the view is gone, so the text has no reader.
@@ -2542,13 +2760,7 @@ impl EditorView {
                 }
             });
         match spawned {
-            Ok(_) => {
-                self.copy_job = Some(CopyJob {
-                    results,
-                    cancel,
-                    is_cut,
-                });
-            }
+            Ok(_) => self.copy_job = Some(CopyJob { results, is_cut }),
             Err(e) => self.set_warning(format!("Copy could not start: {e}"), false),
         }
     }
@@ -2565,7 +2777,11 @@ impl EditorView {
             }
         };
         self.copy_job = None;
-        match answer.and_then(|text| self.clipboard.write(&text)) {
+        let written = answer.and_then(|output| match output {
+            CopyOutput::Text(text) => self.clipboard.write(&text),
+            CopyOutput::Prepared(prepared) => self.clipboard.write_prepared(prepared),
+        });
+        match written {
             Ok(()) => {
                 if std::mem::take(&mut self.pending_paste) {
                     self.run_inner(EditorCommand::Paste, ctx);
@@ -2575,7 +2791,8 @@ impl EditorView {
                 self.pending_paste = false;
                 let text = if is_cut {
                     format!(
-                        "Cut removed the text, but could not put it on the clipboard: {e}. Undo brings it back."
+                        "Cut removed the text, but could not put it on the clipboard: {e}. \
+                         Undo brings it back."
                     )
                 } else {
                     e
@@ -2588,9 +2805,30 @@ impl EditorView {
     /// else changes. The Mac's source has no message for a refused edit, so neither
     /// has this: the command counts in `refused_edits` and changes nothing.
     pub fn run(&mut self, command: EditorCommand, ctx: &mut ViewContext) {
-        self.touch();
-        self.run_inner(command, ctx);
+        if !self.deferred.is_empty() || self.command_must_wait(command) {
+            self.hold(Queued::Command(command));
+        } else {
+            self.touch();
+            self.run_inner(command, ctx);
+        }
         self.finish(Instant::now(), ctx);
+    }
+    /// Keeps input for later, behind what already waits.
+    fn hold(&mut self, input: Queued) {
+        if self.deferred.is_empty() {
+            self.deferred_since = Instant::now();
+        }
+        self.deferred.push_back(input);
+        self.show_caret();
+        self.pending = true;
+    }
+    /// Select All needs the file's end, and only the index knows it.
+    fn command_must_wait(&self, command: EditorCommand) -> bool {
+        command == EditorCommand::SelectAll && self.index_is_running()
+    }
+    fn index_is_running(&self) -> bool {
+        let status = self.source().status();
+        self.mapped.is_some() && !status.complete && status.failure.is_none()
     }
     fn run_inner(&mut self, command: EditorCommand, ctx: &mut ViewContext) {
         if command.edits() && !self.can_edit() {
@@ -3160,32 +3398,62 @@ impl EditorView {
         !self.failed.iter().any(|(failed, _)| *failed == line)
     }
     /// Runs held input in order, as far as the first key that still waits.
-    fn run_deferred(&mut self, ctx: &mut ViewContext) {
-        while let Some(event) = self.deferred.front() {
-            let event = event.clone();
-            if let InputKind::KeyDown {
-                virtual_key,
-                modifiers,
-                ..
-            } = event.kind
-                && self.row_edge_must_wait(virtual_key, modifiers, ctx)
-            {
-                if self.deferred_since.elapsed() < DEFER_LIMIT {
-                    return;
-                }
-                self.deferred.pop_front();
+    fn run_deferred(&mut self, now: Instant, ctx: &mut ViewContext) {
+        while let Some(input) = self.deferred.front().cloned() {
+            let waits = match &input {
+                Queued::Event(event) => match event.kind {
+                    InputKind::KeyDown {
+                        virtual_key,
+                        modifiers,
+                        ..
+                    } => self.key_must_wait(virtual_key, modifiers, ctx),
+                    _ => false,
+                },
+                Queued::Command(command) => self.command_must_wait(*command),
+            };
+            let timed_out = now.saturating_duration_since(self.deferred_since) >= DEFER_LIMIT;
+            if waits && !timed_out {
+                return;
+            }
+            self.deferred.pop_front();
+            if !waits {
+                self.deferred_since = now;
+            }
+            if waits && self.index_is_running() {
+                // Past the limit the action goes ahead on what is known, and it says so,
+                // so nobody copies part of a file without knowing.
+                self.set_warning(
+                    format!(
+                        "This file is still being indexed, so this covers only its first {} MiB.",
+                        self.source().status().known_bytes.0 >> 20
+                    ),
+                    false,
+                );
+            } else if waits {
                 self.set_warning(
                     "Home or End was dropped, because this line's layout did not arrive."
                         .to_string(),
                     false,
                 );
-                self.deferred_since = Instant::now();
                 continue;
             }
-            self.deferred.pop_front();
-            self.deferred_since = Instant::now();
-            let _ = self.handle_inner(&event, ctx);
+            match input {
+                Queued::Event(event) => {
+                    let _ = self.handle_inner(&event, true, ctx);
+                }
+                Queued::Command(command) => {
+                    self.touch();
+                    self.run_inner(command, ctx);
+                }
+            }
         }
+    }
+    /// A key that needs something still on its way: the row, or the end of the file.
+    fn key_must_wait(&mut self, vk: u16, mods: Modifiers, ctx: &mut ViewContext) -> bool {
+        if mods.ctrl && matches!(vk, 0x23 | 0x41) {
+            return self.index_is_running();
+        }
+        self.row_edge_must_wait(vk, mods, ctx)
     }
     /// True for input that must keep its order behind a waiting key.
     fn keeps_order(event: &InputEvent) -> bool {
@@ -3291,10 +3559,33 @@ impl EditorView {
             self.arrive(ByteOffset(target), Affinity::After, shift, ctx);
         }
     }
-    fn key(&mut self, vk: u16, mods: Modifiers, ctx: &mut ViewContext) -> Handled {
+    fn key(&mut self, vk: u16, mods: Modifiers, forced: bool, ctx: &mut ViewContext) -> Handled {
         // Ctrl+Alt is AltGr, so its character arrives as text. Alt and Win are not ours.
         if mods.alt || mods.win {
             return Handled::No;
+        }
+        // Esc takes back a warning. A store failure stays, because its cause stays.
+        if vk == 0x1b {
+            if self.warning.as_ref().is_some_and(|w| !w.sticky) {
+                self.warning = None;
+                self.warning_dirty = true;
+                return Handled::Yes;
+            }
+            return Handled::No;
+        }
+        if !forced && self.key_must_wait(vk, mods, ctx) {
+            self.hold(Queued::Event(InputEvent {
+                time_us: 0,
+                kind: InputKind::KeyDown {
+                    virtual_key: vk,
+                    modifiers: mods,
+                    repeat: false,
+                },
+            }));
+            // The caret's line may be off screen, and then nothing would lay it out.
+            self.reveal_caret(ctx);
+            self.schedule(ctx);
+            return Handled::Yes;
         }
         let command = match (vk, mods.ctrl) {
             (0x41, true) => Some(EditorCommand::SelectAll),
@@ -3317,23 +3608,6 @@ impl EditorView {
             return Handled::Yes;
         }
         if matches!(vk, 0x21..=0x28) {
-            if self.row_edge_must_wait(vk, mods, ctx) {
-                let key = InputKind::KeyDown {
-                    virtual_key: vk,
-                    modifiers: mods,
-                    repeat: false,
-                };
-                self.deferred.push_front(InputEvent {
-                    time_us: 0,
-                    kind: key,
-                });
-                self.deferred_since = Instant::now();
-                self.show_caret();
-                // The caret's line may be off screen, and then nothing would lay it out.
-                self.reveal_caret(ctx);
-                self.schedule(ctx);
-                return Handled::Yes;
-            }
             let pages = self.pending_pages;
             self.touch();
             if matches!(vk, 0x21 | 0x22) {
@@ -3415,26 +3689,35 @@ impl EditorView {
     }
     /// One step of drag scrolling. The first runs on the mouse move that leaves the
     /// view, and the timer repeats it with no more mouse moves.
-    fn drag_step(&mut self, ctx: &mut ViewContext) {
+    fn drag_step(&mut self, now: Instant, ctx: &mut ViewContext) {
         if !self.dragging || !self.drag_is_outside() {
             return;
         }
         let Some(at) = self.drag_point else {
             return;
         };
+        if now < self.drag_due {
+            return;
+        }
+        // One step per tick of the clock, however many events arrive. Time that passed
+        // with no event still counts, up to a limit, so a stall causes no great jump.
+        let ticks = now.saturating_duration_since(self.drag_due).as_millis() as f64
+            / f64::from(WORK_TIMER_MS);
+        let steps = (1.0 + ticks.floor()).min(8.0);
+        self.drag_due = now + Duration::from_millis(u64::from(WORK_TIMER_MS));
         let (old_y, old_x) = (self.scroll, self.scroll_x);
         let row = f64::from(self.row_height);
         let top = self.bounds.y.0;
         let bottom = top + self.bounds.height.0;
         if at.y.0 < top {
-            self.scroll = (self.scroll - row).max(0.0);
+            self.scroll = (self.scroll - row * steps).max(0.0);
         } else if at.y.0 >= bottom {
-            self.scroll = (self.scroll + row).min(self.max_scroll());
+            self.scroll = (self.scroll + row * steps).min(self.max_scroll());
         }
         if !self.wrap {
             let left = self.bounds.x.0;
             let right = left + self.bounds.width.0;
-            let step = f64::from(self.cell_width) * 2.0;
+            let step = f64::from(self.cell_width) * 2.0 * steps;
             if at.x.0 < left {
                 self.scroll_x = (self.scroll_x - step).max(0.0);
             } else if at.x.0 >= right {
@@ -3497,6 +3780,7 @@ impl EditorView {
         self.last_click_at = Some(at);
         self.dragging = true;
         self.drag_point = Some(at);
+        self.drag_due = Instant::now();
         ctx.capture_mouse(true);
         ctx.set_cursor(MouseCursor::IBeam);
         let Some((byte, affinity)) = self.hit(at, ctx) else {
@@ -3539,19 +3823,19 @@ impl EditorView {
     /// Input takes its turn behind any key that still waits for layout.
     fn handle_now(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
         if !self.deferred.is_empty() && Self::keeps_order(event) {
-            self.deferred.push_back(event.clone());
-            self.pending = true;
+            self.hold(Queued::Event(event.clone()));
             return Handled::Yes;
         }
-        self.handle_inner(event, ctx)
+        self.handle_inner(event, false, ctx)
     }
-    fn handle_inner(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
+    /// `forced` runs a held key whose wait has ended.
+    fn handle_inner(&mut self, event: &InputEvent, forced: bool, ctx: &mut ViewContext) -> Handled {
         match &event.kind {
             InputKind::KeyDown {
                 virtual_key,
                 modifiers,
                 ..
-            } => self.key(*virtual_key, *modifiers, ctx),
+            } => self.key(*virtual_key, *modifiers, forced, ctx),
             InputKind::Char(c) if !c.is_control() || *c == '\t' => {
                 self.touch();
                 if self.can_edit() {
@@ -3575,7 +3859,7 @@ impl EditorView {
             InputKind::MouseMove { at } if self.dragging => {
                 self.drag_point = Some(*at);
                 if self.drag_is_outside() {
-                    self.drag_step(ctx);
+                    self.drag_step(Instant::now(), ctx);
                 } else {
                     self.drag_select(*at, ctx);
                 }
@@ -3607,6 +3891,8 @@ impl EditorView {
                 self.scroll =
                     (self.scroll - f64::from(*delta_y) * rows * row).clamp(0.0, self.max_scroll());
                 self.reveal_pending = false;
+                self.pending_anchor = None;
+                self.keep_caret_visible = false;
                 ctx.invalidate(self.bounds);
                 self.schedule(ctx);
                 Handled::Yes
@@ -3672,10 +3958,8 @@ impl EditorView {
 impl Drop for EditorView {
     fn drop(&mut self) {
         self.send_away_document(PieceStore::new(""));
+        self.cancel_copy();
         self.shared.closing.store(true, Ordering::Release);
-        if let Some(job) = &self.copy_job {
-            job.cancel.store(true, Ordering::Release);
-        }
     }
 }
 
@@ -3697,6 +3981,12 @@ fn worker_loop(
         let Ok(task) = next else {
             return;
         };
+        while shared.test_paused.load(Ordering::Acquire) {
+            if shared.closing.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         if shared.closing.load(Ordering::Acquire) {
             return;
         }
@@ -3920,6 +4210,16 @@ impl View for EditorView {
             line_top += f64::from(height.0);
         }
         if let Some(warning) = &self.warning {
+            // A warning sits over the first row of text, so it needs its own background.
+            list.push(DrawCommand::FillRect {
+                rect: Rect {
+                    x: self.bounds.x,
+                    y: self.bounds.y,
+                    width: self.bounds.width,
+                    height: Dip(WARNING_STRIP.min(self.bounds.height.0)),
+                },
+                color: theme.text_background,
+            });
             list.push(DrawCommand::TextRun {
                 at: Point {
                     x: Dip(self.bounds.x.0 + 8.0),

@@ -21,6 +21,8 @@ use std::{
 /// Files above this size open read-only, as the plan says.
 pub const EDITABLE_FILE_LIMIT: u64 = 512 * 1024 * 1024;
 const READ_BYTES: u64 = 16 * 1024 * 1024;
+/// A tree of 4 KiB leaves costs about one part in this much more than its text.
+const TREE_COST_DIVISOR: usize = 16;
 
 /// A file that has finished loading.
 pub enum LoadedFile {
@@ -45,6 +47,9 @@ pub struct LoadOptions {
     /// A pause before each read, for tests of cancelling.
     #[doc(hidden)]
     pub test_read_delay: Option<Duration>,
+    /// A lower size limit, so a test can grow a file past it cheaply.
+    #[doc(hidden)]
+    pub test_editable_limit: Option<u64>,
 }
 
 pub struct FileLoad {
@@ -118,6 +123,16 @@ impl FileLoad {
 impl Drop for FileLoad {
     fn drop(&mut self) {
         self.cancel();
+        // A result nobody took can hold a whole file, so another thread frees it. If that
+        // thread cannot start, the closure comes back and it is freed here instead.
+        let (_, empty) = mpsc::channel();
+        let results = std::mem::replace(&mut self.results, empty);
+        let freeing = std::thread::Builder::new()
+            .name("qe-editor-load-free".into())
+            .spawn(move || drop(results));
+        if let Err(e) = freeing {
+            eprintln!("freeing a finished load on this thread, as no thread started: {e}");
+        }
     }
 }
 
@@ -125,20 +140,41 @@ fn describe(path: &Path, error: impl std::fmt::Display) -> String {
     format!("Could not open {}: {error}", path.display())
 }
 
+fn load_read_only(path: &PathBuf, cancel: &AtomicBool, wake: Notify) -> LoadResult {
+    match MappedStore::open_with_notify(path, wake) {
+        Ok(store) if cancel.load(Ordering::Acquire) => {
+            drop(store);
+            LoadResult::Cancelled
+        }
+        Ok(store) => LoadResult::Loaded(LoadedFile::ReadOnly(store)),
+        Err(e) => LoadResult::Failed(describe(path, e)),
+    }
+}
+
+/// `PieceStore::new` copies the text and cannot report a failed allocation, which would
+/// end the app. So this asks for that much first, plus the tree's own cost, and says so
+/// in words if it is not there. Another program could still take the memory between this
+/// and the copy, and only a change in qe-buffer can close that gap.
+pub(crate) fn check_room_for_tree(path: &Path, bytes: usize) -> Result<(), String> {
+    let needed = bytes.saturating_add(bytes / TREE_COST_DIVISOR);
+    let mut probe: Vec<u8> = Vec::new();
+    probe.try_reserve_exact(needed).map_err(|_| {
+        format!(
+            "Could not open {}: there is not enough memory for its {} MiB.",
+            path.display(),
+            bytes >> 20
+        )
+    })
+}
+
 fn load(path: &PathBuf, options: &LoadOptions, cancel: &AtomicBool, wake: Notify) -> LoadResult {
     let size = match std::fs::metadata(path) {
         Ok(meta) => meta.len(),
         Err(e) => return LoadResult::Failed(describe(path, e)),
     };
-    if options.force_read_only || size > EDITABLE_FILE_LIMIT {
-        return match MappedStore::open_with_notify(path, wake) {
-            Ok(store) if cancel.load(Ordering::Acquire) => {
-                drop(store);
-                LoadResult::Cancelled
-            }
-            Ok(store) => LoadResult::Loaded(LoadedFile::ReadOnly(store)),
-            Err(e) => LoadResult::Failed(describe(path, e)),
-        };
+    let limit = options.test_editable_limit.unwrap_or(EDITABLE_FILE_LIMIT);
+    if options.force_read_only || size > limit {
+        return load_read_only(path, cancel, wake);
     }
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -161,6 +197,11 @@ fn load(path: &PathBuf, options: &LoadOptions, cancel: &AtomicBool, wake: Notify
         }
         match file.by_ref().take(READ_BYTES).read_to_end(&mut bytes) {
             Ok(0) => break,
+            // The file grew past the limit, so it must not stay editable.
+            Ok(_) if bytes.len() as u64 > limit => {
+                drop(bytes);
+                return load_read_only(path, cancel, wake);
+            }
             Ok(_) => {}
             Err(e) => return LoadResult::Failed(describe(path, e)),
         }
@@ -181,9 +222,24 @@ fn load(path: &PathBuf, options: &LoadOptions, cancel: &AtomicBool, wake: Notify
     if cancel.load(Ordering::Acquire) {
         return LoadResult::Cancelled;
     }
+    if let Err(message) = check_room_for_tree(path, text.len()) {
+        return LoadResult::Failed(message);
+    }
     let store = PieceStore::new(&text);
     if cancel.load(Ordering::Acquire) {
         return LoadResult::Cancelled;
     }
     LoadResult::Loaded(LoadedFile::Editable { store, ending })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_tree_too_big_for_memory_gives_a_message_and_not_an_abort() {
+        let path = std::path::Path::new("big.txt");
+        let message = super::check_room_for_tree(path, usize::MAX / 2).unwrap_err();
+        assert!(message.contains("not enough memory"), "{message}");
+        assert!(message.contains("big.txt"), "{message}");
+        assert!(super::check_room_for_tree(path, 1024).is_ok());
+    }
 }

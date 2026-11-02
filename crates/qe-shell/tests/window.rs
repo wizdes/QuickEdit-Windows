@@ -1918,5 +1918,9 @@ fn a_waker_reaches_the_owner_from_another_thread() {
     }
     assert!(f.window.take_events().unwrap().contains(&ShellEvent::Wake));
     f.window.destroy().unwrap();
+    assert!(
+        waker.test_target_is_cleared(),
+        "a dead window's number can be reused, so the waker must forget it"
+    );
     assert!(!waker.wake(), "a window that has gone cannot wake");
 }

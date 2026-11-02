@@ -967,3 +967,28 @@ fn full_rows_stay_inside_the_segment_budget() {
     eprintln!("a segment with its rows chosen again: {worst:.3} ms at worst");
     assert!(worst < SEGMENT_LIMIT_MS, "{worst} ms");
 }
+
+/// A cached segment from a plain engine must not answer for a full-row engine, whose
+/// segment edges differ.
+#[test]
+fn the_cache_tells_full_rows_from_plain_rows() {
+    let width = Dip(820.0);
+    let plain = DirectWriteLayout::new().unwrap();
+    let full = plain.with_full_rows_at(width);
+    let store = LongLine::new("x", 100_000);
+    let mut cache = LineCache::new(1 << 24);
+    let first = cache
+        .get_or_layout_segment(&plain, &store, LineIndex(0), 1, width)
+        .unwrap();
+    assert_eq!(first.rows[0].range.start.0, SEGMENT_BYTES);
+    assert!(
+        cache
+            .cached_segment(&full, &store, LineIndex(0), 1, width)
+            .is_none(),
+        "a layout with other edges answered"
+    );
+    let second = cache
+        .get_or_layout_segment(&full, &store, LineIndex(0), 1, width)
+        .unwrap();
+    assert_ne!(second.rows[0].range.start.0, SEGMENT_BYTES);
+}

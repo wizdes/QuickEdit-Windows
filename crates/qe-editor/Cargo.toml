@@ -18,3 +18,4 @@ windows.workspace = true
 qe-render.workspace = true
 qe-shell.workspace = true
 qe-ui.workspace = true
+windows = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_System_Threading"] }

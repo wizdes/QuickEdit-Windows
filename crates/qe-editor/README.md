@@ -48,11 +48,24 @@ The Mac's source does not override these, so they come from what `NSTextView` do
 - A double click on a space selects the run of spaces. A double click on a mark selects that mark.
 - The caret hides while a selection exists.
 
+## Rules added by the fourth review
+
+- **The view keeps its place.** A change of width, wrap or font remembers the byte at the top row and goes back to it when the layouts arrive. If the caret was on screen before, it stays on screen. A minimized window keeps its scroll and lays out nothing.
+- **Commands wait in line.** `run` uses the same queue as keys, so a menu Paste cannot pass a waiting End.
+- **An index that is still running.** Select All and Ctrl+End wait for it, in order. After 2 s they take the known end and show a warning that says how much they cover.
+- **Warnings.** A warning has a background so that it reads over text. The next edit or Esc clears it. Esc does nothing else in this crate.
+- **Dragging.** Drag scrolling follows a clock, one step for each 16 ms, not the number of events.
+- **Word moves.** One key reads at most 4 runs of text, and looks back at most 1 MiB for flags, so its cost has a limit.
+- **The clipboard.** `Clipboard::preparer` lets a big Copy do its slow part on the copy's thread. The UI thread only hands over the finished blocks. A Paste still decodes the text on the UI thread.
+
 ## Running it
 
 - `cargo run -p qe-editor --locked --example editor -- <file>` opens a window. The window appears first, and a thread loads the file.
 - `--timings` prints `input to present` and `first text frame` when the window closes.
 - `--bench-keys N <file>` runs in a hidden window, with no window on screen, and prints the same numbers. Build with `--release` for numbers worth reading.
+- With `--bench-keys`, four options change the keys. `--bench-wrap` wraps long lines. `--bench-middle` puts the keys in the middle of the text. `--bench-no-pause` sends each key without waiting for the last key's frame. `--bench-end-first` sends Ctrl+End and Home first, so that later keys wait behind them. Alone, each of these options refuses to run.
+- A key that waits counts in `input to present`, with its wait. The output says how many keys waited.
+- `first text frame` and `full first screen` print only for a load. An empty window prints only `first frame`. All of them count from the process creation time that Windows gives.
 - `--force-mapped` opens a small file on the read-only path. Files above 512 MiB always take it.
 - `--help` prints the options and opens nothing. An unknown option also opens nothing.
 - `--hidden-smoke <file>` checks that the file's text reaches a frame.
@@ -66,6 +79,7 @@ The Mac's source does not override these, so they come from what `NSTextView` do
 - `QE_EDITOR_DUMP_IMAGES=1` rewrites the saved pictures. Look at them before you commit them.
 - `tests/example_runs.rs` runs the example as a process, always with a hidden flag.
 - `release_budget_key_work_p99_under_2_ms_on_one_megabyte` and `release_budget_key_through_the_renderer_p99_under_2_ms_on_one_megabyte` run only in a release test build.
+- `release_budget_key_work_p99_under_2_ms_on_tabs_shaped_text_and_a_long_line` types in the middle of these kinds of text.
 - `measure_only_t30_timing_big` and `measure_only_t31_poll_frees_whole_history_on_ui` are ignored by default, because they only print.
 
 The example does not decode non-UTF-8 files. Decoding belongs to M14.

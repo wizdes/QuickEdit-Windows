@@ -130,6 +130,90 @@ fn l3_an_empty_document_prints_first_frame_and_not_first_text_frame() {
 }
 
 #[test]
+fn l5_an_empty_window_prints_only_its_first_frame_even_after_typing() {
+    let output = run(&["--bench-keys", "5"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("first frame:"), "{text}");
+    assert!(!text.contains("first text frame"), "{text}");
+    assert!(!text.contains("full first screen"), "{text}");
+    assert!(!text.contains("load start"), "{text}");
+}
+
+#[test]
+fn p9_the_start_label_says_what_it_measures_and_covers_program_loading() {
+    let file = TempFile::new("label.txt", "hello\n");
+    let output = run(&["--hidden-smoke", "--timings", file.path()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("from process creation"), "{text}");
+    assert!(!text.contains("from process start"), "{text}");
+    // Windows made the process before main ran, so that number is the larger one.
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("first text frame"))
+        .unwrap();
+    let numbers: Vec<f64> = line
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert!(numbers[0] > numbers[1], "{line}");
+}
+
+#[test]
+fn s7_keys_that_wait_count_in_input_to_present() {
+    // The last line has no end of line, and Home on its last row needs its layout.
+    let line = "\u{4e2d}\u{6587}\u{5b57}".repeat(200);
+    let file = TempFile::new(
+        "waits.txt",
+        &format!("{}{line}", format!("{line}\n").repeat(500)),
+    );
+    let output = run(&[
+        "--bench-keys",
+        "30",
+        "--bench-wrap",
+        "--bench-no-pause",
+        "--bench-end-first",
+        file.path(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    let waited: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("keys that waited, typing and Backspace, editable file: "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(waited > 0, "{text}");
+    assert!(text.contains("0 still waiting"), "{text}");
+    assert!(text.contains("0 with no frame"), "{text}");
+}
+
+#[test]
+fn bench_keys_can_go_to_the_middle_of_the_text() {
+    let line = "a\tb\tc\td\n";
+    let file = TempFile::new("middle.txt", &line.repeat(100));
+    let output = run(&["--bench-keys", "6", "--bench-middle", file.path()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(text.contains("the keys go to byte 400"), "{text}");
+}
+
+#[test]
+fn bench_options_alone_open_nothing() {
+    for option in [
+        "--bench-wrap",
+        "--bench-middle",
+        "--bench-no-pause",
+        "--bench-end-first",
+    ] {
+        // `--help` keeps this test safe if the refusal ever goes: help opens no window.
+        let output = run(&[option, "--help"]);
+        assert!(!output.status.success(), "{option}");
+        assert!(stderr(&output).contains("needs --bench-keys"), "{option}");
+    }
+}
+
+#[test]
 fn a_failed_load_says_why_and_the_loop_still_ends() {
     let missing = std::env::temp_dir().join(format!("qe-example-{}-none.txt", std::process::id()));
     let output = run(&["--hidden-loop", missing.to_str().unwrap()]);

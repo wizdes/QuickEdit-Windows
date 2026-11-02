@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    SetClipboardData,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -1282,9 +1282,33 @@ impl Drop for OpenedClipboard {
         let _ = unsafe { CloseClipboard() };
     }
 }
+/// Makes room for decoded text, or says in plain words that the memory is not there.
+#[doc(hidden)]
+pub fn reserve_text(bytes: usize) -> Result<String, String> {
+    let mut text = String::new();
+    text.try_reserve_exact(bytes).map_err(|_| {
+        format!(
+            "There is not enough memory to paste this text ({} MiB).",
+            bytes >> 20
+        )
+    })?;
+    Ok(text)
+}
+/// Turns UTF-16 into a String, with one exact allocation that may fail softly. Text
+/// that is not valid UTF-16 is an error, not a silent change to what the user copied.
+#[doc(hidden)]
+pub fn decode_units(units: &[u16]) -> Result<String, String> {
+    let invalid = || "the clipboard text is not valid Unicode, so it was not pasted".to_string();
+    let mut bytes = 0usize;
+    for unit in char::decode_utf16(units.iter().copied()) {
+        bytes += unit.map_err(|_| invalid())?.len_utf8();
+    }
+    let mut text = reserve_text(bytes)?;
+    text.extend(char::decode_utf16(units.iter().copied()).flatten());
+    Ok(text)
+}
 /// Reads text from a memory block, never past the block's own size, whether or not
-/// the text ends in a zero. Text that is not valid UTF-16 is an error, not a silent
-/// change to what the user copied.
+/// the text ends in a zero.
 ///
 /// # Safety
 /// `memory` must be a live global memory block that nothing else writes to meanwhile.
@@ -1299,53 +1323,228 @@ pub unsafe fn read_text_block(memory: HGLOBAL) -> Result<String, String> {
         }
         let block = std::slice::from_raw_parts(pointer, units);
         let end = block.iter().position(|unit| *unit == 0).unwrap_or(units);
-        let text = String::from_utf16(&block[..end])
-            .map_err(|_| "the clipboard text is not valid Unicode, so it was not pasted".into());
+        let text = decode_units(&block[..end]);
         let _ = GlobalUnlock(memory);
         text
     }
 }
+/// Reads the private format: a `u64` count of UTF-16 units, then the units. Zeros are
+/// text here. A block whose count does not fit it is an error, because pasting only a
+/// part of it would lose text with no word to the user.
+///
+/// # Safety
+/// `memory` must be a live global memory block that nothing else writes to meanwhile.
+#[doc(hidden)]
+pub unsafe fn read_full_text_block(memory: HGLOBAL) -> Result<String, String> {
+    const DAMAGED: &str = "the clipboard's full text is damaged, so it was not pasted";
+    // SAFETY: as this function's contract says. The header is read only after the size
+    // check, and the slice length is checked against the block's size.
+    unsafe {
+        let size = GlobalSize(memory);
+        if size < 8 {
+            return Err(DAMAGED.into());
+        }
+        let pointer = GlobalLock(memory) as *const u8;
+        if pointer.is_null() {
+            return Err("could not lock the clipboard text".into());
+        }
+        let count = (pointer as *const u64).read_unaligned();
+        let fits = usize::try_from(count)
+            .ok()
+            .and_then(|units| units.checked_mul(2))
+            .is_some_and(|bytes| bytes <= size - 8);
+        let text = if fits {
+            let units = std::slice::from_raw_parts(pointer.add(8) as *const u16, count as usize);
+            decode_units(units)
+        } else {
+            Err(DAMAGED.into())
+        };
+        let _ = GlobalUnlock(memory);
+        text
+    }
+}
+/// A movable memory block this code still owns.
+struct OwnedBlock(HGLOBAL);
+// SAFETY: a movable global block is a process-wide handle, not tied to a thread. Nothing
+// holds it locked between calls, and this value is its only owner.
+unsafe impl Send for OwnedBlock {}
+impl OwnedBlock {
+    fn allocate(bytes: usize) -> Result<Self, String> {
+        // SAFETY: a plain allocation, and a failure is returned.
+        unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }
+            .map(Self)
+            .map_err(|_| {
+                format!(
+                    "There is not enough memory to copy this text ({} MiB).",
+                    bytes >> 20
+                )
+            })
+    }
+    /// Gives the block to the clipboard. On success Windows owns it.
+    ///
+    /// # Safety
+    /// The clipboard must be open on this thread and already emptied.
+    unsafe fn hand_over(self, format: u32) -> Result<(), String> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: as this function's contract says.
+        match unsafe { SetClipboardData(format, Some(HANDLE(this.0.0))) } {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // SAFETY: Windows refused it, so this code still owns the block.
+                let _ = unsafe { GlobalFree(Some(this.0)) };
+                Err(format!("could not write the clipboard: {error}"))
+            }
+        }
+    }
+}
+impl Drop for OwnedBlock {
+    fn drop(&mut self) {
+        // SAFETY: only an owned block reaches this drop.
+        let _ = unsafe { GlobalFree(Some(self.0)) };
+    }
+}
+/// Text ready for the clipboard. Making it takes time and memory in proportion to the
+/// text and touches no clipboard state, so it can run on any thread. Handing it over
+/// with `SystemClipboard::write_prepared` costs the same for any size of text.
+pub struct PreparedClipboardText {
+    text: OwnedBlock,
+    /// Present only when the text holds a zero, which the normal format stops at.
+    full: Option<OwnedBlock>,
+}
+impl std::fmt::Debug for PreparedClipboardText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedClipboardText")
+            .field("has_full_text", &self.full.is_some())
+            .finish()
+    }
+}
+/// Writes `text` as UTF-16 into a new block. With `count`, the block starts with that
+/// count and has no end zero; without it, the text ends in a zero.
+fn fill_block(block: &OwnedBlock, text: &str, count: Option<u64>) -> Result<(), String> {
+    // SAFETY: `prepare_clipboard_text` sized the block for the header or the end zero,
+    // and one unit for each unit of `text`. Nothing else can reach the block yet.
+    unsafe {
+        let pointer = GlobalLock(block.0) as *mut u8;
+        if pointer.is_null() {
+            return Err("could not lock clipboard memory".into());
+        }
+        let mut to = pointer as *mut u16;
+        if let Some(count) = count {
+            (pointer as *mut u64).write_unaligned(count);
+            to = pointer.add(8) as *mut u16;
+        }
+        for unit in text.encode_utf16() {
+            to.write_unaligned(unit);
+            to = to.add(1);
+        }
+        if count.is_none() {
+            to.write_unaligned(0);
+        }
+        let _ = GlobalUnlock(block.0);
+    }
+    Ok(())
+}
+/// Makes the memory blocks for `text`. Safe to run on any thread.
+pub fn prepare_clipboard_text(text: &str) -> Result<PreparedClipboardText, String> {
+    let units = text.encode_utf16().count();
+    let too_big = || "This text is too large for the clipboard.".to_string();
+    let bytes = units.checked_mul(2).ok_or_else(too_big)?;
+    let block = OwnedBlock::allocate(bytes.checked_add(2).ok_or_else(too_big)?)?;
+    fill_block(&block, text, None)?;
+    let full = if text.as_bytes().contains(&0) {
+        let full = OwnedBlock::allocate(bytes.checked_add(8).ok_or_else(too_big)?)?;
+        fill_block(&full, text, Some(units as u64))?;
+        Some(full)
+    } else {
+        None
+    };
+    Ok(PreparedClipboardText { text: block, full })
+}
+impl PreparedClipboardText {
+    /// Lets a test look at what a write would give the clipboard, with no clipboard.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn test_read(&self) -> (Result<String, String>, Option<Result<String, String>>) {
+        // SAFETY: this value owns both blocks and nothing else writes to them.
+        unsafe {
+            (
+                read_text_block(self.text.0),
+                self.full.as_ref().map(|full| read_full_text_block(full.0)),
+            )
+        }
+    }
+}
+/// The private format that keeps text a zero would cut short.
+fn full_text_format() -> Result<u32, String> {
+    // SAFETY: a plain call with a constant name. It adds a name to a system table and
+    // does not touch what the clipboard holds.
+    match unsafe { RegisterClipboardFormatW(w!("QuickEdit Full Text")) } {
+        0 => Err(format!(
+            "could not name the clipboard's full text format: {}",
+            windows::core::Error::from_thread()
+        )),
+        format => Ok(format),
+    }
+}
+impl SystemClipboard {
+    /// Replaces the clipboard with prepared text. Its cost does not depend on the size
+    /// of the text, apart from up to 40 ms of retries if another program holds the
+    /// clipboard.
+    pub fn write_prepared(&self, prepared: PreparedClipboardText) -> Result<(), String> {
+        let full_format = match prepared.full {
+            Some(_) => Some(full_text_format()?),
+            None => None,
+        };
+        let _open = OpenedClipboard::open()?;
+        // SAFETY: the clipboard is open, and it is emptied before the blocks go in.
+        unsafe {
+            EmptyClipboard().map_err(|e| format!("could not empty the clipboard: {e}"))?;
+            prepared.text.hand_over(u32::from(CF_UNICODETEXT.0))?;
+            if let (Some(full), Some(format)) = (prepared.full, full_format)
+                && let Err(error) = full.hand_over(format)
+            {
+                // Half a write would paste a part of the text with no word to anyone.
+                if let Err(empty) = EmptyClipboard() {
+                    return Err(format!("{error}; could not empty the clipboard: {empty}"));
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
 impl ClipboardAccess for SystemClipboard {
     fn read_text(&self) -> Result<Option<String>, String> {
-        // SAFETY: a plain query.
-        if unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)) }.is_err() {
+        let full_format = full_text_format()?;
+        // SAFETY: plain queries.
+        let (full, plain) = unsafe {
+            (
+                IsClipboardFormatAvailable(full_format).is_ok(),
+                IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)).is_ok(),
+            )
+        };
+        if !full && !plain {
             return Ok(None);
         }
         let _open = OpenedClipboard::open()?;
         // SAFETY: the clipboard is open, so the data stays valid until it closes.
         unsafe {
-            let handle = GetClipboardData(u32::from(CF_UNICODETEXT.0))
+            let format = if full {
+                full_format
+            } else {
+                u32::from(CF_UNICODETEXT.0)
+            };
+            let handle = GetClipboardData(format)
                 .map_err(|e| format!("could not read the clipboard: {e}"))?;
-            read_text_block(HGLOBAL(handle.0)).map(Some)
+            if full {
+                read_full_text_block(HGLOBAL(handle.0)).map(Some)
+            } else {
+                read_text_block(HGLOBAL(handle.0)).map(Some)
+            }
         }
     }
     fn write_text(&self, text: &str) -> Result<(), String> {
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let _open = OpenedClipboard::open()?;
-        // SAFETY: the clipboard is open. The block is large enough for `wide`. After
-        // a successful SetClipboardData, Windows owns the block.
-        unsafe {
-            let memory = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)
-                .map_err(|e| format!("could not allocate clipboard memory: {e}"))?;
-            let pointer = GlobalLock(memory) as *mut u16;
-            if pointer.is_null() {
-                let _ = GlobalFree(Some(memory));
-                return Err("could not lock clipboard memory".into());
-            }
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
-            let _ = GlobalUnlock(memory);
-            if let Err(error) = EmptyClipboard() {
-                let _ = GlobalFree(Some(memory));
-                return Err(format!("could not empty the clipboard: {error}"));
-            }
-            if let Err(error) =
-                SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(memory.0)))
-            {
-                let _ = GlobalFree(Some(memory));
-                return Err(format!("could not write the clipboard: {error}"));
-            }
-        }
-        Ok(())
+        self.write_prepared(prepare_clipboard_text(text)?)
     }
 }
 

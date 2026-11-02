@@ -6,8 +6,8 @@ use qe_api::{
 };
 use qe_buffer::{MappedStore, PieceStore};
 use qe_editor::{
-    Clipboard, EditorView, FileLoad, LoadOptions, LoadResult, LoadedFile, MemoryClipboard,
-    preferred_line_ending_bytes,
+    Clipboard, EditorCommand, EditorView, FileLoad, LoadOptions, LoadResult, LoadedFile,
+    MemoryClipboard, preferred_line_ending_bytes,
 };
 use qe_layout::DirectWriteLayout;
 use qe_render::{BitmapRenderer, TextSettings};
@@ -1579,12 +1579,15 @@ fn drag_scrolling_starts_at_once_and_repeats_with_no_mouse_move() {
             .any(|r| matches!(r, ViewRequest::RequestTimer(t) if *t <= 16)),
         "a timer repeats it: {requests:?}"
     );
+    // The speed follows a clock, so the next step needs its time to pass.
+    std::thread::sleep(Duration::from_millis(20));
     let mut ctx = ViewContext::default();
     e.on_timer(&mut ctx);
     assert!(e.scroll_offset() > first);
     assert!(timers(&ctx.requests) == 1);
     assert!(!e.selection().is_empty());
     let extent = e.selection().end.0;
+    std::thread::sleep(Duration::from_millis(20));
     e.on_timer(&mut ViewContext::default());
     assert!(e.selection().end.0 > extent, "the selection follows");
     assert!(!glyph_rows(&e).is_empty(), "no blank frames");
@@ -3501,6 +3504,718 @@ fn l4_typing_in_a_long_line_keeps_its_rows_and_loses_nothing() {
     }
 }
 
+// ---- Fourth round: P1 to P14, S1 to S8, and what mutations missed ----
+
+fn row_of_font() -> f32 {
+    measure().layout_line_for_test("x", Dip(100.0)).rows[0]
+        .height
+        .0
+}
+fn resize(e: &mut EditorView, width: f32, height: f32) {
+    send(
+        e,
+        InputKind::Resize {
+            width: Dip(width),
+            height: Dip(height),
+        },
+        0,
+    );
+}
+fn assert_caret_shows(e: &EditorView, height: f32, context: &str) {
+    let caret = caret_rect(e).unwrap_or_else(|| panic!("{context}: no caret painted"));
+    assert!(
+        caret.y.0 >= 0.0 && caret.y.0 + caret.height.0 <= height + 0.5,
+        "{context}: {caret:?}"
+    );
+}
+
+#[test]
+fn p1_a_new_width_keeps_the_same_text_at_the_top_of_a_long_line() {
+    let text = "word ".repeat(40_000);
+    let mut e = open(&text, 400.0, 300.0);
+    for _ in 0..20 {
+        wheel(&mut e, -30.0);
+        settle(&mut e);
+    }
+    assert!(e.scroll_offset() > 20_000.0);
+    click(&mut e, 1.0, 1.0, 1_000_000);
+    let top = e.caret().0;
+    resize(&mut e, 401.0, 300.0);
+    settle(&mut e);
+    assert!(e.scroll_offset() > 20_000.0, "scroll {}", e.scroll_offset());
+    click(&mut e, 1.0, 1.0, 9_000_000);
+    let cols = (401.0 / measure().cell_width().0) as usize;
+    assert!(
+        e.caret().0.abs_diff(top) <= cols,
+        "top was byte {top}, is {}",
+        e.caret().0
+    );
+}
+
+#[test]
+fn p1_a_minimize_and_restore_puts_the_view_back_exactly() {
+    for (text, name) in [
+        ("word ".repeat(40_000), "long line"),
+        (wrapped_lines(400), "many lines"),
+    ] {
+        let mut e = open(&text, 400.0, 300.0);
+        wheel(&mut e, -200.0);
+        settle(&mut e);
+        let before = e.scroll_offset();
+        let rows = glyph_rows(&e);
+        assert!(before > 1000.0, "{name}");
+        resize(&mut e, 0.0, 0.0);
+        settle(&mut e);
+        resize(&mut e, 400.0, 300.0);
+        settle(&mut e);
+        assert!(
+            (e.scroll_offset() - before).abs() < 0.01,
+            "{name}: {before} became {}",
+            e.scroll_offset()
+        );
+        assert_eq!(glyph_rows(&e), rows, "{name}");
+    }
+}
+
+#[test]
+fn p1_a_visible_caret_stays_visible_through_width_wrap_and_font() {
+    let text = "word ".repeat(40_000);
+    let mut e = open(&text, 400.0, 300.0);
+    focus(&mut e);
+    press(&mut e, END, true, false);
+    settle(&mut e);
+    assert_caret_shows(&e, 300.0, "at the end");
+    resize(&mut e, 420.0, 300.0);
+    settle(&mut e);
+    assert_caret_shows(&e, 300.0, "wider, on a long line");
+    resize(&mut e, 200.0, 300.0);
+    settle(&mut e);
+    assert_caret_shows(&e, 300.0, "narrower, on a long line");
+    // Narrowing many wrapped lines pushes the caret's line far below the top.
+    let text = wrapped_lines(300);
+    let mut e = open(&text, 800.0, 200.0);
+    focus(&mut e);
+    click(&mut e, 1.0, 150.0, 1_000_000);
+    settle(&mut e);
+    assert_caret_shows(&e, 200.0, "before");
+    resize(&mut e, 100.0, 200.0);
+    settle(&mut e);
+    assert_caret_shows(&e, 200.0, "narrow");
+    let mut ctx = ViewContext::default();
+    e.apply_font("Consolas", 24.0, &mut ctx).unwrap();
+    settle(&mut e);
+    assert_caret_shows(&e, 200.0, "font");
+    let mut ctx = ViewContext::default();
+    e.apply_wrap(false, &mut ctx).unwrap();
+    settle(&mut e);
+    assert_caret_shows(&e, 200.0, "wrap off");
+    // A caret that was off screen does not pull the view.
+    let mut e = open(&text, 800.0, 200.0);
+    focus(&mut e);
+    wheel(&mut e, -60.0);
+    settle(&mut e);
+    click(&mut e, 1.0, 1.0, 1_000_000);
+    let top = e.caret();
+    press(&mut e, HOME, true, false);
+    wheel(&mut e, -60.0);
+    settle(&mut e);
+    resize(&mut e, 810.0, 200.0);
+    settle(&mut e);
+    assert!(e.scroll_offset() > 100.0, "the view went to the caret");
+    assert!(top.0 > 0);
+}
+
+#[test]
+fn p2_a_wrapped_line_with_tabs_goes_to_a_worker() {
+    let text = "a\tbb\tccc\tdddd\t".repeat(100) + "\nsecond";
+    let mut e = open(&text, 400.0, 300.0);
+    let sent = e.layout_tasks_sent();
+    type_char(&mut e, 'q');
+    assert!(
+        e.layout_tasks_sent() > sent,
+        "a key shaped it on the UI thread"
+    );
+    assert!(!glyph_rows(&e).is_empty(), "its old layout still shows");
+    settle(&mut e);
+    assert_eq!(
+        glyph_rows(&e),
+        glyph_rows(&open(&e.text().unwrap(), 400.0, 300.0))
+    );
+    // With wrap off a tab costs no shaping, so it stays on the UI thread.
+    let mut e = with_wrap(&text, false);
+    let sent = e.layout_tasks_sent();
+    type_char(&mut e, 'q');
+    assert_eq!(e.layout_tasks_sent(), sent);
+}
+
+#[test]
+fn p6_adopting_during_a_drag_leaves_the_selection_inside_the_text() {
+    let mut e = open(&"hello world\n".repeat(50), 400.0, 300.0);
+    send(
+        &mut e,
+        InputKind::MouseDown {
+            at: point(60.0, 200.0),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+        },
+        1,
+    );
+    assert!(e.caret().0 > 5);
+    e.adopt(LoadedFile::Editable {
+        store: PieceStore::new("short"),
+        ending: "\n",
+    })
+    .unwrap();
+    send(
+        &mut e,
+        InputKind::MouseMove {
+            at: point(10.0, 5.0),
+        },
+        2,
+    );
+    assert!(e.selection().is_empty(), "{:?}", e.selection());
+    type_char(&mut e, 'q');
+    assert_eq!(e.text().as_deref(), Some("qshort"));
+    assert_eq!(e.warning(), None);
+    // A range past the end comes back inside the text.
+    e.select(ByteOffset(2)..ByteOffset(5000), &mut ViewContext::default());
+    assert_eq!(e.selection().end.0, 6);
+}
+
+#[test]
+fn s1_a_menu_command_does_not_overtake_a_waiting_key() {
+    let line = "\u{4e2d}".repeat(400);
+    let mut ready = open(&line, 300.0, 600.0);
+    let mut waiting = cold(&line, 300.0, 600.0);
+    for e in [&mut ready, &mut waiting] {
+        e.set_clipboard(Box::new(MemoryClipboard("P".into())));
+        key(e, END);
+        let mut ctx = ViewContext::default();
+        e.run(EditorCommand::Paste, &mut ctx);
+        settle(e);
+    }
+    assert_eq!(waiting.text(), ready.text());
+    assert!(waiting.text().unwrap().find('P').unwrap() > 0);
+}
+
+/// A big file, with the wait for its index under the test's control.
+fn mapped_view(name: &str, lines: usize, delay_ms: u64) -> (EditorView, Remove, usize) {
+    let path = temp_path(name);
+    let line = "0123456789 abcdefghijklmnopqrstuvwxyz\n";
+    std::fs::write(&path, line.repeat(lines)).unwrap();
+    let store = MappedStore::open(&path).unwrap();
+    if delay_ms > 0 {
+        store.set_test_read_delay(Duration::from_millis(delay_ms));
+    }
+    let mut e = EditorView::from_mapped(store).unwrap();
+    e.layout(rect(800.0, 170.0), &measure());
+    (e, Remove(path), lines * line.len())
+}
+
+#[test]
+fn p7_select_all_on_a_file_being_indexed_waits_and_gets_the_whole_file() {
+    let (mut e, _remove, size) = mapped_view("sa.txt", 1_000_000, 0);
+    assert!(!e.store_status().complete, "the index must still run");
+    let (clip, _shared) = slot(None);
+    e.set_clipboard(Box::new(clip));
+    ctrl(&mut e, 0x41);
+    press(&mut e, END, true, false);
+    press(&mut e, UP, false, false);
+    settle(&mut e);
+    assert_eq!(e.warning(), None);
+    assert_eq!(e.caret().0, size - 38, "Ctrl+End then Up, in order");
+    let mut e2 = mapped_view("sa2.txt", 1_000_000, 0);
+    ctrl(&mut e2.0, 0x41);
+    settle(&mut e2.0);
+    assert_eq!(e2.0.selection().end.0, e2.2);
+}
+
+#[test]
+fn p7_select_all_past_the_wait_limit_says_it_is_partial() {
+    let (mut e, _remove, size) = mapped_view("slow.txt", 300_000, 40);
+    let mut ctx = ViewContext::default();
+    e.run(EditorCommand::SelectAll, &mut ctx);
+    assert!(e.selection().is_empty(), "it waits");
+    e.on_timer_at(
+        Instant::now() + Duration::from_secs(3),
+        &mut ViewContext::default(),
+    );
+    let end = e.selection().end.0;
+    assert!(end > 0 && end < size, "{end} of {size}");
+    let warning = e.warning().unwrap_or_default().to_string();
+    assert!(warning.contains("first"), "{warning}");
+}
+
+#[test]
+fn p12_a_dropped_page_key_says_so() {
+    let (mut e, _remove, _size) = mapped_view("page.txt", 600_000, 0);
+    let until = Instant::now() + Duration::from_secs(30);
+    while !e.store_status().complete && Instant::now() < until {
+        e.poll_layout(&mut ViewContext::default());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    settle(&mut e);
+    // No layout may arrive before the timer. A page that arrives ends the wait early.
+    e.test_pause_workers(true);
+    let start = 300_000 * 38;
+    e.select(
+        ByteOffset(start)..ByteOffset(start),
+        &mut ViewContext::default(),
+    );
+    key(&mut e, PG_DOWN);
+    assert_eq!(e.caret().0, start, "the page must not be in memory");
+    e.on_timer_at(
+        Instant::now() + Duration::from_secs(6),
+        &mut ViewContext::default(),
+    );
+    let warning = e.warning().unwrap_or_default().to_string();
+    assert!(warning.contains("Page"), "{warning:?}");
+    assert!(!e.pending_layout() || e.warning().is_some());
+    e.test_pause_workers(false);
+}
+
+#[test]
+fn s8_a_file_that_grows_past_the_limit_while_loading_opens_read_only() {
+    let path = temp_path("grows.txt");
+    std::fs::write(&path, "a\n".repeat(1000)).unwrap();
+    let _remove = Remove(path.clone());
+    let options = LoadOptions {
+        test_read_delay: Some(Duration::from_millis(300)),
+        test_editable_limit: Some(64 * 1024),
+        ..Default::default()
+    };
+    let mut load = FileLoad::start(&path, options, quiet()).unwrap();
+    // The size was read first, and it fit. Now the file grows before the read.
+    std::thread::sleep(Duration::from_millis(100));
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&"b\n".repeat(100_000).into_bytes()).unwrap();
+    }
+    let LoadResult::Loaded(file) = wait_for_load(&mut load) else {
+        panic!("the load failed");
+    };
+    assert!(
+        matches!(file, LoadedFile::ReadOnly(_)),
+        "a file past the limit stayed editable"
+    );
+}
+
+#[test]
+fn p8_caret_is_laid_out_once_work_has_settled() {
+    // The review's case: ghosts left on far segments.
+    let text = "word ".repeat(60_000);
+    let mut e = open(&text, 400.0, 300.0);
+    focus(&mut e);
+    for _ in 0..30 {
+        wheel(&mut e, -3.0);
+        settle(&mut e);
+    }
+    for _ in 0..30 {
+        wheel(&mut e, 3.0);
+        settle(&mut e);
+    }
+    type_char(&mut e, 'Q');
+    settle(&mut e);
+    assert!(e.caret_is_laid_out());
+    // Seeded edits on long and short lines, and off-screen carets.
+    for (seed0, wrap, width, long) in [
+        (7_u32, true, 300.0, 20_000),
+        (8, false, 300.0, 20_000),
+        (9, true, 300.0, 20_000),
+        (10, true, 120.0, 0),
+        (11, false, 300.0, 0),
+    ] {
+        let mut e = EditorView::from_text(&"z".repeat(long)).unwrap();
+        e.set_wrap(wrap).unwrap();
+        e.layout(rect(width, 300.0), &measure());
+        settle(&mut e);
+        focus(&mut e);
+        let mut seed = seed0.wrapping_mul(0x9E37_79B9);
+        for step in 0..120 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let pick = (seed >> 16) as usize;
+            match (seed >> 8) % 13 {
+                0..=3 => {
+                    let token = ["a", "\u{65e5}", "\t", "\n", "\u{1F600}", "e\u{301}"][pick % 6];
+                    let range = e.selection();
+                    e.replace_range(range, token, &mut ViewContext::default());
+                }
+                4 => drop(key(&mut e, BACKSPACE)),
+                5 => drop(key(&mut e, LEFT)),
+                6 => drop(key(&mut e, RIGHT)),
+                7 => drop(key(&mut e, UP)),
+                8 => drop(key(&mut e, DOWN)),
+                9 => drop(key(&mut e, HOME)),
+                10 => drop(key(&mut e, END)),
+                11 => wheel(&mut e, -2.0),
+                _ => drop(ctrl(&mut e, 0x5a)),
+            }
+            settle(&mut e);
+            assert!(e.caret_is_laid_out(), "seed {seed0} step {step}");
+        }
+    }
+}
+
+#[test]
+fn p10_s3_word_keys_cost_little_on_a_run_of_marks() {
+    let marks = format!("a{}\n", "\u{301}".repeat(500_000));
+    let mut e = open(&marks, 400.0, 300.0);
+    let started = Instant::now();
+    ctrl(&mut e, RIGHT);
+    let one = started.elapsed();
+    assert!(one < Duration::from_millis(400), "{one:?}");
+    assert!(e.caret().0 > 0);
+    let blank = format!("x{}y\n", " ".repeat(4_000_000));
+    let mut e = EditorView::from_text(&blank).unwrap();
+    let started = Instant::now();
+    ctrl(&mut e, RIGHT);
+    ctrl(&mut e, RIGHT);
+    let two = started.elapsed();
+    assert!(two < Duration::from_millis(800), "{two:?}");
+    assert!(e.caret().0 > 0);
+}
+
+#[test]
+fn p11_blur_frees_waiting_history() {
+    let big = "abcdefghij\n".repeat(400_000);
+    let mut e = open("", 400.0, 400.0);
+    focus(&mut e);
+    e.set_clipboard(Box::new(MemoryClipboard(big)));
+    ctrl(&mut e, 0x56);
+    settle(&mut e);
+    ctrl(&mut e, 0x5a);
+    settle_workers(&mut e);
+    type_char(&mut e, 'x');
+    settle(&mut e);
+    assert!(e.memory_to_release_bytes() > 0);
+    send(&mut e, InputKind::Blur, 0);
+    assert_eq!(e.memory_to_release_bytes(), 0);
+}
+
+#[test]
+fn s4_closing_a_finished_load_frees_it_on_another_thread() {
+    let path = temp_path("unpolled.txt");
+    let body = "abcdefghij\n".repeat(4_000_000);
+    std::fs::write(&path, &body).unwrap();
+    let _remove = Remove(path.clone());
+    let direct = {
+        let store = PieceStore::new(&body);
+        let started = Instant::now();
+        drop(store);
+        started.elapsed()
+    };
+    drop(body);
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        let wake: qe_buffer::Notify = Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let load = FileLoad::start(&path, LoadOptions::default(), wake).unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while !finished.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        drop(load);
+        best = best.min(started.elapsed());
+    }
+    assert!(best * 4 < direct, "{best:?} against {direct:?}");
+}
+
+#[test]
+fn p13_drag_scrolling_follows_the_clock_and_not_the_events() {
+    let mut e = open(&lines(5000), 200.0, 51.0);
+    send(
+        &mut e,
+        InputKind::MouseDown {
+            at: point(1.0, 1.0),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+        },
+        1,
+    );
+    let started = Instant::now();
+    for i in 0..500 {
+        send(
+            &mut e,
+            InputKind::MouseMove {
+                at: point(1.0 + (i % 3) as f32, 200.0),
+            },
+            2,
+        );
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let row = f64::from(row_of_font());
+    let rows = e.scroll_offset() / row;
+    assert!(rows >= 1.0, "scrolling starts at once");
+    assert!(rows <= ms / 16.0 + 2.0, "{rows} rows in {ms} ms, by events");
+    // Timers that fire early do not add rows, and time does.
+    let at = e.scroll_offset();
+    let now = Instant::now() + Duration::from_millis(40);
+    e.on_timer_at(now, &mut ViewContext::default());
+    let after_one = e.scroll_offset();
+    assert!(after_one > at, "time passed, so it moves");
+    for _ in 0..50 {
+        e.on_timer_at(now, &mut ViewContext::default());
+    }
+    assert_eq!(e.scroll_offset(), after_one, "no time passed");
+}
+
+#[test]
+fn p14_a_warning_has_a_background_and_esc_clears_it() {
+    let mut e = open(&lines(20), 400.0, 300.0);
+    e.show_warning("Could not open a.txt");
+    let theme = Theme::new(ThemeKind::Light);
+    let display = list(&e);
+    let text_at = display
+        .commands
+        .iter()
+        .position(|c| matches!(c, DrawCommand::TextRun { .. }))
+        .expect("the warning paints");
+    assert!(
+        matches!(
+            &display.commands[text_at - 1],
+            DrawCommand::FillRect { color, rect } if *color == theme.text_background && rect.height.0 >= 16.0
+        ),
+        "{:?}",
+        display.commands[text_at - 1]
+    );
+    let requests = key(&mut e, 0x1b);
+    assert_eq!(e.warning(), None);
+    assert!(covers(&requests, 10.0));
+    // With no warning, Esc is not this view's key.
+    let mut ctx = ViewContext::default();
+    let answer = e.handle(
+        &InputEvent {
+            time_us: 0,
+            kind: InputKind::KeyDown {
+                virtual_key: 0x1b,
+                modifiers: Modifiers::default(),
+                repeat: false,
+            },
+        },
+        &mut ctx,
+    );
+    assert_eq!(answer, qe_api::Handled::No);
+}
+
+/// An edit that joins a CR to what follows it changes the line before.
+#[test]
+fn mutation_cr_join_keeps_later_heights() {
+    let long = "abcd ".repeat(40);
+    let text = format!("a\rX\n{long}\nz");
+    let mut e = open(&text, 100.0, 800.0);
+    e.select(ByteOffset(2)..ByteOffset(3), &mut ViewContext::default());
+    key(&mut e, DELETE);
+    settle(&mut e);
+    assert_eq!(e.text().unwrap(), format!("a\r\n{long}\nz"));
+    assert_eq!(
+        glyph_rows(&e),
+        glyph_rows(&open(&e.text().unwrap(), 100.0, 800.0))
+    );
+}
+
+/// The join removes the line after the CR, so the height that goes must be that line's.
+/// The workers wait here, so the check sees what the edit itself did to the heights: a
+/// later line's height that goes by mistake would stay wrong until a new layout, and an
+/// off-screen line gets none.
+#[test]
+fn mutation_cr_join_removes_the_height_of_the_joined_line() {
+    let tall = "\u{4e2d} ".repeat(100);
+    let text = format!("top\na\r{tall}\n\u{4e2d}\nz");
+    let mut e = open(&text, 100.0, 800.0);
+    e.test_pause_workers(true);
+    let start = "top\na\r".len();
+    e.select(
+        ByteOffset(start)..ByteOffset(start + tall.len()),
+        &mut ViewContext::default(),
+    );
+    key(&mut e, DELETE);
+    let after = e.text().unwrap();
+    assert_eq!(after, "top\na\r\n\u{4e2d}\nz");
+    let expected = open(&after, 100.0, 800.0).test_total_height();
+    assert_eq!(e.test_total_height(), expected);
+    e.test_pause_workers(false);
+}
+
+/// A word key over a gap far longer than its reads stops at the cap, in both directions.
+#[test]
+fn p10_a_word_key_over_a_huge_gap_stops_at_its_cap() {
+    const LIMIT: usize = 1 << 20;
+    let gap = 4_000_000;
+    let text = format!("x{}y", " ".repeat(gap));
+    let mut e = EditorView::from_text(&text).unwrap();
+    ctrl(&mut e, RIGHT);
+    assert_eq!(e.caret().0, 1, "the end of x");
+    ctrl(&mut e, RIGHT);
+    let moved = e.caret().0 - 1;
+    assert!(moved > 0 && moved < LIMIT, "moved {moved}");
+    let mut e = EditorView::from_text(&text).unwrap();
+    ctrl(&mut e, 0x23);
+    ctrl(&mut e, LEFT);
+    assert_eq!(e.caret().0, gap + 1, "the start of y");
+    ctrl(&mut e, LEFT);
+    let moved = gap + 1 - e.caret().0;
+    assert!(moved > 0 && moved < LIMIT, "moved {moved}");
+}
+
+/// A long line's map that arrives after lines above it moved lands on its new number.
+#[test]
+fn mutation_map_tasks_follow_their_line() {
+    let text = format!("x\n{}\nend\nmore", "w ".repeat(30_000));
+    let mut e = cold(&text, 200.0, 170.0);
+    e.poll_layout(&mut ViewContext::default());
+    key(&mut e, ENTER);
+    settle(&mut e);
+    let fresh = open(&e.text().unwrap(), 200.0, 170.0);
+    assert_eq!(glyph_rows(&e), glyph_rows(&fresh));
+    // The same with the view past the long line, where its height decides what shows.
+    let mut e = cold(&text, 200.0, 170.0);
+    e.poll_layout(&mut ViewContext::default());
+    key(&mut e, ENTER);
+    settle(&mut e);
+    press(&mut e, END, true, false);
+    settle(&mut e);
+    let mut fresh = open(&e.text().unwrap(), 200.0, 170.0);
+    press(&mut fresh, END, true, false);
+    settle(&mut fresh);
+    assert_eq!(glyph_rows(&e), glyph_rows(&fresh));
+}
+
+/// A later change in a group, past the first, is part of what an undo must redraw.
+#[test]
+fn mutation_a_group_going_forward_invalidates_every_changed_line() {
+    let body = lines(30);
+    let mut e = open(&body, 300.0, 800.0);
+    let second = lines(20).len();
+    let mut ctx = ViewContext::default();
+    e.begin_edit_group();
+    e.replace_range(ByteOffset(0)..ByteOffset(4), "LINE", &mut ctx);
+    e.replace_range(ByteOffset(second)..ByteOffset(second + 4), "DONE", &mut ctx);
+    e.end_edit_group();
+    settle(&mut e);
+    let after = e.text().unwrap();
+    assert_eq!(glyph_rows(&e), glyph_rows(&open(&after, 300.0, 800.0)));
+    ctrl(&mut e, 0x5a);
+    settle(&mut e);
+    assert_eq!(e.text().unwrap(), body);
+    assert_eq!(glyph_rows(&e), glyph_rows(&open(&body, 300.0, 800.0)));
+    ctrl(&mut e, 0x59);
+    settle(&mut e);
+    assert_eq!(glyph_rows(&e), glyph_rows(&open(&after, 300.0, 800.0)));
+}
+
+/// The 2 s limit on a waiting Home runs, and what waited behind it then runs.
+#[test]
+fn mutation_a_waiting_home_gives_up_after_its_limit() {
+    let mut e = cold(&"\u{4e2d}".repeat(400), 300.0, 600.0);
+    e.test_pause_workers(true);
+    key(&mut e, END);
+    key(&mut e, RIGHT);
+    assert_eq!(e.queued_input_count(), 2, "both wait");
+    e.poll_layout(&mut ViewContext::default());
+    assert_eq!(e.queued_input_count(), 2, "both still wait");
+    e.on_timer_at(
+        Instant::now() + Duration::from_secs(3),
+        &mut ViewContext::default(),
+    );
+    assert_eq!(e.queued_input_count(), 0, "the key behind it ran");
+    assert_eq!(e.caret().0, 3, "End was dropped, and Right moved one stop");
+    let warning = e.warning().unwrap_or_default().to_string();
+    assert!(warning.contains("Home or End"), "{warning:?}");
+    e.test_pause_workers(false);
+}
+
+/// An old snapshot goes to a worker and is not freed on the UI thread.
+#[test]
+fn mutation_old_snapshots_go_to_a_worker() {
+    let mut e = open("abc", 300.0, 100.0);
+    settle_workers(&mut e);
+    e.test_pause_workers(true);
+    type_char(&mut e, 'x');
+    assert_eq!(e.test_workers_holding_snapshots(), 1);
+    e.test_pause_workers(false);
+    settle_workers(&mut e);
+    assert_eq!(e.test_workers_holding_snapshots(), 0);
+}
+
+/// Cancelling stops the read itself: this file would take 16 s to read.
+#[test]
+fn mutation_cancel_stops_a_read_that_would_take_long() {
+    let path = temp_path("cancel-long.txt");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(256 * 1024 * 1024).unwrap();
+    }
+    let _remove = Remove(path.clone());
+    let options = LoadOptions {
+        test_read_delay: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let load = FileLoad::start(&path, options, quiet()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    load.cancel_and_wait().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// The clipboard's slow part runs on the copy thread, when the clipboard offers that.
+#[test]
+fn p4_a_big_copy_prepares_its_text_off_the_ui_thread() {
+    struct Prepared {
+        ui: std::thread::ThreadId,
+        prepared_on: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+        written: Rc<RefCell<usize>>,
+    }
+    impl Clipboard for Prepared {
+        fn read(&mut self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn write(&mut self, _: &str) -> Result<(), String> {
+            panic!("a big copy must use the prepared path");
+        }
+        fn preparer(&self) -> Option<qe_editor::ClipboardPreparer> {
+            let seen = self.prepared_on.clone();
+            Some(Arc::new(move |text: &str| {
+                *seen.lock().unwrap() = Some(std::thread::current().id());
+                Ok(Box::new(text.len()) as Box<dyn std::any::Any + Send>)
+            }))
+        }
+        fn write_prepared(
+            &mut self,
+            prepared: Box<dyn std::any::Any + Send>,
+        ) -> Result<(), String> {
+            assert_eq!(std::thread::current().id(), self.ui);
+            *self.written.borrow_mut() = *prepared.downcast::<usize>().unwrap();
+            Ok(())
+        }
+    }
+    let text = "abc\n".repeat(1024 * 1024);
+    let mut e = open(&text, 300.0, 100.0);
+    let written = Rc::new(RefCell::new(0));
+    let on = Arc::new(std::sync::Mutex::new(None));
+    e.set_clipboard(Box::new(Prepared {
+        ui: std::thread::current().id(),
+        prepared_on: on.clone(),
+        written: written.clone(),
+    }));
+    ctrl(&mut e, 0x41);
+    ctrl(&mut e, 0x43);
+    settle(&mut e);
+    assert_eq!(*written.borrow(), text.len());
+    assert_ne!(*on.lock().unwrap(), Some(std::thread::current().id()));
+}
+
 // ---- The seeded model ----
 
 /// One caret stop of the model's text.
@@ -3600,6 +4315,84 @@ impl Model {
     }
 }
 
+/// Every visual row of the text, from a plain layout: its bytes and caret stops.
+fn visual_rows(text: &str, wrap: bool, width: f32) -> Vec<qe_api::LayoutRow> {
+    let engine = measure().with_wrap(wrap);
+    let store = PieceStore::new(text);
+    let width = if wrap { Dip(width) } else { Dip(1_000_000.0) };
+    let count = qe_api::TextSnapshot::line_count(&store);
+    (0..count)
+        .flat_map(|line| {
+            engine
+                .try_layout_line(&store, LineIndex(line), width)
+                .unwrap()
+                .rows
+        })
+        .collect()
+}
+fn rows_holding(rows: &[qe_api::LayoutRow], byte: usize) -> Vec<usize> {
+    (0..rows.len())
+        .filter(|i| rows[*i].range.start.0 <= byte && byte <= rows[*i].range.end.0)
+        .collect()
+}
+fn x_of(rows: &[qe_api::LayoutRow], byte: usize) -> f32 {
+    rows_holding(rows, byte)
+        .iter()
+        .filter_map(|i| rows[*i].caret_stops.iter().find(|s| s.byte.0 == byte))
+        .map(|s| s.x.0)
+        .next_back()
+        .unwrap_or(0.0)
+}
+/// One key moves one visual row, to the stop nearest the remembered x, or to an end of
+/// the text from its first or last row.
+fn check_vertical(
+    rows: &[qe_api::LayoutRow],
+    from: usize,
+    to: usize,
+    goal: f32,
+    down: bool,
+    end: usize,
+    context: &str,
+) {
+    let was = rows_holding(rows, from);
+    let is = rows_holding(rows, to);
+    assert!(
+        !was.is_empty() && !is.is_empty(),
+        "{context}: {from} to {to}"
+    );
+    if down && was.contains(&(rows.len() - 1)) && to == end {
+        return;
+    }
+    if !down && was.contains(&0) && to == 0 {
+        return;
+    }
+    let target = is
+        .iter()
+        .find(|n| {
+            was.iter().any(|p| {
+                if down {
+                    *n == &(p + 1)
+                } else {
+                    p == &(**n + 1)
+                }
+            })
+        })
+        .unwrap_or_else(|| panic!("{context}: {from} on rows {was:?} moved to {to} on {is:?}"));
+    let stops = &rows[*target].caret_stops;
+    let best = stops
+        .iter()
+        .map(|s| (s.x.0 - goal).abs())
+        .fold(f32::MAX, f32::min);
+    let got = stops
+        .iter()
+        .find(|s| s.byte.0 == to)
+        .map_or(f32::MAX, |s| (s.x.0 - goal).abs());
+    assert!(
+        got <= best + 0.01,
+        "{context}: x {goal}: landed {got} from it, a stop is {best} from it"
+    );
+}
+
 /// Runs seeded edits against the plain model. With `settled` false the keys arrive
 /// faster than layout, and only some steps wait.
 fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
@@ -3622,6 +4415,7 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
         typing_end: None,
     };
     let (mut undone, mut redone) = (0, 0);
+    let mut goal_x: Option<f32> = None;
     let mut seed = seed0.wrapping_mul(0x9E37_79B9);
     let mut compared = 0;
     for step in 0..steps {
@@ -3629,6 +4423,9 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
         let op = (seed >> 8) % 16;
         let pick = (seed >> 16) as usize;
         let context = format!("seed {seed0} wrap {wrap} settled {settled} step {step} op {op}");
+        if !matches!(op, 12 | 13) {
+            goal_x = None;
+        }
         match op {
             0..=4 => {
                 let token = ["a", " ", "e\u{301}", "日", "😀", "🇺🇸", "👩‍👩‍👧"][pick % 7];
@@ -3705,9 +4502,25 @@ fn run_model(seed0: u32, wrap: bool, settled: bool, steps: usize) -> usize {
                 }
             }
             12 | 13 => {
-                // Vertical moves: the plain model says only that the caret lands on a stop.
-                key(&mut e, if op == 12 { UP } else { DOWN });
+                let down = op == 13;
+                let start = model.range();
+                let from = if start.is_empty() {
+                    model.caret
+                } else if down {
+                    start.end
+                } else {
+                    start.start
+                };
+                let rows = visual_rows(&model.text, wrap, width);
+                let goal = goal_x.unwrap_or_else(|| x_of(&rows, from));
+                key(&mut e, if down { DOWN } else { UP });
                 let caret = e.caret().0;
+                // With keys faster than layout the rule is an estimate, and it promises
+                // only a caret stop, which the checks below hold it to.
+                if settled {
+                    check_vertical(&rows, from, caret, goal, down, model.text.len(), &context);
+                }
+                goal_x = Some(goal);
                 model.moved_to(caret, caret);
             }
             14 => {
@@ -3930,6 +4743,79 @@ fn release_budget_key_work_p99_under_2_ms_on_one_megabyte() {
     }
     eprintln!("key work p99 on 1 MB, best of 3 runs: {best:.3} ms");
     assert!(best < 2.0, "p99 {best:.3} ms");
+}
+
+/// The same budget where keys cost the most: typing in the middle of a wrapped line of
+/// tabs, of a shaped line and of a long line. Tabs on a wrapped line used to shape on the
+/// UI thread, and only this kind of text shows that.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_budget_key_work_p99_under_2_ms_on_tabs_shaped_text_and_a_long_line() {
+    let cases = [
+        ("wrapped tabs", "\tabc\tdef\tghi".repeat(40) + "\n", true),
+        ("unwrapped tabs", "\tabc\tdef\tghi".repeat(40) + "\n", false),
+        (
+            "wrapped shaped",
+            "\u{4e2d}\u{6587} \u{e9}".repeat(60) + "\n",
+            true,
+        ),
+        (
+            "unwrapped shaped",
+            "\u{4e2d}\u{6587} \u{e9}".repeat(60) + "\n",
+            false,
+        ),
+    ];
+    let measure = measure();
+    let theme = Theme::new(ThemeKind::Light);
+    let mut run_case = |name: &str, text: String, wrap: bool| {
+        let mut e = cold(&text, 800.0, 600.0);
+        e.set_wrap(wrap).unwrap();
+        settle(&mut e);
+        focus(&mut e);
+        let middle = text.len() / 2;
+        let middle = (middle..text.len())
+            .find(|n| text.is_char_boundary(*n))
+            .unwrap();
+        e.select(
+            ByteOffset(middle)..ByteOffset(middle),
+            &mut ViewContext::default(),
+        );
+        settle(&mut e);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut samples = Vec::new();
+            for i in 0..400 {
+                let started = Instant::now();
+                if i % 2 == 0 {
+                    type_char(&mut e, 'q');
+                } else {
+                    key(&mut e, BACKSPACE);
+                }
+                let mut list = DisplayList::default();
+                e.draw(&mut list, &theme, &measure);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                e.poll_layout(&mut ViewContext::default());
+            }
+            samples.sort_by(f64::total_cmp);
+            best = best.min(samples[(samples.len() * 99).div_ceil(100) - 1]);
+        }
+        eprintln!("key work p99, {name}, best of 3 runs: {best:.3} ms");
+        assert!(best < 2.0, "{name}: p99 {best:.3} ms");
+    };
+    for (name, line, wrap) in cases {
+        run_case(name, line.repeat(5_000), wrap);
+    }
+    for wrap in [false, true] {
+        run_case(
+            if wrap {
+                "wrapped long line"
+            } else {
+                "unwrapped long line"
+            },
+            "long line ".repeat(1 << 20),
+            wrap,
+        );
+    }
 }
 
 /// A key's work up to the end of the renderer's frame, which is all but the present call:

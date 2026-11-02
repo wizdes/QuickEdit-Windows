@@ -252,6 +252,8 @@ fn drag_outside_view_keeps_scrolling_on_timer() {
         &mut ctx,
     );
     let before = editor.scroll_offset();
+    // The speed follows a clock, so the next step needs its time to pass.
+    std::thread::sleep(std::time::Duration::from_millis(20));
     editor.on_timer(&mut ctx);
     assert!(editor.scroll_offset() > before);
 }

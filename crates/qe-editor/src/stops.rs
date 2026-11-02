@@ -27,7 +27,7 @@ const FLAG_BYTES: usize = 8;
 /// One read for word movement.
 const WORD_READ: usize = 64 * 1024;
 /// Word movement over blank text stops after this many reads.
-const WORD_READS: usize = 16;
+const WORD_READS: usize = 4;
 
 /// A line's edges in bytes.
 #[derive(Clone, Debug)]
@@ -317,7 +317,8 @@ impl<'a> Stops<'a> {
         Ok((self.read(from..at)?, from))
     }
     /// AppKit's move word forward: past any gap, then to the end of the next word,
-    /// across lines. A word longer than one read ends at the read's edge.
+    /// across lines. A word longer than one read ends at the read's edge. A gap longer
+    /// than `WORD_READS` reads stops there, so one key has a bounded cost.
     pub fn word_end_after(&self, at: usize) -> Result<usize, LookupError> {
         let end = self.text.status().known_bytes.0;
         let mut pos = at;
@@ -368,14 +369,15 @@ impl<'a> Stops<'a> {
         if index > 0 && (index == chars.len() || look_back) {
             index -= 1;
         }
-        let class = class_at(&chars, index);
+        let classes = classes_of(&chars);
+        let class = classes[index];
         let mut first = index;
         let mut last = index + 1;
         if class != Class::Other {
-            while first > 0 && class_at(&chars, first - 1) == class {
+            while first > 0 && classes[first - 1] == class {
                 first -= 1;
             }
-            while last < chars.len() && class_at(&chars, last) == class {
+            while last < chars.len() && classes[last] == class {
                 last += 1;
             }
         }
@@ -418,36 +420,39 @@ enum Class {
     Other,
 }
 
-/// A mark takes the class of the character it sits on, so a word does not start inside
-/// an emoji, and an accent on a space belongs to the space.
-fn class_at(chars: &[(usize, char)], i: usize) -> Class {
-    let mut i = i;
-    while i > 0 && is_mark(chars[i].1) {
-        i -= 1;
+/// Each character's class, in one pass, so a long run of marks costs no more than any
+/// other text. A mark takes the class of the character it sits on, so a word does not
+/// start inside an emoji, and an accent on a space belongs to the space.
+fn classes_of(chars: &[(usize, char)]) -> Vec<Class> {
+    let mut classes: Vec<Class> = Vec::with_capacity(chars.len());
+    for i in 0..chars.len() {
+        let c = chars[i].1;
+        let class = if i > 0 && is_mark(c) {
+            classes[i - 1]
+        } else if is_word(c)
+            || (i > 0
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|(_, after)| joins_word(chars[i - 1].1, c, *after)))
+        {
+            Class::Word
+        } else if c == ' ' || c == '\t' || (c.is_whitespace() && !c.is_control()) {
+            Class::Space
+        } else {
+            Class::Other
+        };
+        classes.push(class);
     }
-    let c = chars[i].1;
-    if is_word(c) {
-        return Class::Word;
-    }
-    if i > 0
-        && let Some((_, after)) = chars.get(i + 1)
-        && joins_word(chars[i - 1].1, c, *after)
-    {
-        return Class::Word;
-    }
-    if c == ' ' || c == '\t' || (c.is_whitespace() && !c.is_control()) {
-        return Class::Space;
-    }
-    Class::Other
+    classes
 }
 
-/// The byte where the first word in `text` ends. `None` when no word starts here, or
-/// when it reaches the end of `text`, unless that is a real end the caller handles.
+/// The byte where the first word in `text` ends. `None` when `text` holds no word.
 fn next_word_end(text: &str) -> Option<usize> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let first = (0..chars.len()).find(|i| class_at(&chars, *i) == Class::Word)?;
+    let classes = classes_of(&chars);
+    let first = classes.iter().position(|c| *c == Class::Word)?;
     let last = (first..chars.len())
-        .find(|i| class_at(&chars, *i) != Class::Word)
+        .find(|i| classes[*i] != Class::Word)
         .unwrap_or(chars.len());
     Some(chars.get(last).map_or(text.len(), |(i, _)| *i))
 }
@@ -455,12 +460,11 @@ fn next_word_end(text: &str) -> Option<usize> {
 /// The byte where the last word in `text` starts.
 fn previous_word_start(text: &str) -> Option<usize> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let last = (0..chars.len())
-        .rev()
-        .find(|i| class_at(&chars, *i) == Class::Word)?;
+    let classes = classes_of(&chars);
+    let last = classes.iter().rposition(|c| *c == Class::Word)?;
     let first = (0..=last)
         .rev()
-        .find(|i| class_at(&chars, *i) != Class::Word)
+        .find(|i| classes[*i] != Class::Word)
         .map_or(0, |i| i + 1);
     Some(chars[first].0)
 }

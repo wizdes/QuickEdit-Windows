@@ -523,6 +523,10 @@ pub struct ShellWaker {
     posted: Arc<AtomicBool>,
 }
 impl ShellWaker {
+    #[doc(hidden)]
+    pub fn test_target_is_cleared(&self) -> bool {
+        self.hwnd.load(Ordering::Acquire) == 0
+    }
     /// Returns false when the window has gone, or when Windows refused the message.
     /// A wake that is already on its way covers this one too.
     pub fn wake(&self) -> bool {

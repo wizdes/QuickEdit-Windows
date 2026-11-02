@@ -36,6 +36,8 @@ struct Key {
     tab_width: u32,
     wrap: bool,
     force_shaping: bool,
+    /// Full rows move the edges of a long line's segments.
+    full_row_cells: Option<usize>,
 }
 struct Slot {
     key: Key,
@@ -390,6 +392,7 @@ impl LineCache {
             tab_width: engine.tab_width() as u32,
             wrap,
             force_shaping: engine.forced_shaping(),
+            full_row_cells: engine.full_row_cells(),
         }
     }
     /// Returns the cached layout after making its line and byte offsets current.

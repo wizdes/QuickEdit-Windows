@@ -8,6 +8,9 @@ pub const ICON_FONT: &str = "Segoe Fluent Icons";
 /// The icon font as a measuring token. The number is in points: 9 pt is 12 dips.
 pub const ICON_MEASURE_TOKEN: &str = "Segoe Fluent Icons 9";
 
+/// How strong dim text in use is, measured on real pixels by the picture tests.
+const HINT_ALPHA: u8 = 210;
+
 /// The system colors of a Windows high contrast theme.
 ///
 /// `qe_api::Theme` has no place for system colors yet. `theme` stores them in its
@@ -164,6 +167,14 @@ pub struct UiTokens {
     pub pressed_text: Color,
     pub selected: Color,
     pub selected_text: Color,
+    /// The bar on a selected row or tab. The fill alone is faint, so this carries the
+    /// selection when the control has no focus.
+    pub selected_mark: Color,
+    /// The focus ring where it sits on a selected or hovered fill.
+    pub focus_on_selected: Color,
+    /// Selected characters in a text field.
+    pub text_selection: Color,
+    pub text_selection_text: Color,
     pub border: Color,
     pub popup_border: Color,
     pub accent: Color,
@@ -171,6 +182,12 @@ pub struct UiTokens {
     pub accent_pressed: Color,
     pub on_accent: Color,
     pub disabled: Color,
+    /// Dim text that is still in use: a hint, a placeholder, a shortcut. Thin stems
+    /// never reach full coverage, so translucent text comes out lighter than its color
+    /// says. `theme.dim_text` gives 2.49:1 on white in real pixels. This reaches 4.5:1.
+    pub hint: Color,
+    /// A scroll thumb, which no row's fill lies under.
+    pub thumb: Color,
     pub disabled_fill: Color,
     pub disabled_border: Color,
     pub warning: Color,
@@ -216,16 +233,32 @@ impl UiTokens {
             } else {
                 Color::rgb(250, 250, 250)
             },
-            hover: Color { a: 15, ..ink },
+            hover: Color { a: 26, ..ink },
             hover_text: ink,
-            pressed: Color { a: 28, ..ink },
+            pressed: Color { a: 44, ..ink },
             pressed_text: ink,
             selected: if dark {
-                Color::rgb(51, 76, 102)
+                Color::rgb(61, 94, 128)
             } else {
-                Color::rgb(221, 236, 250)
+                Color::rgb(204, 226, 248)
             },
             selected_text: ink,
+            selected_mark: if dark {
+                Color::rgb(153, 205, 255)
+            } else {
+                Color::rgb(0, 95, 184)
+            },
+            focus_on_selected: if dark {
+                Color::rgb(190, 225, 255)
+            } else {
+                Color::rgb(0, 72, 143)
+            },
+            text_selection: if dark {
+                Color::rgb(70, 120, 175)
+            } else {
+                Color::rgb(96, 148, 208)
+            },
+            text_selection_text: ink,
             // `theme.border` is about 1.7:1 light and 2.0:1 dark. A control's edge
             // needs 3:1, so it uses a stronger mix of the same ink.
             border: Color {
@@ -250,6 +283,11 @@ impl UiTokens {
             },
             on_accent: theme.text_background,
             disabled: theme.dim_text,
+            hint: Color {
+                a: HINT_ALPHA,
+                ..ink
+            },
+            thumb: theme.dim_text,
             disabled_fill: theme.text_background,
             disabled_border: theme.border,
             warning: theme.warning,
@@ -294,6 +332,10 @@ impl UiTokens {
         tokens.pressed_text = p.window;
         tokens.selected = p.highlight;
         tokens.selected_text = p.highlight_text;
+        tokens.selected_mark = p.highlight_text;
+        tokens.focus_on_selected = p.highlight_text;
+        tokens.text_selection = p.highlight;
+        tokens.text_selection_text = p.highlight_text;
         tokens.border = p.window_text;
         tokens.popup_border = p.window_text;
         tokens.accent = p.highlight;
@@ -301,6 +343,8 @@ impl UiTokens {
         tokens.accent_pressed = p.hotlight;
         tokens.on_accent = p.highlight_text;
         tokens.disabled = p.gray_text;
+        tokens.hint = p.gray_text;
+        tokens.thumb = p.window_text;
         tokens.disabled_fill = p.window;
         tokens.disabled_border = p.gray_text;
         tokens.warning = p.hotlight;

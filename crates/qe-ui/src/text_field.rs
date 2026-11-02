@@ -2,11 +2,16 @@ use crate::control::*;
 use crate::controls::{
     clip, contains, focus_ring, node, rect, state, text_line, text_width, unclip,
 };
-use crate::{Control, SharedClipboard, SystemClipboard, UiTokens};
+use crate::{Control, SharedClipboard, SystemClipboard, UiTokens, child_id};
 use qe_api::{
     Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, MouseButton, MouseCursor, Point,
     Rect, TextMeasurer, Theme, View, ViewContext, Widget, WidgetId, WidgetRole,
 };
+const APPS_KEY: u16 = 0x5d;
+const F10: u16 = 0x79;
+/// Two presses this close, in the same place, are a double click.
+const DOUBLE_CLICK_US: u64 = 500_000;
+const DOUBLE_CLICK_SLOP: f32 = 4.0;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
@@ -19,6 +24,14 @@ pub const UNDO_MAX_STEPS: usize = 256;
 pub const UNDO_MAX_BYTES: usize = 256 * 1024;
 const MAX_CARET_STOPS: usize = 512;
 
+/// A run of edits that one undo takes back. As in the Mac field (`NSTextView` with
+/// `allowsUndo`, whose typing coalesces), typed characters form one step until the
+/// caret moves or another kind of edit comes, and so do Backspaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    Typing,
+    Backspace,
+}
 /// One edit, stored as the change and not as a copy of the whole text.
 #[derive(Clone, Debug)]
 struct UndoStep {
@@ -27,6 +40,12 @@ struct UndoStep {
     inserted: String,
     before: (usize, usize),
     after: (usize, usize),
+}
+/// Text for a field of one line. Each line break or tab becomes one space.
+fn one_line(value: &str) -> String {
+    value
+        .replace("\r\n", " ")
+        .replace(['\r', '\n', '\t', '\u{85}', '\u{2028}', '\u{2029}'], " ")
 }
 impl UndoStep {
     fn bytes(&self) -> usize {
@@ -62,6 +81,10 @@ pub struct TextField {
     /// The last clipboard failure, in words.
     pub clipboard_error: Option<String>,
     undo: Vec<UndoStep>,
+    open_run: Option<Run>,
+    activated: bool,
+    last_click: Option<(u64, Point)>,
+    context_menu: Option<Point>,
     redo: Vec<UndoStep>,
     undo_bytes: usize,
     revision: u64,
@@ -87,6 +110,10 @@ impl TextField {
             rejected_input: None,
             clipboard_error: None,
             undo: vec![],
+            open_run: None,
+            activated: false,
+            last_click: None,
+            context_menu: None,
             redo: vec![],
             undo_bytes: 0,
             revision: 0,
@@ -98,6 +125,27 @@ impl TextField {
     pub fn with_clipboard(mut self, clipboard: SharedClipboard) -> Self {
         self.clipboard = clipboard;
         self
+    }
+    /// What is wrong with the last input, in words, or `None`. While there is something
+    /// to say, the field has a warning border and the widget tree has a label with this
+    /// text. The next accepted edit or clipboard success clears it.
+    pub fn error_message(&self) -> Option<String> {
+        if let Some(error) = &self.clipboard_error {
+            return Some(format!("Clipboard: {error}"));
+        }
+        self.rejected_input.as_ref().map(|input| {
+            if input.is_empty() {
+                "That change is not allowed here.".to_owned()
+            } else {
+                format!("\"{input}\" is not allowed here.")
+            }
+        })
+    }
+    /// Where the user asked for a context menu, by right click, the Apps key or
+    /// Shift+F10. Reading clears it. A host shows the menu. `qe_api` has no request for
+    /// this yet, as the report says.
+    pub fn take_context_menu(&mut self) -> Option<Point> {
+        self.context_menu.take()
     }
     /// How far the text is scrolled to the left.
     pub fn scroll_offset(&self) -> f32 {
@@ -148,6 +196,7 @@ impl TextField {
             return false;
         }
         self.rejected_input = None;
+        self.activated = true;
         let after = a + s.len();
         let step = UndoStep {
             at: a,
@@ -163,6 +212,36 @@ impl TextField {
         self.push_undo(step);
         self.redo.clear();
         true
+    }
+    /// Adds this edit to the last step when both belong to one run.
+    fn merge_into_run(&mut self, run: Run, count_before: usize) {
+        let open = self.open_run == Some(run);
+        self.open_run = Some(run);
+        if !open || self.undo.len() != count_before + 1 || count_before == 0 {
+            return;
+        }
+        let Some(new) = self.undo.pop() else { return };
+        let Some(last) = self.undo.last_mut() else {
+            self.undo.push(new);
+            return;
+        };
+        let fits = match run {
+            Run::Typing => last.at + last.inserted.len() == new.at && new.removed.is_empty(),
+            Run::Backspace => new.inserted.is_empty() && new.at + new.removed.len() == last.at,
+        };
+        if !fits {
+            self.undo.push(new);
+            return;
+        }
+        match run {
+            Run::Typing => last.inserted.push_str(&new.inserted),
+            Run::Backspace => {
+                last.removed.insert_str(0, &new.removed);
+                last.at = new.at;
+            }
+        }
+        // The total in `undo_bytes` holds: the same text moved into the last step.
+        last.after = new.after;
     }
     fn replace_selection(&mut self, s: &str) -> bool {
         let (a, b) = self.selected();
@@ -185,6 +264,7 @@ impl TextField {
             .is_some_and(|s| s == expected)
     }
     fn undo_once(&mut self) {
+        self.open_run = None;
         let Some(step) = self.undo.pop() else { return };
         self.undo_bytes -= step.bytes();
         if !self.step_applies(step.at, &step.inserted) {
@@ -196,10 +276,12 @@ impl TextField {
         self.text
             .replace_range(step.at..step.at + step.inserted.len(), &step.removed);
         self.revision += 1;
+        self.activated = true;
         (self.caret, self.anchor) = step.before;
         self.redo.push(step);
     }
     fn redo_once(&mut self) {
+        self.open_run = None;
         let Some(step) = self.redo.pop() else { return };
         if !self.step_applies(step.at, &step.removed) {
             self.redo.clear();
@@ -208,6 +290,7 @@ impl TextField {
         self.text
             .replace_range(step.at..step.at + step.removed.len(), &step.inserted);
         self.revision += 1;
+        self.activated = true;
         (self.caret, self.anchor) = step.after;
         self.push_undo(step);
     }
@@ -267,8 +350,7 @@ impl TextField {
         match self.clipboard.read_text() {
             Ok(Some(value)) => {
                 self.clipboard_error = None;
-                // One line of text: line breaks become spaces.
-                let value = value.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                let value = one_line(&value);
                 if !value.is_empty() {
                     self.replace_selection(&value);
                 }
@@ -281,7 +363,8 @@ impl TextField {
         if let Some((value, _)) = self.composition.take()
             && !value.is_empty()
         {
-            self.replace_selection(&value);
+            self.open_run = None;
+            self.replace_selection(&one_line(&value));
         }
     }
     fn text_origin(&self, t: UiTokens) -> f32 {
@@ -366,6 +449,25 @@ impl TextField {
             _ => self.ends().0,
         }
     }
+    /// The word under a byte, for a double click.
+    fn word_at(&self, at: usize) -> (usize, usize) {
+        for (start, word) in self.text.split_word_bound_indices() {
+            let end = start + word.len();
+            if at >= start && at < end {
+                return (start, end);
+            }
+        }
+        (self.text.len(), self.text.len())
+    }
+    fn is_double_click(&mut self, now_us: u64, at: Point) -> bool {
+        let last = self.last_click.replace((now_us, at));
+        last.is_some_and(|(then, place)| {
+            now_us > then
+                && now_us - then <= DOUBLE_CLICK_US
+                && (place.x.0 - at.x.0).abs() <= DOUBLE_CLICK_SLOP
+                && (place.y.0 - at.y.0).abs() <= DOUBLE_CLICK_SLOP
+        })
+    }
     fn stop_drag(&mut self, c: &mut ViewContext) {
         if self.dragging {
             self.dragging = false;
@@ -401,13 +503,34 @@ impl View for TextField {
             } if contains(self.bounds, *at) => {
                 self.focused = true;
                 c.set_focus(self.id);
-                self.caret = self.hit_test(*at);
+                // A click ends a preview by committing it. Only then may the caret move,
+                // or the preview would land at the new place.
+                self.commit_composition();
+                self.open_run = None;
+                let hit = self.hit_test(*at);
+                if self.is_double_click(e.time_us, *at) {
+                    let (start, end) = self.word_at(hit);
+                    self.anchor = start;
+                    self.caret = end;
+                    c.invalidate(self.bounds);
+                    return Handled::Yes;
+                }
+                self.caret = hit;
                 if !modifiers.shift {
                     self.anchor = self.caret;
                 }
                 self.dragging = true;
                 c.capture_mouse(true);
                 c.invalidate(self.bounds);
+                Handled::Yes
+            }
+            InputKind::MouseUp {
+                at,
+                button: MouseButton::Right,
+                ..
+            } if contains(self.bounds, *at) => {
+                self.context_menu = Some(*at);
+                c.set_focus(self.id);
                 Handled::Yes
             }
             InputKind::MouseMove { at } => {
@@ -432,8 +555,18 @@ impl View for TextField {
                 self.stop_drag(c);
                 Handled::Yes
             }
+            // A preview has the keyboard. Letters reach the input method, not the text.
+            InputKind::Char(_) if self.focused && self.composition.is_some() => Handled::Yes,
             InputKind::Char(ch) if self.focused && !ch.is_control() => {
-                self.replace_selection(&ch.to_string());
+                let count = self.undo.len();
+                let (a, b) = self.selected();
+                if self.replace_selection(&ch.to_string()) {
+                    if a == b {
+                        self.merge_into_run(Run::Typing, count);
+                    } else {
+                        self.open_run = Some(Run::Typing);
+                    }
+                }
                 Handled::Yes
             }
             InputKind::ImeStart if self.focused => {
@@ -448,7 +581,11 @@ impl View for TextField {
             }
             InputKind::ImeEnd { text } if self.focused => {
                 self.composition = None;
-                self.replace_selection(text);
+                // An empty commit is a cancelled preview, which changes nothing.
+                if !text.is_empty() {
+                    self.open_run = None;
+                    self.replace_selection(&one_line(text));
+                }
                 c.invalidate(self.bounds);
                 Handled::Yes
             }
@@ -463,6 +600,24 @@ impl View for TextField {
                 if modifiers.alt {
                     return Handled::No;
                 }
+                // While a preview is open, keys belong to it and leave the text alone. Esc
+                // ends the preview, so that the next Esc reaches the dialog.
+                if self.composition.is_some() {
+                    if *virtual_key == ESCAPE {
+                        self.composition = None;
+                        c.invalidate(self.bounds);
+                    }
+                    return Handled::Yes;
+                }
+                if *virtual_key == APPS_KEY || (*virtual_key == F10 && shift) {
+                    self.context_menu = Some(Point {
+                        x: self.bounds.x,
+                        y: Dip(self.bounds.y.0 + self.bounds.height.0),
+                    });
+                    return Handled::Yes;
+                }
+                let count = self.undo.len();
+                let keep_run = *virtual_key == BACK && !ctrl;
                 let (caret, _) = self.ends();
                 let (a, b) = self.selected();
                 let has_selection = a != b;
@@ -525,6 +680,11 @@ impl View for TextField {
                     (0x59, true, false) | (0x5a, true, true) => self.redo_once(),
                     _ => return Handled::No,
                 }
+                if keep_run && !has_selection {
+                    self.merge_into_run(Run::Backspace, count);
+                } else {
+                    self.open_run = None;
+                }
                 if matches!(*virtual_key, LEFT | RIGHT | HOME | END) && !shift {
                     self.anchor = self.caret;
                 }
@@ -552,10 +712,12 @@ impl View for TextField {
             rect: self.bounds,
             radius: t.radius,
             width: Dip(1.0),
-            color: if self.enabled {
-                t.border
-            } else {
+            color: if !self.enabled {
                 t.disabled_border
+            } else if self.error_message().is_some() {
+                t.warning
+            } else {
+                t.border
             },
         });
         self.rebuild_stops(m, t);
@@ -589,18 +751,20 @@ impl View for TextField {
                 let w = text_width(m, t, &self.text[a..b]);
                 l.push(DrawCommand::FillRect {
                     rect: rect(start + x, line_top, w, metrics.height.0),
-                    color: t.selected,
+                    color: t.text_selection,
                 });
             }
         }
         let empty = shown.is_empty();
-        let ink = if empty || !self.enabled {
+        let ink = if !self.enabled {
             t.disabled
+        } else if empty {
+            t.hint
         } else {
             t.text
         };
         let (a, b) = self.selected();
-        if preview.is_none() && a < b && t.selected_text != t.text && self.enabled {
+        if preview.is_none() && a < b && t.text_selection_text != t.text && self.enabled {
             // A system selection color needs its own text color, so the three parts
             // of the line paint apart.
             let parts = [
@@ -608,7 +772,7 @@ impl View for TextField {
                 (
                     text_width(m, t, &self.text[..a]),
                     &self.text[a..b],
-                    t.selected_text,
+                    t.text_selection_text,
                 ),
                 (text_width(m, t, &self.text[..b]), &self.text[b..], ink),
             ];
@@ -671,6 +835,26 @@ impl View for TextField {
         self.rebuild_stops(m, UiTokens::sizes());
     }
     fn widgets(&self) -> Option<Widget> {
+        // `qe_api::Widget` has no description field yet, as the report says, so the
+        // placeholder and any error are label nodes under the field.
+        let label = |slot: u64, text: &str| {
+            node(
+                child_id(self.id, slot),
+                self.bounds,
+                WidgetRole::Label,
+                text,
+                None,
+                state(true, false, false, false),
+                vec![],
+            )
+        };
+        let mut children = vec![];
+        if self.text.is_empty() && !self.placeholder.is_empty() {
+            children.push(label(0, &self.placeholder));
+        }
+        if let Some(error) = self.error_message() {
+            children.push(label(1, &error));
+        }
         Some(node(
             self.id,
             self.bounds,
@@ -678,7 +862,7 @@ impl View for TextField {
             &self.name,
             Some(self.text.clone()),
             state(self.enabled, self.focused, false, false),
-            vec![],
+            children,
         ))
     }
 }
@@ -694,8 +878,11 @@ impl Control for TextField {
     fn focusable(&self) -> bool {
         self.enabled
     }
-    fn uses_key(&self, virtual_key: u16) -> bool {
-        // Esc belongs to the input method while a preview is open.
-        virtual_key == ESCAPE && self.composition.is_some()
+    fn uses_key(&self, _virtual_key: u16) -> bool {
+        // While a preview is open it takes every key, such as Enter, Esc and Tab.
+        self.composition.is_some()
+    }
+    fn take_activated(&mut self) -> bool {
+        std::mem::take(&mut self.activated)
     }
 }

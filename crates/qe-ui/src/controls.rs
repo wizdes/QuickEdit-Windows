@@ -126,6 +126,111 @@ pub(crate) fn state(enabled: bool, focused: bool, selected: bool, checked: bool)
         ..Default::default()
     }
 }
+/// The focus ring on a selected or hovered fill, in a color that shows against it.
+pub(crate) fn focus_ring_on_fill(list: &mut DisplayList, r: Rect, t: UiTokens) {
+    list.push(DrawCommand::StrokeRect {
+        rect: inset(r, 1.0, 1.0),
+        radius: t.radius,
+        width: t.focus_width,
+        color: t.focus_on_selected,
+    });
+}
+/// The bar at the left of a selected row.
+pub(crate) fn row_mark(list: &mut DisplayList, r: Rect, t: UiTokens) {
+    list.push(DrawCommand::RoundedRect {
+        rect: rect(r.x.0 + 2.0, r.y.0 + 6.0, 3.0, r.height.0 - 12.0),
+        radius: Dip(1.5),
+        color: t.selected_mark,
+    });
+}
+/// How far a list's rows stop short of its right edge, to leave the thumb clear.
+pub(crate) const THUMB_ROOM: f32 = 8.0;
+const THUMB_STRIP: f32 = 12.0;
+
+/// A press on a list's thumb that is still held.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ThumbDrag {
+    pub start_y: f32,
+    pub start_first: usize,
+}
+/// The small scroll thumb of a list. Its strip at the right edge takes its own mouse
+/// presses, so that a press there never reaches the row under it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ListThumb {
+    pub strip: Rect,
+    pub thumb: Rect,
+    pub shown: usize,
+    pub max_first: usize,
+    pub first: usize,
+}
+impl ListThumb {
+    /// `None` when every row fits. `track` is the height the thumb runs along.
+    pub fn new(
+        track: Rect,
+        shown: usize,
+        total: usize,
+        first: usize,
+        max_first: usize,
+        t: UiTokens,
+    ) -> Option<Self> {
+        if shown >= total || total == 0 {
+            return None;
+        }
+        let height = (track.height.0 * shown as f32 / total as f32)
+            .max(t.scrollbar_wide.0 * 2.0)
+            .min(track.height.0);
+        let room = (track.height.0 - height).max(0.0);
+        let part = first as f32 / max_first.max(1) as f32;
+        let right = track.x.0 + track.width.0;
+        Some(Self {
+            strip: rect(right - THUMB_STRIP, track.y.0, THUMB_STRIP, track.height.0),
+            thumb: rect(
+                right - THUMB_STRIP,
+                track.y.0 + room * part.min(1.0),
+                THUMB_STRIP,
+                height,
+            ),
+            shown,
+            max_first,
+            first,
+        })
+    }
+    pub fn paint(&self, l: &mut DisplayList, t: UiTokens, dragging: bool) {
+        let width = if dragging {
+            t.scrollbar_wide.0 / 2.0
+        } else {
+            t.scrollbar_thin.0
+        };
+        l.push(DrawCommand::RoundedRect {
+            rect: rect(
+                self.strip.x.0 + THUMB_STRIP - width - 2.0,
+                self.thumb.y.0,
+                width,
+                self.thumb.height.0,
+            ),
+            radius: Dip(width / 2.0),
+            color: t.thumb,
+        });
+    }
+    /// What a press in the strip does: a drag on the thumb, or a page above or below.
+    pub fn press(&self, y: f32) -> Result<ThumbDrag, usize> {
+        if y >= self.thumb.y.0 && y < self.thumb.y.0 + self.thumb.height.0 {
+            Ok(ThumbDrag {
+                start_y: y,
+                start_first: self.first,
+            })
+        } else if y < self.thumb.y.0 {
+            Err(self.first.saturating_sub(self.shown))
+        } else {
+            Err((self.first + self.shown).min(self.max_first))
+        }
+    }
+    pub fn dragged_to(&self, drag: ThumbDrag, y: f32) -> usize {
+        let room = (self.strip.height.0 - self.thumb.height.0).max(1.0);
+        let rows = (y - drag.start_y) / room * self.max_first as f32;
+        ((drag.start_first as f32 + rows).round().max(0.0) as usize).min(self.max_first)
+    }
+}
 pub(crate) fn focus_ring(list: &mut DisplayList, r: Rect, t: UiTokens) {
     list.push(DrawCommand::StrokeRect {
         rect: inset(r, 1.0, 1.0),
@@ -201,6 +306,9 @@ impl Button {
 }
 impl View for Button {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         match &e.kind {
             InputKind::Focus => {
                 self.focused = true;
@@ -343,7 +451,11 @@ impl View for Button {
             unclip(l);
         }
         if self.focused && self.enabled {
-            focus_ring(l, self.bounds, t);
+            if self.pressed || self.hovered {
+                focus_ring_on_fill(l, self.bounds, t);
+            } else {
+                focus_ring(l, self.bounds, t);
+            }
         }
     }
     fn layout(&mut self, r: Rect, _: &dyn TextMeasurer) {
@@ -370,6 +482,16 @@ impl Control for Button {
     }
     fn take_activated(&mut self) -> bool {
         std::mem::take(&mut self.activated)
+    }
+    fn cancel_press(&mut self, c: &mut ViewContext) {
+        if self.key_down.take().is_some() {
+            self.pressed = false;
+            c.invalidate(self.bounds);
+        }
+    }
+    fn mark_default(&mut self) -> bool {
+        self.is_default = true;
+        true
     }
 }
 
@@ -415,6 +537,9 @@ impl Checkbox {
 }
 impl View for Checkbox {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         match &e.kind {
             InputKind::Focus => {
                 self.focused = true;
@@ -673,7 +798,7 @@ impl View for Label {
         let color = match self.kind {
             LabelKind::Plain => t.text,
             LabelKind::Group => theme.group_header,
-            LabelKind::Hint => theme.dim_text,
+            LabelKind::Hint => t.hint,
             LabelKind::Warning => t.warning,
         };
         clip(l, self.bounds);
@@ -734,18 +859,23 @@ pub struct TabBar {
     pub bounds: Rect,
     pub hovered: Option<usize>,
     pub pressed: Option<usize>,
+    activated: bool,
 }
 impl TabBar {
-    pub fn new(id: WidgetId, tabs: Vec<String>) -> Self {
+    /// `name` is what a screen reader says for the whole list of tabs.
+    pub fn new(id: WidgetId, name: impl Into<String>, tabs: Vec<String>) -> Self {
+        let name = name.into();
+        debug_assert!(!name.is_empty(), "a list of tabs needs a name");
         Self {
             id,
-            name: String::new(),
+            name,
             tabs,
             selected: 0,
             focused: false,
             bounds: Rect::default(),
             hovered: None,
             pressed: None,
+            activated: false,
         }
     }
     pub fn named(mut self, name: impl Into<String>) -> Self {
@@ -765,12 +895,18 @@ impl TabBar {
         (0..self.tabs.len()).find(|i| contains(self.tab_rect(*i), at))
     }
     fn select(&mut self, i: usize, c: &mut ViewContext) {
+        if i != self.selected {
+            self.activated = true;
+        }
         self.selected = i;
         c.invalidate(self.bounds);
     }
 }
 impl View for TabBar {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         let n = self.tabs.len();
         match &e.kind {
             InputKind::Focus => {
@@ -859,6 +995,16 @@ impl View for TabBar {
                     radius: t.radius,
                     color: t.selected,
                 });
+                l.push(DrawCommand::RoundedRect {
+                    rect: rect(
+                        r.x.0 + t.inset.0,
+                        r.y.0 + r.height.0 - 5.0,
+                        r.width.0 - 2.0 * t.inset.0,
+                        3.0,
+                    ),
+                    radius: Dip(1.5),
+                    color: t.selected_mark,
+                });
                 ink = t.selected_text;
             } else if self.pressed == Some(i) {
                 l.push(DrawCommand::RoundedRect {
@@ -879,7 +1025,7 @@ impl View for TabBar {
             text_line(l, m, t, r.x.0 + t.inset.0, r.y.0, r.height.0, s, ink);
             unclip(l);
             if self.focused && i == self.selected {
-                focus_ring(l, r, t)
+                focus_ring_on_fill(l, r, t)
             }
         }
     }
@@ -922,6 +1068,22 @@ impl Control for TabBar {
     fn focusable(&self) -> bool {
         !self.tabs.is_empty()
     }
+    fn take_activated(&mut self) -> bool {
+        std::mem::take(&mut self.activated)
+    }
+    fn switch_tab(&mut self, back: bool, c: &mut ViewContext) -> bool {
+        let n = self.tabs.len();
+        if n == 0 {
+            return false;
+        }
+        let next = if back {
+            (self.selected + n - 1) % n
+        } else {
+            (self.selected + 1) % n
+        };
+        self.select(next, c);
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -949,11 +1111,19 @@ pub struct Table {
     activated: bool,
 }
 impl Table {
-    pub fn new(id: WidgetId, headers: Vec<String>, rows: Vec<TableRow>) -> Self {
+    /// `name` is what a screen reader says for the table.
+    pub fn new(
+        id: WidgetId,
+        name: impl Into<String>,
+        headers: Vec<String>,
+        rows: Vec<TableRow>,
+    ) -> Self {
+        let name = name.into();
+        debug_assert!(!name.is_empty(), "a table needs a name");
         let selected = rows.iter().position(|r| !r.section).unwrap_or(0);
         Self {
             id,
-            name: String::new(),
+            name,
             headers,
             rows,
             bounds: Rect::default(),
@@ -1000,6 +1170,9 @@ impl Table {
     }
     fn select(&mut self, target: usize, down: bool, c: &mut ViewContext) {
         if let Some(i) = self.nearest_selectable(target, down) {
+            if i != self.selected {
+                self.activated = true;
+            }
             self.selected = i;
             let capacity = self.capacity().max(1);
             if i < self.first_visible {
@@ -1014,6 +1187,14 @@ impl Table {
             if i >= self.first_visible + capacity {
                 self.first_visible = i + 1 - capacity;
             }
+            c.invalidate(self.bounds);
+        }
+    }
+    /// Scrolls to the very top, with any section titles there, if the selected row
+    /// still shows. Titles must not push the selection out of a short table.
+    fn show_top(&mut self, c: &mut ViewContext) {
+        if self.selected < self.capacity().max(1) && self.first_visible != 0 {
+            self.first_visible = 0;
             c.invalidate(self.bounds);
         }
     }
@@ -1047,6 +1228,9 @@ impl Table {
 }
 impl View for Table {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         let page = self.capacity().max(1);
         match &e.kind {
             InputKind::Focus => {
@@ -1066,9 +1250,8 @@ impl View for Table {
                             && (0..=i).any(|r| self.selectable(r))
                         {
                             self.select(i, false, c);
-                        } else if self.first_visible > 0 {
-                            self.first_visible = 0;
-                            c.invalidate(self.bounds);
+                        } else {
+                            self.show_top(c);
                         }
                     }
                     DOWN => self.select(self.selected + 1, true, c),
@@ -1076,8 +1259,7 @@ impl View for Table {
                     PAGE_DOWN => self.select(self.selected + page, true, c),
                     HOME => {
                         self.select(0, true, c);
-                        self.first_visible = 0;
-                        c.invalidate(self.bounds);
+                        self.show_top(c);
                     }
                     END => self.select(self.rows.len() - 1, false, c),
                     LEFT => {
@@ -1125,10 +1307,14 @@ impl View for Table {
                 if let Some(i) = hit
                     && self.selectable(i)
                 {
-                    self.selected = i;
-                    if self.headers.len() > 1 {
-                        self.focused_column = usize::from(at.x.0 >= self.column_x(1));
+                    if i != self.selected {
+                        self.activated = true;
                     }
+                    self.selected = i;
+                    self.focused_column = (0..self.headers.len().max(1))
+                        .rev()
+                        .find(|column| at.x.0 >= self.column_x(*column))
+                        .unwrap_or(0);
                 }
                 c.invalidate(self.bounds);
                 Handled::Yes
@@ -1179,6 +1365,9 @@ impl View for Table {
                     color: t.selected,
                 });
             }
+            if selected {
+                row_mark(l, r, t);
+            }
             let ink = if selected { t.selected_text } else { t.text };
             let label_x = r.x.0 + t.inset.0 * (row.indent + 1) as f32;
             let has_detail = !row.detail.is_empty();
@@ -1205,11 +1394,7 @@ impl View for Table {
                     r.y.0,
                     r.height.0,
                     &row.detail,
-                    if selected {
-                        t.selected_text
-                    } else {
-                        t.disabled
-                    },
+                    if selected { t.selected_text } else { t.hint },
                 );
             }
             if selected && self.focused {
@@ -1218,7 +1403,7 @@ impl View for Table {
                 } else {
                     r
                 };
-                focus_ring(l, ring, t);
+                focus_ring_on_fill(l, ring, t);
             }
         }
         if self.focused && !self.selectable(self.selected) {
@@ -1244,12 +1429,8 @@ impl View for Table {
                     let row = &self.rows[i];
                     let row_id = child_id(self.id, i as u64);
                     let row_rect = self.row_rect(i);
-                    let mut states = state(
-                        true,
-                        self.focused && i == self.selected && !row.section,
-                        i == self.selected && !row.section,
-                        false,
-                    );
+                    // Focus is on the cell that Left and Right move between.
+                    let mut states = state(true, false, i == self.selected && !row.section, false);
                     // No field says "section" yet. See the report's qe-api list.
                     states.read_only = row.section;
                     let cells = (0..self.headers.len().max(1))
@@ -1259,12 +1440,8 @@ impl View for Table {
                                 1 => &row.detail,
                                 _ => "",
                             };
-                            let mut cell_state = state(
-                                true,
-                                false,
-                                states.selected && column == self.focused_column,
-                                false,
-                            );
+                            let here = states.selected && column == self.focused_column;
+                            let mut cell_state = state(true, self.focused && here, here, false);
                             cell_state.read_only = row.section;
                             node(
                                 child_id(row_id, column as u64),
@@ -1322,6 +1499,7 @@ pub struct ScrollBar {
     pub focused: bool,
     drag_start: f32,
     offset_start: f32,
+    activated: bool,
 }
 impl ScrollBar {
     pub fn new(id: WidgetId, content: f32, viewport: f32) -> Self {
@@ -1338,6 +1516,7 @@ impl ScrollBar {
             focused: false,
             drag_start: 0.0,
             offset_start: 0.0,
+            activated: false,
         }
     }
     fn max_offset(&self) -> f32 {
@@ -1370,6 +1549,7 @@ impl ScrollBar {
         let next = offset.clamp(0.0, self.max_offset());
         if next != self.offset {
             self.offset = next;
+            self.activated = true;
             c.invalidate(self.bounds);
         }
     }
@@ -1383,6 +1563,9 @@ impl ScrollBar {
 }
 impl View for ScrollBar {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         let t = UiTokens::sizes();
         match &e.kind {
             InputKind::Focus => {
@@ -1506,6 +1689,9 @@ impl Control for ScrollBar {
     fn focusable(&self) -> bool {
         self.max_offset() > 0.0
     }
+    fn take_activated(&mut self) -> bool {
+        std::mem::take(&mut self.activated)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1531,6 +1717,8 @@ pub struct ComboBox {
     typed: String,
     typed_at_us: u64,
     activated: bool,
+    captured: bool,
+    thumb_drag: Option<ThumbDrag>,
 }
 impl ComboBox {
     pub fn new(id: WidgetId, name: impl Into<String>, items: Vec<Option<String>>) -> Self {
@@ -1553,6 +1741,8 @@ impl ComboBox {
             typed: String::new(),
             typed_at_us: 0,
             activated: false,
+            captured: false,
+            thumb_drag: None,
         }
     }
     fn choosable(&self, i: usize) -> bool {
@@ -1639,10 +1829,61 @@ impl ComboBox {
         }
         self.open = false;
         self.hover_row = None;
+        self.end_thumb_drag(c);
     }
-    fn after_move(&mut self, c: &mut ViewContext) {
+    /// Closes the list and puts back the value from before it opened. A value only
+    /// browsed in the list is not a choice.
+    fn cancel_list(&mut self, c: &mut ViewContext) {
+        if self.open {
+            self.selected = self.selected_on_open;
+        }
+        self.close_list(c);
+    }
+    fn end_thumb_drag(&mut self, c: &mut ViewContext) {
+        if self.thumb_drag.take().is_some() {
+            c.capture_mouse(false);
+        }
+    }
+    fn release_press(&mut self, c: &mut ViewContext) {
+        self.pressed = false;
+        if self.captured {
+            self.captured = false;
+            c.capture_mouse(false);
+        }
+    }
+    /// The last first row that still fills the list.
+    fn max_first(&self, popup: Rect, t: UiTokens) -> usize {
+        let view = popup.height.0 - 2.0 * t.inset.0;
+        let mut used = 0.0;
+        let mut first = self.items.len();
+        for i in (0..self.items.len()).rev() {
+            used += self.row_height(i, t);
+            if used > view + 0.5 {
+                break;
+            }
+            first = i;
+        }
+        first.min(self.items.len().saturating_sub(1))
+    }
+    fn list_thumb(&self, t: UiTokens) -> Option<ListThumb> {
+        let popup = self.popup_rect();
+        let track = inset(popup, 0.0, t.inset.0);
+        ListThumb::new(
+            track,
+            self.visible_rows(popup, t).len(),
+            self.items.len(),
+            self.first_visible,
+            self.max_first(popup, t),
+            t,
+        )
+    }
+    /// Runs after any key, letter or wheel move. A closed combo's value changes for
+    /// good at once, so the change is reported here. An open list reports on closing.
+    fn after_move(&mut self, before: usize, c: &mut ViewContext) {
         if self.open {
             self.keep_selected_visible();
+        } else if self.selected != before {
+            self.activated = true;
         }
         self.repaint(c);
     }
@@ -1693,6 +1934,12 @@ impl ComboBox {
         }
     }
     fn row_at(&self, at: Point) -> Option<usize> {
+        if self
+            .list_thumb(UiTokens::sizes())
+            .is_some_and(|thumb| contains(thumb.strip, at))
+        {
+            return None;
+        }
         self.visible_rows(self.popup_rect(), UiTokens::sizes())
             .into_iter()
             .find(|(_, r)| contains(*r, at))
@@ -1763,7 +2010,11 @@ impl ComboBox {
         unclip(l);
         icon(l, m, t, caret, CARET_ICON, ink);
         if self.focused && self.enabled {
-            focus_ring(l, self.bounds, t)
+            if self.pressed || self.hovered {
+                focus_ring_on_fill(l, self.bounds, t);
+            } else {
+                focus_ring(l, self.bounds, t);
+            }
         }
     }
     fn draw_list(&self, l: &mut DisplayList, theme: &Theme, m: &dyn TextMeasurer) {
@@ -1782,10 +2033,15 @@ impl ComboBox {
         });
         clip(l, popup);
         let rows = self.visible_rows(popup, t);
+        let thumb = self.list_thumb(t);
         for (i, r) in &rows {
             match &self.items[*i] {
                 Some(s) => {
-                    let row = inset(*r, 4.0, 0.0);
+                    let mut row = inset(*r, 4.0, 0.0);
+                    if thumb.is_some() {
+                        // The thumb never lies over a highlighted row.
+                        row.width.0 -= THUMB_ROOM;
+                    }
                     let enabled = self.choosable(*i);
                     let mut ink = if enabled { t.text } else { t.disabled };
                     if *i == self.selected {
@@ -1794,6 +2050,7 @@ impl ComboBox {
                             radius: t.radius,
                             color: t.selected,
                         });
+                        row_mark(l, row, t);
                         ink = t.selected_text;
                     } else if self.hover_row == Some(*i) && enabled {
                         l.push(DrawCommand::RoundedRect {
@@ -1803,7 +2060,8 @@ impl ComboBox {
                         });
                         ink = t.hover_text;
                     }
-                    text_line(l, m, t, r.x.0 + t.inset.0, r.y.0, r.height.0, s, ink);
+                    // Past the bar that marks the selected row.
+                    text_line(l, m, t, row.x.0 + t.inset.0, r.y.0, r.height.0, s, ink);
                 }
                 None => {
                     let y = r.y.0 + r.height.0 / 2.0;
@@ -1823,32 +2081,34 @@ impl ComboBox {
             }
         }
         unclip(l);
-        if rows.len() < self.items.len() {
-            let track = popup.height.0 - 2.0 * t.inset.0;
-            let n = self.items.len() as f32;
-            l.push(DrawCommand::RoundedRect {
-                rect: rect(
-                    popup.x.0 + popup.width.0 - t.scrollbar_thin.0 - 2.0,
-                    popup.y.0 + t.inset.0 + track * self.first_visible as f32 / n,
-                    t.scrollbar_thin.0,
-                    track * rows.len() as f32 / n,
-                ),
-                radius: Dip(t.scrollbar_thin.0 / 2.0),
-                color: t.disabled,
-            });
+        if let Some(thumb) = thumb {
+            thumb.paint(l, t, self.thumb_drag.is_some());
         }
     }
 }
 impl View for ComboBox {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
         if matches!(e.kind, InputKind::Blur) {
-            self.close_list(c);
+            self.cancel_list(c);
             self.focused = false;
-            self.pressed = false;
+            self.release_press(c);
             c.invalidate(self.bounds);
             return Handled::Yes;
         }
         if !self.enabled {
+            return Handled::No;
+        }
+        let before = self.selected;
+        // Alt+Up and Alt+Down belong to the list. Every other Alt chord passes on.
+        if alt_chord(&e.kind)
+            && !matches!(
+                e.kind,
+                InputKind::KeyDown {
+                    virtual_key: UP | DOWN,
+                    ..
+                }
+            )
+        {
             return Handled::No;
         }
         match &e.kind {
@@ -1857,28 +2117,51 @@ impl View for ComboBox {
                 c.invalidate(self.bounds);
                 Handled::Yes
             }
-            InputKind::MouseDown {
-                at,
-                button: MouseButton::Left,
-                ..
-            } => {
+            InputKind::MouseDown { at, button, .. } => {
+                let left = *button == MouseButton::Left;
                 if self.open {
-                    if contains(self.popup_rect(), *at) {
-                        if let Some(i) = self.row_at(*at)
-                            && self.choosable(i)
-                        {
-                            self.selected = i;
+                    if !contains(self.popup_rect(), *at) {
+                        // As in native combos, a press elsewhere cancels. Any button
+                        // counts, as it does for menus. A press on the control itself
+                        // is the toggle, which keeps the browsed value.
+                        if left && contains(self.bounds, *at) {
                             self.close_list(c);
+                        } else {
+                            self.cancel_list(c);
                         }
-                    } else {
+                        return Handled::Yes;
+                    }
+                    if !left {
+                        return Handled::Yes;
+                    }
+                    let t = UiTokens::sizes();
+                    if let Some(thumb) = self.list_thumb(t)
+                        && contains(thumb.strip, *at)
+                    {
+                        match thumb.press(at.y.0) {
+                            Ok(drag) => {
+                                self.thumb_drag = Some(drag);
+                                c.capture_mouse(true);
+                            }
+                            Err(first) => self.first_visible = first,
+                        }
+                        c.invalidate(self.popup_rect());
+                        return Handled::Yes;
+                    }
+                    if let Some(i) = self.row_at(*at)
+                        && self.choosable(i)
+                    {
+                        self.selected = i;
                         self.close_list(c);
                     }
                     return Handled::Yes;
                 }
-                if !contains(self.bounds, *at) {
+                if !left || !contains(self.bounds, *at) {
                     return Handled::No;
                 }
                 self.pressed = true;
+                self.captured = true;
+                c.capture_mouse(true);
                 self.focused = true;
                 c.set_focus(self.id);
                 self.open_list(c);
@@ -1887,12 +2170,23 @@ impl View for ComboBox {
             InputKind::MouseUp {
                 button: MouseButton::Left,
                 ..
-            } if self.pressed => {
-                self.pressed = false;
+            } if self.thumb_drag.is_some() || self.pressed => {
+                self.end_thumb_drag(c);
+                self.release_press(c);
                 c.invalidate(self.bounds);
                 Handled::Yes
             }
             InputKind::MouseMove { at } => {
+                if let Some(drag) = self.thumb_drag {
+                    if let Some(thumb) = self.list_thumb(UiTokens::sizes()) {
+                        let first = thumb.dragged_to(drag, at.y.0);
+                        if first != self.first_visible {
+                            self.first_visible = first;
+                            c.invalidate(self.popup_rect());
+                        }
+                    }
+                    return Handled::Yes;
+                }
                 if self.open {
                     let row = self.row_at(*at);
                     if row != self.hover_row {
@@ -1908,14 +2202,15 @@ impl View for ComboBox {
             InputKind::Wheel { at, delta_y, .. } => {
                 if self.open && contains(self.popup_rect(), *at) {
                     let rows = (-scroll_notches(*delta_y) * 3.0).round() as isize;
-                    let max = self.items.len().saturating_sub(1) as isize;
+                    let popup = self.popup_rect();
+                    let max = self.max_first(popup, UiTokens::sizes()) as isize;
                     self.first_visible =
                         (self.first_visible as isize + rows).clamp(0, max) as usize;
-                    c.invalidate(self.popup_rect());
+                    c.invalidate(popup);
                     Handled::Yes
                 } else if self.focused && contains(self.bounds, *at) {
                     self.step(if *delta_y > 0.0 { -1 } else { 1 });
-                    self.after_move(c);
+                    self.after_move(before, c);
                     Handled::Yes
                 } else {
                     Handled::No
@@ -1924,9 +2219,12 @@ impl View for ComboBox {
             InputKind::KeyDown {
                 virtual_key,
                 modifiers,
-                ..
+                repeat,
             } if self.focused => {
                 match *virtual_key {
+                    // A held key must not open and close the list over and over.
+                    ENTER | SPACE | F4 if *repeat => {}
+                    DOWN if modifiers.alt && *repeat => {}
                     DOWN if modifiers.alt => {
                         if self.open {
                             self.close_list(c);
@@ -1944,30 +2242,30 @@ impl View for ComboBox {
                     }
                     DOWN => {
                         self.step(1);
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     UP => {
                         self.step(-1);
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     HOME => {
                         self.jump(0, true);
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     END => {
                         self.jump(self.items.len(), false);
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     PAGE_DOWN => {
                         self.jump(self.selected + UiTokens::sizes().popup_rows, false);
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     PAGE_UP => {
                         self.jump(
                             self.selected.saturating_sub(UiTokens::sizes().popup_rows),
                             true,
                         );
-                        self.after_move(c);
+                        self.after_move(before, c);
                     }
                     ENTER | SPACE => {
                         if self.open {
@@ -1976,10 +2274,7 @@ impl View for ComboBox {
                             self.open_list(c);
                         }
                     }
-                    ESCAPE if self.open => {
-                        self.selected = self.selected_on_open;
-                        self.close_list(c);
-                    }
+                    ESCAPE if self.open => self.cancel_list(c),
                     _ => return Handled::No,
                 }
                 Handled::Yes
@@ -1987,7 +2282,7 @@ impl View for ComboBox {
             InputKind::Char(ch) if self.focused => {
                 if !ch.is_control() && !ch.is_whitespace() {
                     self.type_to_select(*ch, e.time_us);
-                    self.after_move(c);
+                    self.after_move(before, c);
                 }
                 Handled::Yes
             }

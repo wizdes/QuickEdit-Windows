@@ -225,7 +225,7 @@ fn outside_press_dismisses_and_notifies_the_owner() {
         let owner = Owner::new();
         let popup = PopupWindow::create(owner.0, 10, 10, 200, 100).unwrap();
         let hwnd = popup.hwnd();
-        popup.show_for_test();
+        popup.begin_hidden().unwrap();
         assert_eq!(popup.dismissed(), None);
         // A press inside does nothing.
         // SAFETY: a live window on this thread.
@@ -407,4 +407,550 @@ fn real_clipboard_round_trip_when_asked() {
     let board = SystemClipboard;
     board.write_text("héllo 😀").unwrap();
     assert_eq!(board.read_text().unwrap().as_deref(), Some("héllo 😀"));
+}
+
+// Item 3: one popup for each level, on hidden windows, with the real capture path.
+fn capture_holder() -> HWND {
+    // SAFETY: a plain query.
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
+}
+fn caret_view(x: f32, y: f32) -> MenuView {
+    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", caret_menu());
+    view.bounds = qe_api::Rect {
+        x: qe_api::Dip(x),
+        y: qe_api::Dip(y),
+        width: qe_api::Dip(200.0),
+        height: qe_api::Dip(300.0),
+    };
+    view.open_keyboard();
+    view
+}
+fn key(v: u16) -> qe_api::InputEvent {
+    qe_ui::key(v, qe_api::Modifiers::default())
+}
+fn lparam_at(x: i32, y: i32) -> LPARAM {
+    LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize))
+}
+#[test]
+fn a_submenu_window_does_not_close_the_list() {
+    on_thread(|| {
+        use qe_api::View;
+        let owner = Owner::new();
+        let mut view = caret_view(100.0, 100.0);
+        let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
+        windows.sync(&view).unwrap();
+        assert_eq!(windows.levels().len(), 1);
+        let root = windows.levels()[0].hwnd();
+        assert_eq!(capture_holder(), root, "the first window holds the mouse");
+
+        view.handle(&key(0x27), &mut qe_api::ViewContext::default());
+        windows.sync(&view).unwrap();
+        assert_eq!(windows.levels().len(), 2);
+        assert_eq!(
+            windows.dismissed(),
+            None,
+            "a second window must not end the list"
+        );
+        assert_eq!(
+            capture_holder(),
+            root,
+            "the capture stayed on the first window"
+        );
+        assert_eq!(
+            // SAFETY: a plain query.
+            unsafe { GetWindow(windows.levels()[1].hwnd(), GW_OWNER) }.unwrap(),
+            root
+        );
+        // Each window is the size of its level.
+        let child = view.levels()[1];
+        let b = windows.levels()[1].bounds().unwrap();
+        assert_eq!(b.left, child.x.0 as i32);
+        assert_eq!(b.right - b.left, child.width.0 as i32);
+        assert_ne!(b.right - b.left, 520);
+
+        // A third level, then back out one at a time.
+        view.handle(&key(0x1b), &mut qe_api::ViewContext::default());
+        windows.sync(&view).unwrap();
+        assert_eq!(windows.levels().len(), 1);
+        assert_eq!(windows.dismissed(), None);
+        assert_eq!(capture_holder(), root);
+        assert_eq!(view.levels().len(), 1);
+    });
+}
+#[test]
+fn a_press_on_any_level_is_inside_and_elsewhere_ends_them_all() {
+    on_thread(|| {
+        use qe_api::View;
+        let owner = Owner::new();
+        let mut view = caret_view(100.0, 100.0);
+        let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
+        windows.sync(&view).unwrap();
+        view.handle(&key(0x27), &mut qe_api::ViewContext::default());
+        windows.sync(&view).unwrap();
+        let root = windows.levels()[0].hwnd();
+        // A press in the second window, as the first window hears it with the capture.
+        let child = windows.levels()[1].bounds().unwrap();
+        let inside = lparam_at(child.left + 10 - 100, child.top + 10 - 100);
+        // SAFETY: a live window on this thread.
+        unsafe { SendMessageW(root, WM_LBUTTONDOWN, Some(WPARAM(0)), Some(inside)) };
+        assert_eq!(windows.dismissed(), None, "a press on a submenu is inside");
+        assert_eq!(
+            windows.pointer(inside).unwrap().x.0,
+            (child.left + 10) as f32
+        );
+        // SAFETY: a live window on this thread.
+        unsafe {
+            SendMessageW(
+                root,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(lparam_at(-90, -90)),
+            )
+        };
+        assert_eq!(windows.dismissed(), Some(PopupDismissed::OutsideClick));
+        assert_ne!(capture_holder(), root, "the capture is let go");
+        let mut msg = MSG::default();
+        let mut notices = 0;
+        // SAFETY: `msg` is a valid out pointer.
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                Some(owner.0),
+                POPUP_DISMISSED_MESSAGE,
+                POPUP_DISMISSED_MESSAGE,
+                PM_REMOVE,
+            )
+        }
+        .as_bool()
+        {
+            notices += 1;
+        }
+        assert_eq!(notices, 1, "the owner hears once for the whole group");
+    });
+}
+#[test]
+fn something_else_taking_the_mouse_ends_the_group() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let root = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        let level = root.create_level(110, 10, 100, 100).unwrap();
+        root.begin_hidden().unwrap();
+        level.begin_hidden().unwrap();
+        assert_eq!(capture_holder(), root.hwnd());
+        // SAFETY: a live window on this thread.
+        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(owner.0) };
+        assert_eq!(root.dismissed(), Some(PopupDismissed::CaptureLost));
+        assert_eq!(level.dismissed(), Some(PopupDismissed::CaptureLost));
+    });
+}
+#[test]
+fn another_program_becoming_active_ends_the_group() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let other = Owner::new();
+        let root = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        let level = root.create_level(110, 10, 100, 100).unwrap();
+        assert!(!foreground_watch_active());
+        root.begin_hidden().unwrap();
+        assert!(
+            foreground_watch_active(),
+            "the watch is on while a list shows"
+        );
+        foreground_changed_for_test(owner.0);
+        assert_eq!(
+            root.dismissed(),
+            None,
+            "its own owner in front changes nothing"
+        );
+        foreground_changed_for_test(level.hwnd());
+        assert_eq!(root.dismissed(), None, "nor does one of its levels");
+        foreground_changed_for_test(other.0);
+        assert_eq!(root.dismissed(), Some(PopupDismissed::Deactivated));
+        assert!(!foreground_watch_active(), "the watch ends with the list");
+    });
+}
+#[test]
+fn focus_comes_back_when_the_list_goes() {
+    on_thread(|| {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        let owner = Owner::new();
+        let other = Owner::new();
+        // SAFETY: live windows on this thread.
+        unsafe { SetFocus(Some(owner.0)).ok() };
+        // SAFETY: a plain query.
+        assert_eq!(unsafe { GetFocus() }, owner.0, "this thread can hold focus");
+        let root = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        root.begin_hidden().unwrap();
+        // SAFETY: live windows on this thread.
+        unsafe { SetFocus(Some(other.0)).ok() };
+        // SAFETY: a plain query.
+        assert_eq!(unsafe { GetFocus() }, other.0);
+        root.dismiss();
+        // SAFETY: a plain query.
+        assert_eq!(unsafe { GetFocus() }, owner.0);
+    });
+}
+#[test]
+fn destroying_the_first_window_takes_the_levels_safely() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let root = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        let level = root.create_level(110, 10, 100, 100).unwrap();
+        root.begin_hidden().unwrap();
+        let hwnd = level.hwnd();
+        drop(root);
+        assert!(!level.is_alive());
+        assert!(!alive(hwnd));
+        drop(level);
+        assert!(!foreground_watch_active());
+    });
+}
+
+// Item 7
+#[test]
+fn a_handler_may_drop_its_own_popup() {
+    on_thread(|| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let owner = Owner::new();
+        let slot: Rc<RefCell<Option<PopupWindow>>> = Rc::new(RefCell::new(None));
+        let popup = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        let hwnd = popup.hwnd();
+        let inner = slot.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        popup.set_message_handler(Box::new(move |_, msg, _, _| {
+            if msg == WM_USER {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let gone = inner.borrow_mut().take();
+                drop(gone);
+            }
+            None
+        }));
+        *slot.borrow_mut() = Some(popup);
+        // SAFETY: a live window on this thread.
+        unsafe { SendMessageW(hwnd, WM_USER, None, None) };
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!alive(hwnd));
+        assert!(slot.borrow().is_none());
+    });
+}
+#[test]
+fn a_handler_may_drop_its_own_dialog() {
+    on_thread(|| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let slot: Rc<RefCell<Option<DialogWindow>>> = Rc::new(RefCell::new(None));
+        let dialog = DialogWindow::create("Test", 100, 100, false, false).unwrap();
+        let hwnd = dialog.hwnd();
+        let inner = slot.clone();
+        dialog.set_paint_handler(Box::new(move |_, _| {
+            let gone = inner.borrow_mut().take();
+            drop(gone);
+        }));
+        *slot.borrow_mut() = Some(dialog);
+        // SAFETY: a live window on this thread.
+        unsafe { SendMessageW(hwnd, WM_PAINT, None, None) };
+        assert!(!alive(hwnd));
+    });
+}
+#[test]
+fn a_handler_may_replace_itself() {
+    on_thread(|| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let owner = Owner::new();
+        let popup = Rc::new(RefCell::new(None::<PopupWindow>));
+        let made = PopupWindow::create(owner.0, 10, 10, 100, 100).unwrap();
+        let hwnd = made.hwnd();
+        *popup.borrow_mut() = Some(made);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let again = popup.clone();
+        popup
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .set_message_handler(Box::new(move |_, msg, _, _| {
+                if msg == WM_USER {
+                    let count = count.clone();
+                    again
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .set_message_handler(Box::new(move |_, msg, _, _| {
+                            if msg == WM_USER {
+                                count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            None
+                        }));
+                }
+                None
+            }));
+        // SAFETY: a live window on this thread.
+        unsafe {
+            SendMessageW(hwnd, WM_USER, None, None);
+            SendMessageW(hwnd, WM_USER, None, None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the new handler stays");
+        popup.borrow_mut().take();
+    });
+}
+
+// Item 8
+#[test]
+fn a_modal_opened_from_wm_enable_does_not_abort() {
+    on_thread(|| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let owner = DialogWindow::create("Owner", 100, 100, false, false).unwrap();
+        let owner_hwnd = owner.hwnd();
+        let nested = Rc::new(RefCell::new(Vec::<DialogWindow>::new()));
+        let held = nested.clone();
+        owner.set_message_handler(Box::new(move |_, msg, w, _| {
+            if msg == WM_ENABLE && w.0 == 0 && held.borrow().is_empty() {
+                let made = DialogWindow::create_with_owner(
+                    "Nested",
+                    100,
+                    100,
+                    true,
+                    false,
+                    Some(owner_hwnd),
+                )
+                .unwrap();
+                held.borrow_mut().push(made);
+            }
+            None
+        }));
+        let first =
+            DialogWindow::create_with_owner("First", 100, 100, true, false, Some(owner_hwnd))
+                .unwrap();
+        assert_eq!(nested.borrow().len(), 1, "the handler ran");
+        // SAFETY: a plain query.
+        assert!(!unsafe { IsWindowEnabled(owner_hwnd) }.as_bool());
+        drop(first);
+        // SAFETY: a plain query.
+        assert!(
+            !unsafe { IsWindowEnabled(owner_hwnd) }.as_bool(),
+            "one still holds it"
+        );
+        nested.borrow_mut().clear();
+        // SAFETY: a plain query.
+        assert!(unsafe { IsWindowEnabled(owner_hwnd) }.as_bool());
+    });
+}
+#[test]
+fn a_window_opened_from_wm_enable_on_release_does_not_abort() {
+    on_thread(|| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let owner = DialogWindow::create("Owner", 100, 100, false, false).unwrap();
+        let owner_hwnd = owner.hwnd();
+        let dialog =
+            DialogWindow::create_with_owner("First", 100, 100, true, false, Some(owner_hwnd))
+                .unwrap();
+        let nested = Rc::new(RefCell::new(Vec::<DialogWindow>::new()));
+        let held = nested.clone();
+        owner.set_message_handler(Box::new(move |_, msg, w, _| {
+            if msg == WM_ENABLE && w.0 != 0 && held.borrow().is_empty() {
+                let made = DialogWindow::create_with_owner(
+                    "Nested",
+                    100,
+                    100,
+                    true,
+                    false,
+                    Some(owner_hwnd),
+                )
+                .unwrap();
+                held.borrow_mut().push(made);
+            }
+            None
+        }));
+        drop(dialog);
+        assert_eq!(nested.borrow().len(), 1);
+    });
+}
+
+// Item 15
+#[test]
+fn a_dialog_size_is_its_painted_area() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let dialog = DialogWindow::create_with_owner(
+            "Customize Encodings List",
+            ENCODING_PANEL_WIDTH as i32,
+            ENCODING_PANEL_HEIGHT as i32,
+            false,
+            true,
+            Some(owner.0),
+        )
+        .unwrap();
+        assert_eq!(dialog.client_size().unwrap(), (336, 187), "row I39");
+    });
+}
+#[test]
+fn a_dialog_is_centered_on_its_owner() {
+    on_thread(|| {
+        let owner = Owner::new();
+        // SAFETY: a live window on this thread.
+        unsafe {
+            SetWindowPos(
+                owner.0,
+                None,
+                300,
+                200,
+                800,
+                600,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .unwrap();
+        }
+        let dialog =
+            DialogWindow::create_with_owner("Test", 300, 200, false, false, Some(owner.0)).unwrap();
+        let mut b = windows::Win32::Foundation::RECT::default();
+        // SAFETY: `b` is a valid out pointer.
+        unsafe { GetWindowRect(dialog.hwnd(), &mut b).unwrap() };
+        assert!(((b.left + b.right) / 2 - 700).abs() <= 1, "{b:?}");
+        assert!(((b.top + b.bottom) / 2 - 500).abs() <= 1, "{b:?}");
+    });
+}
+#[test]
+fn a_dialog_with_an_owner_off_screen_stays_on_the_work_area() {
+    on_thread(|| {
+        let owner = Owner::new();
+        // SAFETY: a live window on this thread.
+        unsafe {
+            SetWindowPos(
+                owner.0,
+                None,
+                100_000,
+                100_000,
+                100,
+                100,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .unwrap();
+        }
+        let dialog =
+            DialogWindow::create_with_owner("Test", 300, 200, false, false, Some(owner.0)).unwrap();
+        let mut b = windows::Win32::Foundation::RECT::default();
+        // SAFETY: `b` is a valid out pointer.
+        unsafe { GetWindowRect(dialog.hwnd(), &mut b).unwrap() };
+        assert!(b.right < 100_000, "{b:?}");
+    });
+}
+
+// Item 17
+#[test]
+fn file_dialogs_ask_for_real_file_system_items() {
+    on_com_thread(|| {
+        const FORCE_FILE_SYSTEM: u32 = 0x40;
+        let save = FileDialogSetup::save(&FileDialogOptions::default()).unwrap();
+        assert_ne!(save.options().unwrap() & FORCE_FILE_SYSTEM, 0);
+        let open = FileDialogSetup::open(&FileDialogOptions::default()).unwrap();
+        assert_ne!(open.options().unwrap() & FORCE_FILE_SYSTEM, 0);
+    });
+}
+#[test]
+fn the_default_extension_follows_the_txt_checkbox() {
+    on_com_thread(|| {
+        let on = FileDialogOptions {
+            add_txt: Some(true),
+            ..Default::default()
+        };
+        let dialog = FileDialogSetup::save(&on).unwrap();
+        assert!(
+            dialog.default_extension_is_txt(),
+            "starts from the checkbox"
+        );
+        dialog.send_txt_toggle(false).unwrap();
+        assert!(!dialog.default_extension_is_txt(), "the user turned it off");
+        dialog.send_txt_toggle(true).unwrap();
+        assert!(dialog.default_extension_is_txt(), "and on again");
+        drop(dialog);
+
+        let off = FileDialogOptions {
+            add_txt: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !FileDialogSetup::save(&off)
+                .unwrap()
+                .default_extension_is_txt()
+        );
+    });
+}
+#[test]
+fn with_every_row_disabled_the_choice_keeps_its_path_and_says_why() {
+    on_com_thread(|| {
+        let options = FileDialogOptions {
+            encodings: vec![EncodingRow {
+                name: "Windows-1252".into(),
+                enabled: false,
+            }],
+            ..Default::default()
+        };
+        let dialog = FileDialogSetup::save(&options).unwrap();
+        let (row, note) = dialog.checked_encoding();
+        assert_eq!(row, None);
+        assert!(note.is_some());
+    });
+}
+
+// Item 18, with no use of the real clipboard.
+#[test]
+fn the_clipboard_opens_with_a_real_owner_window() {
+    on_thread(|| {
+        let owner = clipboard_owner_window().unwrap();
+        assert!(alive(owner));
+        assert!(!visible(owner));
+        assert_eq!(
+            clipboard_owner_window().unwrap(),
+            owner,
+            "one for each thread"
+        );
+    });
+}
+fn block_of(units: &[u16]) -> windows::Win32::Foundation::HGLOBAL {
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    // SAFETY: the block is large enough for the copy.
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2).unwrap();
+        let pointer = GlobalLock(memory) as *mut u16;
+        std::ptr::copy_nonoverlapping(units.as_ptr(), pointer, units.len());
+        let _ = GlobalUnlock(memory);
+        memory
+    }
+}
+#[test]
+fn clipboard_text_is_read_inside_its_block() {
+    use windows::Win32::Foundation::GlobalFree;
+    let text: Vec<u16> = "abc".encode_utf16().collect();
+    let no_zero = block_of(&text);
+    // SAFETY: a live block that only this thread uses.
+    unsafe {
+        assert_eq!(read_text_block(no_zero).unwrap(), "abc", "no final zero");
+        let _ = GlobalFree(Some(no_zero));
+    }
+    let with_zero = block_of(&[0x61, 0, 0x62]);
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(
+            read_text_block(with_zero).unwrap(),
+            "a",
+            "it stops at the zero"
+        );
+        let _ = GlobalFree(Some(with_zero));
+    }
+}
+#[test]
+fn clipboard_text_that_is_not_unicode_is_reported() {
+    use windows::Win32::Foundation::GlobalFree;
+    let bad = block_of(&[0x61, 0xd800, 0x62, 0]);
+    // SAFETY: a live block that only this thread uses.
+    unsafe {
+        let error = read_text_block(bad).unwrap_err();
+        assert!(error.contains("not valid Unicode"), "{error}");
+        let _ = GlobalFree(Some(bad));
+    }
 }

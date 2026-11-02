@@ -184,6 +184,7 @@ fn controls(theme: &Theme) -> Scene {
     caption(&mut l, theme, "Tabs", 16.0, 306.0);
     let mut tabs = TabBar::new(
         WidgetId(7),
+        "Test",
         vec![
             "New Document".into(),
             "Open and Save".into(),
@@ -206,6 +207,7 @@ fn controls(theme: &Theme) -> Scene {
     };
     let mut table = Table::new(
         WidgetId(8),
+        "Test",
         vec!["Command".into(), "Shortcut".into()],
         vec![
             row("File", "", true),
@@ -275,7 +277,7 @@ fn caret_list(theme: &Theme) -> Scene {
     background(&mut l, t.background, width, height);
     let model = caret_menu();
     let (w, h) = model.preferred_size(&RealMeasure);
-    let mut menu = MenuView::new(WidgetId(20), model.clone()).named("All menus");
+    let mut menu = MenuView::new(WidgetId(20), "Test", model.clone()).named("All menus");
     menu.layout(r(16.0, 16.0, w, h), &RealMeasure);
     menu.open_keyboard();
     menu.handle(&press(0x27), &mut ViewContext::default());
@@ -291,7 +293,7 @@ fn caret_list(theme: &Theme) -> Scene {
     short.items[3].command = Some(CommandId::ShowDocumentMap);
     short.items[3].key_text = "Ctrl+Shift+Alt+M".into();
     short.items[3].label = "A label too long to share a row with its shortcut".into();
-    let mut narrow = MenuView::new(WidgetId(21), short);
+    let mut narrow = MenuView::new(WidgetId(21), "Test", short);
     narrow.layout(r(450.0, 340.0, 250.0, 110.0), &RealMeasure);
     narrow.selected = Some(1);
     narrow.first_visible = 1;

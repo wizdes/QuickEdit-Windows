@@ -325,7 +325,7 @@ fn nested_menu() -> MenuView {
             MenuItem::command("Open", CommandId::Open),
         ],
     };
-    let mut menu = MenuView::new(WidgetId(1), model);
+    let mut menu = MenuView::new(WidgetId(1), "Test", model);
     menu.layout(r(100.0, 100.0, 200.0, 80.0), &Measure);
     menu.open_keyboard();
     menu
@@ -369,6 +369,7 @@ fn disabled_menu_row_does_not_activate_previous() {
     off.enabled = false;
     let mut menu = MenuView::new(
         WidgetId(1),
+        "Test",
         MenuModel {
             items: vec![MenuItem::command("Open", CommandId::Open), off],
         },
@@ -387,6 +388,7 @@ fn disabled_menu_row_does_not_activate_previous() {
 fn release_below_the_rows_runs_nothing() {
     let mut menu = MenuView::new(
         WidgetId(1),
+        "Test",
         MenuModel {
             items: vec![MenuItem::command("Open", CommandId::Open)],
         },
@@ -405,6 +407,7 @@ fn release_below_the_rows_runs_nothing() {
 fn release_needs_a_press_that_began_in_the_menu() {
     let mut menu = MenuView::new(
         WidgetId(1),
+        "Test",
         MenuModel {
             items: vec![MenuItem::command("Open", CommandId::Open)],
         },
@@ -428,7 +431,7 @@ fn release_needs_a_press_that_began_in_the_menu() {
 fn mnemonic_with_case_expansion_does_not_panic() {
     let mut item = MenuItem::command("\u{130}\u{c4}", CommandId::Open);
     item.mnemonic = Some('\u{e4}');
-    let mut menu = MenuView::new(WidgetId(1), MenuModel { items: vec![item] });
+    let mut menu = MenuView::new(WidgetId(1), "Test", MenuModel { items: vec![item] });
     menu.layout(r(0.0, 0.0, 200.0, 60.0), &Measure);
     menu.open_keyboard();
     let list = draw(&menu);
@@ -623,7 +626,7 @@ fn long_menu(n: usize) -> MenuView {
     let items = (0..n)
         .map(|i| MenuItem::command(format!("Item {i}"), CommandId::Open))
         .collect();
-    let mut menu = MenuView::new(WidgetId(1), MenuModel { items });
+    let mut menu = MenuView::new(WidgetId(1), "Test", MenuModel { items });
     menu.layout(r(0.0, 0.0, 200.0, 100.0), &Measure);
     menu.open_keyboard();
     menu
@@ -686,6 +689,7 @@ fn a_label_letter_only_selects_and_a_mnemonic_runs() {
     save.mnemonic = Some('v');
     let mut menu = MenuView::new(
         WidgetId(1),
+        "Test",
         MenuModel {
             items: vec![MenuItem::command("Open", CommandId::Open), save],
         },
@@ -720,7 +724,7 @@ fn long_labels_do_not_overlap_shortcuts() {
     let (w, _) = model.preferred_size(&Measure);
     assert!(w >= 42.0 * 7.0 + 12.0 * 7.0, "{w}");
     // In a menu too narrow for it, the label is clipped before the shortcut.
-    let mut menu = MenuView::new(WidgetId(1), model);
+    let mut menu = MenuView::new(WidgetId(1), "Test", model);
     menu.layout(r(0.0, 0.0, 200.0, 60.0), &Measure);
     let list = draw(&menu);
     let key_x = list
@@ -755,6 +759,7 @@ fn nested_submenu_uses_measured_width() {
     };
     let mut menu = MenuView::new(
         WidgetId(1),
+        "Test",
         MenuModel {
             items: vec![MenuItem::submenu("Mid", mid)],
         },
@@ -848,8 +853,14 @@ fn combo_click_on_a_separator_or_disabled_row_keeps_the_list() {
 fn combo_click_outside_closes() {
     let mut c = combo();
     send(&mut c, &mouse_down(20.0, 20.0));
+    send(&mut c, &press(0x28));
+    assert_eq!(c.selected, 2, "a value browsed in the open list");
     send(&mut c, &mouse_down(500.0, 500.0));
     assert!(!c.open);
+    assert_eq!(
+        c.selected, 0,
+        "an outside click cancels, as native combos do"
+    );
 }
 #[test]
 fn combo_open_row_is_highlighted() {
@@ -1005,7 +1016,12 @@ fn row(label: &str, section: bool) -> TableRow {
 }
 fn table(n: usize, height: f32) -> Table {
     let rows = (0..n).map(|i| row(&format!("Row {i}"), false)).collect();
-    let mut t = Table::new(WidgetId(1), vec!["Command".into(), "Shortcut".into()], rows);
+    let mut t = Table::new(
+        WidgetId(1),
+        "Test",
+        vec!["Command".into(), "Shortcut".into()],
+        rows,
+    );
     t.layout(r(0.0, 0.0, 300.0, height), &Measure);
     t.handle(&ev(InputKind::Focus), &mut ViewContext::default());
     t
@@ -1059,7 +1075,7 @@ fn section_rows_are_not_selectable() {
         row("Edit", true),
         row("Undo", false),
     ];
-    let mut t = Table::new(WidgetId(1), vec!["Command".into()], rows);
+    let mut t = Table::new(WidgetId(1), "Test", vec!["Command".into()], rows);
     t.layout(r(0.0, 0.0, 300.0, 200.0), &Measure);
     t.handle(&ev(InputKind::Focus), &mut ViewContext::default());
     assert_eq!(t.selected, 1, "it starts past the first section");
@@ -1139,7 +1155,7 @@ fn header_columns_line_up_with_cell_columns() {
 // Item 14
 #[test]
 fn focus_changes_repaint_tabs_tables_and_combos() {
-    let mut tabs = TabBar::new(WidgetId(1), vec!["A".into()]);
+    let mut tabs = TabBar::new(WidgetId(1), "Test", vec!["A".into()]);
     tabs.layout(r(0.0, 0.0, 100.0, 30.0), &Measure);
     let mut t = table(3, 100.0);
     let mut c = combo();
@@ -1150,7 +1166,11 @@ fn focus_changes_repaint_tabs_tables_and_combos() {
 }
 #[test]
 fn tab_bar_home_end_hover_and_pressed() {
-    let mut tabs = TabBar::new(WidgetId(1), vec!["A".into(), "B".into(), "C".into()]);
+    let mut tabs = TabBar::new(
+        WidgetId(1),
+        "Test",
+        vec!["A".into(), "B".into(), "C".into()],
+    );
     tabs.layout(r(0.0, 0.0, 300.0, 30.0), &Measure);
     send(&mut tabs, &ev(InputKind::Focus));
     send(&mut tabs, &press(0x23));
@@ -1235,6 +1255,9 @@ fn undo_history_has_a_limit_and_keeps_changes_not_copies() {
     let mut f = field();
     for _ in 0..(UNDO_MAX_STEPS + 100) {
         send(&mut f, &ev(InputKind::Char('a')));
+        // Typing groups into one step until the caret moves.
+        send(&mut f, &press(0x25));
+        send(&mut f, &press(0x27));
     }
     assert_eq!(f.undo_len(), UNDO_MAX_STEPS);
     assert_eq!(
@@ -1619,7 +1642,9 @@ fn a_row_with_a_submenu_says_so_and_holds_the_child() {
 }
 #[test]
 fn no_empty_shortcut_values() {
-    let tree = MenuView::new(WidgetId(1), caret_menu()).widgets().unwrap();
+    let tree = MenuView::new(WidgetId(1), "Test", caret_menu())
+        .widgets()
+        .unwrap();
     assert!(
         all_nodes(&tree)
             .iter()
@@ -1648,8 +1673,13 @@ fn open_combo_has_list_children_with_one_focus() {
 #[test]
 fn table_exposes_headers_cells_row_count_and_sections() {
     let rows = vec![row("File", true), row("New", false)];
-    let mut t =
-        Table::new(WidgetId(1), vec!["Command".into(), "Shortcut".into()], rows).named("Shortcuts");
+    let mut t = Table::new(
+        WidgetId(1),
+        "Test",
+        vec!["Command".into(), "Shortcut".into()],
+        rows,
+    )
+    .named("Shortcuts");
     t.layout(r(0.0, 0.0, 300.0, 200.0), &Measure);
     t.handle(&ev(InputKind::Focus), &mut ViewContext::default());
     let tree = t.widgets().unwrap();
@@ -1665,22 +1695,27 @@ fn table_exposes_headers_cells_row_count_and_sections() {
     assert_eq!(cells[1].value.as_deref(), Some("Ctrl+K"));
     let focused = focused_nodes(&tree);
     assert_eq!(focused.len(), 1);
-    assert_eq!(focused[0].name, "New");
+    assert_eq!(
+        focused[0].role,
+        WidgetRole::Cell,
+        "focus is on the cell now"
+    );
+    assert_eq!(focused[0].value.as_deref(), Some("New"));
 }
 #[test]
 fn no_fixed_names() {
-    let tabs = TabBar::new(WidgetId(1), vec!["A".into()]);
+    let tabs = TabBar::new(WidgetId(1), "Test", vec!["A".into()]);
     assert_ne!(tabs.widgets().unwrap().name, "Settings tabs");
     assert_eq!(tabs.clone().named("Pages").widgets().unwrap().name, "Pages");
-    let t = Table::new(WidgetId(2), vec![], vec![]);
+    let t = Table::new(WidgetId(2), "Test", vec![], vec![]);
     assert_ne!(t.widgets().unwrap().name, "Table");
-    let m = MenuView::new(WidgetId(3), MenuModel::default());
+    let m = MenuView::new(WidgetId(3), "Test", MenuModel::default());
     assert_ne!(m.widgets().unwrap().name, "Menu");
     assert_eq!(m.named("All menus").widgets().unwrap().name, "All menus");
 }
 #[test]
 fn tabs_report_one_focus() {
-    let mut tabs = TabBar::new(WidgetId(1), vec!["A".into(), "B".into()]);
+    let mut tabs = TabBar::new(WidgetId(1), "Test", vec!["A".into(), "B".into()]);
     tabs.handle(&ev(InputKind::Focus), &mut ViewContext::default());
     let tree = tabs.widgets().unwrap();
     let focused = focused_nodes(&tree);
@@ -1692,13 +1727,17 @@ fn child_ids_do_not_collide_across_a_whole_dialog() {
     let mut frame = DialogFrame::new(WidgetId(1), "All");
     frame.bounds = r(0.0, 0.0, 800.0, 800.0);
     let rows: Vec<TableRow> = (0..20).map(|i| row(&format!("Row {i}"), false)).collect();
-    let mut t = Table::new(WidgetId(2), vec!["A".into(), "B".into()], rows);
+    let mut t = Table::new(WidgetId(2), "Test", vec!["A".into(), "B".into()], rows);
     t.bounds = r(0.0, 0.0, 400.0, 600.0);
     frame.add(Box::new(t));
-    let mut tabs = TabBar::new(WidgetId(3), (0..20).map(|i| format!("T{i}")).collect());
+    let mut tabs = TabBar::new(
+        WidgetId(3),
+        "Test",
+        (0..20).map(|i| format!("T{i}")).collect(),
+    );
     tabs.bounds = r(0.0, 600.0, 400.0, 30.0);
     frame.add(Box::new(tabs));
-    let mut menu = MenuView::new(WidgetId(4), caret_menu());
+    let mut menu = MenuView::new(WidgetId(4), "Test", caret_menu());
     menu.bounds = r(400.0, 0.0, 300.0, 400.0);
     menu.open_keyboard();
     send(&mut menu, &press(0x27));
@@ -1846,7 +1885,7 @@ fn moves_away_from_a_control_do_nothing() {
         Box::new(Checkbox::new(WidgetId(2), "x")),
         Box::new(ScrollBar::new(WidgetId(3), 500.0, 100.0)),
         Box::new(ComboBox::new(WidgetId(4), "x", vec![Some("A".into())])),
-        Box::new(TabBar::new(WidgetId(5), vec!["A".into()])),
+        Box::new(TabBar::new(WidgetId(5), "Test", vec!["A".into()])),
         Box::new(TextField::new(WidgetId(6), "x")),
     ];
     for view in &mut views {
@@ -2029,7 +2068,7 @@ fn caret_list_shows_windows_keys() {
 }
 #[test]
 fn caret_list_runs_a_command_by_keyboard_alone() {
-    let mut menu = MenuView::new(WidgetId(1), caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "Test", caret_menu());
     let (w, h) = caret_menu().preferred_size(&Measure);
     menu.layout(r(0.0, 0.0, w, h), &Measure);
     menu.open_keyboard();
@@ -2129,9 +2168,10 @@ fn encoding_panel_works_by_keyboard_alone() {
 fn encoding_panel_list_works_by_mouse_and_wheel() {
     let mut p = panel();
     let b = p.frame.child::<CheckList>(0).unwrap().bounds;
-    send(&mut p, &wheel(20.0, 20.0, -120.0));
+    let (x, y) = (b.x.0 + 20.0, b.y.0 + 20.0);
+    send(&mut p, &wheel(x, y, -120.0));
     assert_eq!(p.frame.child::<CheckList>(0).unwrap().first_visible, 3);
-    send(&mut p, &wheel(20.0, 20.0, 120.0));
+    send(&mut p, &wheel(x, y, 120.0));
     send(&mut p, &mouse_down(b.x.0 + 12.0, b.y.0 + 30.0));
     send(&mut p, &mouse_up(b.x.0 + 12.0, b.y.0 + 30.0));
     assert!(!p.enabled_encodings().contains(&TextEncoding::Utf16));

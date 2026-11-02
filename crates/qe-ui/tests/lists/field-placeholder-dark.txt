@@ -2,5 +2,5 @@ display-list-v4
 round 0.000,0.000,240.000,32.000 4.000 #2b2b2bff
 stroke-rect 0.000,0.000,240.000,32.000 4.000 1.000 #ffffff6e
 push-clip 8.000,2.000,224.000,28.000
-text 8.000,20.500 "Segoe UI" 13.000 #ffffff9e "Line number"
+text 8.000,20.500 "Segoe UI" 13.000 #ffffffd2 "Line number"
 pop-clip

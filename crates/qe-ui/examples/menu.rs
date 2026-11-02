@@ -1,18 +1,16 @@
-//! Manual check of the caret list in a real popup. It needs a visible desktop, so
-//! root runs it, not the test suite.
+//! Manual check of the caret list in real popups. It needs a visible desktop, so root
+//! runs it, not the test suite.
 //!
-//! Every message goes through `TranslateMessage`, so that typed letters reach the
-//! list as `WM_CHAR`. Focus loss arrives at the window procedure, because Windows
-//! sends `WM_KILLFOCUS` directly and it never passes through this loop.
+//! Each open level of the list has its own window, sized to that level, from
+//! `MenuWindows`. The first window holds the mouse. Every message goes through
+//! `TranslateMessage`, so that typed letters reach the list as `WM_CHAR`.
 use qe_api::{
-    Dip, DisplayList, DrawCommand, InputEvent, InputKind, Modifiers, MouseButton, Point, Rect,
-    Renderer, TextMeasurer, TextMetrics, Theme, ThemeKind, View, ViewContext,
+    Dip, DisplayList, InputEvent, InputKind, Modifiers, MouseButton, Rect, Renderer, TextMeasurer,
+    TextMetrics, Theme, ThemeKind, View, ViewContext,
 };
 use qe_render::{BitmapRenderer, TextSettings};
-use qe_ui::{MenuView, POPUP_DISMISSED_MESSAGE, PopupWindow, caret_menu};
-use std::cell::RefCell;
-use std::rc::Rc;
-use windows::Win32::Foundation::{HWND, LRESULT, RECT};
+use qe_ui::{MenuView, MenuWindows, POPUP_DISMISSED_MESSAGE, caret_menu};
+use std::time::Instant;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
@@ -28,9 +26,6 @@ impl TextMeasurer for Measure {
         }
     }
 }
-fn event(kind: InputKind) -> InputEvent {
-    InputEvent { time_us: 0, kind }
-}
 fn modifiers() -> Modifiers {
     // SAFETY: a plain query.
     let down = |key: i32| unsafe { GetKeyState(key) } < 0;
@@ -41,42 +36,29 @@ fn modifiers() -> Modifiers {
         win: false,
     }
 }
-fn point(lparam: isize) -> Point {
-    Point {
-        x: Dip(lparam as i16 as f32),
-        y: Dip((lparam >> 16) as i16 as f32),
-    }
-}
-struct Shared {
-    view: MenuView,
-    renderer: BitmapRenderer,
-    width: i32,
-    height: i32,
-}
-impl Shared {
-    fn repaint(&mut self, hwnd: HWND) -> Result<(), String> {
+/// Paints every open level into its own window.
+fn repaint(view: &MenuView, windows: &MenuWindows) -> Result<(), String> {
+    let theme = Theme::new(ThemeKind::Light);
+    let rects = view.levels();
+    for (depth, window) in windows.levels().iter().enumerate() {
+        let Some(r) = rects.get(depth) else { break };
+        let (width, height) = (r.width.0.ceil() as u32, r.height.0.ceil() as u32);
+        let mut renderer = BitmapRenderer::new(width, height).map_err(|e| e.message)?;
+        renderer
+            .set_text_settings(TextSettings::reference())
+            .map_err(|e| e.message)?;
         let mut list = DisplayList::default();
-        list.push(DrawCommand::FillRect {
-            rect: Rect {
-                x: Dip(0.0),
-                y: Dip(0.0),
-                width: Dip(self.width as f32),
-                height: Dip(self.height as f32),
-            },
-            color: qe_ui::UiTokens::from_theme(&Theme::new(ThemeKind::Light)).background,
-        });
-        self.view
-            .draw(&mut list, &Theme::new(ThemeKind::Light), &Measure);
-        self.renderer.invalidate_all();
-        self.renderer.begin_frame().map_err(|e| e.message)?;
-        self.renderer.draw(&list).map_err(|e| e.message)?;
-        self.renderer.end_frame().map_err(|e| e.message)?;
-        self.renderer.present(hwnd).map_err(|e| e.message)
+        view.draw_level(depth, &mut list, &theme, &Measure);
+        renderer.begin_frame().map_err(|e| e.message)?;
+        renderer.draw(&list).map_err(|e| e.message)?;
+        renderer.end_frame().map_err(|e| e.message)?;
+        renderer.present(window.hwnd()).map_err(|e| e.message)?;
     }
+    Ok(())
 }
 fn main() -> Result<(), String> {
     let error = |e: windows::core::Error| format!("window: {e}");
-    // SAFETY: creates a plain hidden owner window of a built-in class.
+    // SAFETY: creates a plain owner window of a built-in class.
     let owner = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -94,62 +76,23 @@ fn main() -> Result<(), String> {
         )
     }
     .map_err(error)?;
-    let (width, height) = (520, 460);
-    let popup = PopupWindow::create(owner, 100, 100, width, height).map_err(error)?;
-    if let Some(problem) = popup.decoration_error() {
-        eprintln!("The popup has square corners: {problem}");
-    }
     let model = caret_menu();
-    let (w, h) = model.preferred_size(&Measure);
-    let mut view = MenuView::new(qe_api::WidgetId(1), model).named("All menus");
+    let (width, height) = model.preferred_size(&Measure);
+    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", model);
     view.layout(
         Rect {
-            x: Dip(0.0),
-            y: Dip(0.0),
-            width: Dip(w),
-            height: Dip(h),
+            x: Dip(100.0),
+            y: Dip(200.0),
+            width: Dip(width),
+            height: Dip(height),
         },
         &Measure,
     );
     view.open_keyboard();
-    let mut renderer = BitmapRenderer::new(width as u32, height as u32).map_err(|e| e.message)?;
-    renderer
-        .set_text_settings(TextSettings::reference())
-        .map_err(|e| e.message)?;
-    let shared = Rc::new(RefCell::new(Shared {
-        view,
-        renderer,
-        width,
-        height,
-    }));
-    let hwnd = popup.hwnd();
-    let for_messages = shared.clone();
-    popup.set_message_handler(Box::new(move |hwnd, msg, _, l| {
-        let kind = match msg {
-            WM_KILLFOCUS => Some(InputKind::Blur),
-            WM_MOUSEMOVE => Some(InputKind::MouseMove { at: point(l.0) }),
-            WM_LBUTTONDOWN => Some(InputKind::MouseDown {
-                at: point(l.0),
-                button: MouseButton::Left,
-                modifiers: Modifiers::default(),
-            }),
-            WM_LBUTTONUP => Some(InputKind::MouseUp {
-                at: point(l.0),
-                button: MouseButton::Left,
-                modifiers: Modifiers::default(),
-            }),
-            _ => None,
-        }?;
-        let mut state = for_messages.borrow_mut();
-        state.view.handle(&event(kind), &mut ViewContext::default());
-        if let Err(problem) = state.repaint(hwnd) {
-            eprintln!("Painting failed: {problem}");
-        }
-        Some(LRESULT(0))
-    }));
-    popup.show();
-    shared.borrow_mut().repaint(hwnd)?;
-    let _ = RECT::default();
+    let mut windows = MenuWindows::new(owner, 1.0);
+    windows.sync(&view)?;
+    repaint(&view, &windows)?;
+    let start = Instant::now();
     let mut msg = MSG::default();
     loop {
         // SAFETY: `msg` is a valid out pointer.
@@ -161,39 +104,56 @@ fn main() -> Result<(), String> {
         unsafe {
             let _ = TranslateMessage(&msg);
         }
+        let pointer = windows.pointer(msg.lParam);
         let kind = match msg.message {
             WM_KEYDOWN | WM_SYSKEYDOWN => Some(InputKind::KeyDown {
                 virtual_key: msg.wParam.0 as u16,
                 modifiers: modifiers(),
                 repeat: msg.lParam.0 & (1 << 30) != 0,
             }),
+            WM_KEYUP | WM_SYSKEYUP => Some(InputKind::KeyUp {
+                virtual_key: msg.wParam.0 as u16,
+                modifiers: modifiers(),
+            }),
             WM_CHAR => char::from_u32(msg.wParam.0 as u32).map(InputKind::Char),
+            WM_MOUSEMOVE => pointer.map(|at| InputKind::MouseMove { at }),
+            WM_LBUTTONDOWN => pointer.map(|at| InputKind::MouseDown {
+                at,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+            }),
+            WM_LBUTTONUP => pointer.map(|at| InputKind::MouseUp {
+                at,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+            }),
             _ => None,
         };
+        // SAFETY: `msg` came from GetMessageW. The popup's own procedure judges each
+        // press before the view hears of it.
+        unsafe {
+            DispatchMessageW(&msg);
+        }
         if let Some(kind) = kind {
-            let mut state = shared.borrow_mut();
             let mut ctx = ViewContext::default();
-            state.view.handle(&event(kind), &mut ctx);
+            let event = InputEvent {
+                time_us: start.elapsed().as_micros() as u64,
+                kind,
+            };
+            view.handle(&event, &mut ctx);
             for request in ctx.requests {
                 if let qe_api::ViewRequest::Run(command) = request {
                     println!("ran {command:?}");
                 }
             }
-            if state.view.closed {
+            if view.closed {
                 break;
             }
-            state.repaint(hwnd)?;
-        } else {
-            // SAFETY: `msg` came from GetMessageW.
-            unsafe {
-                DispatchMessageW(&msg);
-            }
-        }
-        if shared.borrow().view.closed {
-            break;
+            windows.sync(&view)?;
+            repaint(&view, &windows)?;
         }
     }
-    drop(popup);
+    drop(windows);
     // SAFETY: the owner window is still alive here.
     unsafe {
         let _ = DestroyWindow(owner);

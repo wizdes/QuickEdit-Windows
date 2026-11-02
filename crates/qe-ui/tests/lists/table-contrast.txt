@@ -4,6 +4,7 @@ text 8.000,18.500 "Segoe UI" 13.000 #ffffffff "Command"
 line 0.000,27.500 240.000,27.500 1.000 #ffffffff
 text 8.000,46.500 "Segoe UI" 13.000 #ffffffff "File"
 fill 0.000,56.000,240.000,28.000 #1aebffff
+round 2.000,62.000,3.000,16.000 1.500 #000000ff
 push-clip 0.000,56.000,144.000,28.000
 text 16.000,74.500 "Segoe UI" 13.000 #000000ff "Save"
 pop-clip

@@ -3,10 +3,11 @@ push-clip 0.000,0.000,240.000,100.000
 text 8.000,18.500 "Segoe UI" 13.000 #ffffffff "Command"
 line 0.000,27.500 240.000,27.500 1.000 #ffffff38
 text 8.000,46.500 "Segoe UI" 13.000 #ffffffd9 "File"
-fill 0.000,56.000,240.000,28.000 #334c66ff
+fill 0.000,56.000,240.000,28.000 #3d5e80ff
+round 2.000,62.000,3.000,16.000 1.500 #99cdffff
 push-clip 0.000,56.000,144.000,28.000
 text 16.000,74.500 "Segoe UI" 13.000 #ffffffff "Save"
 pop-clip
 text 152.000,74.500 "Segoe UI" 13.000 #ffffffff "Ctrl+S"
-stroke-rect 1.000,57.000,238.000,26.000 4.000 2.000 #99cdffff
+stroke-rect 1.000,57.000,238.000,26.000 4.000 2.000 #bee1ffff
 pop-clip

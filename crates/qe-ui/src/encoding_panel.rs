@@ -2,9 +2,10 @@
 //! per encoding, and the buttons Select all, Clear all and Revert to default.
 use crate::control::*;
 use crate::controls::{
-    CheckLook, check_box, clip, contains, focus_ring, inset, node, rect, state, text_line, unclip,
+    CheckLook, ListThumb, THUMB_ROOM, ThumbDrag, check_box, clip, contains, focus_ring, inset,
+    node, rect, state, text_line, unclip,
 };
-use crate::{Button, Control, DialogFrame, UiTokens, child_id};
+use crate::{Button, Control, DialogFrame, Label, LabelKind, UiTokens, child_id};
 use qe_api::{
     Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, MouseButton, Rect, TextEncoding,
     TextMeasurer, Theme, View, ViewContext, Widget, WidgetId, WidgetRole,
@@ -27,6 +28,7 @@ pub struct CheckList {
     pub focused: bool,
     pub hover_row: Option<usize>,
     activated: bool,
+    thumb_drag: Option<ThumbDrag>,
 }
 impl CheckList {
     pub fn new(id: WidgetId, name: impl Into<String>, rows: Vec<(String, bool)>) -> Self {
@@ -40,6 +42,7 @@ impl CheckList {
             focused: false,
             hover_row: None,
             activated: false,
+            thumb_drag: None,
         }
     }
     fn capacity(&self) -> usize {
@@ -48,6 +51,29 @@ impl CheckList {
     pub fn visible_range(&self) -> std::ops::Range<usize> {
         let first = self.first_visible.min(self.rows.len());
         first..(first + self.capacity()).min(self.rows.len())
+    }
+    fn max_first(&self) -> usize {
+        self.rows.len().saturating_sub(self.capacity())
+    }
+    fn thumb(&self, t: UiTokens) -> Option<ListThumb> {
+        ListThumb::new(
+            inset(self.bounds, 0.0, 2.0),
+            self.visible_range().len(),
+            self.rows.len(),
+            self.first_visible.min(self.rows.len()),
+            self.max_first(),
+            t,
+        )
+    }
+    fn row_at(&self, at: qe_api::Point) -> Option<usize> {
+        if self
+            .thumb(UiTokens::sizes())
+            .is_some_and(|thumb| contains(thumb.strip, at))
+        {
+            return None;
+        }
+        self.visible_range()
+            .find(|i| contains(self.row_rect(*i), at))
     }
     fn row_rect(&self, i: usize) -> Rect {
         let h = UiTokens::sizes().check_row.0;
@@ -81,6 +107,9 @@ impl CheckList {
 }
 impl View for CheckList {
     fn handle(&mut self, e: &InputEvent, c: &mut ViewContext) -> Handled {
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         let page = self.capacity();
         match &e.kind {
             InputKind::Focus => {
@@ -90,6 +119,9 @@ impl View for CheckList {
             }
             InputKind::Blur => {
                 self.focused = false;
+                if self.thumb_drag.take().is_some() {
+                    c.capture_mouse(false);
+                }
                 c.invalidate(self.bounds);
                 Handled::Yes
             }
@@ -123,9 +155,17 @@ impl View for CheckList {
                 Handled::Yes
             }
             InputKind::MouseMove { at } => {
-                let hit = self
-                    .visible_range()
-                    .find(|i| contains(self.row_rect(*i), *at));
+                if let Some(drag) = self.thumb_drag {
+                    if let Some(thumb) = self.thumb(UiTokens::sizes()) {
+                        let first = thumb.dragged_to(drag, at.y.0);
+                        if first != self.first_visible {
+                            self.first_visible = first;
+                            c.invalidate(self.bounds);
+                        }
+                    }
+                    return Handled::Yes;
+                }
+                let hit = self.row_at(*at);
                 if hit != self.hover_row {
                     self.hover_row = hit;
                     c.invalidate(self.bounds);
@@ -142,13 +182,34 @@ impl View for CheckList {
                 ..
             } if contains(self.bounds, *at) => {
                 c.set_focus(self.id);
-                if let Some(i) = self
-                    .visible_range()
-                    .find(|i| contains(self.row_rect(*i), *at))
+                // The thumb takes its own presses. Changes apply at once here, so a
+                // press meant for scrolling must never flip the row under it.
+                if let Some(thumb) = self.thumb(UiTokens::sizes())
+                    && contains(thumb.strip, *at)
                 {
+                    match thumb.press(at.y.0) {
+                        Ok(drag) => {
+                            self.thumb_drag = Some(drag);
+                            c.capture_mouse(true);
+                        }
+                        Err(first) => self.first_visible = first,
+                    }
+                    c.invalidate(self.bounds);
+                    return Handled::Yes;
+                }
+                if let Some(i) = self.row_at(*at) {
                     self.current = i;
                     self.flip(i, c);
                 }
+                Handled::Yes
+            }
+            InputKind::MouseUp {
+                button: MouseButton::Left,
+                ..
+            } if self.thumb_drag.is_some() => {
+                self.thumb_drag = None;
+                c.capture_mouse(false);
+                c.invalidate(self.bounds);
                 Handled::Yes
             }
             _ => Handled::No,
@@ -162,8 +223,12 @@ impl View for CheckList {
             color: t.surface,
         });
         clip(l, self.bounds);
+        let thumb = self.thumb(t);
         for i in self.visible_range() {
-            let r = self.row_rect(i);
+            let mut r = self.row_rect(i);
+            if thumb.is_some() {
+                r.width.0 -= THUMB_ROOM;
+            }
             let (label, checked) = &self.rows[i];
             let current = self.focused && i == self.current;
             let mut ink = t.text;
@@ -204,7 +269,12 @@ impl View for CheckList {
                 ink,
             );
             if current {
-                focus_ring(l, inset(r, 2.0, 0.0), t);
+                let ring = inset(r, 2.0, 0.0);
+                if self.hover_row == Some(i) {
+                    crate::controls::focus_ring_on_fill(l, ring, t);
+                } else {
+                    focus_ring(l, ring, t);
+                }
             }
         }
         unclip(l);
@@ -214,25 +284,8 @@ impl View for CheckList {
             width: Dip(1.0),
             color: t.border,
         });
-        let shown = self.visible_range().len();
-        if shown < self.rows.len() && !self.rows.is_empty() {
-            let n = self.rows.len() as f32;
-            let track = self.bounds.height.0 - 4.0;
-            let height = (track * shown as f32 / n).max(t.scrollbar_wide.0 * 2.0);
-            let last_first = (self.rows.len() - shown).max(1) as f32;
-            l.push(DrawCommand::RoundedRect {
-                rect: rect(
-                    self.bounds.x.0 + self.bounds.width.0 - t.scrollbar_thin.0 - 2.0,
-                    self.bounds.y.0
-                        + 2.0
-                        + (track - height) * self.first_visible.min(self.rows.len()) as f32
-                            / last_first,
-                    t.scrollbar_thin.0,
-                    height,
-                ),
-                radius: Dip(t.scrollbar_thin.0 / 2.0),
-                color: t.disabled,
-            });
+        if let Some(thumb) = thumb {
+            thumb.paint(l, t, self.thumb_drag.is_some());
         }
     }
     fn layout(&mut self, r: Rect, _: &dyn TextMeasurer) {
@@ -286,11 +339,15 @@ const LIST: usize = 0;
 const SELECT_ALL: usize = 1;
 const CLEAR_ALL: usize = 2;
 const REVERT: usize = 3;
+const NOTE: usize = 4;
+/// The Mac panel's line above the list.
+const NOTE_TEXT: &str = "Select the encodings you want to appear in text encoding menus.";
 
 /// The encoding panel as a painted dialog. Changes apply as they happen, as on the
 /// Mac. The caller reads `enabled_encodings` after any event and closes on `closed`.
 pub struct EncodingPanel {
     pub frame: DialogFrame,
+    enabled: Vec<TextEncoding>,
 }
 impl EncodingPanel {
     pub fn new(id: WidgetId, enabled: &[TextEncoding], bounds: Rect) -> Self {
@@ -311,7 +368,13 @@ impl EncodingPanel {
         {
             frame.add(Box::new(Button::new(WidgetId(id.0 + 2 + i as u64), label)));
         }
-        let mut panel = Self { frame };
+        let mut note = Label::new(WidgetId(id.0 + 5), NOTE_TEXT, LabelKind::Plain);
+        note.wrap = true;
+        frame.add(Box::new(note));
+        let mut panel = Self {
+            frame,
+            enabled: enabled.to_vec(),
+        };
         panel.arrange();
         panel
     }
@@ -320,12 +383,18 @@ impl EncodingPanel {
         let b = self.frame.bounds;
         let gap = t.inset.0;
         let button_y = b.y.0 + b.height.0 - t.control_height.0 - gap;
+        // Two lines of text at this size. The Mac's smaller font fits in one.
+        let note_height = 36.0;
+        if let Some(note) = self.frame.child_mut::<Label>(NOTE) {
+            note.bounds = rect(b.x.0 + gap, b.y.0 + 4.0, b.width.0 - 2.0 * gap, note_height);
+        }
+        let list_y = b.y.0 + 4.0 + note_height;
         if let Some(list) = self.frame.child_mut::<CheckList>(LIST) {
             list.bounds = rect(
                 b.x.0 + gap,
-                b.y.0 + gap,
+                list_y,
                 b.width.0 - 2.0 * gap,
-                button_y - b.y.0 - 2.0 * gap,
+                button_y - list_y - gap,
             );
         }
         // The third label is longer, so it takes more of the row.
@@ -340,8 +409,13 @@ impl EncodingPanel {
             x += width + gap;
         }
     }
-    /// The encodings with a check, in the panel's order.
+    /// The enabled list. As on the Mac, it keeps the order it came in (row I42) until
+    /// the user changes it. A checkbox or Select all then gives the panel's order, and
+    /// Revert gives the default list's order.
     pub fn enabled_encodings(&self) -> Vec<TextEncoding> {
+        self.enabled.clone()
+    }
+    fn read_checks(&self) -> Vec<TextEncoding> {
         let Some(list) = self.frame.child::<CheckList>(LIST) else {
             return vec![];
         };
@@ -368,9 +442,19 @@ impl View for EncodingPanel {
     fn handle(&mut self, event: &InputEvent, c: &mut ViewContext) -> Handled {
         let handled = self.frame.handle(event, c);
         match self.frame.take_last_activated() {
-            Some(SELECT_ALL) => self.set_all(|_| true, c),
-            Some(CLEAR_ALL) => self.set_all(|_| false, c),
-            Some(REVERT) => self.set_all(|e| TextEncoding::DEFAULT_LIST.contains(&e), c),
+            Some(LIST) => self.enabled = self.read_checks(),
+            Some(SELECT_ALL) => {
+                self.set_all(|_| true, c);
+                self.enabled = self.read_checks();
+            }
+            Some(CLEAR_ALL) => {
+                self.set_all(|_| false, c);
+                self.enabled.clear();
+            }
+            Some(REVERT) => {
+                self.set_all(|e| TextEncoding::DEFAULT_LIST.contains(&e), c);
+                self.enabled = TextEncoding::DEFAULT_LIST.to_vec();
+            }
             _ => {}
         }
         handled

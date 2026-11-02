@@ -1,7 +1,7 @@
 use crate::control::*;
 use crate::controls::{
-    CHECK_ICON, SUBMENU_ICON, clip, contains, focus_ring, icon, inset, rect, text_line, text_width,
-    unclip, union,
+    CHECK_ICON, ListThumb, SUBMENU_ICON, THUMB_ROOM, ThumbDrag, clip, contains, focus_ring_on_fill,
+    icon, inset, rect, text_line, text_width, unclip, union,
 };
 use crate::{Control, UiTokens, child_id};
 use qe_api::{
@@ -21,6 +21,9 @@ pub struct MenuItem {
     pub separator: bool,
     pub command: Option<CommandId>,
     pub mnemonic: Option<char>,
+    /// What this row is about when its command alone cannot say, such as the path of
+    /// an Open Recent file. `MenuView::take_chosen_data` gives it after a choice.
+    pub data: Option<String>,
 }
 impl MenuItem {
     pub fn command(label: impl Into<String>, command: CommandId) -> Self {
@@ -33,6 +36,7 @@ impl MenuItem {
             separator: false,
             command: Some(command),
             mnemonic: None,
+            data: None,
         }
     }
     pub fn separator() -> Self {
@@ -45,6 +49,7 @@ impl MenuItem {
             separator: true,
             command: None,
             mnemonic: None,
+            data: None,
         }
     }
     pub fn submenu(label: impl Into<String>, model: MenuModel) -> Self {
@@ -57,6 +62,7 @@ impl MenuItem {
             separator: false,
             command: None,
             mnemonic: None,
+            data: None,
         }
     }
     fn usable(&self) -> bool {
@@ -135,6 +141,10 @@ pub struct MenuView {
     child_row: Option<usize>,
     /// Submenu sizes, measured in `layout`, because `handle` has no measurer.
     measured: Vec<Option<MeasuredMenu>>,
+    keys_used: bool,
+    alt: AltKeyTracker,
+    chosen_data: Option<String>,
+    thumb_drag: Option<ThumbDrag>,
 }
 /// The size of a submenu and of the submenus inside it.
 #[derive(Clone, Debug)]
@@ -155,10 +165,13 @@ fn measure_rows(model: &MenuModel, m: &dyn TextMeasurer) -> Vec<Option<MeasuredM
         .collect()
 }
 impl MenuView {
-    pub fn new(id: WidgetId, model: MenuModel) -> Self {
+    /// `name` is what a screen reader says for this list.
+    pub fn new(id: WidgetId, name: impl Into<String>, model: MenuModel) -> Self {
+        let name = name.into();
+        debug_assert!(!name.is_empty(), "a menu needs a name");
         Self {
             id,
-            name: String::new(),
+            name,
             model,
             bounds: Rect::default(),
             selected: None,
@@ -173,6 +186,10 @@ impl MenuView {
             ended: None,
             child_row: None,
             measured: vec![],
+            keys_used: false,
+            alt: AltKeyTracker::default(),
+            chosen_data: None,
+            thumb_drag: None,
         }
     }
     pub fn named(mut self, name: impl Into<String>) -> Self {
@@ -189,8 +206,46 @@ impl MenuView {
     fn last_enabled(&self) -> Option<usize> {
         self.model.items.iter().rposition(MenuItem::usable)
     }
+    /// The extra text of the row chosen last, such as an Open Recent file's path.
+    /// Reading clears it.
+    pub fn take_chosen_data(&mut self) -> Option<String> {
+        self.chosen_data.take()
+    }
+    /// The bounds of each open level, from this one down. A host gives each its own
+    /// window, because the levels can overlap the screen edge in different ways.
+    pub fn levels(&self) -> Vec<Rect> {
+        let mut out = vec![self.bounds];
+        let mut level = self;
+        while let Some(child) = &level.child {
+            out.push(child.bounds);
+            level = child;
+        }
+        out
+    }
+    fn level(&self, depth: usize) -> Option<&MenuView> {
+        let mut level = self;
+        for _ in 0..depth {
+            level = level.child.as_deref()?;
+        }
+        Some(level)
+    }
+    /// Paints one level alone, with its top left corner at (0, 0) of its own window.
+    pub fn draw_level(
+        &self,
+        depth: usize,
+        list: &mut DisplayList,
+        theme: &Theme,
+        measure: &dyn TextMeasurer,
+    ) {
+        if let Some(level) = self.level(depth) {
+            let mut own = DisplayList::default();
+            level.draw_own(&mut own, theme, measure);
+            shift_list(&mut own, level.bounds.x.0, level.bounds.y.0);
+            list.commands.append(&mut own.commands);
+        }
+    }
     /// All the area that this level and its open children paint.
-    fn full_bounds(&self) -> Rect {
+    pub fn full_bounds(&self) -> Rect {
         match &self.child {
             Some(child) => union(self.bounds, child.full_bounds()),
             None => self.bounds,
@@ -229,6 +284,9 @@ impl MenuView {
         let t = UiTokens::sizes();
         let rows = (self.viewport(t).height.0 / t.menu_row.0).floor().max(1.0) as usize;
         let n = self.model.items.len();
+        if n == 0 {
+            return;
+        }
         let from = self.selected.unwrap_or(0);
         let target = if down {
             (from + rows).min(n.saturating_sub(1))
@@ -279,8 +337,37 @@ impl MenuView {
             self.first_visible += 1;
         }
     }
+    fn max_first(&self, t: UiTokens) -> usize {
+        let view = self.viewport(t).height.0;
+        let mut used = 0.0;
+        let mut first = self.model.items.len();
+        for i in (0..self.model.items.len()).rev() {
+            used += self.model.row_height(i, t);
+            if used > view + 0.5 {
+                break;
+            }
+            first = i;
+        }
+        first.min(self.model.items.len().saturating_sub(1))
+    }
+    fn list_thumb(&self, t: UiTokens) -> Option<ListThumb> {
+        ListThumb::new(
+            self.viewport(t),
+            self.visible_rows(t).len(),
+            self.model.items.len(),
+            self.first_visible,
+            self.max_first(t),
+            t,
+        )
+    }
     fn row_at(&self, at: Point) -> Option<usize> {
         if !contains(self.bounds, at) {
+            return None;
+        }
+        if self
+            .list_thumb(UiTokens::sizes())
+            .is_some_and(|thumb| contains(thumb.strip, at))
+        {
             return None;
         }
         self.visible_rows(UiTokens::sizes())
@@ -290,7 +377,12 @@ impl MenuView {
     }
     fn open_child(&mut self, c: &mut ViewContext) {
         let Some(i) = self.selected else { return };
-        let Some(model) = self.model.items[i].submenu.clone() else {
+        let Some(model) = self
+            .model
+            .items
+            .get(i)
+            .and_then(|item| item.submenu.clone())
+        else {
             return;
         };
         if self.child_row == Some(i) && self.child.is_some() {
@@ -304,9 +396,13 @@ impl MenuView {
             .into_iter()
             .find(|(row, _)| *row == i)
             .map_or(self.bounds, |(_, r)| r);
-        let mut child = MenuView::new(child_id(self.id, 1_000_000 + i as u64), model);
-        child.name.clone_from(&self.model.items[i].label);
+        let mut child = MenuView::new(
+            child_id(self.id, 1_000_000 + i as u64),
+            self.model.items[i].label.clone(),
+            model,
+        );
         child.keyboard_opened = self.keyboard_opened;
+        child.keys_used = self.keys_used;
         child.selected = child.first_enabled();
         child.is_submenu = true;
         child.work_area = self.work_area;
@@ -329,14 +425,17 @@ impl MenuView {
         self.child_row = Some(i);
     }
     fn activate(&mut self, c: &mut ViewContext) {
-        let Some(i) = self.selected else { return };
-        let item = &self.model.items[i];
+        // A caller may have replaced the model, so the old row may be gone.
+        let Some(item) = self.selected.and_then(|i| self.model.items.get(i)) else {
+            return;
+        };
         if !item.usable() {
             return;
         }
         if item.submenu.is_some() {
             self.open_child(c)
         } else if let Some(cmd) = item.command {
+            self.chosen_data.clone_from(&item.data);
             c.run(cmd);
             self.end(Ended::Command, c);
         }
@@ -371,7 +470,13 @@ impl MenuView {
             return;
         };
         match ended {
-            Ended::Command => self.end(Ended::Command, c),
+            Ended::Command => {
+                self.chosen_data = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.chosen_data.take());
+                self.end(Ended::Command, c)
+            }
             Ended::Back => self.close_child(c),
         }
         c.invalidate(self.bounds);
@@ -417,6 +522,14 @@ impl View for MenuView {
             self.end(Ended::Back, c);
             return Handled::Yes;
         }
+        // A second tap of Alt closes the list that the first one opened.
+        if !self.is_submenu && self.alt.event(e) {
+            self.end(Ended::Back, c);
+            return Handled::Yes;
+        }
+        if alt_chord(&e.kind) {
+            return Handled::No;
+        }
         if let InputKind::MouseDown { at, .. } = &e.kind
             && !self.is_submenu
             && !self.contains_deep(*at)
@@ -430,6 +543,10 @@ impl View for MenuView {
             if h == Handled::Yes || self.closed {
                 return Handled::Yes;
             }
+        }
+        if matches!(e.kind, InputKind::KeyDown { .. }) {
+            // Keys have taken over from the mouse, so the row needs its ring.
+            self.keys_used = true;
         }
         match &e.kind {
             InputKind::KeyDown { virtual_key, .. } => match *virtual_key {
@@ -487,8 +604,7 @@ impl View for MenuView {
             }
             InputKind::Wheel { at, delta_y, .. } if contains(self.bounds, *at) => {
                 let t = UiTokens::sizes();
-                let shown = self.visible_rows(t).len();
-                let max = self.model.items.len().saturating_sub(shown.max(1));
+                let max = self.max_first(t);
                 let rows = (-delta_y / WHEEL_NOTCH * 3.0).round() as isize;
                 let next = (self.first_visible as isize + rows).clamp(0, max as isize) as usize;
                 if next != self.first_visible {
@@ -498,7 +614,21 @@ impl View for MenuView {
                 }
                 Handled::Yes
             }
+            InputKind::MouseMove { at } if self.thumb_drag.is_some() => {
+                if let (Some(drag), Some(thumb)) =
+                    (self.thumb_drag, self.list_thumb(UiTokens::sizes()))
+                {
+                    let first = thumb.dragged_to(drag, at.y.0);
+                    if first != self.first_visible {
+                        self.first_visible = first;
+                        self.close_child(c);
+                        c.invalidate(self.bounds);
+                    }
+                }
+                Handled::Yes
+            }
             InputKind::MouseMove { at } if contains(self.bounds, *at) => {
+                self.keys_used = false;
                 let t = UiTokens::sizes();
                 let hit = self.row_at(*at).filter(|i| self.model.items[*i].usable());
                 if hit != self.selected {
@@ -523,7 +653,33 @@ impl View for MenuView {
                 Handled::Yes
             }
             InputKind::MouseDown { at, .. } if contains(self.bounds, *at) => {
+                // The thumb takes its own presses, and its release runs no row.
+                if let Some(thumb) = self.list_thumb(UiTokens::sizes())
+                    && contains(thumb.strip, *at)
+                {
+                    match thumb.press(at.y.0) {
+                        Ok(drag) => {
+                            self.thumb_drag = Some(drag);
+                            c.capture_mouse(true);
+                        }
+                        Err(first) => {
+                            self.first_visible = first;
+                            self.close_child(c);
+                        }
+                    }
+                    c.invalidate(self.bounds);
+                    return Handled::Yes;
+                }
                 self.press_began = true;
+                Handled::Yes
+            }
+            InputKind::MouseUp {
+                button: MouseButton::Left,
+                ..
+            } if self.thumb_drag.is_some() => {
+                self.thumb_drag = None;
+                c.capture_mouse(false);
+                c.invalidate(self.bounds);
                 Handled::Yes
             }
             InputKind::MouseUp {
@@ -550,6 +706,22 @@ impl View for MenuView {
         }
     }
     fn draw(&self, l: &mut DisplayList, theme: &Theme, m: &dyn TextMeasurer) {
+        self.draw_own(l, theme, m);
+        if let Some(child) = &self.child {
+            child.draw(l, theme, m)
+        }
+    }
+    fn layout(&mut self, r: Rect, m: &dyn TextMeasurer) {
+        self.bounds = r;
+        self.measured = measure_rows(&self.model, m);
+    }
+    fn widgets(&self) -> Option<Widget> {
+        self.tree()
+    }
+}
+impl MenuView {
+    /// Paints this level only, in the coordinates of `bounds`.
+    fn draw_own(&self, l: &mut DisplayList, theme: &Theme, m: &dyn TextMeasurer) {
         let t = UiTokens::from_theme(theme);
         l.push(DrawCommand::RoundedRect {
             rect: self.bounds,
@@ -563,6 +735,7 @@ impl View for MenuView {
             color: t.border,
         });
         let rows = self.visible_rows(t);
+        let thumb = self.list_thumb(t);
         clip(l, self.bounds);
         for (i, row) in &rows {
             let item = &self.model.items[*i];
@@ -582,7 +755,11 @@ impl View for MenuView {
                 });
                 continue;
             }
-            let r = inset(*row, t.inset.0 / 2.0, 0.0);
+            let mut r = inset(*row, t.inset.0 / 2.0, 0.0);
+            if thumb.is_some() {
+                // The thumb never lies over a highlighted row.
+                r.width.0 -= THUMB_ROOM;
+            }
             let selected = self.selected == Some(*i);
             if selected {
                 l.push(DrawCommand::RoundedRect {
@@ -654,7 +831,13 @@ impl View for MenuView {
                     r.y.0,
                     r.height.0,
                     &item.key_text,
-                    if selected { t.hover_text } else { t.disabled },
+                    if !item.enabled {
+                        t.disabled
+                    } else if selected {
+                        t.hover_text
+                    } else {
+                        t.hint
+                    },
                 );
             }
             if item.submenu.is_some() {
@@ -668,37 +851,16 @@ impl View for MenuView {
                 );
             }
             // The fill alone is faint, so a keyboard user also gets a ring.
-            if selected && self.keyboard_opened && self.deepest_has_focus() {
-                focus_ring(l, r, t);
+            if selected && (self.keyboard_opened || self.keys_used) && self.deepest_has_focus() {
+                focus_ring_on_fill(l, r, t);
             }
         }
         unclip(l);
-        if rows.len() < self.model.items.len() {
-            let view = self.viewport(t);
-            let n = self.model.items.len() as f32;
-            let height = (view.height.0 * rows.len() as f32 / n).max(t.scrollbar_wide.0 * 2.0);
-            let room = (view.height.0 - height).max(0.0);
-            let last_first = (self.model.items.len() - rows.len()).max(1) as f32;
-            l.push(DrawCommand::RoundedRect {
-                rect: rect(
-                    self.bounds.x.0 + self.bounds.width.0 - t.scrollbar_thin.0 - 2.0,
-                    view.y.0 + room * self.first_visible as f32 / last_first,
-                    t.scrollbar_thin.0,
-                    height,
-                ),
-                radius: Dip(t.scrollbar_thin.0 / 2.0),
-                color: t.disabled,
-            });
-        }
-        if let Some(child) = &self.child {
-            child.draw(l, theme, m)
+        if let Some(thumb) = thumb {
+            thumb.paint(l, t, self.thumb_drag.is_some());
         }
     }
-    fn layout(&mut self, r: Rect, m: &dyn TextMeasurer) {
-        self.bounds = r;
-        self.measured = measure_rows(&self.model, m);
-    }
-    fn widgets(&self) -> Option<Widget> {
+    fn tree(&self) -> Option<Widget> {
         let t = UiTokens::sizes();
         let rows = self.visible_rows(t);
         let mut children: Vec<_> = Vec::with_capacity(self.model.items.len());
@@ -730,7 +892,7 @@ impl View for MenuView {
                 value,
                 states: WidgetStates {
                     enabled: item.enabled,
-                    focused: selected && self.child.is_none(),
+                    focused: selected && self.child.is_none() && !self.closed,
                     selected,
                     checked: item.checked,
                     expanded: open_child.is_some(),
@@ -747,7 +909,7 @@ impl View for MenuView {
             value: None,
             states: WidgetStates {
                 enabled: true,
-                focused: self.selected.is_none() && self.child.is_none(),
+                focused: self.selected.is_none() && self.child.is_none() && !self.closed,
                 ..Default::default()
             },
             children,
@@ -760,6 +922,35 @@ impl Control for MenuView {
     }
     fn uses_key(&self, _: u16) -> bool {
         true
+    }
+}
+
+/// Moves every command of a list by (-dx, -dy), from screen places to a window's own.
+fn shift_list(list: &mut DisplayList, dx: f32, dy: f32) {
+    let rect_of = |r: &mut Rect| {
+        r.x.0 -= dx;
+        r.y.0 -= dy;
+    };
+    let point_of = |p: &mut Point| {
+        p.x.0 -= dx;
+        p.y.0 -= dy;
+    };
+    for command in &mut list.commands {
+        match command {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::StrokeRect { rect, .. }
+            | DrawCommand::RoundedRect { rect, .. }
+            | DrawCommand::PushClip(rect) => rect_of(rect),
+            DrawCommand::FillRects { rects, .. } => rects.iter_mut().for_each(rect_of),
+            DrawCommand::WavyUnderline { from, to, .. } | DrawCommand::Line { from, to, .. } => {
+                point_of(from);
+                point_of(to);
+            }
+            DrawCommand::TextRun { at, .. }
+            | DrawCommand::GlyphRun { at, .. }
+            | DrawCommand::Icon { at, .. } => point_of(at),
+            DrawCommand::PopClip | DrawCommand::PushOpacity(_) | DrawCommand::PopOpacity => {}
+        }
     }
 }
 

@@ -82,7 +82,7 @@ fn menu_keyboard_nested_and_placement() {
             MenuItem::command("About", qe_api::CommandId::About),
         ],
     };
-    let mut view = MenuView::new(WidgetId(10), model);
+    let mut view = MenuView::new(WidgetId(10), "Test", model);
     view.open_keyboard();
     view.layout(
         Rect {
@@ -169,7 +169,7 @@ fn table_virtualizes_and_has_rows() {
             indent: i % 3,
         })
         .collect();
-    let mut table = Table::new(WidgetId(20), vec!["Command".into()], rows);
+    let mut table = Table::new(WidgetId(20), "Test", vec!["Command".into()], rows);
     table.layout(
         Rect {
             x: Dip(0.0),
@@ -203,7 +203,11 @@ fn theme_lists_and_uia() {
         b.draw(&mut list, &Theme::new(kind), &Measure);
         assert!(list.commands.len() > 2)
     }
-    let mut tabs = TabBar::new(WidgetId(31), vec!["New Document".into(), "Keyboard".into()]);
+    let mut tabs = TabBar::new(
+        WidgetId(31),
+        "Test",
+        vec!["New Document".into(), "Keyboard".into()],
+    );
     tabs.layout(bounds(), &Measure);
     let tree = tabs.widgets().unwrap();
     assert_eq!(tree.role, WidgetRole::TabList);
@@ -258,6 +262,7 @@ fn submenu_starts_on_the_selected_row_after_menu_padding() {
     });
     let mut menu = MenuView::new(
         WidgetId(40),
+        "Test",
         MenuModel {
             items: vec![parent],
         },
@@ -356,11 +361,12 @@ fn saved_display_lists() {
         combo.enabled = true;
         combo.open = true;
         samples.push(("combo-open", Box::new(combo)));
-        let mut tabs = TabBar::new(WidgetId(54), vec!["New".into(), "Keyboard".into()]);
+        let mut tabs = TabBar::new(WidgetId(54), "Test", vec!["New".into(), "Keyboard".into()]);
         tabs.layout(bounds(), &Measure);
         samples.push(("tabs", Box::new(tabs)));
         let mut table = Table::new(
             WidgetId(55),
+            "Test",
             vec!["Command".into()],
             vec![
                 TableRow {
@@ -425,6 +431,7 @@ fn saved_display_lists() {
         }
         let mut menu = MenuView::new(
             WidgetId(61),
+            "Test",
             MenuModel {
                 items: vec![
                     MenuItem::command("Open", qe_api::CommandId::Open),

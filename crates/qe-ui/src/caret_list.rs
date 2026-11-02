@@ -19,13 +19,45 @@ pub fn key_text(key: KeyBinding) -> String {
     match code {
         0x30..=0x39 | 0x41..=0x5a => out.push(char::from(code as u8)),
         0x70..=0x87 => out.push_str(&format!("F{}", code - 0x6f)),
+        0x60..=0x69 => out.push_str(&format!("Num {}", code - 0x60)),
+        0x08 => out.push_str("Backspace"),
         0x09 => out.push_str("Tab"),
+        0x0d => out.push_str("Enter"),
+        0x13 => out.push_str("Pause"),
+        0x14 => out.push_str("Caps Lock"),
+        0x1b => out.push_str("Esc"),
         0x20 => out.push_str("Space"),
+        0x21 => out.push_str("Page Up"),
+        0x22 => out.push_str("Page Down"),
+        0x23 => out.push_str("End"),
+        0x24 => out.push_str("Home"),
+        0x25 => out.push_str("Left"),
+        0x26 => out.push_str("Up"),
+        0x27 => out.push_str("Right"),
+        0x28 => out.push_str("Down"),
+        0x2c => out.push_str("Print Screen"),
+        0x2d => out.push_str("Insert"),
+        0x2e => out.push_str("Delete"),
+        0x5d => out.push_str("Menu"),
+        0x6a => out.push_str("Num *"),
+        0x6b => out.push_str("Num +"),
+        0x6d => out.push_str("Num -"),
+        0x6e => out.push_str("Num ."),
+        0x6f => out.push_str("Num /"),
+        0x90 => out.push_str("Num Lock"),
+        0x91 => out.push_str("Scroll Lock"),
         0xba => out.push(';'),
         0xbb => out.push('='),
         0xbc => out.push(','),
         0xbd => out.push('-'),
         0xbe => out.push('.'),
+        0xbf => out.push('/'),
+        0xc0 => out.push('`'),
+        0xdb => out.push('['),
+        0xdc => out.push('\\'),
+        0xdd => out.push(']'),
+        0xde => out.push('\''),
+        0xe2 => out.push_str("OEM 102"),
         other => out.push_str(&format!("Key {other:#04x}")),
     }
     out
@@ -209,6 +241,40 @@ pub fn caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>) ->
             r("Quit QuickEdit", Quit),
         ],
     }
+}
+
+/// Fills Open Recent with files, above Clear Menu. Each pair is the label and the
+/// path. A chosen row runs `CommandId::OpenRecent`, and `MenuView::take_chosen_data`
+/// gives its path. Returns false if the model has no Open Recent row.
+pub fn set_recent_files(model: &mut MenuModel, files: &[(String, String)]) -> bool {
+    for item in &mut model.items {
+        if item.command == Some(CommandId::OpenRecent)
+            && let Some(sub) = &mut item.submenu
+        {
+            sub.items
+                .retain(|row| row.command == Some(CommandId::ClearRecent));
+            let at = 0;
+            let mut rows: Vec<MenuItem> = files
+                .iter()
+                .map(|(label, path)| {
+                    let mut row = MenuItem::command(label, CommandId::OpenRecent);
+                    row.data = Some(path.clone());
+                    row
+                })
+                .collect();
+            if !rows.is_empty() {
+                rows.push(MenuItem::separator());
+            }
+            sub.items.splice(at..at, rows);
+            return true;
+        }
+        if let Some(sub) = &mut item.submenu
+            && set_recent_files(sub, files)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Sets a command's row in a model, at any depth. Returns false if no row has it.

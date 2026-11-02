@@ -8,8 +8,9 @@ icon 220.500,20.500 "E96E" 12.000 #ffffffff
 round 0.000,32.000,240.000,81.000 8.000 #2b2b2bff
 stroke-rect 0.000,32.000,240.000,81.000 8.000 1.000 #ffffff6e
 push-clip 0.000,32.000,240.000,81.000
-round 4.000,40.000,232.000,28.000 4.000 #334c66ff
-text 8.000,58.500 "Segoe UI" 13.000 #ffffffff "UTF-8"
+round 4.000,40.000,232.000,28.000 4.000 #3d5e80ff
+round 6.000,46.000,3.000,16.000 1.500 #99cdffff
+text 12.000,58.500 "Segoe UI" 13.000 #ffffffff "UTF-8"
 line 8.000,72.500 232.000,72.500 1.000 #ffffff38
-text 8.000,95.500 "Segoe UI" 13.000 #ffffffff "UTF-16"
+text 12.000,95.500 "Segoe UI" 13.000 #ffffffff "UTF-16"
 pop-clip

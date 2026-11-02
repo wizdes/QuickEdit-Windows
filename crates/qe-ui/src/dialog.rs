@@ -36,6 +36,7 @@ pub struct DialogFrame {
     enter_target: Option<usize>,
     mouse_target: Option<usize>,
     alert_layout: bool,
+    problem: Option<String>,
 }
 impl DialogFrame {
     pub fn new(id: WidgetId, title: impl Into<String>) -> Self {
@@ -54,6 +55,7 @@ impl DialogFrame {
             enter_target: None,
             mouse_target: None,
             alert_layout: false,
+            problem: None,
         }
     }
     /// Adds a child. The first child that can take focus has it from the start.
@@ -78,6 +80,11 @@ impl DialogFrame {
     /// Makes activating this child close the dialog with `DialogResult::Button(result)`.
     pub fn close_on_activate(&mut self, child: usize, result: usize) {
         self.closing.push((child, result));
+    }
+    /// A mistake in how the dialog was set up, such as a `default_index` that names
+    /// no button. Enter does nothing in that case, and this says why.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
     /// How the dialog ended. `None` while it is open.
     pub fn result(&self) -> Option<DialogResult> {
@@ -177,8 +184,8 @@ impl DialogFrame {
     }
     fn move_focus(&mut self, index: usize, time_us: u64, ctx: &mut ViewContext) {
         if index != self.focus_index {
+            self.cancel_enter(ctx);
             self.send(self.focus_index, InputKind::Blur, time_us, ctx);
-            self.enter_target = None;
             self.focus_index = index;
             self.send(index, InputKind::Focus, time_us, ctx);
         }
@@ -187,6 +194,20 @@ impl DialogFrame {
             ctx.set_focus(w.id)
         }
         ctx.invalidate(self.bounds);
+    }
+    /// Ends a press of Enter that focus has moved away from. The button under it must
+    /// not stay pressed, because its Enter up will not come.
+    fn cancel_enter(&mut self, ctx: &mut ViewContext) {
+        if let Some(target) = self.enter_target.take()
+            && let Some(child) = self.children.get_mut(target)
+        {
+            child.cancel_press(ctx);
+        }
+    }
+    fn focused_takes(&self, virtual_key: u16) -> bool {
+        self.children
+            .get(self.focus_index)
+            .is_some_and(|c| c.uses_key(virtual_key))
     }
     /// The open list of the focused control, which is above everything else.
     fn open_overlay(&self) -> Option<Rect> {
@@ -218,20 +239,21 @@ impl DialogFrame {
                 Handled::Yes
             }
             InputKind::Blur => {
-                self.enter_target = None;
+                self.cancel_enter(ctx);
                 self.mouse_target = None;
                 self.send(self.focus_index, InputKind::Blur, time, ctx);
                 Handled::Yes
             }
+            // Alt chords belong to the system and the host, so the frame leaves them.
+            _ if alt_chord(&event.kind) => self
+                .children
+                .get_mut(self.focus_index)
+                .map_or(Handled::No, |child| child.handle(event, ctx)),
             InputKind::KeyDown {
                 virtual_key: ESCAPE,
                 ..
             } => {
-                let takes = self
-                    .children
-                    .get(self.focus_index)
-                    .is_some_and(|c| c.uses_key(ESCAPE));
-                if takes {
+                if self.focused_takes(ESCAPE) {
                     return self.children[self.focus_index].handle(event, ctx);
                 }
                 self.finish(DialogResult::Dismissed);
@@ -242,7 +264,22 @@ impl DialogFrame {
                 virtual_key: TAB,
                 modifiers,
                 ..
+            } if modifiers.ctrl && !self.focused_takes(TAB) => {
+                for child in &mut self.children {
+                    if child.switch_tab(modifiers.shift, ctx) {
+                        return Handled::Yes;
+                    }
+                }
+                Handled::No
+            }
+            InputKind::KeyDown {
+                virtual_key: TAB,
+                modifiers,
+                ..
             } if !self.children.is_empty() => {
+                if self.focused_takes(TAB) {
+                    return self.children[self.focus_index].handle(event, ctx);
+                }
                 if let Some(next) = self.next_focusable(modifiers.shift) {
                     self.move_focus(next, time, ctx);
                 }
@@ -251,11 +288,7 @@ impl DialogFrame {
             InputKind::KeyDown {
                 virtual_key: ENTER, ..
             } => {
-                let focused_takes = self
-                    .children
-                    .get(self.focus_index)
-                    .is_some_and(|c| c.uses_key(ENTER));
-                let target = if focused_takes {
+                let target = if self.focused_takes(ENTER) {
                     Some(self.focus_index)
                 } else {
                     self.default_index
@@ -263,6 +296,19 @@ impl DialogFrame {
                 let Some(target) = target else {
                     return Handled::No;
                 };
+                if !self.focused_takes(ENTER) {
+                    // `default_index` is enough to make a button the default one.
+                    let usable = self
+                        .children
+                        .get_mut(target)
+                        .is_some_and(|child| child.mark_default());
+                    if !usable {
+                        self.problem = Some(format!(
+                            "default_index {target} names no control that Enter can press"
+                        ));
+                        return Handled::No;
+                    }
+                }
                 self.enter_target = Some(target);
                 self.children
                     .get_mut(target)

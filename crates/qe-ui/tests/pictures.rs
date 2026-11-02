@@ -188,8 +188,8 @@ fn text_sits_inside_each_control_and_is_centered() {
             ),
             (
                 "tab",
-                Box::new(TabBar::new(WidgetId(6), vec![SAMPLE.into()])),
-                Box::new(TabBar::new(WidgetId(6), vec![String::new()])),
+                Box::new(TabBar::new(WidgetId(6), "Test", vec![SAMPLE.into()])),
+                Box::new(TabBar::new(WidgetId(6), "Test", vec![String::new()])),
             ),
         ];
         for (name, mut with, mut without) in with_and_without {
@@ -209,6 +209,7 @@ fn text_sits_inside_each_control_and_is_centered() {
         let row_of = |label: &str| {
             MenuView::new(
                 WidgetId(7),
+                "Test",
                 MenuModel {
                     items: vec![MenuItem::command(label, qe_api::CommandId::Open)],
                 },
@@ -233,7 +234,7 @@ fn text_sits_inside_each_control_and_is_centered() {
             indent: 0,
         };
         let table_of = |head0: &str, head1: &str, rows: Vec<TableRow>| {
-            Table::new(WidgetId(8), vec![head0.into(), head1.into()], rows)
+            Table::new(WidgetId(8), "Test", vec![head0.into(), head1.into()], rows)
         };
         let bounds = r(10.0, 4.0, 280.0, 84.0);
         let shortcut_head = ink_between(
@@ -386,18 +387,59 @@ fn control_edges_and_the_keyboard_highlight_reach_three_to_one() {
     for (name, theme) in [
         ("light", Theme::new(ThemeKind::Light)),
         ("dark", Theme::new(ThemeKind::Dark)),
+        ("contrast black", SystemPalette::HIGH_CONTRAST_BLACK.theme()),
+        ("contrast white", SystemPalette::HIGH_CONTRAST_WHITE.theme()),
     ] {
         let t = UiTokens::from_theme(&theme);
+        let hover = over(t.hover, t.surface);
+        let pressed = over(t.pressed, t.surface);
+        let on_selected = contrast_ratio(t.focus_on_selected, t.selected);
+        // The fills themselves are measured and printed, and they stay subtle in the
+        // normal themes. The mark and the ring carry the state, so those get the limit.
+        println!(
+            "{name}: selected fill on surface {:.2}:1, hover on surface {:.2}:1",
+            contrast_ratio(t.selected, t.surface),
+            contrast_ratio(hover, t.surface)
+        );
+        assert!(
+            contrast_ratio(hover, t.surface) >= 1.2,
+            "{name}: a hovered row is too faint"
+        );
+        assert!(
+            contrast_ratio(t.selected, t.surface) >= 1.25,
+            "{name}: a selected row's fill is too faint"
+        );
         let measured = [
+            (
+                "selection mark on surface",
+                contrast_ratio(
+                    t.selected_mark,
+                    if t.high_contrast {
+                        t.selected
+                    } else {
+                        t.surface
+                    },
+                ),
+            ),
+            (
+                "selection mark on fill",
+                contrast_ratio(t.selected_mark, t.selected),
+            ),
+            (
+                "text selection on surface",
+                contrast_ratio(t.text_selection, t.surface),
+            ),
+            ("focus ring on selected row", on_selected),
+            (
+                "focus ring on hovered row",
+                contrast_ratio(t.focus_on_selected, hover),
+            ),
+            ("thumb on surface", contrast_ratio(t.thumb, t.surface)),
             ("border on surface", contrast_ratio(t.border, t.surface)),
             ("border on page", contrast_ratio(t.border, t.background)),
             ("accent on page", contrast_ratio(t.accent, t.background)),
             ("focus ring on surface", contrast_ratio(t.focus, t.surface)),
             ("focus ring on page", contrast_ratio(t.focus, t.background)),
-            (
-                "focus ring on a hovered row",
-                contrast_ratio(t.focus, over(t.hover, t.surface)),
-            ),
         ];
         for (what, ratio) in measured {
             println!("{name}: {what} {ratio:.2}:1");
@@ -408,6 +450,15 @@ fn control_edges_and_the_keyboard_highlight_reach_three_to_one() {
             (
                 "text on a selected row",
                 contrast_ratio(t.selected_text, t.selected),
+            ),
+            (
+                "text on selected characters",
+                contrast_ratio(t.text_selection_text, t.text_selection),
+            ),
+            ("text on a hovered row", contrast_ratio(t.hover_text, hover)),
+            (
+                "text on a pressed control",
+                contrast_ratio(t.pressed_text, pressed),
             ),
             ("mark on accent", contrast_ratio(t.on_accent, t.accent)),
             ("dim text on page", contrast_ratio(t.disabled, t.background)),
@@ -426,9 +477,9 @@ fn keyboard_menu_highlight_shows_a_ring_in_the_picture() {
         let model = MenuModel {
             items: vec![MenuItem::command("", qe_api::CommandId::Open)],
         };
-        let mut mouse = MenuView::new(WidgetId(1), model.clone());
+        let mut mouse = MenuView::new(WidgetId(1), "Test", model.clone());
         mouse.selected = Some(0);
-        let mut keyboard = MenuView::new(WidgetId(1), model);
+        let mut keyboard = MenuView::new(WidgetId(1), "Test", model);
         keyboard.open_keyboard();
         let ring = ink_between(
             &shot(&mut keyboard, &theme, bounds),
@@ -457,7 +508,11 @@ fn encoding_panel_is_336_by_187_and_stays_inside() {
         );
     }
     // Every button label fits its button in the real font.
-    for child in tree.children.iter().skip(1) {
+    for child in tree
+        .children
+        .iter()
+        .filter(|c| c.role == qe_api::WidgetRole::Button)
+    {
         let width = RealMeasure.measure(&child.name, UI_MEASURE_TOKEN).width.0;
         assert!(
             width <= child.bounds.width.0 - 8.0,
@@ -468,3 +523,93 @@ fn encoding_panel_is_336_by_187_and_stays_inside() {
     }
 }
 use qe_api::TextMeasurer;
+
+/// The strongest contrast any pixel of the ink reaches against its flat background,
+/// from the real renderer. A color calculation is not enough: thin stems never reach
+/// full coverage, so translucent text comes out lighter than its color says.
+fn strongest_ink(image: &Bitmap, fill: Color) -> f32 {
+    image
+        .bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| contrast_ratio(Color::rgb(p[2], p[1], p[0]), fill))
+        .fold(1.0, f32::max)
+}
+fn ink_of(theme: &Theme, fill: Color, view: &mut dyn View, bounds: Rect) -> f32 {
+    let mut list = DisplayList::default();
+    list.push(DrawCommand::FillRect {
+        rect: r(0.0, 0.0, W as f32, H as f32),
+        color: fill,
+    });
+    view.layout(bounds, &RealMeasure);
+    view.draw(&mut list, theme, &RealMeasure);
+    strongest_ink(&render(&list, W, H), fill)
+}
+#[test]
+fn enabled_text_reaches_four_and_a_half_to_one_in_real_pixels() {
+    const LINE: &str = "Click a shortcut, then press";
+    let line_box = r(4.0, 4.0, 290.0, 28.0);
+    for (name, theme) in [
+        ("light", Theme::new(ThemeKind::Light)),
+        ("dark", Theme::new(ThemeKind::Dark)),
+        ("contrast black", SystemPalette::HIGH_CONTRAST_BLACK.theme()),
+        ("contrast white", SystemPalette::HIGH_CONTRAST_WHITE.theme()),
+    ] {
+        let t = UiTokens::from_theme(&theme);
+        let page = t.background;
+        let mut measured = Vec::new();
+        for (what, kind) in [
+            ("plain", LabelKind::Plain),
+            ("group", LabelKind::Group),
+            ("hint", LabelKind::Hint),
+            ("warning", LabelKind::Warning),
+        ] {
+            let mut label = Label::new(WidgetId(1), LINE, kind);
+            measured.push((what, ink_of(&theme, page, &mut label, line_box)));
+        }
+        // No border or fill darker than the text may decide these, so each view is
+        // painted on the same color as its own fill and its text alone stands out.
+        let mut field = TextField::new(WidgetId(2), "Name");
+        field.placeholder = LINE.into();
+        let hint_only = text_runs_only(&mut field, &theme, r(4.0, 4.0, 280.0, 32.0));
+        measured.push(("placeholder", hint_only_ink(&hint_only, t.surface)));
+        let rows = vec![TableRow {
+            label: String::new(),
+            detail: "Ctrl+Shift+S".into(),
+            section: false,
+            indent: 0,
+        }];
+        let mut table = Table::new(WidgetId(3), "Keys", vec![String::new(); 2], rows);
+        table.selected = 5;
+        let detail = text_runs_only(&mut table, &theme, r(4.0, 2.0, 280.0, 84.0));
+        measured.push(("table shortcut", hint_only_ink(&detail, page)));
+        let mut row = MenuItem::command("", qe_api::CommandId::Open);
+        row.key_text = "Ctrl+Shift+S".into();
+        let mut menu = MenuView::new(WidgetId(4), "Menu", MenuModel { items: vec![row] });
+        let shortcut = text_runs_only(&mut menu, &theme, r(4.0, 4.0, 280.0, 60.0));
+        measured.push(("menu shortcut", hint_only_ink(&shortcut, t.surface)));
+        for (what, ratio) in measured {
+            println!("{name}: {what} text, real pixels {ratio:.2}:1");
+            assert!(ratio >= 4.5, "{name}: {what} text is only {ratio:.2}:1");
+        }
+    }
+}
+/// A view's text commands alone, without its fills and borders.
+fn text_runs_only(view: &mut dyn View, theme: &Theme, bounds: Rect) -> DisplayList {
+    let mut all = DisplayList::default();
+    view.layout(bounds, &RealMeasure);
+    view.draw(&mut all, theme, &RealMeasure);
+    all.commands
+        .retain(|c| matches!(c, DrawCommand::TextRun { .. }));
+    all
+}
+fn hint_only_ink(text: &DisplayList, fill: Color) -> f32 {
+    let mut list = DisplayList::default();
+    list.push(DrawCommand::FillRect {
+        rect: r(0.0, 0.0, W as f32, H as f32),
+        color: fill,
+    });
+    list.commands.extend(text.commands.iter().cloned());
+    strongest_ink(&render(&list, W, H), fill)
+}

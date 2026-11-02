@@ -1,5 +1,6 @@
 display-list-v4
-round 0.000,0.000,120.000,32.000 4.000 #334c66ff
+round 0.000,0.000,120.000,32.000 4.000 #3d5e80ff
+round 8.000,27.000,104.000,3.000 1.500 #99cdffff
 push-clip 0.000,0.000,120.000,32.000
 text 8.000,20.500 "Segoe UI" 13.000 #ffffffff "New"
 pop-clip

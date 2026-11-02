@@ -1,4 +1,7 @@
-use qe_api::{DisplayList, Rect, TextMeasurer, Theme, View, Widget, WidgetId, WidgetRole};
+use qe_api::{
+    DisplayList, InputKind, Rect, TextMeasurer, Theme, View, ViewContext, Widget, WidgetId,
+    WidgetRole,
+};
 use std::any::Any;
 use std::collections::HashSet;
 
@@ -21,6 +24,12 @@ pub(crate) const F4: u16 = 0x73;
 /// One wheel notch, in the units of `InputKind::Wheel`.
 pub(crate) const WHEEL_NOTCH: f32 = 120.0;
 
+/// True for a key pressed with Alt, which AltGr also reports. These chords belong to
+/// the system and the host, such as Alt+F4 and Alt+Space, so a control leaves them.
+pub(crate) fn alt_chord(kind: &InputKind) -> bool {
+    matches!(kind, InputKind::KeyDown { modifiers, .. } if modifiers.alt)
+}
+
 /// What a `DialogFrame` needs from a child beyond `View`.
 pub trait Control: View + Any {
     /// True when Tab may stop here.
@@ -34,8 +43,19 @@ pub trait Control: View + Any {
     fn uses_key(&self, _virtual_key: u16) -> bool {
         false
     }
-    /// True once for each activation since the last call.
+    /// True once after the user changed or activated this control. Every control
+    /// reports a user's change here, by any route: key, wheel or mouse.
     fn take_activated(&mut self) -> bool {
+        false
+    }
+    /// Ends a key press that began on this control, with no click.
+    fn cancel_press(&mut self, _: &mut ViewContext) {}
+    /// Makes this control the one Enter presses. False if it cannot be that.
+    fn mark_default(&mut self) -> bool {
+        false
+    }
+    /// Moves to the next or previous tab, for Ctrl+Tab. False if this has no tabs.
+    fn switch_tab(&mut self, _back: bool, _: &mut ViewContext) -> bool {
         false
     }
     /// The part painted above other controls, such as an open list.

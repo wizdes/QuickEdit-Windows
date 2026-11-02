@@ -59,6 +59,25 @@ impl TextSettings {
     }
 }
 
+/// How full the caches other than the glyph cache are, for tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheSizes {
+    pub shape_bytes: usize,
+    pub inks: usize,
+    pub color_glyphs: usize,
+    pub corner_bytes: usize,
+}
+
+/// For tests: which step of a resize should fail.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeFault {
+    /// DirectWrite cannot change the bitmap.
+    Resize,
+    /// The bitmap changed, and its pixels cannot be found.
+    Lookup,
+}
+
 /// What the current frame did, for tests and benchmarks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats {
@@ -66,6 +85,8 @@ pub struct FrameStats {
     pub pixels: u64,
     pub glyphs_rasterized: u64,
     pub glyphs_drawn: u64,
+    /// How many glyphs of its runs the frame looked at. Most may lie off to one side.
+    pub glyphs_walked: u64,
 }
 
 pub struct BitmapRenderer {
@@ -85,16 +106,18 @@ pub struct BitmapRenderer {
     /// Changed pixels that the window has not received yet.
     damage: Regions,
     errors: Vec<RenderError>,
+    /// Problems from calls that cannot return one. The next `draw` reports them.
+    held_errors: Vec<RenderError>,
+    /// Why the bitmap has no pixels, after a resize that failed part of the way.
+    lost: Option<RenderError>,
+    fault: Option<ResizeFault>,
     stats: FrameStats,
     clips: Vec<Area>,
     opacities: Vec<f32>,
 }
 
-fn surface_of(
-    target: &IDWriteBitmapRenderTarget,
-    width: u32,
-    height: u32,
-) -> Result<Surface, RenderError> {
+/// The bitmap's pixels and real size, from the bitmap itself.
+fn surface_of(target: &IDWriteBitmapRenderTarget) -> Result<Surface, RenderError> {
     let dc = unsafe { target.GetMemoryDC() };
     let object = unsafe { GetCurrentObject(dc, OBJ_BITMAP) };
     let mut dib: DIBSECTION = unsafe { mem::zeroed() };
@@ -114,9 +137,75 @@ fn surface_of(
     Ok(Surface {
         bits: dib.dsBm.bmBits.cast(),
         stride: dib.dsBm.bmWidthBytes as isize,
-        width: width as i32,
-        height: height as i32,
+        width: dib.dsBm.bmWidth,
+        height: dib.dsBm.bmHeight.abs(),
     })
+}
+fn finite(values: &[f32]) -> bool {
+    values.iter().all(|v| v.is_finite())
+}
+fn finite_rect(r: &Rect) -> bool {
+    finite(&[r.x.0, r.y.0, r.width.0, r.height.0])
+}
+fn finite_point(p: &Point) -> bool {
+    finite(&[p.x.0, p.y.0])
+}
+fn not_finite(what: &str) -> RenderError {
+    error(format!(
+        "a {what} has a value that is not a finite number, so it was skipped"
+    ))
+}
+/// A position or size that is not a finite number would turn into pixel 0.
+fn check_command(cmd: &DrawCommand) -> Result<(), RenderError> {
+    let (what, fine) = match cmd {
+        DrawCommand::FillRect { rect, .. } => ("FillRect", finite_rect(rect)),
+        DrawCommand::FillRects { rects, .. } => ("FillRects", rects.iter().all(finite_rect)),
+        DrawCommand::RoundedRect { rect, radius, .. } => {
+            ("RoundedRect", finite_rect(rect) && radius.0.is_finite())
+        }
+        DrawCommand::StrokeRect {
+            rect,
+            radius,
+            width,
+            ..
+        } => (
+            "StrokeRect",
+            finite_rect(rect) && finite(&[radius.0, width.0]),
+        ),
+        DrawCommand::Line {
+            from, to, width, ..
+        } => (
+            "Line",
+            finite_point(from) && finite_point(to) && width.0.is_finite(),
+        ),
+        DrawCommand::WavyUnderline { from, to, .. } => {
+            ("WavyUnderline", finite_point(from) && finite_point(to))
+        }
+        DrawCommand::TextRun { at, font_size, .. } => {
+            ("TextRun", finite_point(at) && font_size.0.is_finite())
+        }
+        DrawCommand::Icon { at, font_size, .. } => {
+            ("Icon", finite_point(at) && font_size.0.is_finite())
+        }
+        // A run's arrays are checked glyph by glyph as it draws, so that a very long run
+        // costs only its visible part.
+        DrawCommand::GlyphRun {
+            at, font_em_size, ..
+        } => ("GlyphRun", finite_point(at) && font_em_size.0.is_finite()),
+        DrawCommand::PushClip(r) => ("PushClip", finite_rect(r)),
+        DrawCommand::PushOpacity(a) => ("PushOpacity", a.is_finite()),
+        DrawCommand::PopClip | DrawCommand::PopOpacity => ("", true),
+    };
+    if fine { Ok(()) } else { Err(not_finite(what)) }
+}
+fn line_bounds(from: Point, to: Point, reach: f32) -> Rect {
+    let (x, y) = (from.x.0.min(to.x.0) - reach, from.y.0.min(to.y.0) - reach);
+    Rect {
+        x: Dip(x),
+        y: Dip(y),
+        width: Dip(from.x.0.max(to.x.0) + reach - x),
+        height: Dip(from.y.0.max(to.y.0) + reach - y),
+    }
 }
 fn to_rect(a: Area) -> RECT {
     RECT {
@@ -139,6 +228,8 @@ fn parse_icon(id: &str) -> Option<u32> {
 }
 
 const ICON_FONT: &str = "Segoe Fluent Icons";
+/// GDI's limit on a bitmap's side.
+const MOST_BITMAP_SIDE: u32 = 32767;
 
 impl BitmapRenderer {
     pub fn new(width: u32, height: u32) -> Result<Self, RenderError> {
@@ -153,7 +244,8 @@ impl BitmapRenderer {
                 .CreateBitmapRenderTarget(None, capacity_width, capacity_height)
                 .map_err(error)?
         };
-        let surface = surface_of(&target, capacity_width, capacity_height)?;
+        let surface = surface_of(&target)?;
+        let (capacity_width, capacity_height) = (surface.width as u32, surface.height as u32);
         let mut pending = Regions::default();
         pending.add(Area::full(width, height));
         Ok(Self {
@@ -170,6 +262,9 @@ impl BitmapRenderer {
             frame: Regions::default(),
             damage: Regions::default(),
             errors: Vec::new(),
+            held_errors: Vec::new(),
+            lost: None,
+            fault: None,
             stats: FrameStats::default(),
             clips: Vec::new(),
             opacities: Vec::new(),
@@ -180,6 +275,164 @@ impl BitmapRenderer {
     }
     fn scale64(&self) -> f64 {
         f64::from(self.dpi) / 96.0
+    }
+    /// For tests: makes one step of the next resize fail.
+    #[doc(hidden)]
+    pub fn fail_next_resize(&mut self, fault: ResizeFault) {
+        self.fault = Some(fault);
+    }
+    pub fn cache_sizes(&self) -> CacheSizes {
+        CacheSizes {
+            corner_bytes: self.corners.bytes(),
+            ..self.text.cache_sizes()
+        }
+    }
+    /// The rectangle of dips that this command can ink. Glyphs can reach past their row,
+    /// and a redraw clips strictly. So when a text command changes, invalidate its bounds
+    /// from before and from after the change, and not only its row. Clip commands return
+    /// `None`. A problem with the command comes back as the `Err` that drawing it would
+    /// report.
+    pub fn ink_bounds(&mut self, command: &DrawCommand) -> Result<Option<Rect>, RenderError> {
+        let s = self.scale64();
+        check_command(command)?;
+        let run_rect = |at: Point, e: (f64, f64, f64, f64)| {
+            let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
+            Rect {
+                x: Dip((x + e.0 / s) as f32),
+                y: Dip((y + e.1 / s) as f32),
+                width: Dip(((e.2 - e.0) / s) as f32),
+                height: Dip(((e.3 - e.1) / s) as f32),
+            }
+        };
+        Ok(match command {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::RoundedRect { rect, .. }
+            | DrawCommand::StrokeRect { rect, .. } => Some(*rect),
+            DrawCommand::FillRects { rects, .. } => {
+                let mut all = None::<(f32, f32, f32, f32)>;
+                for r in rects {
+                    let one = (r.x.0, r.y.0, r.x.0 + r.width.0, r.y.0 + r.height.0);
+                    all = Some(match all {
+                        None => one,
+                        Some(b) => (
+                            b.0.min(one.0),
+                            b.1.min(one.1),
+                            b.2.max(one.2),
+                            b.3.max(one.3),
+                        ),
+                    });
+                }
+                all.map(|b| Rect {
+                    x: Dip(b.0),
+                    y: Dip(b.1),
+                    width: Dip(b.2 - b.0),
+                    height: Dip(b.3 - b.1),
+                })
+            }
+            DrawCommand::Line {
+                from, to, width, ..
+            } => Some(line_bounds(*from, *to, width.0 / 2.0 + 2.0 / self.scale())),
+            DrawCommand::WavyUnderline { from, to, .. } => {
+                Some(line_bounds(*from, *to, 1.25 + 2.0 / self.scale() + 0.5))
+            }
+            DrawCommand::GlyphRun {
+                at,
+                bidi_level,
+                font_id,
+                font_em_size,
+                glyph_ids,
+                advances,
+                offsets,
+                ..
+            } => {
+                let face = self
+                    .text
+                    .face_of_id(*font_id)
+                    .ok_or_else(|| error(format!("font ID {font_id} is not registered")))?;
+                let extents = self.text.run_extents(
+                    &RunRef {
+                        face,
+                        em: font_em_size.0,
+                        bidi: *bidi_level,
+                        ids: glyph_ids,
+                        advances,
+                        offsets,
+                        gray: false,
+                    },
+                    s,
+                );
+                if !offsets.iter().all(finite_point)
+                    || !finite(&[
+                        extents.0 as f32,
+                        extents.1 as f32,
+                        extents.2 as f32,
+                        extents.3 as f32,
+                    ])
+                {
+                    return Err(not_finite("GlyphRun"));
+                }
+                Some(run_rect(*at, extents))
+            }
+            DrawCommand::TextRun {
+                at,
+                text,
+                font,
+                font_size,
+                ..
+            } => {
+                let shaped = self.text.shape(font, font_size.0, text)?;
+                self.text
+                    .shaped_extents(&shaped, s)
+                    .map(|e| run_rect(*at, e))
+            }
+            DrawCommand::Icon { at, font_size, .. } => {
+                let face = self.text.family(ICON_FONT)?;
+                Some(run_rect(
+                    *at,
+                    self.text.run_extents(
+                        &RunRef {
+                            face,
+                            em: font_size.0,
+                            bidi: 0,
+                            ids: &[0],
+                            advances: &[Dip(0.0)],
+                            offsets: &[Point {
+                                x: Dip(0.0),
+                                y: Dip(0.0),
+                            }],
+                            gray: true,
+                        },
+                        s,
+                    ),
+                ))
+            }
+            DrawCommand::PushClip(_)
+            | DrawCommand::PopClip
+            | DrawCommand::PushOpacity(_)
+            | DrawCommand::PopOpacity => None,
+        })
+    }
+    /// Reads the text settings that Windows has now for this monitor. If they differ from
+    /// the ones in use, it uses them, asks for a full repaint and returns `true`.
+    pub fn refresh_text_settings_for_monitor(
+        &mut self,
+        monitor: HMONITOR,
+    ) -> Result<bool, RenderError> {
+        let changed = self.text.refresh_settings(monitor)?;
+        if changed {
+            self.invalidate_all();
+        }
+        Ok(changed)
+    }
+    /// The same for the monitor that this window is on. The window calls this after
+    /// WM_SETTINGCHANGE, WM_DISPLAYCHANGE and WM_DPICHANGED, and after a move that may
+    /// have changed the monitor.
+    pub fn refresh_text_settings_for_window(&mut self, hwnd: HWND) -> Result<bool, RenderError> {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.0.is_null() {
+            return Err(error("this window is on no monitor"));
+        }
+        self.refresh_text_settings_for_monitor(monitor)
     }
     /// Device pixels per dip.
     pub fn scale(&self) -> f32 {
@@ -194,6 +447,9 @@ impl BitmapRenderer {
         self.text.set_settings(settings)
     }
     pub fn bitmap(&self) -> Result<Bitmap, RenderError> {
+        if let Some(lost) = &self.lost {
+            return Err(lost.clone());
+        }
         let mut bgra = vec![0; self.width as usize * self.height as usize * 4];
         for (y, row) in bgra.chunks_exact_mut(self.width as usize * 4).enumerate() {
             let pixels = self.surface.span(y as i32, 0, self.width as i32);
@@ -210,7 +466,14 @@ impl BitmapRenderer {
     /// Asks the next frame to repaint this rectangle. An empty or off-screen
     /// rectangle asks for nothing.
     pub fn invalidate(&mut self, rect: Rect) {
-        let area = Area::outward(rect, self.scale64()).clip(self.full());
+        if !finite_rect(&rect) {
+            // No one can say what it meant to repaint, so everything repaints.
+            self.held_errors
+                .push(not_finite("rectangle for invalidate"));
+            self.invalidate_all();
+            return;
+        }
+        let area = Area::damage(rect, self.scale64()).clip(self.full());
         self.pending.add(area);
     }
     /// Asks the next frame to repaint the whole bitmap. With nothing pending, a frame
@@ -302,18 +565,26 @@ impl BitmapRenderer {
     /// Moves the pixels of `rect` by `dy` dips.
     ///
     /// Rule: pixels can only move by whole device pixels, and the list drawn next has
-    /// positions that may round differently after any other shift. So a `dy` that is a
-    /// whole number of device pixels copies rows and repaints only the revealed strip.
+    /// positions that may round differently after any other shift. So a `dy` that is
+    /// exactly `pixels as f32 / scale()` copies rows and repaints only the revealed strip.
     /// Any other `dy` copies nothing and repaints all of `rect`. That is always right
     /// and never drifts, but it costs a repaint. For speed, keep the scroll position on
     /// whole device pixels: `dy = pixels / scale()`, or use `scroll_pixels`.
     pub fn scroll(&mut self, rect: Rect, dy: Dip) -> Result<(), RenderError> {
+        if !finite_rect(&rect) || !dy.0.is_finite() {
+            return Err(not_finite("scroll"));
+        }
         let device = f64::from(dy.0) * self.scale64();
         if device == 0.0 {
             return Ok(());
         }
+        // A copy is exact only if every position in the next list moved by whole pixels.
+        // So the shift must be exactly `pixels / scale()`, the value that `f32` division
+        // gives. Any allowance around that adds up: 1.001 dips at 96 DPI moves a shape
+        // at y=20.4985 across a rounding edge, and 200 shifts of 1.0025 pixels are half a
+        // pixel. Every other shift repaints.
         let whole = device.round();
-        if whole != 0.0 && (device - whole).abs() < 1.0 / 256.0 {
+        if whole != 0.0 && (whole as f32 / self.scale()).to_bits() == dy.0.to_bits() {
             return self.scroll_pixels(rect, whole as i32);
         }
         let area = Area::snapped(rect, self.scale64()).clip(self.full());
@@ -323,6 +594,9 @@ impl BitmapRenderer {
     /// Moves the pixels of `rect` by `dy` device pixels. It repaints only the part that
     /// the move reveals, and moves any rectangles already waiting for a repaint.
     pub fn scroll_pixels(&mut self, rect: Rect, dy: i32) -> Result<(), RenderError> {
+        if !finite_rect(&rect) {
+            return Err(not_finite("scroll"));
+        }
         let area = Area::snapped(rect, self.scale64()).clip(self.full());
         if !area.valid() || dy == 0 {
             return Ok(());
@@ -435,6 +709,7 @@ impl BitmapRenderer {
     /// Draws one command. `DrawCommand` has no catch-all arm here, so a new command
     /// cannot be dropped silently: it stops this file from compiling.
     fn command(&mut self, cmd: &DrawCommand, clip: Area, opacity: f32) -> Result<(), RenderError> {
+        check_command(cmd)?;
         let s = self.scale64();
         match cmd {
             DrawCommand::FillRect { rect, color } => {
@@ -537,6 +812,7 @@ impl BitmapRenderer {
                         ids: glyph_ids,
                         advances,
                         offsets,
+                        gray: false,
                     },
                     fade(*color, opacity),
                 )
@@ -588,6 +864,7 @@ impl BitmapRenderer {
                             x: Dip(0.0),
                             y: Dip(0.0),
                         }],
+                        gray: true,
                     },
                     fade(*color, opacity),
                 )
@@ -610,7 +887,14 @@ impl BitmapRenderer {
             let clip = clips[clips.len() - 1];
             let opacity = opacities[opacities.len() - 1];
             match cmd {
-                DrawCommand::PushClip(r) => clips.push(clip.clip(Area::snapped(*r, s))),
+                DrawCommand::PushClip(r) => match check_command(cmd) {
+                    Ok(()) => clips.push(clip.clip(Area::snapped(*r, s))),
+                    // What it held has no known place, so it stays hidden.
+                    Err(problem) => {
+                        self.report(problem);
+                        clips.push(Area::EMPTY);
+                    }
+                },
                 DrawCommand::PopClip => {
                     if clips.len() == 1 {
                         self.report(error("clip stack underflow"));
@@ -618,7 +902,13 @@ impl BitmapRenderer {
                         clips.pop();
                     }
                 }
-                DrawCommand::PushOpacity(a) => opacities.push(opacity * a.clamp(0.0, 1.0)),
+                DrawCommand::PushOpacity(a) => match check_command(cmd) {
+                    Ok(()) => opacities.push(opacity * a.clamp(0.0, 1.0)),
+                    Err(problem) => {
+                        self.report(problem);
+                        opacities.push(0.0);
+                    }
+                },
                 DrawCommand::PopOpacity => {
                     if opacities.len() == 1 {
                         self.report(error("opacity stack underflow"));
@@ -645,6 +935,27 @@ impl BitmapRenderer {
         self.clips = clips;
         self.opacities = opacities;
     }
+    /// No pixels can be reached. With a size of zero, no rectangle reaches the pointer.
+    /// Only a later `resize` that finds the pixels again ends this state.
+    fn lose_bitmap(&mut self, why: &RenderError) {
+        self.lost = Some(error(format!(
+            "the bitmap was lost in a resize, so nothing can draw until a resize works: {}",
+            why.message
+        )));
+        self.surface = Surface {
+            bits: std::ptr::null_mut(),
+            stride: 0,
+            width: 0,
+            height: 0,
+        };
+        self.capacity_width = 0;
+        self.capacity_height = 0;
+        self.width = 0;
+        self.height = 0;
+        self.pending.clear();
+        self.frame.clear();
+        self.damage.clear();
+    }
     /// Moves what is pending into this frame's regions.
     fn take_pending(&mut self) {
         for i in 0..self.pending.list.len() {
@@ -656,12 +967,11 @@ impl BitmapRenderer {
 }
 
 impl Renderer for BitmapRenderer {
-    /// Starts a frame. Each `draw` in it paints what was pending at this point, plus
-    /// anything invalidated before that `draw`.
+    /// Starts a frame. Pending work stays pending until a `draw` paints it, so a frame
+    /// with no `draw` loses nothing.
     fn begin_frame(&mut self) -> Result<(), RenderError> {
         self.stats = FrameStats::default();
         self.frame.clear();
-        self.take_pending();
         Ok(())
     }
     /// Paints `list` inside the frame's regions, and does nothing when there are none.
@@ -671,8 +981,15 @@ impl Renderer for BitmapRenderer {
     /// The list must paint an opaque background over each region, because a translucent
     /// command blends with whatever the region holds.
     fn draw(&mut self, list: &DisplayList) -> Result<(), RenderError> {
+        if let Some(lost) = &self.lost {
+            self.errors = vec![lost.clone()];
+            return Err(lost.clone());
+        }
         self.take_pending();
         self.errors.clear();
+        for problem in mem::take(&mut self.held_errors) {
+            self.report(problem);
+        }
         self.text.next_draw();
         self.text.counts = Default::default();
         let regions = mem::take(&mut self.frame.list);
@@ -684,6 +1001,7 @@ impl Renderer for BitmapRenderer {
         self.stats.pixels = regions.iter().map(|a| a.pixels()).sum();
         self.stats.glyphs_rasterized += self.text.counts.rasterized;
         self.stats.glyphs_drawn += self.text.counts.drawn;
+        self.stats.glyphs_walked += self.text.counts.walked;
         self.frame.list = regions;
         if self.errors.is_empty() {
             return Ok(());
@@ -702,15 +1020,38 @@ impl Renderer for BitmapRenderer {
         if width == 0 || height == 0 {
             return Err(error("empty bitmap"));
         }
-        if width > self.capacity_width || height > self.capacity_height {
+        if width > MOST_BITMAP_SIDE || height > MOST_BITMAP_SIDE {
+            return Err(error(format!(
+                "a bitmap of {width}x{height} is larger than GDI can hold"
+            )));
+        }
+        if self.lost.is_some() || width > self.capacity_width || height > self.capacity_height {
             let w = width.max(self.capacity_width).next_multiple_of(256);
             let h = height.max(self.capacity_height).next_multiple_of(128);
-            unsafe {
-                self.target.Resize(w, h).map_err(error)?;
+            let changed = match self.fault.take_if(|f| *f == ResizeFault::Resize) {
+                Some(_) => Err(error("a resize failed, as a test asked")),
+                None => unsafe { self.target.Resize(w, h).map_err(error) },
+            };
+            // Whatever happened, the bitmap may have moved. Believe only the bitmap.
+            let looked = match self.fault.take_if(|f| *f == ResizeFault::Lookup) {
+                Some(_) => Err(error("a pixel lookup failed, as a test asked")),
+                None => surface_of(&self.target),
+            };
+            match looked {
+                Ok(surface) => {
+                    self.surface = surface;
+                    self.capacity_width = surface.width as u32;
+                    self.capacity_height = surface.height as u32;
+                    if self.lost.take().is_some() && changed.is_err() {
+                        self.lost = Some(error("the bitmap was lost in a resize"));
+                    }
+                }
+                Err(problem) => {
+                    self.lose_bitmap(&problem);
+                    return Err(problem);
+                }
             }
-            self.capacity_width = w;
-            self.capacity_height = h;
-            self.surface = surface_of(&self.target, w, h)?;
+            changed?;
         }
         self.width = width;
         self.height = height;

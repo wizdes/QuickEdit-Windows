@@ -10,7 +10,7 @@ text 415.333,28.000 "Segoe UI" 13.000 #ffffff9e "Tab 2"
 icon 580.000,28.000 "E8BB" 10.000 #ffffffff
 pop-clip
 icon 611.000,28.000 "E710" 12.000 #ffffffff
-icon 641.000,28.000 "E96E" 9.000 #ffffffc5
+icon 641.000,28.000 "E96E" 10.000 #ffffffc5
 fill 630.000,12.000,1.000,24.000 #ffffff12
 icon 682.000,24.000 "E921" 10.000 #ffffffff
 icon 728.000,24.000 "E922" 10.000 #ffffffff

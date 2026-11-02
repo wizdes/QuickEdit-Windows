@@ -274,7 +274,13 @@ fn run() -> Result<i32, Failure> {
         }
     }
     let start = qpc()?;
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
+    // Windows gives Access Denied when a process's DPI awareness is already set. That
+    // leaves the window working, at whatever awareness it has, so this says so and goes on.
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        eprintln!("window renderer: DPI awareness was not changed: {e}");
+    }
     let renderer = BitmapRenderer::new(724, 540)?;
     let mut state = Box::new(State {
         renderer,
@@ -293,7 +299,7 @@ fn run() -> Result<i32, Failure> {
     let state_ptr: *mut State = state.as_mut();
     let class = wide("QuickEditRendererWindow");
     let title = wide("QuickEdit renderer");
-    let module = unsafe { GetModuleHandleW(None)? };
+    let module = unsafe { GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e}"))? };
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wndproc),
         hInstance: HINSTANCE(module.0),
@@ -317,7 +323,8 @@ fn run() -> Result<i32, Failure> {
             None,
             Some(HINSTANCE(module.0)),
             None,
-        )?
+        )
+        .map_err(|e| format!("CreateWindowExW: {e}"))?
     };
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0 {
@@ -326,7 +333,7 @@ fn run() -> Result<i32, Failure> {
     state.dpi = dpi;
     state.renderer.set_dpi(dpi)?;
     let mut client = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut client)? };
+    unsafe { GetClientRect(hwnd, &mut client).map_err(|e| format!("GetClientRect: {e}"))? };
     state.width = (client.right - client.left).max(1) as u32;
     state.height = (client.bottom - client.top).max(1) as u32;
     state.renderer.resize(state.width, state.height)?;
@@ -352,7 +359,7 @@ fn run() -> Result<i32, Failure> {
             );
         }
         let mut now = RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut now)? };
+        unsafe { GetWindowRect(hwnd, &mut now).map_err(|e| format!("GetWindowRect: {e}"))? };
         let state = unsafe { &*state_ptr };
         println!(
             "dpi {} window {}x{}",

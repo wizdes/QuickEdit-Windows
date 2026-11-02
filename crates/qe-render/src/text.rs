@@ -8,7 +8,6 @@ use crate::{
 };
 use qe_api::{Color, Dip, Point, RenderError};
 use std::{
-    cell::RefCell,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     mem::ManuallyDrop,
@@ -16,7 +15,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 use windows::{
-    Win32::{Foundation::DWRITE_E_NOCOLOR, Graphics::DirectWrite::*},
+    Win32::{
+        Foundation::{DWRITE_E_NOCOLOR, RECT},
+        Graphics::{DirectWrite::*, Gdi::HMONITOR},
+    },
     core::{BOOL, HRESULT, HSTRING, Interface, PCWSTR, implement},
 };
 
@@ -59,12 +61,26 @@ type Map<K, V> = HashMap<K, V, BuildHasherDefault<QuickHasher>>;
 /// 32 MiB holds about 40,000 glyphs at ordinary sizes.
 pub(crate) const GLYPH_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const SHAPE_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const MOST_INKS: usize = 64;
+/// A screen of emoji uses over 64 layer colors. With too few slots, each frame would
+/// rebuild inks in turn. One ink costs at most about 4 KiB.
+const MOST_INKS: usize = 256;
 const MOST_COLOR_GLYPHS: usize = 4096;
 /// Coverage is made for this many positions across one pixel.
 const SUBPIXEL_POSITIONS: f64 = 4.0;
 /// Glyph edges spread past the outline by the ClearType filter.
 const FILTER_REACH: f64 = 3.0;
+/// Past this size, a rendering mode can stop giving coverage.
+const LARGE_EM_PIXELS: f32 = 256.0;
+/// Keeps an icon's glyph apart from a ClearType glyph of the same font, size and id.
+const GRAY_KEY_BIT: u32 = 63;
+/// A run stops at the clip's far edge plus this many font sizes, so that its cost is
+/// its visible part. A glyph offset further sideways than this past the edge is not
+/// drawn. Shaped marks move far less than this.
+const MOST_SIDEWAYS_EMS: f64 = 8.0;
+/// The largest font size that a glyph can have, in device pixels.
+const MOST_EM_PIXELS: f64 = 16384.0;
+/// The most memory for the coverage of one glyph.
+const MOST_GLYPH_BYTES: usize = 256 * 1024 * 1024;
 
 struct Face {
     face: IDWriteFontFace,
@@ -117,6 +133,10 @@ impl Gamma {
             from_linear[start..end.max(start)].fill(i as u8);
             start = end.max(start);
         }
+        // Near-black bytes can share one light value at a high gamma. No light must
+        // still mean level 0, and full light level 255.
+        from_linear[0] = 0;
+        from_linear[65535] = 255;
         Self {
             to_linear,
             from_linear,
@@ -131,18 +151,28 @@ struct OnBackground {
 const BACKGROUNDS_PER_INK: usize = 4;
 /// What blending needs for one ink color.
 struct Ink {
+    key: u32,
+    bytes: [u32; 3],
     linear: [u32; 3],
     /// The blend alpha for each coverage value and channel.
     alpha: [[u8; 256]; 3],
     backgrounds: Vec<OnBackground>,
     next_slot: usize,
-    candidate: u32,
+    candidate: Option<u32>,
     gamma: Rc<Gamma>,
 }
 impl Ink {
     #[inline]
     fn channel(&self, c: usize, coverage: u8, destination: u32) -> u32 {
         let alpha = u32::from(self.alpha[c][coverage as usize]);
+        // The ends are exact: nothing changes with no alpha, and full alpha gives the
+        // ink itself. Light values alone cannot promise that for near-black bytes.
+        if alpha == 0 {
+            return destination;
+        }
+        if alpha == 255 {
+            return self.bytes[c];
+        }
         let light = (self.linear[c] * alpha
             + u32::from(self.gamma.to_linear[destination as usize]) * (255 - alpha)
             + 127)
@@ -164,8 +194,8 @@ impl Ink {
         if let Some(found) = self.backgrounds.iter().position(|t| t.pixel == pixel) {
             return Some(found);
         }
-        if self.candidate != pixel {
-            self.candidate = pixel;
+        if self.candidate != Some(pixel) {
+            self.candidate = Some(pixel);
             return None;
         }
         let mut made = OnBackground {
@@ -215,6 +245,7 @@ pub(crate) struct Shaped {
 }
 
 /// One glyph run's data. Glyph runs and shaped text both draw through this.
+#[derive(Clone, Copy)]
 pub(crate) struct RunRef<'a> {
     pub face: u32,
     pub em: f32,
@@ -222,12 +253,41 @@ pub(crate) struct RunRef<'a> {
     pub ids: &'a [u16],
     pub advances: &'a [Dip],
     pub offsets: &'a [Point],
+    /// Icons: grayscale coverage with no color fringes, on a whole pixel. Its glyphs have
+    /// their own cache entries.
+    pub gray: bool,
+}
+
+/// A face at one size. `em` is the size that `em_units` stands for, in pixels.
+#[derive(Clone, Copy)]
+struct GlyphFont {
+    face: u32,
+    em: f32,
+    em_units: u64,
+    gray: bool,
+}
+
+struct Reach {
+    left: f64,
+    right: f64,
+    above: f64,
+    below: f64,
+}
+
+impl RunRef<'_> {
+    fn without_offsets(&self) -> Self {
+        Self {
+            offsets: &[],
+            ..*self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Counts {
     pub rasterized: u64,
     pub drawn: u64,
+    pub walked: u64,
 }
 
 pub(crate) struct Text {
@@ -243,8 +303,13 @@ pub(crate) struct Text {
     glyphs: Map<u64, GlyphImage>,
     glyph_bytes: usize,
     glyph_limit: usize,
-    inks: Map<u32, Rc<RefCell<Ink>>>,
+    /// A fixed list of inks. A draw holds only a slot number, and borrows the ink for
+    /// one blit at a time, so a nested use of the same ink cannot conflict.
+    inks: Vec<Ink>,
+    ink_slots: Map<u32, usize>,
+    next_ink: usize,
     gamma: Rc<Gamma>,
+    no_ligatures: Option<IDWriteTypography>,
     color_layers: Map<u64, Option<Rc<[Layer]>>>,
     tick: u32,
     pub counts: Counts,
@@ -284,8 +349,11 @@ impl Text {
             glyphs: Map::default(),
             glyph_bytes: 0,
             glyph_limit: GLYPH_CACHE_BYTES,
-            inks: Map::default(),
+            inks: Vec::new(),
+            ink_slots: Map::default(),
+            next_ink: 0,
             gamma: Rc::new(Gamma::new(settings.gamma)),
+            no_ligatures: None,
             color_layers: Map::default(),
             tick: 0,
             counts: Counts::default(),
@@ -314,8 +382,33 @@ impl Text {
         self.glyphs.clear();
         self.glyph_bytes = 0;
         self.inks.clear();
+        self.ink_slots.clear();
+        self.next_ink = 0;
         self.gamma = Rc::new(Gamma::new(v.gamma));
         Ok(())
+    }
+    /// Reads the settings that Windows has now for this monitor. It returns whether
+    /// they differ from the ones in use, and uses the new ones if so.
+    pub fn refresh_settings(&mut self, monitor: HMONITOR) -> Result<bool, RenderError> {
+        let params = unsafe {
+            self.factory
+                .CreateMonitorRenderingParams(monitor)
+                .map_err(error)?
+        };
+        let now = system_settings(&params);
+        if now == self.settings {
+            return Ok(false);
+        }
+        self.set_settings(now)?;
+        Ok(true)
+    }
+    pub fn cache_sizes(&self) -> crate::CacheSizes {
+        crate::CacheSizes {
+            shape_bytes: self.shaped_bytes,
+            inks: self.inks.len(),
+            color_glyphs: self.color_layers.len(),
+            corner_bytes: 0,
+        }
     }
     pub fn next_draw(&mut self) {
         self.tick = self.tick.wrapping_add(1);
@@ -470,14 +563,18 @@ impl Text {
         }
         let shaped = match self.plain_shape(face, size, text)? {
             Some(shaped) => shaped,
-            None => self.layout_shape(family, size, text)?,
+            None => self.layout_shape(family, face, size, text)?,
         };
+        let shaped = Rc::new(shaped);
+        // A string over the whole limit is drawn and not kept.
+        if shaped.bytes > SHAPE_CACHE_BYTES {
+            return Ok(shaped);
+        }
         if self.shaped_bytes + shaped.bytes > SHAPE_CACHE_BYTES {
             self.shaped.clear();
             self.shaped_bytes = 0;
         }
         self.shaped_bytes += shaped.bytes;
-        let shaped = Rc::new(shaped);
         self.shaped
             .entry(key)
             .or_default()
@@ -532,7 +629,13 @@ impl Text {
             bytes,
         }))
     }
-    fn layout_shape(&mut self, family: &str, size: f32, text: &str) -> Result<Shaped, RenderError> {
+    fn layout_shape(
+        &mut self,
+        family: &str,
+        face: u32,
+        size: f32,
+        text: &str,
+    ) -> Result<Shaped, RenderError> {
         let units: Vec<u16> = text.encode_utf16().collect();
         if units.is_empty() {
             return Ok(Shaped {
@@ -558,15 +661,19 @@ impl Text {
                 .CreateTextLayout(&units, &format, 1_000_000.0, 1_000_000.0)
                 .map_err(error)?
         };
-        let mut line = [DWRITE_LINE_METRICS::default(); 1];
+        if self.faces[face as usize].is_monospaced {
+            self.turn_off_ascii_ligatures(&layout, &units)?;
+        }
+        // DirectWrite fills nothing in when the array is too short, so ask with the
+        // size that the layout itself reports.
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut metrics).map_err(error)? };
+        let mut lines = vec![DWRITE_LINE_METRICS::default(); metrics.lineCount.max(1) as usize];
         let mut count = 0;
-        // A text of many lines reports that the array is short. Only the first
-        // baseline is needed, and DirectWrite fills it in before it reports that.
-        let lines = unsafe { layout.GetLineMetrics(Some(&mut line), &mut count) };
-        if let Err(e) = lines
-            && count == 0
-        {
-            return Err(error(e));
+        unsafe {
+            layout
+                .GetLineMetrics(Some(&mut lines), &mut count)
+                .map_err(error)?;
         }
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collector: IDWriteTextRenderer = RunCollector {
@@ -590,7 +697,7 @@ impl Text {
                 em: run.em,
                 bidi: run.bidi,
                 x: run.x,
-                y: run.y - line[0].baseline,
+                y: run.y - lines[0].baseline,
                 ids: run.ids,
                 advances: run.advances,
                 offsets: run.offsets,
@@ -599,17 +706,134 @@ impl Text {
         Ok(Shaped { runs, bytes })
     }
 
-    fn ink(&mut self, c: Color) -> Rc<RefCell<Ink>> {
+    /// qe-layout's rule: a fixed-pitch font has no ligatures in ASCII, on either path.
+    /// Text in other scripts keeps its own features.
+    fn turn_off_ascii_ligatures(
+        &mut self,
+        layout: &IDWriteTextLayout,
+        units: &[u16],
+    ) -> Result<(), RenderError> {
+        let typography = match &self.no_ligatures {
+            Some(typography) => typography.clone(),
+            None => {
+                let typography = unsafe { self.factory.CreateTypography().map_err(error)? };
+                for tag in [
+                    DWRITE_FONT_FEATURE_TAG_STANDARD_LIGATURES,
+                    DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_LIGATURES,
+                    DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_ALTERNATES,
+                ] {
+                    unsafe {
+                        typography
+                            .AddFontFeature(DWRITE_FONT_FEATURE {
+                                nameTag: tag,
+                                parameter: 0,
+                            })
+                            .map_err(error)?;
+                    }
+                }
+                self.no_ligatures = Some(typography.clone());
+                typography
+            }
+        };
+        let mut at = 0;
+        while at < units.len() {
+            if units[at] >= 0x80 {
+                at += 1;
+                continue;
+            }
+            let begin = at;
+            while at < units.len() && units[at] < 0x80 {
+                at += 1;
+            }
+            let range = DWRITE_TEXT_RANGE {
+                startPosition: begin as u32,
+                length: (at - begin) as u32,
+            };
+            unsafe { layout.SetTypography(&typography, range).map_err(error)? };
+        }
+        Ok(())
+    }
+
+    /// The slot of an ink. The list stays at a fixed limit, so a new color can take the
+    /// slot of an old one. A slot number is good until the next call of this function.
+    fn ink_slot(&mut self, c: Color) -> usize {
         let key = u32::from_le_bytes([c.r, c.g, c.b, c.a]);
-        if let Some(found) = self.inks.get(&key) {
-            return found.clone();
+        if let Some(slot) = self.ink_slots.get(&key) {
+            return *slot;
         }
-        if self.inks.len() >= MOST_INKS {
-            self.inks.clear();
+        let ink = make_ink(key, c, self.settings, self.gamma.clone());
+        let slot = if self.inks.len() < MOST_INKS {
+            self.inks.push(ink);
+            self.inks.len() - 1
+        } else {
+            let slot = self.next_ink;
+            self.next_ink = (slot + 1) % MOST_INKS;
+            self.ink_slots.remove(&self.inks[slot].key);
+            self.inks[slot] = ink;
+            slot
+        };
+        self.ink_slots.insert(key, slot);
+        slot
+    }
+
+    /// The rectangle that one shaped text can ink, around its start, in device pixels:
+    /// left, top, right and bottom.
+    pub fn shaped_extents(&self, shaped: &Shaped, scale: f64) -> Option<(f64, f64, f64, f64)> {
+        let mut all = None::<(f64, f64, f64, f64)>;
+        for run in &shaped.runs {
+            let (x, y) = (f64::from(run.x) * scale, f64::from(run.y) * scale);
+            let one = self.run_extents(
+                &RunRef {
+                    face: run.face,
+                    em: run.em,
+                    bidi: run.bidi,
+                    ids: &run.ids,
+                    advances: &run.advances,
+                    offsets: &run.offsets,
+                    gray: false,
+                },
+                scale,
+            );
+            let one = (one.0 + x, one.1 + y, one.2 + x, one.3 + y);
+            all = Some(match all {
+                None => one,
+                Some(b) => (
+                    b.0.min(one.0),
+                    b.1.min(one.1),
+                    b.2.max(one.2),
+                    b.3.max(one.3),
+                ),
+            });
         }
-        let ink = Rc::new(RefCell::new(make_ink(c, self.settings, self.gamma.clone())));
-        self.inks.insert(key, ink.clone());
-        ink
+        all
+    }
+    /// The rectangle that one glyph run can ink, around its start, in device pixels:
+    /// left, top, right and bottom. Glyphs lie along the advances, and ink stays within
+    /// the font's box around each glyph's origin.
+    pub fn run_extents(&self, run: &RunRef<'_>, scale: f64) -> (f64, f64, f64, f64) {
+        let reach = self.reach(run, scale);
+        let total: f64 = run.advances.iter().map(|a| f64::from(a.0)).sum::<f64>() * scale;
+        if run.bidi & 1 == 1 {
+            (-total - reach.left, -reach.above, reach.right, reach.below)
+        } else {
+            (-reach.left, -reach.above, total + reach.right, reach.below)
+        }
+    }
+    fn reach(&self, run: &RunRef<'_>, scale: f64) -> Reach {
+        let entry = &self.faces[run.face as usize];
+        let em_device = f64::from(run.em) * scale;
+        let (mut most_x, mut most_up, mut most_down) = (0f32, 0f32, 0f32);
+        for o in run.offsets {
+            most_x = most_x.max(o.x.0.abs());
+            most_up = most_up.max(o.y.0);
+            most_down = most_down.max(-o.y.0);
+        }
+        Reach {
+            left: f64::from(-entry.left) * em_device + f64::from(most_x) * scale + FILTER_REACH,
+            right: f64::from(entry.right) * em_device + f64::from(most_x) * scale + FILTER_REACH,
+            above: f64::from(entry.up) * em_device + f64::from(most_up) * scale + FILTER_REACH,
+            below: f64::from(entry.down) * em_device + f64::from(most_down) * scale + FILTER_REACH,
+        }
     }
 
     /// Draws a shaped text with its start at `at`, in device pixels.
@@ -639,6 +863,7 @@ impl Text {
                     ids: &run.ids,
                     advances: &run.advances,
                     offsets: &run.offsets,
+                    gray: false,
                 },
                 color,
             );
@@ -671,69 +896,63 @@ impl Text {
         if em_units == 0 {
             return Ok(());
         }
-        if em_units >= 1 << 24 {
-            return Err(error(format!("font size {em_device} pixels is too large")));
+        if em_device > MOST_EM_PIXELS {
+            return Err(too_large(em_device));
         }
-        let entry = &self.faces[run.face as usize];
-        // Real extents. Ink stays within the font's box of each glyph's origin.
-        let (mut most_x, mut most_up, mut most_down) = (0f32, 0f32, 0f32);
-        for o in run.offsets {
-            most_x = most_x.max(o.x.0.abs());
-            most_up = most_up.max(o.y.0);
-            most_down = most_down.max(-o.y.0);
-        }
-        let reach_left =
-            f64::from(-entry.left) * em_device + f64::from(most_x) * scale + FILTER_REACH;
-        let reach_right =
-            f64::from(entry.right) * em_device + f64::from(most_x) * scale + FILTER_REACH;
-        let above = f64::from(entry.up) * em_device + f64::from(most_up) * scale + FILTER_REACH;
-        let below = f64::from(entry.down) * em_device + f64::from(most_down) * scale + FILTER_REACH;
-        if at.1 + below < f64::from(clip.y) || at.1 - above > f64::from(clip.b) {
-            return Ok(());
-        }
-        let is_color = entry.is_color;
+        // No scan of the whole run before this: each glyph below is tested with its own
+        // offset, and the walk stops past the clip.
+        let reach = self.reach(&run.without_offsets(), scale);
+        let stop_past = MOST_SIDEWAYS_EMS * em_device;
+        let is_color = self.faces[run.face as usize].is_color;
         let rtl = run.bidi & 1 == 1;
         let direction = if rtl { -1.0 } else { 1.0 };
         let (clip_left, clip_right) = (f64::from(clip.x), f64::from(clip.r));
-        let ink = self.ink(color);
-        let mut ink = ink.borrow_mut();
-        let ink = &mut *ink;
-        let prefix = (u64::from(run.face) << 42) | (em_units << 18);
-        let tick = self.tick;
+        let mut slot = self.ink_slot(color);
+        let font = GlyphFont {
+            face: run.face,
+            em: em_units as f32 / 64.0,
+            em_units,
+            gray: run.gray,
+        };
         let mut pen = at.0;
         let mut first_error = Ok(());
-        let em_key = em_units as f32 / 64.0;
         for i in 0..run.ids.len() {
+            let offset = run.offsets[i];
+            if !(run.advances[i].0.is_finite() && offset.x.0.is_finite() && offset.y.0.is_finite())
+            {
+                return Err(error(
+                    "a GlyphRun has a value that is not a finite number, so the rest of it was skipped",
+                ));
+            }
             let advance = f64::from(run.advances[i].0) * scale;
             if rtl {
                 pen -= advance;
-                if pen + reach_right < clip_left {
+                if pen + reach.right + stop_past < clip_left {
                     break;
                 }
-            } else if pen - reach_left > clip_right {
+            } else if pen - reach.left - stop_past > clip_right {
                 break;
             }
+            self.counts.walked += 1;
             let glyph_pen = pen;
             if !rtl {
                 pen += advance;
             }
-            if glyph_pen + reach_right < clip_left || glyph_pen - reach_left > clip_right {
-                continue;
-            }
-            let offset = run.offsets[i];
             let x = glyph_pen + direction * f64::from(offset.x.0) * scale;
             let y = at.1 - f64::from(offset.y.0) * scale;
+            if x + reach.right < clip_left
+                || x - reach.left > clip_right
+                || y + reach.below < f64::from(clip.y)
+                || y - reach.above > f64::from(clip.b)
+            {
+                continue;
+            }
             let id = run.ids[i];
             self.counts.drawn += 1;
             if is_color {
-                let drew = self.draw_color_glyph(
-                    surface,
-                    clip,
-                    (x, y),
-                    (run.face, em_key, em_units),
-                    id,
-                    color,
-                );
+                let drew = self.draw_color_glyph(surface, clip, (x, y), font, id, color);
+                // The layers may have taken the slot of this run's ink.
+                slot = self.ink_slot(color);
                 match drew {
                     Ok(true) => continue,
                     Ok(false) => {}
@@ -744,32 +963,61 @@ impl Text {
                     }
                 }
             }
-            let (pixel_x, position) = place(x);
-            let key = prefix | (u64::from(id) << 2) | u64::from(position);
-            let pixel_y = snap(y);
-            if let Some(image) = self.glyphs.get_mut(&key) {
-                image.used = tick;
-                blit(surface, clip, pixel_x, pixel_y, image, ink);
-                continue;
-            }
-            match self.rasterize(run.face, em_key, id, position) {
-                Ok(image) => {
-                    let bytes = image.bytes();
-                    if self.glyph_bytes + bytes > self.glyph_limit {
-                        self.evict_to(self.glyph_limit.saturating_sub(bytes));
-                    }
-                    blit(surface, clip, pixel_x, pixel_y, &image, ink);
-                    self.glyph_bytes += bytes;
-                    self.glyphs.insert(key, image);
-                }
-                Err(e) => {
-                    if first_error.is_ok() {
-                        first_error = Err(e);
-                    }
-                }
+            let stamped = self.stamp(surface, clip, (x, y), font, id, slot);
+            if first_error.is_ok() {
+                first_error = stamped;
             }
         }
         first_error
+    }
+
+    /// Blends one glyph with the ink in `slot`, through the glyph cache.
+    #[inline]
+    fn stamp(
+        &mut self,
+        surface: Surface,
+        clip: Area,
+        at: (f64, f64),
+        font: GlyphFont,
+        glyph: u16,
+        slot: usize,
+    ) -> Result<(), RenderError> {
+        // An icon's stems stay even only on a whole pixel.
+        let (pixel_x, position) = if font.gray {
+            (snap(at.0), 0)
+        } else {
+            place(at.0)
+        };
+        let pixel_y = snap(at.1);
+        let key = (u64::from(font.gray) << GRAY_KEY_BIT)
+            | (u64::from(font.face) << 42)
+            | (font.em_units << 18)
+            | (u64::from(glyph) << 2)
+            | u64::from(position);
+        if let Some(image) = self.glyphs.get_mut(&key) {
+            image.used = self.tick;
+            blit(surface, clip, pixel_x, pixel_y, image, &mut self.inks[slot]);
+            return Ok(());
+        }
+        let image = self.rasterize(font, glyph, position)?;
+        blit(
+            surface,
+            clip,
+            pixel_x,
+            pixel_y,
+            &image,
+            &mut self.inks[slot],
+        );
+        let bytes = image.bytes();
+        // A glyph larger than the whole limit is drawn and not kept.
+        if bytes <= self.glyph_limit {
+            if self.glyph_bytes + bytes > self.glyph_limit {
+                self.evict_to(self.glyph_limit - bytes);
+            }
+            self.glyph_bytes += bytes;
+            self.glyphs.insert(key, image);
+        }
+        Ok(())
     }
 
     /// Draws the color layers of a glyph. `Ok(false)` means the glyph has none, so it
@@ -779,16 +1027,15 @@ impl Text {
         surface: Surface,
         clip: Area,
         at: (f64, f64),
-        font: (u32, f32, u64),
+        font: GlyphFont,
         glyph: u16,
         color: Color,
     ) -> Result<bool, RenderError> {
-        let (face, em, em_units) = font;
-        let key = (u64::from(face) << 42) | (em_units << 18) | (u64::from(glyph) << 2);
+        let key = (u64::from(font.face) << 42) | (font.em_units << 18) | (u64::from(glyph) << 2);
         let layers = match self.color_layers.get(&key) {
             Some(found) => found.clone(),
             None => {
-                let found = self.translate_color(face, em, glyph)?;
+                let found = self.translate_color(font.face, font.em, glyph)?;
                 if self.color_layers.len() >= MOST_COLOR_GLYPHS {
                     self.color_layers.clear();
                 }
@@ -811,35 +1058,12 @@ impl Text {
             if layer_color.a == 0 {
                 continue;
             }
-            let ink = self.ink(layer_color);
-            let mut ink = ink.borrow_mut();
-            let ink = &mut *ink;
-            let (pixel_x, position) = place(at.0 + f64::from(layer.x));
-            let pixel_y = snap(at.1 + f64::from(layer.y));
-            let key = (u64::from(face) << 42)
-                | (em_units << 18)
-                | (u64::from(layer.glyph) << 2)
-                | u64::from(position);
-            if let Some(image) = self.glyphs.get_mut(&key) {
-                image.used = self.tick;
-                blit(surface, clip, pixel_x, pixel_y, image, ink);
-                continue;
-            }
-            match self.rasterize(face, em, layer.glyph, position) {
-                Ok(image) => {
-                    let bytes = image.bytes();
-                    if self.glyph_bytes + bytes > self.glyph_limit {
-                        self.evict_to(self.glyph_limit.saturating_sub(bytes));
-                    }
-                    blit(surface, clip, pixel_x, pixel_y, &image, ink);
-                    self.glyph_bytes += bytes;
-                    self.glyphs.insert(key, image);
-                }
-                Err(e) => {
-                    if first_error.is_ok() {
-                        first_error = Err(e);
-                    }
-                }
+            let slot = self.ink_slot(layer_color);
+            let at = (at.0 + f64::from(layer.x), at.1 + f64::from(layer.y));
+            if let Err(e) = self.stamp(surface, clip, at, font, layer.glyph, slot)
+                && first_error.is_ok()
+            {
+                first_error = Err(e);
             }
         }
         first_error
@@ -915,11 +1139,11 @@ impl Text {
     }
     fn rasterize(
         &mut self,
-        face: u32,
-        em: f32,
+        font: GlyphFont,
         glyph: u16,
         position: u8,
     ) -> Result<GlyphImage, RenderError> {
+        let (face, em) = (font.face, font.em);
         self.counts.rasterized += 1;
         let entry = &self.faces[face as usize];
         let mut mode = unsafe {
@@ -928,40 +1152,74 @@ impl Text {
                 .GetRecommendedRenderingMode(em, 1.0, DWRITE_MEASURING_MODE_NATURAL, &self.params)
                 .map_err(error)?
         };
-        // The analysis cannot make outlines, and its nearest mode gives the same ink.
+        // The system's default asks for outlines even at ordinary sizes, and an analysis
+        // cannot make them. Symmetric is the mode with smoothing in both directions, like
+        // an outline. A test compares the result with DirectWrite's own drawing. Up to 300
+        // pixels no pixel is far off. At 600 to 1200 pixels, 2% to 3% of the ink's pixels
+        // differ by over 96 levels, all near edges, and total ink stays within 0.3%.
         if mode == DWRITE_RENDERING_MODE_OUTLINE || mode == DWRITE_RENDERING_MODE_DEFAULT {
             mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
         }
+        // Each mode gives empty coverage past its own size, with no error. Measured on
+        // Windows build 26300: symmetric stops near 700 pixels, natural near 1500, and
+        // aliased does not stop. So large glyphs step down the list. The last step has
+        // hard edges, at sizes where one pixel of edge hardly shows.
+        let large = em >= LARGE_EM_PIXELS;
+        let steps = [
+            Some(mode),
+            large.then_some(DWRITE_RENDERING_MODE_NATURAL),
+            large.then_some(DWRITE_RENDERING_MODE_ALIASED),
+        ];
         let (advance, offset) = (0f32, DWRITE_GLYPH_OFFSET::default());
         let mut run = glyph_run(&entry.face, em, &glyph, &advance, &offset);
-        let analysis = unsafe {
-            self.factory.CreateGlyphRunAnalysis(
-                &run,
-                1.0,
-                None,
-                mode,
-                DWRITE_MEASURING_MODE_NATURAL,
-                f32::from(position) / SUBPIXEL_POSITIONS as f32,
-                0.0,
-            )
-        };
-        unsafe { ManuallyDrop::drop(&mut run.fontFace) };
-        let analysis = analysis.map_err(error)?;
-        let (bounds, aliased) = unsafe {
-            let bounds = analysis
-                .GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1)
-                .map_err(error)?;
-            if bounds.left < bounds.right && bounds.top < bounds.bottom {
-                (bounds, false)
-            } else {
-                let aliased = analysis
-                    .GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)
-                    .map_err(error)?;
-                (aliased, true)
+        let mut found = None;
+        let mut failure = None;
+        if font.gray {
+            match unsafe { gray_bounds(&self.factory, &run) } {
+                Ok(step) => {
+                    if step.1.left < step.1.right && step.1.top < step.1.bottom {
+                        found = Some(step);
+                    }
+                }
+                Err(e) => failure = Some(e),
             }
+        }
+        let tried_gray = found.is_some() || failure.is_some();
+        for mode in steps.into_iter().flatten().filter(|_| !tried_gray) {
+            let step = unsafe {
+                texture_bounds(
+                    &self.factory,
+                    &run,
+                    mode,
+                    f32::from(position) / SUBPIXEL_POSITIONS as f32,
+                )
+            };
+            match step {
+                Ok((analysis, bounds, aliased)) => {
+                    let has_ink = bounds.left < bounds.right && bounds.top < bounds.bottom;
+                    found = Some((analysis, bounds, aliased));
+                    if has_ink {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        unsafe { ManuallyDrop::drop(&mut run.fontFace) };
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        let Some((analysis, bounds, aliased)) = found else {
+            return Err(error("no rendering mode to try"));
         };
         let width = (bounds.right - bounds.left).max(0) as usize;
         let height = (bounds.bottom - bounds.top).max(0) as usize;
+        if width.saturating_mul(height).saturating_mul(3) > MOST_GLYPH_BYTES {
+            return Err(too_large(f64::from(em)));
+        }
         let mut coverage = vec![0u8; width * height * 3];
         if width > 0 && height > 0 {
             unsafe {
@@ -979,7 +1237,16 @@ impl Text {
                         .map_err(error)?;
                 }
             }
-            adjust_coverage(&mut coverage, self.settings);
+            if font.gray {
+                // Past the size where the grayscale mode stops, a ClearType mode made this.
+                let flat = TextSettings {
+                    cleartype_level: 0.0,
+                    ..self.settings
+                };
+                adjust_coverage(&mut coverage, flat);
+            } else {
+                adjust_coverage(&mut coverage, self.settings);
+            }
         }
         Ok(GlyphImage {
             left: bounds.left,
@@ -992,6 +1259,75 @@ impl Text {
     }
 }
 
+/// A new analysis for this mode, its coverage rectangle, and whether that coverage is
+/// aliased.
+///
+/// # Safety
+/// `run` must be a valid glyph run.
+unsafe fn texture_bounds(
+    factory: &IDWriteFactory,
+    run: &DWRITE_GLYPH_RUN,
+    mode: DWRITE_RENDERING_MODE,
+    x: f32,
+) -> Result<(IDWriteGlyphRunAnalysis, RECT, bool), RenderError> {
+    let analysis = unsafe {
+        factory
+            .CreateGlyphRunAnalysis(run, 1.0, None, mode, DWRITE_MEASURING_MODE_NATURAL, x, 0.0)
+            .map_err(error)?
+    };
+    let bounds = unsafe {
+        analysis
+            .GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1)
+            .map_err(error)?
+    };
+    if bounds.left < bounds.right && bounds.top < bounds.bottom {
+        return Ok((analysis, bounds, false));
+    }
+    let aliased = unsafe {
+        analysis
+            .GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)
+            .map_err(error)?
+    };
+    Ok((analysis, aliased, true))
+}
+/// Grayscale coverage with smoothing in both directions, which is what gives an icon's
+/// stems an even look. Measured for Segoe Fluent Icons at 12 pixels: the + is 11x11 with
+/// this mode, and 11x10 with the natural, GDI natural or GDI classic modes. Measuring
+/// mode and grid fit made no difference to the size.
+///
+/// # Safety
+/// `run` must be a valid glyph run.
+unsafe fn gray_bounds(
+    factory: &IDWriteFactory,
+    run: &DWRITE_GLYPH_RUN,
+) -> Result<(IDWriteGlyphRunAnalysis, RECT, bool), RenderError> {
+    let factory: IDWriteFactory2 = factory.cast().map_err(error)?;
+    let analysis = unsafe {
+        factory
+            .CreateGlyphRunAnalysis(
+                run,
+                None,
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                DWRITE_MEASURING_MODE_NATURAL,
+                DWRITE_GRID_FIT_MODE_DISABLED,
+                DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                0.0,
+                0.0,
+            )
+            .map_err(error)?
+    };
+    let bounds = unsafe {
+        analysis
+            .GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)
+            .map_err(error)?
+    };
+    Ok((analysis, bounds, true))
+}
+fn too_large(em_device: f64) -> RenderError {
+    error(format!(
+        "a glyph at {em_device:.0} pixels is too large to draw"
+    ))
+}
 fn missing_family(name: &str) -> RenderError {
     error(format!("font not installed: {name}"))
 }
@@ -1052,7 +1388,7 @@ fn adjust_coverage(coverage: &mut [u8], settings: TextSettings) {
 ///
 /// So white text on black gets more ink than black text on white. That is the weight
 /// people see from other Windows programs that draw with DirectWrite.
-fn make_ink(c: Color, settings: TextSettings, gamma: Rc<Gamma>) -> Ink {
+fn make_ink(key: u32, c: Color, settings: TextSettings, gamma: Rc<Gamma>) -> Ink {
     let channels = [c.r, c.g, c.b].map(|v| f32::from(v) / 255.0);
     let lightness = 0.30 * channels[0] + 0.59 * channels[1] + 0.11 * channels[2];
     let contrast = settings.enhanced_contrast.max(0.0) * (4.0 * (0.75 - lightness)).clamp(0.0, 1.0);
@@ -1063,12 +1399,15 @@ fn make_ink(c: Color, settings: TextSettings, gamma: Rc<Gamma>) -> Ink {
         *out = (a.clamp(0.0, 1.0) * f32::from(c.a)).round() as u8;
     }
     Ink {
+        key,
+        // With partial alpha in the color, full coverage is not the ink itself. The
+        // alpha table then never reaches 255, so this stays unused.
+        bytes: [c.r, c.g, c.b].map(u32::from),
         linear: [c.r, c.g, c.b].map(|v| u32::from(gamma.to_linear[v as usize])),
         alpha: [table; 3],
         backgrounds: Vec::new(),
         next_slot: 0,
-        // No pixel is ever this value: the bitmap's alpha byte is always 255.
-        candidate: 0,
+        candidate: None,
         gamma,
     }
 }
@@ -1086,28 +1425,36 @@ fn blit(surface: Surface, clip: Area, x: i32, y: i32, image: &GlyphImage, ink: &
     let corner = surface.span(y0, x0, x0 + 1)[0];
     let table = ink.table(corner);
     let ink = &*ink;
-    let flat = table.map(|t| &ink.backgrounds[t]);
-    let empty = [[0u8; 256]; 3];
-    let (flat_pixel, [red, green, blue]) = match flat {
-        Some(t) => (t.pixel, &t.out),
-        // No pixel has an alpha byte of 0, so this never matches.
-        None => (0, &empty),
-    };
+    // Pixels that nothing has painted yet have alpha 0 and color 0. They blend as black
+    // and come out opaque, the same as a pixel painted black, on either branch here.
     for row in y0..y1 {
         let start = ((row - top) as usize * width as usize + (x0 - left) as usize) * 3;
-        let source = &image.coverage[start..start + count * 3];
+        let source = image.coverage[start..start + count * 3].as_chunks::<3>().0;
         let target = surface.span(row, x0, x1);
-        for (p, c) in target.iter_mut().zip(source.as_chunks::<3>().0) {
-            if c[0] | c[1] | c[2] == 0 {
-                continue;
+        match table {
+            Some(slot) => {
+                let flat = &ink.backgrounds[slot];
+                let [red, green, blue] = &flat.out;
+                for (p, c) in target.iter_mut().zip(source) {
+                    if c[0] | c[1] | c[2] == 0 {
+                        continue;
+                    }
+                    *p = if *p == flat.pixel {
+                        u32::from(blue[c[2] as usize])
+                            | (u32::from(green[c[1] as usize]) << 8)
+                            | (u32::from(red[c[0] as usize]) << 16)
+                            | 0xFF00_0000
+                    } else {
+                        ink.blend(*p, c)
+                    };
+                }
             }
-            if *p == flat_pixel {
-                *p = u32::from(blue[c[2] as usize])
-                    | (u32::from(green[c[1] as usize]) << 8)
-                    | (u32::from(red[c[0] as usize]) << 16)
-                    | 0xFF00_0000;
-            } else {
-                *p = ink.blend(*p, c);
+            None => {
+                for (p, c) in target.iter_mut().zip(source) {
+                    if c[0] | c[1] | c[2] != 0 {
+                        *p = ink.blend(*p, c);
+                    }
+                }
             }
         }
     }

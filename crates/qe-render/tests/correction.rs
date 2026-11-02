@@ -144,7 +144,7 @@ fn full_text_frame(width: u32, height: u32, dark: bool) -> DisplayList {
 }
 #[test]
 fn full_frame_of_glyph_runs_stays_under_a_generous_limit() {
-    let limit = limit_ms(40.0, 700.0);
+    let limit = limit_ms(16.0, 150.0);
     for dark in [false, true] {
         let mut r = renderer(1920, 1080);
         let list = full_text_frame(1920, 1080, dark);
@@ -2020,38 +2020,59 @@ fn example(name: &str) -> std::path::PathBuf {
     path.pop();
     path.join("examples").join(format!("{name}.exe"))
 }
+/// Runs the example window. `None` means this account cannot run it: the test account
+/// over SSH can get Access Denied (0x80070005) with no desktop to make a window on.
+/// Only that exact failure skips, and it says so.
+fn run_window(args: &[&str]) -> Option<std::process::Output> {
+    let path = example("render_window");
+    let output = match std::process::Command::new(&path).args(args).output() {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            println!(
+                "skipped: this account may not start {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+        Err(e) => panic!("{} did not start: {e}", path.display()),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let denied = stderr.contains("0x80070005") && !stderr.contains("DPI awareness was not changed");
+    if denied {
+        println!("skipped: this account may not make a window here: {stderr}");
+        return None;
+    }
+    Some(output)
+}
 #[test]
 fn render_window_reports_failures_and_its_exit_code() {
-    let output = std::process::Command::new(example("render_window"))
-        .args([
-            "--hidden",
-            "--exit-after-first-frame",
-            "--font",
-            "No Such Font",
-        ])
-        .output()
-        .unwrap();
+    let Some(output) = run_window(&[
+        "--hidden",
+        "--exit-after-first-frame",
+        "--font",
+        "No Such Font",
+    ]) else {
+        return;
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains("No Such Font"), "stderr: {stderr}");
-    let output = std::process::Command::new(example("render_window"))
-        .arg("--no-such-option")
-        .output()
-        .unwrap();
+    let Some(output) = run_window(&["--no-such-option"]) else {
+        return;
+    };
     assert_ne!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--no-such-option"));
 }
 #[test]
 fn render_window_follows_the_suggested_rectangle_and_starts_at_the_window_dpi() {
-    let output = std::process::Command::new(example("render_window"))
-        .args([
-            "--hidden",
-            "--exit-after-first-frame",
-            "--simulate-dpi-change",
-            "144",
-        ])
-        .output()
-        .unwrap();
+    let Some(output) = run_window(&[
+        "--hidden",
+        "--exit-after-first-frame",
+        "--simulate-dpi-change",
+        "144",
+    ]) else {
+        return;
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
@@ -2066,15 +2087,14 @@ fn render_window_follows_the_suggested_rectangle_and_starts_at_the_window_dpi() 
 #[test]
 fn render_window_keeps_supplementary_characters_typed_as_two_messages() {
     // Astra's review: char::from_u32 rejected each half of a surrogate pair.
-    let output = std::process::Command::new(example("render_window"))
-        .args([
-            "--hidden",
-            "--exit-after-first-frame",
-            "--simulate-char",
-            "1F600",
-        ])
-        .output()
-        .unwrap();
+    let Some(output) = run_window(&[
+        "--hidden",
+        "--exit-after-first-frame",
+        "--simulate-char",
+        "1F600",
+    ]) else {
+        return;
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),

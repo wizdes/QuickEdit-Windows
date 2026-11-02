@@ -1081,7 +1081,7 @@ fn caption_icons_request_ten_pixel_font() {
         ("E922", 10.0),
         ("E8BB", 10.0),
         ("E710", 12.0),
-        ("E96E", 9.0),
+        ("E96E", 10.0),
     ] {
         assert!(sizes.contains(&(id.to_string(), size)), "{id} at {size}");
     }

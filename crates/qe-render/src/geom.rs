@@ -65,6 +65,16 @@ impl Area {
             b: ((f64::from(v.y.0) + f64::from(v.height.0)) * scale - NUDGE).ceil() as i32,
         }
     }
+    /// Every pixel that a repaint of this rectangle must cover: all that it touches, and
+    /// also where `snapped` draws it. A thin rectangle can draw just past what it touches.
+    pub fn damage(v: Rect, scale: f64) -> Self {
+        let outward = Self::outward(v, scale);
+        if outward.valid() {
+            outward.union(Self::snapped(v, scale))
+        } else {
+            outward
+        }
+    }
     pub fn clip(self, other: Self) -> Self {
         Self {
             x: self.x.max(other.x),

@@ -122,6 +122,91 @@ fn text_frame(width: f32, height: f32, theme: (Color, Color)) -> DisplayList {
     }
     list
 }
+/// A screen of emoji, the slowest kind of text: each one has several color layers.
+fn emoji_frame(width: f32, height: f32, theme: (Color, Color), text_run: bool) -> DisplayList {
+    let mut list = DisplayList::default();
+    list.push(DrawCommand::FillRect {
+        rect: rect(0.0, 0.0, width, height),
+        color: theme.0,
+    });
+    // Cut from one line of emoji whose layers differ.
+    let line: String = (0x1F300u32..0x1FA00)
+        .filter_map(char::from_u32)
+        .cycle()
+        .take((width / 20.0) as usize)
+        .collect();
+    let mut y = 18.0;
+    while y < height {
+        if text_run {
+            list.push(DrawCommand::TextRun {
+                at: Point {
+                    x: Dip(2.0),
+                    y: Dip(y),
+                },
+                text: line.clone(),
+                font: "Segoe UI Emoji".into(),
+                font_size: Dip(14.0),
+                color: theme.1,
+            });
+        }
+        y += 22.0;
+    }
+    list
+}
+fn emoji_screens() -> Result<(), Failure> {
+    for (theme, name) in [(LIGHT, "light"), (DARK, "dark")] {
+        let list = emoji_frame(1920.0, 1080.0, theme, true);
+        let count: usize = list
+            .commands
+            .iter()
+            .map(|c| match c {
+                DrawCommand::TextRun { text, .. } => text.chars().count(),
+                _ => 0,
+            })
+            .sum();
+        let start = Instant::now();
+        let mut renderer = BitmapRenderer::new(1920, 1080)?;
+        frame(&mut renderer, &list)?;
+        let cold = start.elapsed().as_secs_f64() * 1000.0;
+        let warm = median(|| frame_all(&mut renderer, &list))?;
+        println!(
+            "measured on this PC: {name} 1920x1080 emoji screen of {count} emoji: cold {cold:.3} ms, warm {warm:.3} ms; cache {} glyphs, {} KiB",
+            renderer.glyph_cache_entries(),
+            renderer.glyph_cache_bytes() / 1024
+        );
+    }
+    Ok(())
+}
+/// One line of giant text, as at the top of the zoom range.
+fn large_text() -> Result<(), Failure> {
+    for em in [600.0f32, 1000.0, 1600.0] {
+        let mut renderer = BitmapRenderer::new(1920, 1080)?;
+        let mut list = DisplayList::default();
+        list.push(DrawCommand::FillRect {
+            rect: rect(0.0, 0.0, 1920.0, 1080.0),
+            color: Color::rgb(255, 255, 255),
+        });
+        list.push(DrawCommand::TextRun {
+            at: Point {
+                x: Dip(2.0),
+                y: Dip(em * 0.9),
+            },
+            text: "QuickEdit".into(),
+            font: "Segoe UI".into(),
+            font_size: Dip(em),
+            color: Color::rgb(0, 0, 0),
+        });
+        let start = Instant::now();
+        frame(&mut renderer, &list)?;
+        let cold = start.elapsed().as_secs_f64() * 1000.0;
+        let warm = median(|| frame_all(&mut renderer, &list))?;
+        println!(
+            "measured on this PC: one line of Segoe UI at {em} pixels: cold {cold:.3} ms, warm {warm:.3} ms; cache {} KiB",
+            renderer.glyph_cache_bytes() / 1024
+        );
+    }
+    Ok(())
+}
 fn median(mut task: impl FnMut() -> Result<(), Failure>) -> Result<f64, Failure> {
     for _ in 0..3 {
         task()?;
@@ -275,32 +360,62 @@ fn shapes() -> Result<(), Failure> {
     Ok(())
 }
 fn main() {
-    if let Err(e) = run() {
+    let result = if std::env::args().any(|a| a == "--one-cold-frame") {
+        one_cold_frame()
+    } else {
+        run()
+    };
+    if let Err(e) = result {
         eprintln!("bench failed: {}", e.0);
         std::process::exit(1);
     }
 }
-fn cold_frame() -> Result<(), Failure> {
-    let list = glyph_frame(1920.0, 1080.0, DARK)?;
+/// The first DirectWrite use of this process: the list needs no DirectWrite call, and
+/// the clock starts before the renderer makes its factory.
+fn one_cold_frame() -> Result<(), Failure> {
+    let list = text_frame(1920.0, 1080.0, DARK);
     let start = Instant::now();
     let mut renderer = BitmapRenderer::new(1920, 1080)?;
-    renderer.register_font(FONT, "Cascadia Mono")?;
     let made = start.elapsed().as_secs_f64() * 1000.0;
     frame(&mut renderer, &list)?;
     let first = start.elapsed().as_secs_f64() * 1000.0;
+    println!("{made} {first}");
+    Ok(())
+}
+/// A new process for each sample. The system's font service and file cache stay warm,
+/// so this is a warm launch and not the first launch after a reboot.
+fn cold_frames() -> Result<(), Failure> {
+    let (mut made, mut first) = (Vec::new(), Vec::new());
+    for _ in 0..9 {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .arg("--one-cold-frame")
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut parts = text.split_whitespace();
+        made.push(parts.next().ok_or("no sample")?.parse::<f64>()?);
+        first.push(parts.next().ok_or("no sample")?.parse::<f64>()?);
+    }
+    made.sort_by(f64::total_cmp);
+    first.sort_by(f64::total_cmp);
     println!(
-        "measured on this PC: cold 1920x1080 dark in one process: renderer {made:.3} ms, with the first GlyphRun frame {first:.3} ms"
+        "measured on this PC: new process each time, 1920x1080 dark TextRun, median of 9: renderer {:.3} ms, with the first frame {:.3} ms",
+        made[4], first[4]
     );
     Ok(())
 }
 fn run() -> Result<(), Failure> {
-    cold_frame()?;
+    cold_frames()?;
     for (theme, name) in [(LIGHT, "light"), (DARK, "dark")] {
         window_frames(1920, 1080, 96, theme, name)?;
         window_frames(1920, 1080, 144, theme, name)?;
         window_frames(3840, 2160, 192, theme, name)?;
     }
     shapes()?;
+    emoji_screens()?;
+    large_text()?;
     let mut renderer = BitmapRenderer::new(1920, 1080)?;
     let mut list = DisplayList::default();
     list.push(DrawCommand::FillRect {

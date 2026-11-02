@@ -356,7 +356,7 @@ fn caret_has_winuis_ink_and_position() {
             );
             println!("measured {name} {dpi}: caret ink {w:.1} x {h:.1} dips");
             assert!((w - 7.7).abs() <= 1.34, "{name} {dpi}: ink width {w}");
-            assert!((h - 4.2).abs() <= 1.0, "{name} {dpi}: ink height {h}");
+            assert!((h - 5.0).abs() <= 1.0, "{name} {dpi}: ink height {h}");
             let cx = (ink.0 + ink.2) as f32 / 2.0 - area.0 as f32;
             let cy = (ink.1 + ink.3) as f32 / 2.0 - area.1 as f32;
             assert!((cx - 13.0 * scale).abs() <= 1.0, "{name} {dpi}: x {cx}");

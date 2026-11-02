@@ -186,7 +186,7 @@ impl ShellTokens {
             top_band: 8.0,
             icon: 12.0,
             caption_icon: 10.0,
-            caret_icon: 9.0,
+            caret_icon: 10.0,
             caret_box: 12.0,
             caret_right_padding: 12.0,
             focus_width: 2.0,

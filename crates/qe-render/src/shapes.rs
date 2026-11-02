@@ -124,8 +124,10 @@ struct CornerMask {
 #[derive(Default)]
 pub(crate) struct Corners {
     masks: HashMap<CornerKey, Rc<CornerMask>>,
+    bytes: usize,
 }
-const MOST_CORNER_MASKS: usize = 256;
+/// One mask costs a byte per pixel of its corner. A mask over this limit is not kept.
+const MOST_CORNER_BYTES: usize = 1024 * 1024;
 
 fn inside(x: f32, y: f32, width: f32, height: f32, inset: f32, radius: f32) -> bool {
     let (left, top, right, bottom) = (inset, inset, width - inset, height - inset);
@@ -165,6 +167,9 @@ fn make_mask(key: CornerKey) -> CornerMask {
     }
 }
 impl Corners {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
     /// A rounded rectangle whose edges lie on whole pixels. `stroke` of 0 fills it;
     /// otherwise only a border of that many pixels is drawn.
     pub fn rounded(
@@ -205,11 +210,16 @@ impl Corners {
         let mask = match self.masks.get(&key) {
             Some(mask) => mask.clone(),
             None => {
-                if self.masks.len() >= MOST_CORNER_MASKS {
-                    self.masks.clear();
-                }
                 let mask = Rc::new(make_mask(key));
-                self.masks.insert(key, mask.clone());
+                let bytes = mask.coverage.len();
+                if bytes <= MOST_CORNER_BYTES {
+                    if self.bytes + bytes > MOST_CORNER_BYTES {
+                        self.masks.clear();
+                        self.bytes = 0;
+                    }
+                    self.bytes += bytes;
+                    self.masks.insert(key, mask.clone());
+                }
                 mask
             }
         };

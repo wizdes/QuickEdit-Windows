@@ -2,6 +2,7 @@
 mod support;
 use qe_api::{Bitmap, Color, Dip, DisplayList, DrawCommand, Rect, Renderer};
 use qe_render::BitmapRenderer;
+use std::collections::BTreeMap;
 use support::*;
 
 const FONT: u32 = 3;
@@ -27,7 +28,13 @@ fn content_rect(height: f32, width: f32) -> Rect {
 
 /// The top row and the scrolling text. Everything comes from `width`, `height`,
 /// the theme and how far the text has scrolled.
-fn scene(width: f32, height: f32, dark: bool, scrolled: f32) -> DisplayList {
+fn scene(
+    width: f32,
+    height: f32,
+    dark: bool,
+    scrolled: f32,
+    edits: &BTreeMap<i32, u32>,
+) -> DisplayList {
     let (background, ink, row) = if dark {
         (
             DARK_BG,
@@ -96,7 +103,10 @@ fn scene(width: f32, height: f32, dark: bool, scrolled: f32) -> DisplayList {
             FONT,
             MONO,
             13.0 + (line % 3) as f32,
-            &format!("{line:03} The quick brown fox jumps"),
+            &match edits.get(&line) {
+                None => format!("{line:03} The quick brown fox jumps"),
+                Some(edit) => format!("{line:03} edit {edit} of this line"),
+            },
             point(4.0, top + 13.0),
             ink,
         ));
@@ -150,6 +160,8 @@ struct Run {
     dpi: u32,
     dark: bool,
     scrolled: f32,
+    edits: BTreeMap<i32, u32>,
+    next_edit: u32,
 }
 impl Run {
     fn dips(&self) -> (f32, f32) {
@@ -158,7 +170,7 @@ impl Run {
     }
     fn list(&self) -> DisplayList {
         let (w, h) = self.dips();
-        scene(w, h, self.dark, self.scrolled)
+        scene(w, h, self.dark, self.scrolled, &self.edits)
     }
     fn expected(&self) -> Bitmap {
         fresh(
@@ -200,6 +212,8 @@ fn run_sequence(dpi: u32, dark: bool, seed: u64) {
     renderer.set_dpi(dpi).unwrap();
     renderer.register_font(FONT, MONO).unwrap();
     let mut run = Run {
+        edits: BTreeMap::new(),
+        next_edit: 0,
         renderer,
         width_px: 420,
         height_px: 300,
@@ -211,8 +225,19 @@ fn run_sequence(dpi: u32, dark: bool, seed: u64) {
     let mut random = Random(seed);
     for step in 0..30 {
         let (w, h) = run.dips();
-        let what = match random.below(6) {
+        let what = match random.below(7) {
             0 => {
+                // The text of one line really changes, and only its rectangle is
+                // invalidated. A repaint that is too small would leave old text.
+                let first = (run.scrolled / LINE).floor() as i32;
+                let line = first + random.below(8) as i32;
+                run.next_edit += 1;
+                run.edits.insert(line, run.next_edit);
+                let top = 40.0 + line as f32 * LINE - run.scrolled;
+                run.renderer.invalidate(rect(0.0, top, w, LINE));
+                format!("step {step}: edit line {line}")
+            }
+            6 => {
                 // A line of the text: nothing changed, so nothing may move.
                 let line = random.below(10) as f32;
                 run.renderer
@@ -275,7 +300,7 @@ fn line_and_strip_redraws_match_full_redraw_at_every_scale() {
             renderer.set_dpi(dpi).unwrap();
             renderer.register_font(FONT, MONO).unwrap();
             let s = dpi as f32 / 96.0;
-            let list = scene(420.0 / s, 300.0 / s, dark, 0.0);
+            let list = scene(420.0 / s, 300.0 / s, dark, 0.0, &BTreeMap::new());
             frame(&mut renderer, &list);
             let full = renderer.bitmap().unwrap();
             for y in (0..60).step_by(7) {
@@ -286,6 +311,35 @@ fn line_and_strip_redraws_match_full_redraw_at_every_scale() {
                     0,
                     "dpi {dpi} y {y}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn editing_one_line_and_invalidating_only_that_line_matches_full_redraw() {
+    for dark in [false, true] {
+        for dpi in [96u32, 120, 144, 168, 192] {
+            let mut renderer = BitmapRenderer::new(420, 300).unwrap();
+            renderer.set_dpi(dpi).unwrap();
+            renderer.register_font(FONT, MONO).unwrap();
+            let s = dpi as f32 / 96.0;
+            let (w, h) = (420.0 / s, 300.0 / s);
+            let mut edits = BTreeMap::new();
+            frame(&mut renderer, &scene(w, h, dark, 0.0, &edits));
+            for line in 0..6 {
+                edits.insert(line, line as u32 + 1);
+                let list = scene(w, h, dark, 0.0, &edits);
+                renderer.invalidate(rect(0.0, 40.0 + line as f32 * LINE, w, LINE));
+                frame(&mut renderer, &list);
+                let wanted = fresh(420, 300, dpi, &list, &[(FONT, MONO)]);
+                assert_eq!(
+                    difference(&renderer.bitmap().unwrap(), &wanted),
+                    0,
+                    "dpi {dpi} line {line}"
+                );
+                // Only the rectangle that was asked for repainted.
+                assert!(renderer.frame_stats().pixels <= 420 * ((LINE * s) as u64 + 2));
             }
         }
     }

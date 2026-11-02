@@ -875,7 +875,7 @@ fn a_big_selection_transforms_on_a_worker_and_a_stale_one_is_refused() {
 
     // The user types while the worker runs: the result is refused, in words.
     s.select(0, big.len());
-    s.command(CommandId::LowerCase);
+    s.command(CommandId::UpperCase);
     s.select(0, 0);
     s.view
         .replace_range(ByteOffset(0)..ByteOffset(0), "Z", &mut s.ctx);

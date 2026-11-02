@@ -12,7 +12,14 @@ workspace = true
 qe-api.workspace = true
 qe-ui.workspace = true
 qe-editor.workspace = true
+unicode-segmentation.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+qe-layout.workspace = true
+qe-render.workspace = true
 windows = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[features]
+default = ["graphemes"]
+graphemes = []

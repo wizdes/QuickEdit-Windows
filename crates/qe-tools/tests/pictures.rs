@@ -1,7 +1,7 @@
 //! The find bar, Select Line and Complete's list through the real `qe-render`, at 96 DPI, in
 //! light and dark. Saved images are compared by pixels. Update them with
 //! `QE_TOOLS_UPDATE_IMAGES=1`, then look at each one.
-#[path = "../../../qe-ui/tests/support/png.rs"]
+#[path = "../../qe-ui/tests/support/png.rs"]
 mod png;
 
 use qe_api::{
@@ -82,7 +82,10 @@ impl Scene {
             if self.tools.is_quiet() && !self.view.pending_layout() {
                 return;
             }
-            assert!(start.elapsed() < Duration::from_secs(60), "it did not settle");
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "it did not settle"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -92,7 +95,9 @@ impl Scene {
         self.view.draw(&mut list, theme, &self.measure);
         self.tools.draw(&mut list, theme, &self.measure);
         let mut renderer = BitmapRenderer::new(WIDTH, HEIGHT).unwrap();
-        renderer.set_text_settings(TextSettings::reference()).unwrap();
+        renderer
+            .set_text_settings(TextSettings::reference())
+            .unwrap();
         for command in &list.commands {
             if let qe_api::DrawCommand::GlyphRun { font_id, .. } = command {
                 renderer.register_font_face(*font_id, &qe_layout::font_face(*font_id).unwrap());
@@ -173,8 +178,7 @@ fn select_line_error() -> Scene {
 fn complete_list() -> Scene {
     let mut s = Scene::new();
     let end = TEXT.len();
-    s.view
-        .select(ByteOffset(end)..ByteOffset(end), &mut s.ctx);
+    s.view.select(ByteOffset(end)..ByteOffset(end), &mut s.ctx);
     s.settle();
     s.command(CommandId::Complete);
     s
@@ -191,7 +195,14 @@ const SCENES: [(&str, Build); 6] = [
 ];
 
 fn image_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("images")
+    // The runner package sits one folder below the crate until root removes it.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let here = manifest.join("tests/images");
+    if here.exists() {
+        here
+    } else {
+        manifest.join("../tests/images")
+    }
 }
 
 #[test]
@@ -214,7 +225,12 @@ fn saved_images_match_in_both_themes() {
                 .zip(&current)
                 .filter(|(a, b)| a.abs_diff(**b) > 3)
                 .count();
-            assert_eq!(different, 0, "{} differs in {different} channels", path.display());
+            assert_eq!(
+                different,
+                0,
+                "{} differs in {different} channels",
+                path.display()
+            );
         }
     }
 }
@@ -225,7 +241,10 @@ fn has_color(image: &qe_api::Bitmap, r: Rect, color: qe_api::Color) -> bool {
         for x in r.x.0 as u32..(r.x.0 + r.width.0) as u32 {
             let at = (y * image.width + x) as usize * 4;
             let px = &image.bgra[at..at + 3];
-            if px[0].abs_diff(color.b) < 40 && px[1].abs_diff(color.g) < 40 && px[2].abs_diff(color.r) < 40 {
+            if px[0].abs_diff(color.b) < 40
+                && px[1].abs_diff(color.g) < 40
+                && px[2].abs_diff(color.r) < 40
+            {
                 return true;
             }
         }
@@ -244,8 +263,16 @@ fn matches_paint_in_their_colors_and_the_panel_has_the_macs_size() {
         width: Dip(WIDTH as f32),
         height: Dip(HEIGHT as f32 - 32.0),
     };
-    assert!(has_color(&image, below, qe_ui::over(theme.current_find_match, theme.text_background)));
-    assert!(has_color(&image, below, qe_ui::over(theme.find_match, theme.text_background)));
+    assert!(has_color(
+        &image,
+        below,
+        qe_ui::over(theme.current_find_match, theme.text_background)
+    ));
+    assert!(has_color(
+        &image,
+        below,
+        qe_ui::over(theme.find_match, theme.text_background)
+    ));
     let s = select_line();
     assert_eq!(s.tools.panel().bounds.width.0, 253.0);
     assert_eq!(s.tools.panel().bounds.height.0, 62.0);

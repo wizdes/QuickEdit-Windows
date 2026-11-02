@@ -1,6 +1,7 @@
 //! `ToolsHost`: the find bar, the panels and their workers, for one window. `WIRING.md` lists
 //! the calls a window makes. All of them run on the UI thread, and none reads a mapped file's
-//! disk there or does work that grows with the text.
+//! disk there. One does work that grows with the text: applying a finished Replace All or
+//! transform, through `apply_edits` in `qe-editor`. `WIRING.md` says what would bound it.
 use crate::complete::complete_candidates;
 use crate::lines::{LINE_SUGGESTION, LineError, LineSpec, line_error_message, lines_for_spec};
 use crate::replace::{ReplaceAllReady, Worker, prepare_replace_all};
@@ -10,7 +11,9 @@ use crate::search::{
 use crate::substitute::Substitutions;
 use crate::text::{is_word, readable_len};
 use crate::transform::{Transform, prepare_transform};
-use crate::ui::{BAR_ROW_HEIGHT, BarAction, BarStop, FindBar, SelectLinePanel, mouse_point};
+use crate::ui::{
+    BAR_ROW_HEIGHT, BarAction, BarStop, FindBar, PanelStop, SelectLinePanel, contains, mouse_point,
+};
 use qe_api::{
     ByteOffset, CommandId, Dip, DisplayList, Handled, InputEvent, InputKind, LookupError, Rect,
     TextMeasurer, Theme, View, ViewContext, ViewRequest, Widget, WidgetId,
@@ -75,13 +78,24 @@ struct OpenList {
     menu: MenuView,
     complete: Option<(Range<ByteOffset>, u64)>,
 }
+/// What the user asked Replace All to do, kept with its job.
+#[derive(Clone)]
+struct ReplaceRequest {
+    matcher: Matcher,
+    replacement: String,
+}
+struct ReplaceRun {
+    worker: Worker<Option<ReplaceAllReady>>,
+    request: ReplaceRequest,
+}
 struct VisibleScan {
+    wanted: Range<usize>,
     job: FindJob,
     covers: Range<usize>,
     revision: u64,
 }
 struct TransformRun {
-    worker: Worker<PreparedEdits>,
+    worker: Worker<Option<PreparedEdits>>,
     start: ByteOffset,
     keep_selected: bool,
 }
@@ -110,8 +124,11 @@ pub struct ToolsHost {
     anchor: ByteOffset,
     typed_search: bool,
     seen_revision: u64,
-    replace_job: Option<Worker<Option<ReplaceAllReady>>>,
-    replace_ready: Option<ReplaceAllReady>,
+    replace_job: Option<ReplaceRun>,
+    replace_ready: Option<(ReplaceAllReady, ReplaceRequest)>,
+    scanned_for: Option<Range<usize>>,
+    layout_changed: bool,
+    view_has_keys: bool,
     transform_job: Option<TransformRun>,
     complete_job: Option<Worker<CompleteResult>>,
     complete_again: Option<u64>,
@@ -160,6 +177,9 @@ impl ToolsHost {
             seen_revision: 0,
             replace_job: None,
             replace_ready: None,
+            scanned_for: None,
+            layout_changed: false,
+            view_has_keys: true,
             transform_job: None,
             complete_job: None,
             complete_again: None,
@@ -275,6 +295,28 @@ impl ToolsHost {
             && self.pending_lines.is_none()
             && !self.pending_center
     }
+    #[doc(hidden)]
+    pub fn set_step_waiting_for_test(&mut self, direction: Direction, from: Range<ByteOffset>) {
+        self.step_waiting = Some((direction, from, usize::MAX));
+    }
+    #[doc(hidden)]
+    pub fn is_step_waiting_for_test(&self) -> bool {
+        self.step_waiting.is_some()
+    }
+    #[doc(hidden)]
+    pub fn press_replace_all_for_test(&mut self, view: &mut EditorView) {
+        self.press_replace_all(view);
+    }
+    /// True while a Replace All runs or waits behind keys.
+    #[doc(hidden)]
+    pub fn replace_is_ready_for_test(&self) -> bool {
+        self.replace_job.is_some() || self.replace_ready.is_some()
+    }
+    /// True when a finished Replace All waits for keys, for tests.
+    #[doc(hidden)]
+    pub fn replace_waits_for_test(&self) -> bool {
+        self.replace_ready.is_some()
+    }
     /// Sets the options with no list open, for tests.
     #[doc(hidden)]
     pub fn set_find_options_for_test(&mut self, options: FindOptions) {
@@ -290,6 +332,7 @@ impl ToolsHost {
         ctx: &mut ViewContext,
     ) {
         self.set_query(query.to_string());
+        self.query_changed(view, ctx);
         self.anchor = view.selection().start;
         self.start_search(view, true, ctx);
     }
@@ -299,7 +342,7 @@ impl ToolsHost {
             ToolsFocus::List
         } else if self.alert.is_some() {
             ToolsFocus::Alert
-        } else if self.panel.open {
+        } else if self.panel.keyboard.is_some() {
             ToolsFocus::SelectLine
         } else if let Some(stop) = self.bar.focus {
             ToolsFocus::Bar(stop)
@@ -374,6 +417,8 @@ impl ToolsHost {
                 self.panel.place(self.area, measure);
                 ctx.invalidate(self.panel.bounds);
             }
+            // Complete is for the text, so it does nothing while a field has the keyboard.
+            C::Complete if self.focus() != ToolsFocus::Editor => {}
             C::Complete => self.start_complete(view),
             C::UpperCase => self.transform(Transform::Upper, view, ctx),
             C::LowerCase => self.transform(Transform::Lower, view, ctx),
@@ -383,6 +428,7 @@ impl ToolsHost {
             C::SmartDashes => self.substitutions.dashes ^= true,
             _ => return Handled::No,
         }
+        self.sync_view_focus(view, ctx);
         Handled::Yes
     }
 
@@ -409,6 +455,8 @@ impl ToolsHost {
     ) {
         let opening = !self.bar.open;
         let editable = view.can_edit();
+        self.layout_changed |= opening || (replacing && !self.bar.replacing);
+        self.panel.set_keyboard(None, ctx);
         self.bar.open = true;
         self.bar.replacing = replacing || self.bar.replacing;
         self.bar.replace.enabled = editable;
@@ -432,9 +480,11 @@ impl ToolsHost {
         field.caret = field.text.len();
         self.place_all(measure);
         ctx.invalidate(self.area);
-        if opening && !self.query.is_empty() {
+        if opening {
             self.seen_revision = view.revision();
-            self.start_search(view, false, ctx);
+            if !self.query.is_empty() {
+                self.start_search(view, false, ctx);
+            }
         }
     }
     fn close_bar(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
@@ -445,16 +495,10 @@ impl ToolsHost {
         self.replace_ready = None;
         self.status = None;
         self.clear_marks(view, ctx);
-        // As on the Mac, closing the bar selects the match it stood on.
-        if let Some(current) = self.current.take() {
-            view.run_host(
-                HostCommand::Select {
-                    range: current,
-                    reveal: true,
-                },
-                ctx,
-            );
-        }
+        // A step has already selected its match, so the selection stays as it is. Selecting here
+        // would pull it back from wherever the user has gone since.
+        self.current = None;
+        self.layout_changed = true;
         ctx.invalidate(self.area);
     }
     fn cancel_search(&mut self) {
@@ -470,6 +514,7 @@ impl ToolsHost {
         self.step_queue.clear();
         self.step_waiting = None;
         self.covered = None;
+        self.scanned_for = None;
     }
     fn clear_marks(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
         if !view.decorations(DecorationKind::FindMatch).is_empty() {
@@ -550,6 +595,8 @@ impl ToolsHost {
         self.start_step(direction, from, view);
     }
     fn start_step(&mut self, direction: Direction, from: Range<ByteOffset>, view: &mut EditorView) {
+        // This step is newer than any that waits for the index.
+        self.step_waiting = None;
         let Some(matcher) = self.matcher() else {
             return;
         };
@@ -609,7 +656,9 @@ impl ToolsHost {
         }
         let Some(found) = result.found else {
             self.current = None;
-            self.set_current_mark(view, ctx);
+            if self.bar.open {
+                self.set_current_mark(view, ctx);
+            }
             if !self.typed_search {
                 self.beep = true;
             }
@@ -618,7 +667,7 @@ impl ToolsHost {
             }
             return;
         };
-        self.current = Some(found.clone());
+        self.current = self.bar.open.then(|| found.clone());
         view.run_host(
             HostCommand::Select {
                 range: found.clone(),
@@ -632,6 +681,7 @@ impl ToolsHost {
         if self.bar.open {
             self.set_current_mark(view, ctx);
             self.covered = None;
+            self.scanned_for = None;
             self.refresh_marks(view);
         }
     }
@@ -643,21 +693,23 @@ impl ToolsHost {
             ctx,
         );
     }
-    /// Scans the text near the view for marks, if the view has left what was scanned.
+    /// Scans from the view for marks, if the view has left what was scanned. A scan that
+    /// stopped at its limit, or that reached all the text it can read, is not started again
+    /// for the same view.
     fn refresh_marks(&mut self, view: &mut EditorView) {
         let Ok(visible) = view.visible_range() else {
             return;
         };
         let wanted = visible.start.0..visible.end.0;
         let covers = |range: &Range<usize>| range.start <= wanted.start && wanted.end <= range.end;
-        if self.covered.as_ref().is_some_and(covers) {
+        if self.covered.as_ref().is_some_and(covers) || self.scanned_for.as_ref() == Some(&wanted) {
             return;
         }
         let revision = view.revision();
         if self
             .visible
             .as_ref()
-            .is_some_and(|scan| scan.revision == revision && covers(&scan.covers))
+            .is_some_and(|scan| scan.revision == revision && scan.wanted == wanted)
         {
             return;
         }
@@ -666,7 +718,9 @@ impl ToolsHost {
         };
         let margin = MARK_MARGIN.max(matcher.max_match_bytes() * 2);
         let snapshot = view.worker_snapshot();
-        let scan = wanted.start.saturating_sub(margin)
+        // It starts at the view, less room for a match that begins just above it, so that a
+        // dense query spends its marks on what shows.
+        let scan = wanted.start.saturating_sub(matcher.max_match_bytes())
             ..wanted
                 .end
                 .saturating_add(margin)
@@ -682,6 +736,7 @@ impl ToolsHost {
         self.visible = Some(VisibleScan {
             job,
             covers: scan,
+            wanted,
             revision,
         });
     }
@@ -705,6 +760,7 @@ impl ToolsHost {
         self.marks_set += 1;
         view.set_decorations(DecorationKind::FindMatch, marks, ctx);
         self.covered = Some(covers);
+        self.scanned_for = Some(scan.wanted);
     }
 
     // ---- Replace ----
@@ -715,7 +771,11 @@ impl ToolsHost {
             return;
         }
         let selection = view.selection();
-        if self.current.as_ref() != Some(&selection) || selection.start >= selection.end {
+        let eligible = selection.start < selection.end
+            && self.current.as_ref() == Some(&selection)
+            && self.current_still_matches(selection.clone(), view);
+        if !eligible {
+            self.typed_search = false;
             self.request_step(Direction::Forward, view);
             return;
         }
@@ -746,37 +806,60 @@ impl ToolsHost {
             Err(message) => self.fail(message, view),
         }
     }
-    fn start_replace_all(&mut self, view: &mut EditorView) {
-        if !view.can_edit() {
-            self.beep = true;
-            return;
-        }
+    /// The All button: the request is what the bar says now.
+    fn press_replace_all(&mut self, view: &mut EditorView) {
         let Some(matcher) = self.matcher() else {
             self.beep = true;
             return;
         };
-        let replacement = self.bar.replace.text.clone();
+        self.start_replace_all(
+            ReplaceRequest {
+                matcher,
+                replacement: self.bar.replace.text.clone(),
+            },
+            view,
+        );
+    }
+    /// Starts or restarts a request. It keeps its own query and replacement, so a run again
+    /// after an edit never reads the fields, which the user may have changed.
+    fn start_replace_all(&mut self, request: ReplaceRequest, view: &mut EditorView) {
+        if !view.can_edit() {
+            self.beep = true;
+            return;
+        }
         self.replace_ready = None;
         let snapshot = view.worker_snapshot();
         self.workers_started += 1;
-        self.replace_job = Some(Worker::start(
-            "qe-tools-replace",
-            self.snapshot_wake(),
-            move |cancel| prepare_replace_all(snapshot.as_ref(), &matcher, &replacement, cancel),
-        ));
+        let (matcher, replacement) = (request.matcher.clone(), request.replacement.clone());
+        self.replace_job = Some(ReplaceRun {
+            worker: Worker::start("qe-tools-replace", self.snapshot_wake(), move |cancel| {
+                prepare_replace_all(snapshot.as_ref(), &matcher, &replacement, cancel)
+            }),
+            request,
+        });
+    }
+    /// A new query or option ends what was asked for the old one.
+    fn query_changed(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        if let Some(run) = self.replace_job.take() {
+            run.worker.cancel();
+        }
+        self.replace_ready = None;
+        if self.current.take().is_some() {
+            self.set_current_mark(view, ctx);
+        }
     }
     /// Applies a finished Replace All. Text that moved since refuses it, and it runs again.
     fn finish_replace_all(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
-        let Some(ready) = self.replace_ready.take() else {
+        let Some((ready, request)) = self.replace_ready.take() else {
             return;
         };
         // Keys still waiting would run first and move the text, so wait for them.
         if view.queued_input_count() > 0 {
-            self.replace_ready = Some(ready);
+            self.replace_ready = Some((ready, request));
             return;
         }
         if ready.prepared.base_revision() != view.revision() {
-            self.start_replace_all(view);
+            self.start_replace_all(request, view);
             return;
         }
         let caret = ready.caret_after;
@@ -811,6 +894,7 @@ impl ToolsHost {
         match snapshot.try_visit_chunks(selection.clone(), &mut |part| text.push_str(part)) {
             Ok(()) => {
                 self.set_query(text);
+                self.query_changed(view, ctx);
                 self.anchor = selection.start;
                 self.typed_search = false;
                 if self.bar.open {
@@ -969,7 +1053,10 @@ impl ToolsHost {
         if range.end.0 - range.start.0 <= TRANSFORM_INLINE_BYTES {
             let never = std::sync::atomic::AtomicBool::new(false);
             match prepare_transform(snapshot.as_ref(), range, transform, &never) {
-                Ok(prepared) => self.apply_transform(&prepared, start, keep_selected, view, ctx),
+                Ok(Some(prepared)) => {
+                    self.apply_transform(prepared, start, keep_selected, view, ctx);
+                }
+                Ok(None) => {}
                 Err(message) => self.fail(message, view),
             }
             return;
@@ -989,7 +1076,7 @@ impl ToolsHost {
     }
     fn apply_transform(
         &mut self,
-        prepared: &PreparedEdits,
+        prepared: PreparedEdits,
         start: ByteOffset,
         keep_selected: bool,
         view: &mut EditorView,
@@ -1001,7 +1088,7 @@ impl ToolsHost {
         // this and shows why.
         view.run_host(
             HostCommand::ApplyEdits {
-                edits: Arc::new(prepared.clone()),
+                edits: Arc::new(prepared),
                 selection,
             },
             ctx,
@@ -1285,8 +1372,7 @@ impl ToolsHost {
             _ => return,
         }
         // Wrap Around changes no match, but a new search is the plain way to show the rest.
-        self.current = None;
-        self.set_current_mark(view, ctx);
+        self.query_changed(view, ctx);
         self.anchor = view.selection().start;
         self.start_search(view, true, ctx);
     }
@@ -1294,7 +1380,7 @@ impl ToolsHost {
     // ---- Input ----
 
     /// Sends an event to the tools first. `Handled::Yes` ends it. Otherwise the host looks up
-    /// its keys, and then gives the event to the editor if `focus` is `ToolsFocus::Editor`.
+    /// its keys, and then gives the event to the editor if `event_for_editor` says so.
     pub fn handle_input(
         &mut self,
         event: &InputEvent,
@@ -1302,6 +1388,62 @@ impl ToolsHost {
         measure: &dyn TextMeasurer,
         ctx: &mut ViewContext,
     ) -> Handled {
+        let handled = self.route_input(event, view, measure, ctx);
+        self.sync_view_focus(view, ctx);
+        handled
+    }
+    /// True when an event that `handle_input` left goes on to the editor. The mouse, the wheel
+    /// and window events always do. Keys do only while the text has the keyboard.
+    pub fn event_for_editor(&self, event: &InputEvent) -> bool {
+        match event.kind {
+            InputKind::KeyDown { .. }
+            | InputKind::KeyUp { .. }
+            | InputKind::Char(_)
+            | InputKind::ImeStart
+            | InputKind::ImeUpdate { .. }
+            | InputKind::ImeEnd { .. }
+            | InputKind::Focus
+            | InputKind::Blur => self.focus() == ToolsFocus::Editor,
+            _ => true,
+        }
+    }
+    /// True once after the bar's height changed, so the editor's area must be laid out again.
+    pub fn take_layout_changed(&mut self) -> bool {
+        std::mem::take(&mut self.layout_changed)
+    }
+    /// Tells the view when the keyboard moves between the text and the tools, so that only one
+    /// caret blinks.
+    fn sync_view_focus(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        let has_keys = self.focus() == ToolsFocus::Editor;
+        if has_keys != self.view_has_keys {
+            self.view_has_keys = has_keys;
+            let kind = if has_keys {
+                InputKind::Focus
+            } else {
+                InputKind::Blur
+            };
+            view.handle(&InputEvent { time_us: 0, kind }, ctx);
+        }
+    }
+    fn route_input(
+        &mut self,
+        event: &InputEvent,
+        view: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) -> Handled {
+        // The window gained or lost the keyboard: whichever control has it hears this.
+        if matches!(event.kind, InputKind::Focus | InputKind::Blur) {
+            if let Some(stop) = self.panel.keyboard {
+                self.panel.control(stop).handle(event, ctx);
+                return Handled::Yes;
+            }
+            if let Some(stop) = self.bar.focus {
+                self.bar.control(stop).handle(event, ctx);
+                return Handled::Yes;
+            }
+            return Handled::No;
+        }
         if self.list.is_some() {
             return self.handle_list(event, view, ctx);
         }
@@ -1330,6 +1472,7 @@ impl ToolsHost {
             BarAction::None => {}
             BarAction::QueryChanged => {
                 self.query = self.bar.find.text.clone();
+                self.query_changed(view, ctx);
                 self.start_search(view, true, ctx);
                 ctx.invalidate(self.bar.bounds);
             }
@@ -1342,7 +1485,7 @@ impl ToolsHost {
                 self.request_step(Direction::Backward, view);
             }
             BarAction::Replace => self.replace_one(view, ctx),
-            BarAction::ReplaceAll => self.start_replace_all(view),
+            BarAction::ReplaceAll => self.press_replace_all(view),
             BarAction::Close => self.close_bar(view, ctx),
             BarAction::Options => self.open_options_list(measure, ctx),
         }
@@ -1368,7 +1511,8 @@ impl ToolsHost {
         }
         handled
     }
-    /// `None` passes the event on, for a click outside the panel.
+    /// `None` passes the event on: a click outside the panel, or a key while the panel does
+    /// not have the keyboard.
     fn handle_panel(
         &mut self,
         event: &InputEvent,
@@ -1376,16 +1520,24 @@ impl ToolsHost {
         ctx: &mut ViewContext,
     ) -> Option<Handled> {
         if let Some(at) = mouse_point(&event.kind) {
-            let r = self.panel.bounds;
-            let inside = at.x.0 >= r.x.0
-                && at.y.0 >= r.y.0
-                && at.x.0 < r.x.0 + r.width.0
-                && at.y.0 < r.y.0 + r.height.0;
+            let inside = contains(self.panel.frame, at);
+            if matches!(event.kind, InputKind::MouseDown { .. }) {
+                if inside {
+                    self.bar.set_focus(None, ctx);
+                    // Buttons do not take the keyboard from the field on a click, as on the
+                    // Mac, so a click anywhere in the panel leaves it in the field.
+                    self.panel.set_keyboard(Some(PanelStop::Field), ctx);
+                } else {
+                    self.panel.set_keyboard(None, ctx);
+                }
+            }
             self.panel.field.handle(event, ctx);
             self.panel.select.handle(event, ctx);
+            self.panel.close.handle(event, ctx);
             self.after_panel_input(view, ctx);
             return inside.then_some(Handled::Yes);
         }
+        let stop = self.panel.keyboard?;
         if let InputKind::KeyDown {
             virtual_key,
             modifiers,
@@ -1396,37 +1548,26 @@ impl ToolsHost {
             if !composing && !modifiers.alt && !modifiers.ctrl {
                 match *virtual_key {
                     0x1b => {
-                        self.pending_lines = None;
-                        self.panel.hide(ctx);
-                        ctx.invalidate(self.panel.bounds);
+                        self.close_panel(ctx);
                         return Some(Handled::Yes);
                     }
-                    0x0d => {
+                    0x0d if stop == PanelStop::Field => {
                         let input = self.panel.field.text.clone();
                         self.submit_lines(input, true, view, ctx);
                         return Some(Handled::Yes);
                     }
                     0x09 => {
-                        self.panel.button_focused ^= true;
-                        let (to_field, to_button) = if self.panel.button_focused {
-                            (InputKind::Blur, InputKind::Focus)
-                        } else {
-                            (InputKind::Focus, InputKind::Blur)
-                        };
-                        let wrap = |kind| InputEvent { time_us: 0, kind };
-                        self.panel.field.handle(&wrap(to_field), ctx);
-                        self.panel.select.handle(&wrap(to_button), ctx);
+                        let order = [PanelStop::Field, PanelStop::Select, PanelStop::Close];
+                        let at = order.iter().position(|s| *s == stop).unwrap_or(0);
+                        let next = if modifiers.shift { at + 2 } else { at + 1 } % order.len();
+                        self.panel.set_keyboard(Some(order[next]), ctx);
                         return Some(Handled::Yes);
                     }
                     _ => {}
                 }
             }
         }
-        let handled = if self.panel.button_focused {
-            self.panel.select.handle(event, ctx)
-        } else {
-            self.panel.field.handle(event, ctx)
-        };
+        let handled = self.panel.control(stop).handle(event, ctx);
         self.after_panel_input(view, ctx);
         Some(match (&event.kind, handled) {
             (
@@ -1442,9 +1583,18 @@ impl ToolsHost {
             _ => Handled::Yes,
         })
     }
+    fn close_panel(&mut self, ctx: &mut ViewContext) {
+        self.pending_lines = None;
+        self.panel.hide(ctx);
+        ctx.invalidate(self.panel.frame);
+    }
     fn after_panel_input(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
         use qe_ui::Control;
         self.panel.field.take_activated();
+        if self.panel.close.take_activated() {
+            self.close_panel(ctx);
+            return;
+        }
         if self.panel.select.take_activated() {
             let input = self.panel.field.text.clone();
             self.submit_lines(input, false, view, ctx);
@@ -1464,6 +1614,20 @@ impl ToolsHost {
         if self.is_idle() {
             return;
         }
+        self.poll_jobs(view, measure, ctx);
+        self.sync_view_focus(view, ctx);
+    }
+    fn poll_jobs(
+        &mut self,
+        view: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) {
+        // First the edits since the last look, so that a result for the text as it stands is
+        // not moved through them a second time.
+        if self.bar.open {
+            self.follow_changes(view, ctx);
+        }
         if let Some(result) = self.step.as_ref().and_then(Worker::take) {
             self.step = None;
             self.on_step(result, view, ctx);
@@ -1478,21 +1642,19 @@ impl ToolsHost {
         if let Some((direction, from, past)) = self.step_waiting.clone() {
             let status = view.store_status();
             if status.complete || status.known_bytes.0 > past {
-                self.step_waiting = None;
                 self.start_step(direction, from, view);
             }
         }
-        if let Some(result) = self.replace_job.as_ref().and_then(Worker::take) {
-            self.replace_job = None;
+        if let Some(result) = self.replace_job.as_ref().and_then(|run| run.worker.take())
+            && let Some(run) = self.replace_job.take()
+        {
             match result {
-                Ok(Some(ready)) => self.replace_ready = Some(ready),
+                Ok(Some(ready)) => self.replace_ready = Some((ready, run.request)),
                 Ok(None) => {
                     self.beep = true;
                     self.bar.set_count("Not found", false);
                 }
-                Err(message) => {
-                    self.fail(message, view);
-                }
+                Err(message) => self.fail(message, view),
             }
         }
         self.finish_replace_all(view, ctx);
@@ -1503,12 +1665,14 @@ impl ToolsHost {
             && let Some(run) = self.transform_job.take()
         {
             match result {
-                // The stale check is in `apply_edits`. A transformation does not run again,
-                // because the selection it was for has moved.
-                Ok(prepared) if prepared.base_revision() == view.revision() => {
-                    self.apply_transform(&prepared, run.start, run.keep_selected, view, ctx);
+                // No change: no edit and no undo step, and the selection stays.
+                Ok(None) => {}
+                // A transformation does not run again, because the selection it was for has
+                // moved.
+                Ok(Some(prepared)) if prepared.base_revision() == view.revision() => {
+                    self.apply_transform(prepared, run.start, run.keep_selected, view, ctx);
                 }
-                Ok(_) => self.fail(
+                Ok(Some(_)) => self.fail(
                     "The text changed while the selection was being transformed, so nothing was changed.",
                     view,
                 ),
@@ -1522,11 +1686,17 @@ impl ToolsHost {
                 Err(message) => self.fail(message, view),
             }
         }
-        if let Some(revision) = self.complete_again
-            && revision != view.revision()
-        {
-            self.complete_again = None;
-            self.start_complete(view);
+        // One look, once a letter that went to the editor has gone in. A letter still waiting
+        // behind a key keeps it for later, and nothing else keeps it open.
+        if let Some(revision) = self.complete_again {
+            if revision != view.revision() {
+                self.complete_again = None;
+                if self.focus() == ToolsFocus::Editor {
+                    self.start_complete(view);
+                }
+            } else if view.queued_input_count() == 0 {
+                self.complete_again = None;
+            }
         }
         if let Some((input, close)) = self.pending_lines.take() {
             self.submit_lines(input, close, view, ctx);
@@ -1539,28 +1709,60 @@ impl ToolsHost {
         }
         self.poll_search(view, ctx);
     }
+    /// Moves the bar's state through the edits since the last look.
+    fn follow_changes(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        let revision = view.revision();
+        if revision == self.seen_revision {
+            return;
+        }
+        match view.changes_since(self.seen_revision) {
+            ChangesSince::Current => {}
+            ChangesSince::Changes(list) => {
+                // The editor moved the mark with its text, and dropped it if an edit cut it.
+                self.current = view
+                    .decorations(DecorationKind::CurrentFindMatch)
+                    .into_iter()
+                    .next();
+                for tracked in &list {
+                    self.anchor = move_offset(self.anchor, tracked);
+                }
+                // An edit beside a match can end it, as a letter after a Full Word match does.
+                if !self.query.is_empty()
+                    && let Some(current) = self.current.clone()
+                    && !self.current_still_matches(current, view)
+                {
+                    self.current = None;
+                    self.set_current_mark(view, ctx);
+                }
+                self.on_text_changed(view, false, ctx);
+            }
+            ChangesSince::Rescan => self.on_text_changed(view, true, ctx),
+        }
+        self.seen_revision = revision;
+    }
+    fn current_still_matches(&self, current: Range<ByteOffset>, view: &EditorView) -> bool {
+        // Only an editable view has edits, and its text is in memory.
+        let never = std::sync::atomic::AtomicBool::new(false);
+        self.matcher().is_some_and(|matcher| {
+            matcher.still_matches(view.worker_snapshot().as_ref(), current, &never)
+        })
+    }
     fn poll_search(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
         // Prevent Editing can change while the bar stands open.
         let editable = view.can_edit();
         self.bar.replace.enabled = editable;
         self.bar.replace_one.enabled = editable;
         self.bar.replace_all.enabled = editable;
+        if !editable
+            && matches!(
+                self.bar.focus,
+                Some(BarStop::Replace | BarStop::ReplaceOne | BarStop::ReplaceAll)
+            )
+        {
+            self.bar.set_focus(Some(BarStop::Find), ctx);
+        }
         if self.query.is_empty() {
             return;
-        }
-        let revision = view.revision();
-        if revision != self.seen_revision {
-            match view.changes_since(self.seen_revision) {
-                ChangesSince::Current => {}
-                ChangesSince::Changes(list) => {
-                    self.current = self.current.take().and_then(|m| map_through(m, &list));
-                    // Setting the mark again keeps the editor's own list exact. WIRING.md says why.
-                    self.set_current_mark(view, ctx);
-                    self.on_text_changed(view, false, ctx);
-                }
-                ChangesSince::Rescan => self.on_text_changed(view, true, ctx),
-            }
-            self.seen_revision = revision;
         }
         if let Some(job) = &self.count_job {
             self.count = job.count();
@@ -1607,6 +1809,7 @@ impl ToolsHost {
             scan.job.cancel();
         }
         self.covered = None;
+        self.scanned_for = None;
         self.count = 0;
         self.count_done = false;
         if let Some(matcher) = self.matcher() {
@@ -1640,9 +1843,19 @@ impl ToolsHost {
         self.pending_center = false;
         self.list = None;
         self.current = None;
-        if let Some(old) = old {
+        let mut old_view = old;
+        if let Some(old) = old_view.as_deref_mut() {
             self.clear_marks(old, ctx);
         }
+        if let (Some(old), true) = (old_view, self.view_has_keys) {
+            let blur = InputEvent {
+                time_us: 0,
+                kind: InputKind::Blur,
+            };
+            old.handle(&blur, ctx);
+        }
+        self.view_has_keys = false;
+        self.sync_view_focus(new, ctx);
         self.anchor = new.selection().start;
         self.seen_revision = new.revision();
         if self.bar.open {
@@ -1743,24 +1956,17 @@ fn grouped(value: u64) -> String {
     out
 }
 
-/// Where a match stands after edits, by the rules in `HOOKS.md`: one with any byte replaced,
-/// or with an insertion inside it, is gone. An insertion at either end leaves it on its text.
-fn map_through(
-    mut found: Range<ByteOffset>,
-    changes: &[qe_api::TrackedChange],
-) -> Option<Range<ByteOffset>> {
-    for tracked in changes {
-        let (start, end) = (
-            tracked.change.replaced.start.0,
-            tracked.change.replaced.end.0,
-        );
-        let added = tracked.change.new_len;
-        if end <= found.start.0 {
-            found = ByteOffset(found.start.0 - (end - start) + added)
-                ..ByteOffset(found.end.0 - (end - start) + added);
-        } else if start < found.end.0 {
-            return None;
-        }
+/// Where an offset stands after one edit. Inside the edit, it goes to the edit's start.
+fn move_offset(at: ByteOffset, tracked: &qe_api::TrackedChange) -> ByteOffset {
+    let (start, end) = (
+        tracked.change.replaced.start.0,
+        tracked.change.replaced.end.0,
+    );
+    if at.0 >= end {
+        ByteOffset(at.0 - (end - start) + tracked.change.new_len)
+    } else if at.0 > start {
+        ByteOffset(start)
+    } else {
+        at
     }
-    Some(found)
 }

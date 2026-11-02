@@ -24,4 +24,4 @@ pub use search::*;
 pub use substitute::*;
 pub use text::{fold_char, is_cluster_edge, is_extend, is_word, readable_len};
 pub use transform::*;
-pub use ui::{BAR_ROW_HEIGHT, BarStop, FindBar, SelectLinePanel};
+pub use ui::{BAR_ROW_HEIGHT, BarStop, FindBar, PanelStop, SelectLinePanel};

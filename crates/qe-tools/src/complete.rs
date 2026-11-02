@@ -35,8 +35,9 @@ pub fn complete_candidates(
     let want = folded(prefix);
     let mut words: BTreeSet<(String, String)> = BTreeSet::new();
     let mut word = String::new();
-    let mut add = |word: &mut String| {
-        if !word.is_empty() && word.len() <= LONGEST_WORD_BYTES {
+    let mut first_piece = start > 0;
+    let mut add = |word: &mut String, whole: bool| {
+        if whole && !word.is_empty() && word.len() <= LONGEST_WORD_BYTES {
             let key = folded(word);
             if key.starts_with(&want) && key != want {
                 words.insert((key, word.clone()));
@@ -49,12 +50,13 @@ pub fn complete_candidates(
             if is_word(c) {
                 word.push(c);
             } else {
-                add(&mut word);
+                add(&mut word, !first_piece);
+                first_piece = false;
             }
         }
         !cancel.load(Ordering::Acquire)
     });
-    add(&mut word);
+    add(&mut word, !first_piece && end == snapshot.len_bytes().0);
     if cancel.load(Ordering::Acquire) {
         return Err("Complete was cancelled.".to_string());
     }

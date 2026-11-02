@@ -1,7 +1,7 @@
 //! The find engine, with no UI. It reads a snapshot in bounded pieces. It holds about
 //! `BLOCK` bytes of text at a time, so a 1 GiB mapped file costs no more than a small one.
 use crate::text::{
-    align_down, align_up, fold_char, is_cluster_edge, is_word, read_failure, readable_len,
+    FlagRun, align_down, align_up, flags_odd_before, fold_char, is_word, read_failure, readable_len,
 };
 use qe_api::{ByteOffset, TextSnapshot};
 use std::collections::VecDeque;
@@ -132,9 +132,9 @@ impl Matcher {
         None
     }
     /// The match at `at`, with all the rules, or `None`.
-    fn match_at(&self, text: &str, at: usize) -> Option<usize> {
+    fn match_at(&self, text: &str, at: usize, flags: &mut FlagRun) -> Option<usize> {
         let end = self.end_of_match(text, at)?;
-        if !is_cluster_edge(text, at) || !is_cluster_edge(text, end) {
+        if !flags.is_edge(text, at) || !flags.is_edge(text, end) {
             return None;
         }
         let word_before = || {
@@ -155,6 +155,28 @@ impl Matcher {
         };
         good.then_some(end)
     }
+    /// True when `range` is still a match in the text as it stands, with its neighbors. It
+    /// reads a small window, plus any run of flags before it, so call it on the UI thread only
+    /// for an editable view, whose text is in memory.
+    pub fn still_matches(
+        &self,
+        snapshot: &dyn TextSnapshot,
+        range: Range<ByteOffset>,
+        cancel: &AtomicBool,
+    ) -> bool {
+        let low = align_down(snapshot, range.start.0.saturating_sub(CONTEXT));
+        let high = align_up(snapshot, range.end.0.saturating_add(CONTEXT));
+        let mut text = String::new();
+        if !snapshot.visit_chunks(ByteOffset(low)..ByteOffset(high), &mut |part| {
+            text.push_str(part)
+        }) {
+            return false;
+        }
+        let Ok(odd) = flags_odd_before(snapshot, low, cancel) else {
+            return false;
+        };
+        self.match_at(&text, range.start.0 - low, &mut FlagRun::new(odd)) == Some(range.end.0 - low)
+    }
     /// Calls `found` for each match that starts in `from..=last_start`, in order. A match
     /// never overlaps the one before. With `overlap`, each start is tried. It returns the
     /// offset to go on from, or `None` once `found` says to stop.
@@ -164,6 +186,7 @@ impl Matcher {
         from: usize,
         last_start: usize,
         overlap: bool,
+        flags: &mut FlagRun,
         found: &mut dyn FnMut(usize, usize) -> bool,
     ) -> Option<usize> {
         let bytes = text.as_bytes();
@@ -177,7 +200,7 @@ impl Matcher {
                 return Some(stop + 1);
             };
             at += skip;
-            match self.match_at(text, at) {
+            match self.match_at(text, at, flags) {
                 Some(end) => {
                     if !found(at, end) {
                         return None;
@@ -197,10 +220,18 @@ pub fn find_text(text: &str, query: &str, options: FindOptions) -> Vec<Range<usi
     if let Some(matcher) = Matcher::new(query, options)
         && !text.is_empty()
     {
-        matcher.scan_text(text, 0, text.len() - 1, false, &mut |start, end| {
-            out.push(start..end);
-            true
-        });
+        let mut flags = FlagRun::default();
+        matcher.scan_text(
+            text,
+            0,
+            text.len() - 1,
+            false,
+            &mut flags,
+            &mut |start, end| {
+                out.push(start..end);
+                true
+            },
+        );
     }
     out
 }
@@ -256,6 +287,10 @@ pub fn scan_forward(
     }
     let read_from = align_down(snapshot, start.saturating_sub(CONTEXT));
     let read_to = align_up(snapshot, end.saturating_add(CONTEXT));
+    let mut flags = match flags_odd_before(snapshot, read_from, cancel) {
+        Ok(odd) => FlagRun::new(odd),
+        Err(message) => return ScanEnd::Failed(message),
+    };
     let tail = matcher.max_bytes + CONTEXT;
     let block = BLOCK.max(tail * 2);
     let mut window = Window {
@@ -276,12 +311,19 @@ pub fn scan_forward(
             return true;
         }
         let doc = window.base;
-        let going = matcher.scan_text(&window.buf, window.next, room - 1, false, &mut |s, e| {
-            if doc + e > end {
-                return true;
-            }
-            on_match(ByteOffset(doc + s)..ByteOffset(doc + e))
-        });
+        let going = matcher.scan_text(
+            &window.buf,
+            window.next,
+            room - 1,
+            false,
+            &mut flags,
+            &mut |s, e| {
+                if doc + e > end {
+                    return true;
+                }
+                on_match(ByteOffset(doc + s)..ByteOffset(doc + e))
+            },
+        );
         let Some(place) = going else {
             return false;
         };
@@ -291,6 +333,7 @@ pub fn scan_forward(
             while cut > 0 && !window.buf.is_char_boundary(cut) {
                 cut -= 1;
             }
+            flags.rebase(&window.buf, cut);
             window.buf.drain(..cut);
             window.next -= cut;
             window.base += cut;
@@ -385,9 +428,13 @@ pub fn last_match(
         // The first bytes of a block that is not the first have no context, so the block
         // before covers them.
         let from = if low == 0 { 0 } else { CONTEXT }.max(floor.saturating_sub(low));
+        let mut flags = match flags_odd_before(snapshot, low, cancel) {
+            Ok(odd) => FlagRun::new(odd),
+            Err(message) => return Err(ScanEnd::Failed(message)),
+        };
         let mut best = None;
         if !buf.is_empty() {
-            matcher.scan_text(&buf, from, buf.len() - 1, true, &mut |s, e| {
+            matcher.scan_text(&buf, from, buf.len() - 1, true, &mut flags, &mut |s, e| {
                 if low + e <= limit {
                     best = Some(low + s..low + e);
                 }

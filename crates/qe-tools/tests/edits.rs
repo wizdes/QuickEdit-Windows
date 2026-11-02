@@ -188,7 +188,7 @@ fn transform_table() {
         ("", Upper, ""),
     ];
     for (text, how, want) in cases {
-        assert_eq!(transform_text(text, how), want, "{text:?} {how:?}");
+        assert_eq!(transform_text(text, how).unwrap(), want, "{text:?} {how:?}");
     }
 }
 
@@ -198,8 +198,9 @@ fn a_transform_is_one_edit_on_a_real_view_and_keeps_crlf() {
     let mut view = EditorView::from_text(start).unwrap();
     let snapshot = view.worker_snapshot();
     let range = ByteOffset(0)..ByteOffset(start.len());
-    let ready =
-        prepare_transform(snapshot.as_ref(), range, Transform::Upper, &NOT_CANCELLED).unwrap();
+    let ready = prepare_transform(snapshot.as_ref(), range, Transform::Upper, &NOT_CANCELLED)
+        .unwrap()
+        .unwrap();
     let mut ctx = ViewContext::default();
     view.apply_edits(&ready, ByteOffset(0)..ByteOffset(ready.new_len()), &mut ctx)
         .unwrap();
@@ -365,4 +366,77 @@ fn smart_delete_table() {
     for (range, before, after, o, was_word, want) in cases {
         assert_eq!(smart_delete_range(range, before, after, o, was_word), want);
     }
+}
+
+#[test]
+fn transforms_match_the_standard_calls_on_seeded_unicode() {
+    // These do not use the standard calls, which abort when memory runs out, so hold them to
+    // what those calls give.
+    let parts = [
+        "a",
+        "Z",
+        " ",
+        "\u{df}",
+        "\u{130}",
+        "\u{131}",
+        "\u{3a3}",
+        "\u{3a3} ",
+        "x\u{3a3}",
+        "\u{3c2}",
+        "\u{149}",
+        "\u{fb01}",
+        "e\u{301}",
+        "\u{1f600}",
+        "\r\n",
+        "\u{1c6}",
+        "1",
+        ".",
+        "'",
+        "\u{4e2d}",
+    ];
+    let mut seed = 0xfeed_u64;
+    for _ in 0..300 {
+        let mut text = String::new();
+        for _ in 0..40 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            text.push_str(parts[seed as usize % parts.len()]);
+        }
+        assert_eq!(
+            transform_text(&text, Transform::Upper).unwrap(),
+            text.to_uppercase()
+        );
+        assert_eq!(
+            transform_text(&text, Transform::Lower).unwrap(),
+            text.to_lowercase(),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn complete_does_not_offer_a_word_cut_by_the_window() {
+    let window = qe_tools::COMPLETE_WINDOW_BYTES;
+    // The window starts inside this word.
+    let mut text = String::from("zzzzzzalphaxx ");
+    let at = window + 6;
+    text.push_str(&"- ".repeat((at - text.len()) / 2));
+    while text.len() < at {
+        text.push(' ');
+    }
+    // The window ends inside this one.
+    text.push_str(&" ".repeat(window - 7));
+    text.push_str("alphayyzzz end");
+    let view = EditorView::from_text(&text).unwrap();
+    let snapshot = view.worker_snapshot();
+    let words =
+        complete_candidates(snapshot.as_ref(), "alpha", ByteOffset(at), &NOT_CANCELLED).unwrap();
+    assert!(words.is_empty(), "{words:?}");
+    // A word that ends right at the end of the text is whole.
+    let view = EditorView::from_text("alpha alphabet").unwrap();
+    let snapshot = view.worker_snapshot();
+    let words =
+        complete_candidates(snapshot.as_ref(), "alpha", ByteOffset(5), &NOT_CANCELLED).unwrap();
+    assert_eq!(words, ["alphabet"]);
 }

@@ -23,6 +23,7 @@ const DONE_WIDTH: f32 = 58.0;
 const REPLACE_WIDTH: f32 = 70.0;
 const ALL_WIDTH: f32 = 50.0;
 const MIN_FIELD_WIDTH: f32 = 80.0;
+const PANEL_TITLE_HEIGHT: f32 = 26.0;
 
 const ID_BAR: u64 = 12100;
 
@@ -34,7 +35,7 @@ fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
         height: Dip(height),
     }
 }
-fn contains(r: Rect, at: Point) -> bool {
+pub(crate) fn contains(r: Rect, at: Point) -> bool {
     at.x.0 >= r.x.0 && at.y.0 >= r.y.0 && at.x.0 < r.x.0 + r.width.0 && at.y.0 < r.y.0 + r.height.0
 }
 fn event(kind: InputKind) -> InputEvent {
@@ -137,7 +138,7 @@ impl FindBar {
             (true, true) => BAR_ROW_HEIGHT * 2.0,
         }
     }
-    fn control(&mut self, stop: BarStop) -> &mut dyn Control {
+    pub(crate) fn control(&mut self, stop: BarStop) -> &mut dyn Control {
         match stop {
             BarStop::Find => &mut self.find,
             BarStop::Previous => &mut self.previous,
@@ -438,13 +439,28 @@ fn group(
     }
 }
 
-/// The Select Line panel, 253 by 62 with the Mac's field and button in their places.
+/// Which control of the panel has the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelStop {
+    Field,
+    Select,
+    Close,
+}
+
+/// The Select Line panel. Its content is 253 by 62, with the Mac's field and button in their
+/// places, under a title row with a close button, as the Mac's window has. It is not modal:
+/// it stays open while the keyboard goes back to the text.
 pub struct SelectLinePanel {
     pub field: TextField,
     pub select: Button,
+    pub close: Button,
+    pub title: Label,
     pub open: bool,
+    /// The 253 by 62 content.
     pub bounds: Rect,
-    pub button_focused: bool,
+    /// The content and the title row.
+    pub frame: Rect,
+    pub keyboard: Option<PanelStop>,
 }
 impl SelectLinePanel {
     pub fn new(clipboard: SharedClipboard) -> Self {
@@ -452,33 +468,70 @@ impl SelectLinePanel {
         field.placeholder = LINE_PLACEHOLDER.to_string();
         let mut select = Button::new(WidgetId(12002), "Select");
         select.is_default = true;
+        let mut close = Button::new(WidgetId(12003), "Close");
+        close.icon = Some("E711".to_string());
         Self {
             field,
             select,
+            close,
+            title: Label::new(WidgetId(12004), "Select Line", LabelKind::Plain),
             open: false,
             bounds: Rect::default(),
-            button_focused: false,
+            frame: Rect::default(),
+            keyboard: None,
+        }
+    }
+    /// Moves the keyboard to a control, or out of the panel with `None`. Only one control
+    /// has it, so only one reports focus.
+    pub fn set_keyboard(&mut self, stop: Option<PanelStop>, ctx: &mut ViewContext) {
+        if self.keyboard == stop {
+            return;
+        }
+        if let Some(old) = self.keyboard {
+            self.control(old).handle(&event(InputKind::Blur), ctx);
+        }
+        self.keyboard = stop;
+        if let Some(new) = stop {
+            self.control(new).handle(&event(InputKind::Focus), ctx);
+        }
+    }
+    pub(crate) fn control(&mut self, stop: PanelStop) -> &mut dyn Control {
+        match stop {
+            PanelStop::Field => &mut self.field,
+            PanelStop::Select => &mut self.select,
+            PanelStop::Close => &mut self.close,
         }
     }
     /// Shows the panel with the keyboard in its field and the old entry selected.
     pub fn show(&mut self, ctx: &mut ViewContext) {
         self.open = true;
-        self.button_focused = false;
-        self.select.handle(&event(InputKind::Blur), ctx);
-        self.field.handle(&event(InputKind::Focus), ctx);
+        self.set_keyboard(Some(PanelStop::Field), ctx);
         self.field.anchor = 0;
         self.field.caret = self.field.text.len();
     }
     pub fn hide(&mut self, ctx: &mut ViewContext) {
+        self.set_keyboard(None, ctx);
         self.open = false;
-        self.field.handle(&event(InputKind::Blur), ctx);
-        self.select.handle(&event(InputKind::Blur), ctx);
     }
     pub fn place(&mut self, area: Rect, m: &dyn TextMeasurer) {
         let (width, height) = SELECT_LINE_SIZE;
+        let total = height + PANEL_TITLE_HEIGHT;
         let x = area.x.0 + ((area.width.0 - width) / 2.0).max(0.0);
-        let y = area.y.0 + 24.0_f32.min((area.height.0 - height).max(0.0));
+        let top = area.y.0 + 24.0_f32.min((area.height.0 - total).max(0.0));
+        let y = top + PANEL_TITLE_HEIGHT;
+        self.frame = rect(x, top, width, total);
         self.bounds = rect(x, y, width, height);
+        self.title
+            .layout(rect(x + 12.0, top, width - 48.0, PANEL_TITLE_HEIGHT), m);
+        self.close.layout(
+            rect(
+                x + width - PANEL_TITLE_HEIGHT - 2.0,
+                top + 2.0,
+                PANEL_TITLE_HEIGHT,
+                PANEL_TITLE_HEIGHT - 2.0,
+            ),
+            m,
+        );
         let (fx, fy, fw, fh) = SELECT_LINE_FIELD;
         self.field.layout(rect(x + fx, y + fy, fw, fh), m);
         let (bx, by, bw, bh) = SELECT_LINE_BUTTON;
@@ -490,16 +543,18 @@ impl SelectLinePanel {
         }
         let t = UiTokens::from_theme(theme);
         list.push(DrawCommand::RoundedRect {
-            rect: self.bounds,
+            rect: self.frame,
             radius: t.popup_radius,
             color: t.surface,
         });
         list.push(DrawCommand::StrokeRect {
-            rect: self.bounds,
+            rect: self.frame,
             radius: t.popup_radius,
             width: Dip(1.0),
             color: t.popup_border,
         });
+        self.title.draw(list, theme, m);
+        self.close.draw(list, theme, m);
         self.field.draw(list, theme, m);
         self.select.draw(list, theme, m);
     }
@@ -507,13 +562,17 @@ impl SelectLinePanel {
         if !self.open {
             return None;
         }
-        let children = [self.field.widgets(), self.select.widgets()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let children = [
+            self.close.widgets(),
+            self.field.widgets(),
+            self.select.widgets(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         Some(group(
             WidgetId(12000),
-            self.bounds,
+            self.frame,
             WidgetRole::Dialog,
             "Select Line",
             Some(LINE_TOOLTIP.to_string()),

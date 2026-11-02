@@ -228,40 +228,71 @@ fn match_kinds_table() {
     );
 }
 
-/// The model: each start in order, checked with plain string calls.
-fn slow_model(text: &str, query: &str) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
+/// One piece of the seeded text: one whole character as a reader sees it, and what it folds
+/// to, both written here by hand. So the model below uses no rule from the crate.
+const TOKENS: &[(&str, &str)] = &[
+    ("a", "a"),
+    ("A", "a"),
+    ("b", "b"),
+    ("s", "s"),
+    ("S", "s"),
+    ("\u{df}", "ss"),
+    ("\u{1e9e}", "ss"),
+    ("k", "k"),
+    ("\u{212a}", "k"),
+    ("\u{3a3}", "\u{3c3}"),
+    ("\u{3c3}", "\u{3c3}"),
+    ("\u{3c2}", "\u{3c3}"),
+    ("\u{131}", "\u{131}"),
+    ("i", "i"),
+    ("I", "i"),
+    ("e\u{301}", "e\u{301}"),
+    ("\u{1f600}", "\u{1f600}"),
+    ("\u{1f468}\u{200d}\u{1f469}", "\u{1f468}\u{200d}\u{1f469}"),
+    ("\u{1f1fa}\u{1f1f8}", "\u{1f1fa}\u{1f1f8}"),
+    ("\r\n", "\r\n"),
+    (" ", " "),
+    ("\n", "\n"),
+    ("\u{4e2d}", "\u{4e2d}"),
+];
+
+/// Leftmost matches with no overlap, on whole tokens only: the tokens from a start must spell
+/// the query, and the last token must end with it. `folded` compares what they fold to.
+fn token_model(tokens: &[usize], query: &str, folded: bool) -> Vec<Range<usize>> {
+    let spell = |t: usize| if folded { TOKENS[t].1 } else { TOKENS[t].0 };
+    let mut starts = Vec::with_capacity(tokens.len() + 1);
     let mut at = 0;
-    while at < text.len() {
-        if text.is_char_boundary(at)
-            && text[at..].starts_with(query)
-            && qe_tools::is_cluster_edge(text, at)
-            && qe_tools::is_cluster_edge(text, at + query.len())
-        {
-            out.push(at..at + query.len());
-            at += query.len();
+    for &t in tokens {
+        starts.push(at);
+        at += TOKENS[t].0.len();
+    }
+    starts.push(at);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut left = query;
+        let mut j = i;
+        while !left.is_empty() && j < tokens.len() {
+            match left.strip_prefix(spell(tokens[j])) {
+                Some(rest) => {
+                    left = rest;
+                    j += 1;
+                }
+                None => break,
+            }
+        }
+        if left.is_empty() {
+            out.push(starts[i]..starts[j]);
+            i = j;
         } else {
-            at += 1;
+            i += 1;
         }
     }
     out
 }
 
 #[test]
-fn seeded_search_matches_a_slow_model_at_every_piece_size() {
-    let parts = [
-        "a",
-        "A",
-        "b",
-        "e\u{301}",
-        "\u{1f600}",
-        "\r\n",
-        " ",
-        "\u{df}",
-        "\u{4e2d}",
-        "ab",
-        "\n",
-    ];
+fn seeded_search_matches_an_independent_model_past_the_buffer_turnover() {
     let mut seed = 0x9e37_79b9_u64;
     let mut next = move || {
         seed ^= seed << 13;
@@ -269,42 +300,237 @@ fn seeded_search_matches_a_slow_model_at_every_piece_size() {
         seed ^= seed << 17;
         seed as usize
     };
+    let exact_queries = [
+        "a",
+        "b",
+        "ab",
+        "e\u{301}",
+        "\u{1f600}",
+        "\r\n",
+        "\u{1f1fa}\u{1f1f8}",
+        "\u{4e2d}a",
+    ];
+    // Each is what it folds to, as the model compares.
+    let folded_queries = [
+        "a", "ss", "k", "\u{3c3}", "as", "\u{131}", "i", "\r\n", "e\u{301}",
+    ];
     let mut compared = 0;
-    for round in 0..60 {
+    let mut matches = 0;
+    let mut longest = 0;
+    for round in 0..4 {
+        // Over 200 KB, so the 64 KiB buffer turns over a few times.
+        let mut tokens = Vec::new();
         let mut text = String::new();
-        for _ in 0..(40 + round * 8) {
-            text.push_str(parts[next() % parts.len()]);
+        while text.len() < 200_000 {
+            let t = next() % TOKENS.len();
+            tokens.push(t);
+            text.push_str(TOKENS[t].0);
         }
-        let piece = [1, 2, 3, 5, 7, 16, 4096][round % 7];
+        longest = longest.max(text.len());
+        let piece = [3, 4096, 65_536, 7][round % 4];
         let store = Pieces::new(&text, piece);
-        for query in [
-            "a",
-            "b",
-            "ab",
-            "aa",
-            "e\u{301}",
-            "\u{1f600}",
-            "\r\n",
-            "\u{4e2d}a",
-        ] {
-            let want = slow_model(&text, query);
+        for query in exact_queries {
+            let want = token_model(&tokens, query, false);
             let exact = options(false, MatchKind::Contains);
+            matches += want.len();
+            assert_eq!(
+                scan_all(&store, query, exact),
+                want,
+                "{query:?}, piece {piece}"
+            );
             assert_eq!(
                 find_text(&text, query, exact),
                 want,
-                "{query:?} in {text:?}"
+                "{query:?}, whole string"
             );
-            assert_eq!(scan_all(&store, query, exact), want, "pieces of {piece}");
-            compared += 1;
+            compared += 2;
         }
-        // Ignoring case, a scan over pieces agrees with one over the whole string.
-        for query in ["A", "AB", "SS", "\u{df}"] {
+        for query in folded_queries {
+            let want = token_model(&tokens, query, true);
             let any = FindOptions::default();
-            assert_eq!(scan_all(&store, query, any), find_text(&text, query, any));
+            matches += want.len();
+            assert_eq!(
+                scan_all(&store, query, any),
+                want,
+                "{query:?}, piece {piece}"
+            );
             compared += 1;
         }
     }
-    assert!(compared >= 700);
+    assert!(longest > 2 * 64 * 1024);
+    assert!(
+        compared >= 90 && matches > 10_000,
+        "{compared} compared, {matches} matches"
+    );
+}
+
+// ---- Flags, which are pairs, across every kind of edge ----
+
+fn flags_text(prefix: &str, pairs: usize) -> String {
+    format!("{prefix}{}", "\u{1f1f8}\u{1f1fa}".repeat(pairs))
+}
+
+#[test]
+fn flags_at_a_buffer_edge_give_no_false_match_and_replace_all_leaves_them() {
+    // The first letter of this query's pair is the second letter of each flag.
+    let query = "\u{1f1fa}\u{1f1f8}";
+    let exact = options(false, MatchKind::Contains);
+    for prefix in ["", "\u{1f600}", "x", "xy", "xyz"] {
+        let text = flags_text(prefix, 12_000);
+        for piece in [3, 4096, 65_536] {
+            let store = Pieces::new(&text, piece);
+            assert!(
+                scan_all(&store, query, exact).is_empty(),
+                "{prefix:?} piece {piece}"
+            );
+        }
+        let view = EditorView::from_text(&text).unwrap();
+        let snapshot = view.worker_snapshot();
+        assert!(scan_all(snapshot.as_ref(), query, exact).is_empty());
+        let matcher = Matcher::new(query, exact).unwrap();
+        let ready = qe_tools::prepare_replace_all(snapshot.as_ref(), &matcher, "X", &NOT_CANCELLED);
+        assert!(
+            ready.unwrap().is_none(),
+            "Replace All finds nothing to change"
+        );
+        let back = last_match(
+            snapshot.as_ref(),
+            &matcher,
+            ByteOffset(0),
+            snapshot.len_bytes(),
+            &NOT_CANCELLED,
+        );
+        assert_eq!(back.unwrap(), None, "backward agrees");
+    }
+}
+
+#[test]
+fn a_real_flag_past_a_buffer_edge_is_found_and_a_scan_from_inside_a_run_counts_right() {
+    let exact = options(false, MatchKind::Contains);
+    let us = "\u{1f1fa}\u{1f1f8}";
+    // 65,000 plain bytes, flags past the 64 KiB edge, then one rare US flag.
+    let text = format!(
+        "{}{}{us}",
+        "x".repeat(65_000),
+        "\u{1f1ec}\u{1f1e7}".repeat(150)
+    );
+    let place = text.len() - us.len();
+    let store = Pieces::new(&text, 32_769);
+    assert_eq!(scan_all(&store, us, exact), vec![place..place + us.len()]);
+
+    // One flag letter later, the same letters are not a flag.
+    let text = format!(
+        "{}\u{1f1ec}{}{us}",
+        "x".repeat(65_000),
+        "\u{1f1ec}\u{1f1e7}".repeat(150)
+    );
+    let store = Pieces::new(&text, 32_769);
+    assert!(scan_all(&store, us, exact).is_empty());
+
+    // A scan that starts deep inside a run reads back to learn where the pairs fall.
+    let text = "\u{1f1f8}\u{1f1fa}".repeat(1000);
+    let store = Pieces::new(&text, 4096);
+    let matcher = Matcher::new("\u{1f1f8}\u{1f1fa}", exact).unwrap();
+    let from = ByteOffset(4 * 1000); // on a pair's first letter
+    let found = first_match(
+        &store,
+        &matcher,
+        from..ByteOffset(text.len()),
+        &NOT_CANCELLED,
+    );
+    assert_eq!(found.unwrap().unwrap().start, from);
+    let matcher = Matcher::new(us, exact).unwrap();
+    let found = first_match(
+        &store,
+        &matcher,
+        ByteOffset(4 * 1001)..ByteOffset(text.len()),
+        &NOT_CANCELLED,
+    );
+    assert_eq!(found.unwrap(), None, "from a pair's second letter");
+}
+
+#[test]
+fn a_long_run_of_flags_is_searched_in_time_that_follows_its_length() {
+    // Walking the whole run for each candidate took seconds on 96 KB. 2 MB here would take
+    // far longer than this limit, even on a loaded PC in a debug build.
+    let text = "\u{1f1f8}\u{1f1fa}".repeat(250_000);
+    let store = Pieces::new(&text, 64 * 1024);
+    let started = Instant::now();
+    assert!(
+        scan_all(
+            &store,
+            "\u{1f1fa}\u{1f1f8}",
+            options(false, MatchKind::Contains)
+        )
+        .is_empty()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+// ---- Wrap around, with the caret inside the only match ----
+
+#[test]
+fn wrap_finds_the_only_match_with_the_caret_inside_it() {
+    let store = Pieces::new("xneedley", 3);
+    let matcher = Matcher::new("needle", FindOptions::default()).unwrap();
+    let at = ByteOffset(3)..ByteOffset(3);
+    for direction in [Direction::Forward, Direction::Backward] {
+        let found = find_step(
+            &store,
+            &matcher,
+            at.clone(),
+            direction,
+            true,
+            &NOT_CANCELLED,
+        );
+        let (found, wrapped) = found.unwrap().unwrap();
+        assert_eq!(found, ByteOffset(1)..ByteOffset(7), "{direction:?}");
+        assert!(wrapped);
+    }
+}
+
+// ---- The bytes kept past a candidate ----
+
+#[test]
+fn a_mark_right_after_a_match_at_every_offset_near_the_buffer_edge_is_seen() {
+    // Each offset, so that one match ends right where the 64 KiB buffer ends.
+    let exact = options(false, MatchKind::Contains);
+    for offset in 65_520..65_545 {
+        let text = format!("{}e\u{301}{}", "z".repeat(offset), "y".repeat(70_000));
+        for piece in [4096, 65_536] {
+            let store = Pieces::new(&text, piece);
+            assert!(
+                scan_all(&store, "e", exact).is_empty(),
+                "offset {offset}, piece {piece}"
+            );
+        }
+    }
+    let word = options(false, MatchKind::FullWord);
+    for offset in 65_520..65_545 {
+        let text = format!("{}cats{}", " ".repeat(offset), " ".repeat(70_000));
+        let store = Pieces::new(&text, 4096);
+        assert!(scan_all(&store, "cat", word).is_empty(), "offset {offset}");
+    }
+}
+
+#[test]
+fn what_stands_before_a_match_is_kept_when_the_buffer_turns_over() {
+    // The buffer keeps some bytes back and drops those before them, so each offset near that
+    // place has a match whose left neighbor must still be read.
+    let word = options(false, MatchKind::FullWord);
+    let exact = options(false, MatchKind::Contains);
+    for offset in 65_420..65_540 {
+        let text = format!("{}xcat{}", " ".repeat(offset), " ".repeat(70_000));
+        let store = Pieces::new(&text, 4096);
+        assert!(scan_all(&store, "cat", word).is_empty(), "offset {offset}");
+        let text = format!("{}\r\n{}", " ".repeat(offset), " ".repeat(70_000));
+        let store = Pieces::new(&text, 4096);
+        assert!(scan_all(&store, "\n", exact).is_empty(), "offset {offset}");
+    }
 }
 
 #[test]

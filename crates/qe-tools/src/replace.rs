@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 /// Matches gathered between copies of the text between them.
 const BATCH: usize = 4096;
+const NO_MEMORY: &str = "There is not enough memory to replace this text.";
 
 /// A finished Replace All, ready for `EditorView::apply_edits`.
 #[derive(Clone, Debug)]
@@ -56,7 +57,12 @@ pub fn prepare_replace_all(
                 return Err("Replace All was cancelled.".to_string());
             }
             match first {
-                None => first = Some(found.start),
+                None => {
+                    first = Some(found.start);
+                    if merged.try_reserve_exact(len.0 - found.start.0).is_err() {
+                        return Err(NO_MEMORY.to_string());
+                    }
+                }
                 Some(_) => {
                     let mut good = true;
                     let mut problem = None;
@@ -68,7 +74,7 @@ pub fn prepare_replace_all(
                         }
                     });
                     if problem.is_some() {
-                        return Err("There is not enough memory to replace this text.".to_string());
+                        return Err(NO_MEMORY.to_string());
                     }
                     if !good {
                         return Err(read_failure(snapshot));
@@ -76,7 +82,7 @@ pub fn prepare_replace_all(
                 }
             }
             if merged.try_reserve(replacement.len()).is_err() {
-                return Err("There is not enough memory to replace this text.".to_string());
+                return Err(NO_MEMORY.to_string());
             }
             merged.push_str(replacement);
             next_copy = found.end;

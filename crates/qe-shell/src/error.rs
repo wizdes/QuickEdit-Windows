@@ -20,6 +20,8 @@ pub enum ShellError {
     Reentered { message: u32 },
     /// `WM_CHAR` gave half of a surrogate pair, with no other half. It was dropped.
     LoneSurrogate { unit: u16 },
+    /// A menu could not open, for this reason. The menu bar is back in its closed state.
+    Menu(String),
     /// The window no longer exists.
     WindowGone,
 }
@@ -42,6 +44,7 @@ impl fmt::Display for ShellError {
             Self::LoneSurrogate { unit } => {
                 write!(f, "WM_CHAR gave a lone surrogate {unit:#x}; it was dropped")
             }
+            Self::Menu(message) => write!(f, "menu: {message}"),
             Self::WindowGone => f.write_str("the window no longer exists"),
         }
     }

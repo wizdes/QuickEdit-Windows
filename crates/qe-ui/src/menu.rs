@@ -509,6 +509,30 @@ impl MenuView {
             self.select_row(i, c);
         }
     }
+    /// True when this arrow key leaves for the next menu on the bar: Left on the first
+    /// level, or Right on a row with no submenu to open.
+    pub fn arrow_moves_to_next_menu(&self, right: bool) -> bool {
+        let mut level = self;
+        while let Some(child) = &level.child {
+            level = child;
+        }
+        if right {
+            level
+                .selected
+                .and_then(|i| level.model.items.get(i))
+                .is_none_or(|item| item.submenu.is_none() || !item.usable())
+        } else {
+            !level.is_submenu
+        }
+    }
+    /// True while a submenu waits for its hover delay to end, so that `tick` has work.
+    pub fn waiting_for_submenu(&self) -> bool {
+        self.pending_submenu.is_some()
+            || self
+                .child
+                .as_ref()
+                .is_some_and(|child| child.waiting_for_submenu())
+    }
     fn deepest_has_focus(&self) -> bool {
         self.child.is_none()
     }
@@ -969,7 +993,7 @@ fn mnemonic_position(label: &str, mnemonic: char) -> Option<(usize, char)> {
         .find(|(_, c)| c.to_lowercase().eq(wanted.iter().copied()))
 }
 
-/// Tracks a lone tap of Alt, which opens the caret list.
+/// Tracks a lone tap of Alt, which closes an open list.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AltKeyTracker {
     armed: bool,

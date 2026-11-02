@@ -413,3 +413,36 @@ fn groups_and_caret_keep_every_command_once() {
     commands(&qe_ui::legacy_caret_menu(), &mut baseline);
     assert_eq!(actual, baseline);
 }
+
+#[test]
+fn the_hover_highlight_goes_when_the_pointer_leaves() {
+    let mut bar = MenuBar::new(WidgetId(100));
+    bar.layout(
+        Rect {
+            x: Dip(0.0),
+            y: Dip(40.0),
+            width: Dip(500.0),
+            height: Dip(32.0),
+        },
+        &Measure,
+    );
+    let label = bar.label_rect(1);
+    bar.handle(
+        &InputEvent {
+            time_us: 0,
+            kind: InputKind::MouseMove {
+                at: qe_api::Point {
+                    x: Dip(label.x.0 + 2.0),
+                    y: Dip(label.y.0 + 2.0),
+                },
+            },
+        },
+        &mut ViewContext::default(),
+    );
+    let mut ctx = ViewContext::default();
+    bar.pointer_left(&mut ctx);
+    assert_eq!(ctx.requests, vec![qe_api::ViewRequest::Invalidate(label)]);
+    let mut again = ViewContext::default();
+    bar.pointer_left(&mut again);
+    assert!(again.requests.is_empty(), "no highlight is left to repaint");
+}

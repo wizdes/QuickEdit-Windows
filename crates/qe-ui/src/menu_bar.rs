@@ -49,6 +49,16 @@ impl MenuBar {
     pub fn label_rect(&self, index: usize) -> Rect {
         self.labels[index]
     }
+    /// The label that this key's letter opens.
+    pub fn mnemonic_label(virtual_key: u16) -> Option<usize> {
+        MNEMONICS.iter().position(|key| *key == virtual_key)
+    }
+    /// The pointer left the bar with no message over it, so no label stays highlighted.
+    pub fn pointer_left(&mut self, ctx: &mut ViewContext) {
+        if let Some(i) = self.hover.take() {
+            ctx.invalidate(self.labels[i]);
+        }
+    }
     pub fn take_open_request(&mut self) -> Option<(usize, Rect)> {
         self.request.take()
     }
@@ -204,6 +214,10 @@ impl View for MenuBar {
                     if let Some(i) = MNEMONICS.iter().position(|key| *key == virtual_key) {
                         self.show(i, ctx);
                         return Handled::Yes;
+                    }
+                    // Alt+Space and Alt+F4 go on to Windows, and the text gets the focus.
+                    if matches!(virtual_key, 0x20 | 0x73) && self.focused.is_some() {
+                        self.leave(ctx);
                     }
                     return Handled::No;
                 }

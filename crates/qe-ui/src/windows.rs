@@ -168,6 +168,7 @@ thread_local! {
     static FOREGROUND_HOOK: Cell<Option<HWINEVENTHOOK>> = const { Cell::new(None) };
     static MODAL_OWNERS: RefCell<HashMap<isize, ModalOwner>> = RefCell::new(HashMap::new());
     static CLIPBOARD_OWNER: Cell<Option<HWND>> = const { Cell::new(None) };
+    static IGNORE_FOREGROUND: Cell<bool> = const { Cell::new(false) };
 }
 impl PopupGroup {
     fn members(&self) -> Vec<Rc<PopupState>> {
@@ -263,7 +264,16 @@ unsafe extern "system" fn foreground_changed(
     _: u32,
     _: u32,
 ) {
-    foreground_is(foreground);
+    if !IGNORE_FOREGROUND.get() {
+        foreground_is(foreground);
+    }
+}
+/// On this thread, the system's foreground notices stop counting. A hidden test window
+/// is never in front, so any other program's window would close its menu. A test that is
+/// about this notice calls `foreground_changed_for_test`.
+#[doc(hidden)]
+pub fn ignore_foreground_changes_for_test() {
+    IGNORE_FOREGROUND.set(true);
 }
 /// What the system's foreground notice does. A test with no desktop cannot make
 /// another program active, so it calls this.
@@ -723,7 +733,10 @@ pub struct MenuWindows {
     scale: f32,
     on_screen: bool,
     levels: Vec<PopupWindow>,
+    level_setup: Option<LevelSetup>,
 }
+/// Runs once for each new level, with its depth, before the level shows.
+pub type LevelSetup = Box<dyn FnMut(usize, &PopupWindow)>;
 impl MenuWindows {
     /// `scale` is device pixels per dip.
     pub fn new(owner: HWND, scale: f32) -> Self {
@@ -732,7 +745,13 @@ impl MenuWindows {
             scale,
             on_screen: true,
             levels: Vec::new(),
+            level_setup: None,
         }
+    }
+    /// Gives each new level its handlers, so that a host can run on the normal message
+    /// loop: `PopupWindow::set_message_handler` gets the mouse messages.
+    pub fn set_level_setup(&mut self, setup: LevelSetup) {
+        self.level_setup = Some(setup);
     }
     /// The same windows with none of them made visible, for tests.
     #[doc(hidden)]
@@ -782,6 +801,9 @@ impl MenuWindows {
                     None => PopupWindow::create(self.owner, x, y, w, h),
                 }
                 .map_err(|e| format!("making a menu level: {e}"))?;
+                if let Some(setup) = &mut self.level_setup {
+                    setup(depth, &made);
+                }
                 let shown = if self.on_screen {
                     made.show()
                 } else {
@@ -799,12 +821,16 @@ impl MenuWindows {
     /// messages for every level arrive there, because it holds the capture.
     pub fn pointer(&self, l: LPARAM) -> Option<qe_api::Point> {
         let root = self.levels.first()?;
+        self.pointer_on(root.hwnd(), l)
+    }
+    /// A mouse message's place in the menu's own dips, for a message sent to `hwnd`.
+    pub fn pointer_on(&self, hwnd: HWND, l: LPARAM) -> Option<qe_api::Point> {
         let mut point = POINT {
             x: l.0 as i16 as i32,
             y: (l.0 >> 16) as i16 as i32,
         };
         // SAFETY: `point` is a valid in and out pointer.
-        unsafe { ClientToScreen(root.hwnd(), &mut point) }
+        unsafe { ClientToScreen(hwnd, &mut point) }
             .as_bool()
             .then(|| qe_api::Point {
                 x: Dip(point.x as f32 / self.scale),

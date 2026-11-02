@@ -6,6 +6,7 @@
 //! No reference to the state lives across a call that can send a message. `RefCell`
 //! enforces this: each borrow is short, and a message that finds the state in use takes
 //! the default path and names itself in `ShellError::Reentered`.
+use crate::menu_host::{MenuRun, PopupMessages, PopupRendererFactory};
 use crate::{
     CONTENT_WIDGET, CaptionHit, ContrastColors, FrameMode, ShellError, ShellEvent, ShellTokens,
     Tab, TabId, TabStrip, caption_hit, maximized_insets,
@@ -15,7 +16,9 @@ use qe_api::{
     MouseCursor, PixelRect, Point, Rect as ApiRect, Renderer, TextMeasurer, Theme, ThemeKind, View,
     ViewContext, ViewRequest, Widget, WidgetId, WidgetRole, WidgetStates,
 };
-use qe_ui::MenuBar;
+use qe_ui::{
+    MENU_LABELS, MenuBar, MenuModel, MenuView, POPUP_DISMISSED_MESSAGE, PopupDismissed, place_popup,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -32,9 +35,9 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BeginPaint, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetSysColor, HBRUSH,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-    SYS_COLOR_INDEX, ScreenToClient, UpdateWindow,
+    COLOR_WINDOWTEXT, ClientToScreen, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
+    GetSysColor, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -517,6 +520,26 @@ impl State {
 }
 /// The private message behind `ShellWaker`.
 const WM_SHELL_WAKE: u32 = WM_APP + 1;
+/// A menu's hover delay before a submenu opens. It stays inside this window.
+const MENU_TIMER: u32 = u32::MAX - 1;
+/// A timer's message time has a grain of about 16 ms, so the delay gets this on top.
+const MENU_TIMER_MARGIN_MS: u32 = 20;
+const VK_ESCAPE_KEY: u16 = 0x1b;
+const VK_LEFT_KEY: u16 = 0x25;
+const VK_RIGHT_KEY: u16 = 0x27;
+const VK_SPACE_KEY: u16 = 0x20;
+const VK_F4_KEY: u16 = 0x73;
+
+/// What the menu bar does when a menu goes away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuEnd {
+    /// The bar lets go of the focus, and keys go to the text.
+    Leave,
+    /// Esc: the label keeps the focus.
+    KeepBarFocus,
+    /// The bar stays as it is: another menu opens, or the window is going away.
+    Silent,
+}
 
 /// Wakes a window from any thread. The event handler gets `ShellEvent::Wake` on the
 /// window's own thread. It uses a posted message, so nothing the window does with its
@@ -593,6 +616,14 @@ struct Shared {
     queue: RefCell<VecDeque<ShellEvent>>,
     problems: RefCell<Vec<ShellError>>,
     dispatching: Cell<bool>,
+    /// The open menu. While `menu_active`, keys and mouse messages go to it and nowhere
+    /// else: a key that also reached the bar would open the menu again.
+    menu: RefCell<Option<MenuRun>>,
+    menu_active: Cell<bool>,
+    popup_renderers: RefCell<Option<PopupRendererFactory>>,
+    /// The message being served is a key, so a menu it opens starts with a row selected.
+    input_is_key: Cell<bool>,
+    chosen_data: RefCell<Option<String>>,
 }
 impl Shared {
     fn report(&self, problem: ShellError) {
@@ -1451,6 +1482,429 @@ impl Shared {
             }
         }
     }
+    /// Input for the bar alone, from a menu: a switch to another label, or leaving.
+    fn bar_input(&self, kind: InputKind) {
+        let event = self.make_event(kind);
+        self.bar_action(|bar, ctx| {
+            bar.handle(&event, ctx);
+        });
+    }
+    fn bar_action(&self, f: impl FnOnce(&mut MenuBar, &mut ViewContext)) {
+        let result = self.with_state(WM_KEYDOWN, |state| {
+            let mut ctx = ViewContext::default();
+            let was_focused = state.menu_bar.focused().is_some();
+            f(&mut state.menu_bar, &mut ctx);
+            let mut events = Vec::new();
+            if let Some((index, anchor)) = state.menu_bar.take_open_request() {
+                events.push(ShellEvent::OpenMenuGroup(index, anchor));
+            }
+            if was_focused && state.menu_bar.focused().is_none() {
+                events.push(ShellEvent::FocusContent);
+            }
+            (ctx.requests, events)
+        });
+        if let Some((requests, events)) = result {
+            self.apply(requests, events);
+        }
+    }
+    fn open_group(&self) -> Option<usize> {
+        self.with_state(WM_KEYDOWN, |state| state.menu_bar.open())
+            .flatten()
+    }
+    /// Opens a menu under `anchor`, in client dips, and returns at once. The menu runs on
+    /// the window's normal message loop.
+    fn open_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
+        // A switch between labels: the old menu goes, and the bar stays as it is.
+        self.end_menu(MenuEnd::Silent);
+        let opened = self.start_menu(model, anchor);
+        if let Err(problem) = &opened {
+            self.end_menu(MenuEnd::Silent);
+            self.bar_action(|bar, ctx| bar.close_popup(ctx));
+            self.report(problem.clone());
+        }
+        opened
+    }
+    fn start_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
+        if self.popup_renderers.borrow().is_none() {
+            return Err(ShellError::Menu(
+                "the owner has not called set_popup_renderers".into(),
+            ));
+        }
+        let owner = self.hwnd.get();
+        let scale = self.scale();
+        let mut screen = POINT {
+            x: (anchor.x.0 * scale).round() as i32,
+            y: (anchor.y.0 * scale).round() as i32,
+        };
+        if !unsafe { ClientToScreen(owner, &mut screen) }.as_bool() {
+            return Err(ShellError::Win32 {
+                call: "ClientToScreen",
+                message: "it returned false".into(),
+            });
+        }
+        let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return Err(ShellError::Win32 {
+                call: "GetMonitorInfoW",
+                message: "it returned false".into(),
+            });
+        }
+        let work = ApiRect {
+            x: Dip(info.rcWork.left as f32 / scale),
+            y: Dip(info.rcWork.top as f32 / scale),
+            width: Dip((info.rcWork.right - info.rcWork.left) as f32 / scale),
+            height: Dip((info.rcWork.bottom - info.rcWork.top) as f32 / scale),
+        };
+        let on_screen_anchor = ApiRect {
+            x: Dip(screen.x as f32 / scale),
+            y: Dip(screen.y as f32 / scale),
+            width: anchor.width,
+            height: anchor.height,
+        };
+        let name = self
+            .open_group()
+            .map_or("QuickEdit menu", |index| MENU_LABELS[index]);
+        let mut view = MenuView::new(WidgetId(20_000), name, model);
+        view.work_area = Some(work);
+        self.with_state(WM_KEYDOWN, |state| {
+            let size = view.model.preferred_size(state.measurer.as_ref());
+            let bounds = place_popup(on_screen_anchor, size, work, false);
+            view.layout(bounds, state.measurer.as_ref());
+        })
+        .ok_or(ShellError::Reentered { message: 0 })?;
+        if self.input_is_key.get() {
+            view.open_keyboard();
+        }
+        let weak = Rc::downgrade(self);
+        let messages: PopupMessages = Rc::new(move |hwnd, msg, w, l| {
+            let shared = weak.upgrade()?;
+            let answer = shared.menu_mouse(hwnd, msg, w, l);
+            shared.dispatch();
+            answer
+        });
+        // A hidden window's menu stays hidden too.
+        let on_screen = unsafe { IsWindowVisible(owner) }.as_bool();
+        let mut run = MenuRun::new(owner, scale, on_screen, view, messages);
+        self.menu_active.set(true);
+        let synced = run.windows.sync(&run.view);
+        let made = run.root().is_some();
+        *self.menu.borrow_mut() = Some(run);
+        if let Err(problem) = synced {
+            if !made {
+                return Err(ShellError::Menu(problem));
+            }
+            // A capture or a foreground watch that Windows refused: the menu still shows.
+            self.report(ShellError::Menu(problem));
+        }
+        self.paint_menu();
+        Ok(())
+    }
+    fn paint_menu(&self) {
+        let Some(mut run) = self.menu.borrow_mut().take() else {
+            return;
+        };
+        let factory = self.popup_renderers.borrow_mut().take();
+        if let Some(mut factory) = factory {
+            let painted = self.with_state(WM_PAINT, |state| {
+                run.paint(&mut factory, &state.theme, state.measurer.as_ref())
+            });
+            *self.popup_renderers.borrow_mut() = Some(factory);
+            if let Some(Err(problem)) = painted {
+                self.report(problem);
+            }
+        }
+        *self.menu.borrow_mut() = Some(run);
+    }
+    /// Destroys the popups, so that none outlives its menu, and tells the bar.
+    fn end_menu(&self, how: MenuEnd) {
+        let run = self.menu.borrow_mut().take();
+        let was_open = self.menu_active.replace(false);
+        if let Some(run) = run {
+            self.drop_menu_run(run);
+        }
+        if was_open {
+            match how {
+                MenuEnd::Leave => self.bar_action(|bar, ctx| bar.leave(ctx)),
+                MenuEnd::KeepBarFocus => self.bar_action(|bar, ctx| bar.close_popup(ctx)),
+                MenuEnd::Silent => {}
+            }
+        }
+    }
+    fn drop_menu_run(&self, mut run: MenuRun) {
+        if run.timer_set
+            && let Err(e) = unsafe { KillTimer(Some(self.hwnd.get()), MENU_TIMER as usize) }
+        {
+            self.report(win32("KillTimer", e));
+        }
+        run.view.closed = true;
+        if let Err(problem) = run.windows.sync(&run.view) {
+            self.report(ShellError::Menu(problem));
+        }
+        // The popup held the mouse, so the next move must ask for the leave notice again.
+        self.tracking.set(Tracking::None);
+    }
+    /// Gives an event to the open menu, and acts on what the menu asked for. `end` says
+    /// what the bar does if this event closes the menu with no command.
+    fn menu_event(&self, kind: InputKind, end: MenuEnd) -> Handled {
+        let Some(mut run) = self.menu.borrow_mut().take() else {
+            return Handled::No;
+        };
+        let event = self.make_event(kind);
+        let mut ctx = ViewContext::default();
+        let handled = run.view.handle(&event, &mut ctx);
+        let mut commands = Vec::new();
+        let mut repaint = false;
+        let mut timer = None;
+        for request in ctx.requests {
+            match request {
+                ViewRequest::Run(command) => commands.push(command),
+                ViewRequest::Invalidate(_) => repaint = true,
+                ViewRequest::RequestTimer(ms) => timer = Some(ms),
+                // The first popup already holds the mouse for every level.
+                _ => {}
+            }
+        }
+        if let Some(ms) = timer {
+            self.set_menu_timer(&mut run, ms);
+        }
+        if run.view.closed {
+            let data = run.view.take_chosen_data();
+            self.drop_menu_run(run);
+            self.end_menu(if commands.is_empty() {
+                end
+            } else {
+                MenuEnd::Leave
+            });
+            if data.is_some() {
+                *self.chosen_data.borrow_mut() = data;
+            }
+            self.queue
+                .borrow_mut()
+                .extend(commands.into_iter().map(ShellEvent::RunCommand));
+            return handled;
+        }
+        if let Err(problem) = run.windows.sync(&run.view) {
+            self.report(ShellError::Menu(problem));
+        }
+        *self.menu.borrow_mut() = Some(run);
+        if repaint {
+            self.paint_menu();
+        }
+        handled
+    }
+    fn set_menu_timer(&self, run: &mut MenuRun, ms: u32) {
+        let id = unsafe {
+            SetTimer(
+                Some(self.hwnd.get()),
+                MENU_TIMER as usize,
+                ms + MENU_TIMER_MARGIN_MS,
+                None,
+            )
+        };
+        if id == 0 {
+            self.report(win32("SetTimer", windows::core::Error::from_thread()));
+        } else {
+            run.timer_set = true;
+        }
+    }
+    fn on_menu_timer(&self) {
+        if let Err(e) = unsafe { KillTimer(Some(self.hwnd.get()), MENU_TIMER as usize) } {
+            self.report(win32("KillTimer", e));
+        }
+        let Some(mut run) = self.menu.borrow_mut().take() else {
+            return;
+        };
+        run.timer_set = false;
+        let now_us = u64::from(unsafe { GetMessageTime() } as u32) * 1000;
+        let opened = run.view.tick(now_us).is_some();
+        if opened {
+            if let Err(problem) = run.windows.sync(&run.view) {
+                self.report(ShellError::Menu(problem));
+            }
+        } else if run.view.waiting_for_submenu() {
+            self.set_menu_timer(&mut run, 0);
+        }
+        *self.menu.borrow_mut() = Some(run);
+        if opened {
+            self.paint_menu();
+        }
+    }
+    /// A key while a menu is open. It goes to the menu alone.
+    fn menu_key_down(
+        &self,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+        default: impl FnOnce() -> LRESULT,
+    ) -> LRESULT {
+        let vk = w.0 as u16;
+        let repeat = l.0 & (1 << 30) != 0;
+        let mut key_mods = modifiers();
+        // Bit 29 says Alt is down. F10 alone is a system key too, and it has no such bit.
+        key_mods.alt |= msg == WM_SYSKEYDOWN && l.0 & (1 << 29) != 0;
+        let alt_key = matches!(vk, 0x12 | 0xa4 | 0xa5);
+        self.swallow_char.set(true);
+        // AltGr reaches Windows programs as Ctrl plus Alt, and it types into the menu.
+        if key_mods.alt && !key_mods.ctrl && !alt_key {
+            if vk == VK_F4_KEY || vk == VK_SPACE_KEY {
+                self.end_menu(MenuEnd::Leave);
+                self.swallow_char.set(false);
+                return default();
+            }
+            if let Some(index) = MenuBar::mnemonic_label(vk)
+                && self.open_group() != Some(index)
+            {
+                self.bar_input(InputKind::KeyDown {
+                    virtual_key: vk,
+                    modifiers: key_mods,
+                    repeat,
+                });
+            }
+            return LRESULT(0);
+        }
+        if vk == VK_F10.0 {
+            self.end_menu(MenuEnd::Leave);
+            self.swallow_up.set(Some(vk));
+            return LRESULT(0);
+        }
+        if (vk == VK_LEFT_KEY || vk == VK_RIGHT_KEY)
+            && self.open_group().is_some()
+            && self
+                .menu
+                .borrow()
+                .as_ref()
+                .is_some_and(|run| run.view.arrow_moves_to_next_menu(vk == VK_RIGHT_KEY))
+        {
+            self.bar_input(InputKind::KeyDown {
+                virtual_key: vk,
+                modifiers: Modifiers::default(),
+                repeat: false,
+            });
+            return LRESULT(0);
+        }
+        let end = if vk == VK_ESCAPE_KEY {
+            MenuEnd::KeepBarFocus
+        } else {
+            MenuEnd::Leave
+        };
+        let handled = self.menu_event(
+            InputKind::KeyDown {
+                virtual_key: vk,
+                modifiers: key_mods,
+                repeat,
+            },
+            end,
+        );
+        // The menu has no use for a letter's key down: its `WM_CHAR` is what counts.
+        self.swallow_char.set(handled == Handled::Yes);
+        if !self.menu_active.get() {
+            self.swallow_up.set(Some(vk));
+        }
+        LRESULT(0)
+    }
+    fn menu_key_up(&self, msg: u32, w: WPARAM) -> LRESULT {
+        let vk = w.0 as u16;
+        if self.swallow_up.get() == Some(vk) {
+            self.swallow_up.set(None);
+            return LRESULT(0);
+        }
+        let mut key_mods = modifiers();
+        key_mods.alt |= msg == WM_SYSKEYUP;
+        // A lone tap of Alt ends the menu here, and the bar lets go with it.
+        self.menu_event(
+            InputKind::KeyUp {
+                virtual_key: vk,
+                modifiers: key_mods,
+            },
+            MenuEnd::Leave,
+        );
+        LRESULT(0)
+    }
+    /// A mouse message from a popup, or from the window while a menu is open. Points are
+    /// the menu's own dips: the screen's pixels over the scale.
+    fn menu_mouse(&self, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+        self.input_is_key.set(false);
+        if !self.menu_active.get() {
+            return None;
+        }
+        let scale = self.scale();
+        let at = if matches!(msg, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+            let screen = xy(l);
+            Point {
+                x: Dip(screen.x as f32 / scale),
+                y: Dip(screen.y as f32 / scale),
+            }
+        } else if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+            self.menu.borrow().as_ref()?.windows.pointer_on(hwnd, l)?
+        } else {
+            return None;
+        };
+        let notches = f32::from((w.0 >> 16) as i16) / WHEEL_DELTA as f32;
+        let kind = match msg {
+            WM_MOUSEMOVE => {
+                let on_a_level = self.menu.borrow().as_ref()?.view.levels().iter().any(|r| {
+                    at.x.0 >= r.x.0
+                        && at.x.0 < r.x.0 + r.width.0
+                        && at.y.0 >= r.y.0
+                        && at.y.0 < r.y.0 + r.height.0
+                });
+                // Over a menu, no label counts as under the pointer.
+                let client = if on_a_level {
+                    POINT { x: -1, y: -1 }
+                } else {
+                    self.screen_to_client(POINT {
+                        x: (at.x.0 * scale).round() as i32,
+                        y: (at.y.0 * scale).round() as i32,
+                    })
+                };
+                self.bar_input(InputKind::MouseMove {
+                    at: self.dips(client),
+                });
+                InputKind::MouseMove { at }
+            }
+            WM_LBUTTONDOWN => InputKind::MouseDown {
+                at,
+                button: MouseButton::Left,
+                modifiers: modifiers(),
+            },
+            WM_LBUTTONUP => InputKind::MouseUp {
+                at,
+                button: MouseButton::Left,
+                modifiers: modifiers(),
+            },
+            WM_MOUSEHWHEEL => InputKind::Wheel {
+                at,
+                delta_x: notches,
+                delta_y: 0.0,
+                modifiers: modifiers(),
+            },
+            _ => InputKind::Wheel {
+                at,
+                delta_x: 0.0,
+                delta_y: notches,
+                modifiers: modifiers(),
+            },
+        };
+        self.menu_event(kind, MenuEnd::Leave);
+        Some(LRESULT(0))
+    }
+    /// A popup went away on its own. Only the open menu's first popup counts: `Caller`
+    /// comes from this window's own closing, and the menu it names has gone by now.
+    fn on_popup_dismissed(&self, w: WPARAM, l: LPARAM) {
+        let current = self
+            .menu
+            .borrow()
+            .as_ref()
+            .and_then(MenuRun::root)
+            .is_some_and(|root| root.0 as usize == w.0);
+        if current && l.0 != PopupDismissed::Caller as isize {
+            self.end_menu(MenuEnd::Leave);
+        }
+    }
     fn on_message(&self, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         let default = || {
             if self.record_commands {
@@ -1459,6 +1913,53 @@ impl Shared {
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         };
         match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => self.input_is_key.set(true),
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+            | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                self.input_is_key.set(false);
+            }
+            _ => {}
+        }
+        if self.menu_active.get() {
+            match msg {
+                WM_KEYDOWN | WM_SYSKEYDOWN => return self.menu_key_down(msg, w, l, default),
+                WM_KEYUP | WM_SYSKEYUP => return self.menu_key_up(msg, w),
+                WM_CHAR => {
+                    if !self.swallow_char.take()
+                        && let Some(c) = char::from_u32(w.0 as u32)
+                    {
+                        self.menu_event(InputKind::Char(c), MenuEnd::Leave);
+                    }
+                    return LRESULT(0);
+                }
+                WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_LBUTTONUP => {
+                    self.menu_mouse(hwnd, msg, w, l);
+                    return LRESULT(0);
+                }
+                // The popup holds the mouse, so a press here means it lost it.
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+                    self.end_menu(MenuEnd::Leave);
+                    return LRESULT(0);
+                }
+                WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => return LRESULT(0),
+                // The owner answers a close and must find no menu in the way. The others
+                // leave a popup in the wrong place, or take away what its keys depend on.
+                WM_CLOSE | WM_KILLFOCUS | WM_DPICHANGED | WM_SIZE | WM_MOVE => {
+                    self.end_menu(MenuEnd::Leave);
+                }
+                WM_DESTROY => self.end_menu(MenuEnd::Silent),
+                _ => {}
+            }
+        }
+        match msg {
+            POPUP_DISMISSED_MESSAGE => {
+                self.on_popup_dismissed(w, l);
+                LRESULT(0)
+            }
+            WM_TIMER if w.0 as u32 == MENU_TIMER => {
+                self.on_menu_timer();
+                LRESULT(0)
+            }
             WM_NCCALCSIZE => self.on_nccalcsize(hwnd, w, l),
             WM_NCHITTEST => self.on_nchittest(hwnd, w, l),
             WM_CREATE if self.fault == Some(TestFault::FailWmCreate) => LRESULT(-1),
@@ -1605,6 +2106,7 @@ impl Shared {
                     self.tracking.set(Tracking::None);
                 }
                 self.strip_action(msg, |strip, ctx| strip.pointer_left(ctx));
+                self.bar_action(|bar, ctx| bar.pointer_left(ctx));
                 // The same handler in Terminal: its `break` reaches `DefWindowProc`.
                 default()
             }
@@ -1649,6 +2151,11 @@ impl Shared {
                 LRESULT(0)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
+                // A held key that closed a menu must not go on into the text.
+                if l.0 & (1 << 30) != 0 && self.swallow_up.get() == Some(w.0 as u16) {
+                    self.swallow_char.set(true);
+                    return LRESULT(0);
+                }
                 // Bit 30 says that the key was already down: this is a repeat.
                 if self.on_key_table(w.0 as u16, l.0 & (1 << 30) != 0) {
                     return LRESULT(0);
@@ -1965,46 +2472,39 @@ impl ShellHandle {
             children,
         })
     }
-    /// Marks a popup closed while keeping keyboard focus on its label.
-    pub fn close_menu_popup(&self) -> Result<(), ShellError> {
-        let shared = self.live()?;
-        let requests = {
-            let mut state = shared
-                .state
-                .try_borrow_mut()
-                .map_err(|_| ShellError::Reentered { message: 0 })?;
-            let mut ctx = ViewContext::default();
-            state.menu_bar.close_popup(&mut ctx);
-            ctx.requests
-        };
-        shared.apply(requests, Vec::new());
+    /// Says how to make a popup level's renderer. Call once, before the first menu opens.
+    pub fn set_popup_renderers(
+        &self,
+        factory: impl FnMut(u32, u32) -> Result<Box<dyn Renderer>, qe_api::RenderError> + 'static,
+    ) -> Result<(), ShellError> {
+        *self.live()?.popup_renderers.borrow_mut() = Some(Box::new(factory));
         Ok(())
     }
-    /// Lets a popup pass a pointer move or an arrow key back to its owning bar.
-    pub fn menu_bar_input(&self, kind: InputKind) -> Result<(), ShellError> {
+    /// Opens a menu under `anchor`, in client dips, and returns at once. Call it to answer
+    /// `ShellEvent::OpenMenuGroup` and `ShellEvent::OpenCaretList`, with their rectangle.
+    /// It replaces a menu that is open, which is how a switch between labels works.
+    ///
+    /// The menu runs on the window's normal message loop, so the owner's other events keep
+    /// coming. A chosen command arrives as `ShellEvent::RunCommand`, after every popup has
+    /// gone and the bar has let go of the focus. Keys and mouse messages reach the menu
+    /// alone. `WM_CLOSE`, Alt+F4 and a lost focus end it.
+    pub fn open_menu(&self, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
+        self.live()?.open_menu(model, anchor)
+    }
+    /// Closes the open menu, and the bar lets go of the focus. No menu open: nothing happens.
+    pub fn close_menu(&self) -> Result<(), ShellError> {
         let shared = self.live()?;
-        let (requests, events) = {
-            let mut state = shared
-                .state
-                .try_borrow_mut()
-                .map_err(|_| ShellError::Reentered { message: 0 })?;
-            let mut ctx = ViewContext::default();
-            let old_focus = state.menu_bar.focused().is_some();
-            state
-                .menu_bar
-                .handle(&InputEvent { time_us: 0, kind }, &mut ctx);
-            let mut events = Vec::new();
-            if let Some((index, anchor)) = state.menu_bar.take_open_request() {
-                events.push(ShellEvent::OpenMenuGroup(index, anchor));
-            }
-            if old_focus && state.menu_bar.focused().is_none() {
-                events.push(ShellEvent::FocusContent);
-            }
-            (ctx.requests, events)
-        };
-        shared.apply(requests, events);
+        shared.end_menu(MenuEnd::Leave);
         shared.dispatch();
         Ok(())
+    }
+    pub fn menu_is_open(&self) -> Result<bool, ShellError> {
+        Ok(self.live()?.menu_active.get())
+    }
+    /// The extra text of the row chosen last, such as an Open Recent file's path. Reading
+    /// clears it. Read it when `ShellEvent::RunCommand` arrives.
+    pub fn take_menu_chosen_data(&self) -> Result<Option<String>, ShellError> {
+        Ok(self.live()?.chosen_data.borrow_mut().take())
     }
     /// Asks the next paint to repaint the whole text area.
     pub fn invalidate_content(&self) -> Result<(), ShellError> {
@@ -2253,6 +2753,11 @@ impl ShellWindow {
             queue: RefCell::new(VecDeque::new()),
             problems: RefCell::new(Vec::new()),
             dispatching: Cell::new(false),
+            menu: RefCell::new(None),
+            menu_active: Cell::new(false),
+            popup_renderers: RefCell::new(None),
+            input_is_key: Cell::new(false),
+            chosen_data: RefCell::new(None),
         });
         let raw = Rc::into_raw(shared.clone());
         let created = unsafe {

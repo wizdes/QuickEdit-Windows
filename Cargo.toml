@@ -1,0 +1,45 @@
+# Only root edits this file and Cargo.lock.
+# A crate may add `windows` features in its own Cargo.toml. Asking for a new
+# outside crate is a one-line note to root in the builder's report.
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/*", "tools/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+windows = { version = "=0.62.2", default-features = false }
+windows-core = "0.62"
+qe-api = { path = "crates/qe-api" }
+qe-buffer = { path = "crates/qe-buffer" }
+qe-codec = { path = "crates/qe-codec" }
+qe-layout = { path = "crates/qe-layout" }
+qe-render = { path = "crates/qe-render" }
+qe-shell = { path = "crates/qe-shell" }
+qe-ui = { path = "crates/qe-ui" }
+qe-settings = { path = "crates/qe-settings" }
+qe-editor = { path = "crates/qe-editor" }
+qe-ime = { path = "crates/qe-ime" }
+qe-spell = { path = "crates/qe-spell" }
+qe-a11y = { path = "crates/qe-a11y" }
+qe-tools = { path = "crates/qe-tools" }
+qe-views = { path = "crates/qe-views" }
+qe-pdf = { path = "crates/qe-pdf" }
+qe-docs = { path = "crates/qe-docs" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

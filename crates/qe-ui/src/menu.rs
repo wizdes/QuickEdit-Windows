@@ -898,6 +898,9 @@ impl MenuView {
                     expanded: open_child.is_some(),
                     ..Default::default()
                 },
+                selection: None,
+                range_value: None,
+                description: None,
                 children: open_child.into_iter().collect(),
             });
         }
@@ -912,6 +915,9 @@ impl MenuView {
                 focused: self.selected.is_none() && self.child.is_none() && !self.closed,
                 ..Default::default()
             },
+            selection: None,
+            range_value: None,
+            description: None,
             children,
         })
     }

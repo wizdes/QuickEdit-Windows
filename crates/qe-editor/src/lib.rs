@@ -18,9 +18,16 @@
 //! `width / cell width` characters, and the x position becomes a character count. The
 //! estimate lands on a caret stop, and the remembered x stays, so the next Up or Down
 //! moves from the true position once layout arrives.
+#[doc = include_str!("../HOOKS.md")]
+pub mod hooks_guide {}
+mod hooks;
 mod load;
 mod stops;
 
+pub use hooks::{
+    ChangesSince, CompositionState, DecorationKind, GeometryError, HostCommand, PageWrap,
+    PreparedEdits, RangeRect, TextEdit, VisibleRow, VisibleRows, prepare_edits,
+};
 pub use load::{EDITABLE_FILE_LIMIT, FileLoad, LoadOptions, LoadResult, LoadedFile};
 pub use stops::preferred_line_ending_bytes;
 
@@ -56,7 +63,7 @@ const PAGE_RETRY: Duration = Duration::from_secs(5);
 const DEFER_LIMIT: Duration = Duration::from_secs(2);
 /// Each waiting key has its own `DEFER_LIMIT`, but no input waits longer than this, however
 /// many keys wait in front of it. Keys that still wait at this limit go at once.
-const DEFER_TOTAL_LIMIT: Duration = Duration::from_secs(6);
+pub(crate) const DEFER_TOTAL_LIMIT: Duration = Duration::from_secs(6);
 /// A drag scroll step for each this much time, and at most this many steps at once.
 const DRAG_STEP: Duration = Duration::from_millis(WORK_TIMER_MS as u64);
 const DRAG_MOST_STEPS: u32 = 8;
@@ -154,6 +161,12 @@ enum WorkerTask {
     Drop(Arc<dyn TextSnapshot>),
     /// A whole old document, with its history, to free away from the UI thread.
     DropDocument(Box<dyn std::any::Any + Send>),
+    /// A line with composition text in it, which only the view's own hooks know of.
+    Composition(u64, Arc<dyn TextSnapshot>, Arc<DirectWriteLayout>, Dip),
+}
+struct ComposedResult {
+    task: u64,
+    result: Result<LineLayout, String>,
 }
 
 /// State the view and its workers share.
@@ -377,6 +390,7 @@ enum DragUnit {
 /// Input that takes its turn behind a key that waits.
 #[derive(Clone)]
 enum Queued {
+    Host(HostCommand),
     Event(InputEvent),
     Command(EditorCommand),
 }
@@ -399,8 +413,10 @@ impl Queued {
     fn changes_text(&self) -> bool {
         match self {
             Queued::Command(command) => command.edits(),
+            Queued::Host(HostCommand::ApplyEdits { .. }) => true,
+            Queued::Host(_) => false,
             Queued::Event(event) => match &event.kind {
-                InputKind::Char(_) => true,
+                InputKind::Char(_) | InputKind::ImeEnd { .. } => true,
                 InputKind::KeyDown {
                     virtual_key,
                     modifiers,
@@ -542,6 +558,8 @@ pub struct EditorView {
     partial_selection: Option<Range<ByteOffset>>,
     /// The view's height, the last time it had one.
     last_view_height: f64,
+    hooks: hooks::HookState,
+    composed_results: Receiver<ComposedResult>,
     /// A Paste that waits for the copy in progress.
     pending_paste: bool,
     loading: bool,
@@ -828,6 +846,7 @@ impl EditorView {
         let (result_tx, results) = mpsc::channel();
         let (map_tx, map_results) = mpsc::channel();
         let (known_tx, known_results) = mpsc::channel();
+        let (composed_tx, composed_results) = mpsc::channel();
         let shared = Arc::new(WorkerShared {
             closing: AtomicBool::new(false),
             alive: AtomicUsize::new(0),
@@ -844,12 +863,22 @@ impl EditorView {
             let result_tx: Sender<LayoutResult> = result_tx.clone();
             let map_tx: Sender<MapResult> = map_tx.clone();
             let known_tx: Sender<KnownResult> = known_tx.clone();
+            let composed_tx: Sender<ComposedResult> = composed_tx.clone();
             let task_rx = shared_rx.clone();
             let worker_shared = shared.clone();
             shared.alive.fetch_add(1, Ordering::AcqRel);
             let spawned = thread::Builder::new()
                 .name(format!("qe-editor-layout-{worker}"))
-                .spawn(move || worker_loop(task_rx, result_tx, map_tx, known_tx, worker_shared));
+                .spawn(move || {
+                    worker_loop(
+                        task_rx,
+                        result_tx,
+                        map_tx,
+                        known_tx,
+                        composed_tx,
+                        worker_shared,
+                    )
+                });
             if let Err(e) = spawned {
                 shared.alive.fetch_sub(1, Ordering::AcqRel);
                 return Err(e.to_string());
@@ -912,6 +941,8 @@ impl EditorView {
             deferred_first: now,
             partial_selection: None,
             last_view_height: 0.0,
+            hooks: hooks::HookState::default(),
+            composed_results,
             pending_paste: false,
             loading: false,
             ink_margin: INK_MARGIN,
@@ -959,6 +990,12 @@ impl EditorView {
         if self.mapped.is_none() && !self.history.is_at_save_point(&self.store) {
             return Err("This view has edits, so a file cannot replace them.".to_string());
         }
+        if self.cut_is_running() {
+            return Err(
+                "A Cut's text is still on its way to the clipboard, so a file cannot replace this view yet."
+                    .to_string(),
+            );
+        }
         if self.can_edit() && self.deferred.iter().any(Queued::changes_text) {
             return Err(
                 "This view has typing still waiting, so a file cannot replace it.".to_string(),
@@ -993,6 +1030,7 @@ impl EditorView {
         self.pending_anchor = None;
         self.cancel_drag();
         self.cancel_copy();
+        self.forget_document();
         self.preferred_ending = ending;
         self.heights = heights;
         self.long_maps.clear();
@@ -1347,7 +1385,7 @@ impl EditorView {
             if enabled {
                 self.scroll_x = 0.0;
             }
-            self.engine = Arc::new(engine.with_full_rows_at(self.laid_width));
+            self.engine = Arc::new(engine.with_full_rows_at(self.full_rows_width()));
             self.restart_layout()?;
         }
         Ok(())
@@ -1380,7 +1418,7 @@ impl EditorView {
         self.remember_view();
         (self.row_height, self.cell_width, self.fast_font) = measure_font(&engine)?;
         self.font = font;
-        self.engine = Arc::new(engine.with_full_rows_at(self.laid_width));
+        self.engine = Arc::new(engine.with_full_rows_at(self.full_rows_width()));
         self.restart_layout()
     }
     /// Forgets all measured sizes, and keeps the top line on screen.
@@ -1524,7 +1562,7 @@ impl EditorView {
     }
     fn width(&self) -> Dip {
         if self.wrap {
-            self.laid_width
+            self.full_rows_width()
         } else {
             Dip(1_000_000.0)
         }
@@ -1533,10 +1571,12 @@ impl EditorView {
         (self.heights.total_height() - f64::from(self.bounds.height.0)).max(0.0)
     }
     fn max_scroll_x(&self) -> f64 {
-        if self.wrap {
-            0.0
-        } else {
-            (self.widest + 2.0 - f64::from(self.bounds.width.0)).max(0.0)
+        match self.hooks.page {
+            Some(page) if self.wrap => (f64::from(page.margin.0 * 2.0 + page.text_width.0)
+                - f64::from(self.bounds.width.0))
+            .max(0.0),
+            None | Some(_) if self.wrap => 0.0,
+            _ => (self.widest + 2.0 - f64::from(self.bounds.width.0)).max(0.0),
         }
     }
     fn clamp_scroll(&mut self) {
@@ -1550,7 +1590,8 @@ impl EditorView {
             return;
         }
         self.last_view_height = f64::from(bounds.height.0);
-        let width_changed = self.wrap && bounds.width != self.laid_width;
+        let width_changed =
+            self.wrap && self.hooks.page.is_none() && bounds.width != self.laid_width;
         let moved = bounds != self.bounds;
         if width_changed {
             self.remember_view();
@@ -1666,6 +1707,9 @@ impl EditorView {
         (line, segment)
     }
     fn drain_results(&mut self, ctx: &mut ViewContext) {
+        while let Ok(done) = self.composed_results.try_recv() {
+            self.note_composition(done.task, done.result, ctx);
+        }
         while let Ok(done) = self.results.try_recv() {
             let (line, segment) = self.take_task(done.id);
             let Some(line) = line else {
@@ -1894,7 +1938,7 @@ impl EditorView {
             }
             return;
         }
-        let x = place.x - self.scroll_x + f64::from(self.bounds.x.0) - 2.0;
+        let x = place.x - self.scroll_x + f64::from(self.text_left()) - 2.0;
         let y = place.y - self.scroll + f64::from(self.bounds.y.0);
         let left = x.max(f64::from(self.bounds.x.0));
         let right = (x + 5.0).min(f64::from(self.bounds.x.0 + self.bounds.width.0));
@@ -2179,6 +2223,11 @@ impl EditorView {
         }
         // Results for changed lines are dropped when they arrive, so they must arrive.
         if !self.layout_tasks.is_empty()
+            || self
+                .hooks
+                .composition
+                .as_ref()
+                .is_some_and(|c| c.task.is_some())
             || !self.map_tasks.is_empty()
             || self.retry_key.is_some()
             || self.caret_line.is_none()
@@ -2458,13 +2507,14 @@ impl EditorView {
         } else if bottom > self.scroll + view {
             self.scroll = bottom - view;
         }
-        if !self.wrap && place.x_known {
+        if (!self.wrap || self.hooks.page.is_some()) && place.x_known {
             let width = f64::from(self.bounds.width.0);
+            let x = place.x + f64::from(self.page_margin());
             self.widest = self.widest.max(place.x);
-            if place.x < self.scroll_x {
-                self.scroll_x = place.x;
-            } else if place.x > self.scroll_x + width - 2.0 {
-                self.scroll_x = (place.x - width + 2.0).max(0.0);
+            if x < self.scroll_x {
+                self.scroll_x = x;
+            } else if x > self.scroll_x + width - 2.0 {
+                self.scroll_x = (x - width + 2.0).max(0.0);
             }
         }
         self.scroll = self.scroll.max(0.0);
@@ -2485,6 +2535,10 @@ impl EditorView {
     ) {
         if caret != self.caret {
             self.history.cursor_moved();
+        }
+        if self.hooks.composition.is_some() && (anchor != self.anchor || caret != self.caret) {
+            self.end_composition(ctx);
+            ctx.cancel_composition();
         }
         let old = self.selection();
         let (old_caret, old_affinity) = (self.caret, self.affinity);
@@ -2581,6 +2635,12 @@ impl EditorView {
         // Text moved, so the place the view was heading for is no longer the one to keep.
         self.pending_anchor = None;
         self.keep_caret_visible = false;
+        self.note_change(old.as_ref(), &change);
+        // The composition's place is gone. Its own commit ends it before the edit.
+        if self.hooks.composition.is_some() {
+            self.end_composition(ctx);
+            ctx.cancel_composition();
+        }
         let first_of = old.try_byte_to_position(change.replaced.start);
         let last_of = old.try_byte_to_position(change.replaced.end);
         let (mut first, old_last) = match (first_of, last_of) {
@@ -3224,7 +3284,7 @@ impl EditorView {
         self.estimate_in(edges.start..edges.content_end, x, row)
     }
     fn hit(&mut self, at: Point, ctx: &mut ViewContext) -> Option<(ByteOffset, Affinity)> {
-        let x = f64::from(at.x.0 - self.bounds.x.0) + self.scroll_x;
+        let x = f64::from(at.x.0 - self.text_left()) + self.scroll_x;
         let y = f64::from(at.y.0 - self.bounds.y.0) + self.scroll;
         self.resolve(x, y, ctx)
     }
@@ -3563,6 +3623,7 @@ impl EditorView {
                     self.touch();
                     self.run_inner(command, ctx);
                 }
+                Queued::Host(command) => self.run_host_now(command, ctx),
             }
             if wait == Some(WaitsFor::Index) {
                 // The action went ahead on what is known, and it says so, so nobody
@@ -3603,7 +3664,7 @@ impl EditorView {
                         .then_some(WaitsFor::Layout)
                 }
             }
-            Queued::Event(_) => None,
+            Queued::Event(_) | Queued::Host(_) => None,
             Queued::Command(command) => self.command_must_wait(*command).then_some(WaitsFor::Index),
         }
     }
@@ -3647,6 +3708,7 @@ impl EditorView {
                             && matches!(*virtual_key, 0x41 | 0x43 | 0x56 | 0x58 | 0x59 | 0x5a)))
             }
             InputKind::Char(c) => !c.is_control() || *c == '\t',
+            InputKind::ImeStart | InputKind::ImeUpdate { .. } | InputKind::ImeEnd { .. } => true,
             InputKind::MouseDown { .. }
             | InputKind::MouseUp { .. }
             | InputKind::MouseMove { .. } => true,
@@ -3740,6 +3802,12 @@ impl EditorView {
         // Ctrl+Alt is AltGr, so its character arrives as text. Alt and Win are not ours.
         if mods.alt || mods.win {
             return Handled::No;
+        }
+        // Esc ends a composition first. The host then tells the input method.
+        if vk == 0x1b && self.hooks.composition.is_some() {
+            self.end_composition(ctx);
+            ctx.cancel_composition();
+            return Handled::Yes;
         }
         // Esc takes back a warning. A store failure stays, because its cause stays.
         if vk == 0x1b {
@@ -3971,7 +4039,7 @@ impl EditorView {
             2 => {
                 // A click on a character's right half lands on the stop after it, but
                 // the word is the one under the mouse.
-                let doc_x = f64::from(at.x.0 - self.bounds.x.0) + self.scroll_x;
+                let doc_x = f64::from(at.x.0 - self.text_left()) + self.scroll_x;
                 let look_back = self
                     .place(byte, affinity)
                     .is_some_and(|p| p.exact && doc_x < p.x);
@@ -4085,14 +4153,36 @@ impl EditorView {
                 Handled::Yes
             }
             InputKind::Resize { width, height } => {
-                let bounds = Rect {
+                self.hooks.outer = Rect {
                     width: *width,
                     height: *height,
-                    ..self.bounds
+                    ..self.hooks.outer
                 };
+                let bounds = self.inner_bounds(self.hooks.outer);
                 self.set_bounds(bounds);
                 self.schedule(ctx);
                 ctx.invalidate(self.bounds);
+                Handled::Yes
+            }
+            InputKind::ImeStart => {
+                self.ime_start();
+                Handled::Yes
+            }
+            InputKind::ImeUpdate { text, cursor_utf16 } => {
+                self.ime_update(text, *cursor_utf16, ctx);
+                Handled::Yes
+            }
+            // An input method that gives up ends with no text.
+            InputKind::ImeEnd { text } => {
+                self.ime_commit(text, ctx);
+                Handled::Yes
+            }
+            InputKind::MouseDown {
+                at,
+                button: MouseButton::Right,
+                ..
+            } => {
+                ctx.context_menu(*at);
                 Handled::Yes
             }
             InputKind::Focus => {
@@ -4112,6 +4202,45 @@ impl EditorView {
             }
             _ => Handled::No,
         }
+    }
+    /// One layout with the host's marks: fills behind the text, and lines over it.
+    fn paint_marked(&self, list: &mut DisplayList, layout: &LineLayout, frame: &LineFrame) {
+        self.paint_under(list, layout, frame.theme, frame.x, frame.y);
+        paint_line_layout(list, layout, frame);
+        self.paint_over(list, layout, frame.theme, frame.x, frame.y);
+    }
+    /// Paints the composition if it stands on this line or segment and has a layout.
+    fn paint_composition_here(
+        &self,
+        list: &mut DisplayList,
+        line: usize,
+        segment: Option<usize>,
+        theme: &Theme,
+        view_right: f32,
+    ) -> bool {
+        let Some(composition) = &self.hooks.composition else {
+            return false;
+        };
+        let Some(layout) = &composition.layout else {
+            return false;
+        };
+        if composition.line != line || composition.segment != segment {
+            return false;
+        }
+        let (x, y) = self.composition_origin(composition);
+        let frame = LineFrame {
+            theme,
+            selection: ByteOffset(0)..ByteOffset(0),
+            x,
+            y,
+            caret: (self.focused && self.visible).then_some((composition.cursor, Affinity::After)),
+            view_right,
+            content_end: None,
+            wrap: self.wrap,
+        };
+        paint_line_layout(list, layout, &frame);
+        hooks::paint_composition_underline(list, layout, &composition.text_range, x, y, theme);
+        true
     }
     /// The line as it was before an edit, with no selection, until its layout arrives.
     fn paint_ghost(&self, list: &mut DisplayList, ghost: &LineLayout, frame: &LineFrame) {
@@ -4155,6 +4284,7 @@ fn worker_loop(
     results: Sender<LayoutResult>,
     maps: Sender<MapResult>,
     known: Sender<KnownResult>,
+    composed: Sender<ComposedResult>,
     shared: Arc<WorkerShared>,
 ) {
     let _exit = WorkerExit(shared.clone());
@@ -4250,6 +4380,16 @@ fn worker_loop(
                 }
                 shared.wake_host();
             }
+            WorkerTask::Composition(task, snapshot, engine, width) => {
+                let result = engine
+                    .try_layout_line(snapshot.as_ref(), LineIndex(0), width)
+                    .map_err(|e| e.to_string());
+                drop(snapshot);
+                if composed.send(ComposedResult { task, result }).is_err() {
+                    return;
+                }
+                shared.wake_host();
+            }
             WorkerTask::Drop(snapshot) => {
                 drop(snapshot);
                 shared.drops_out.fetch_sub(1, Ordering::AcqRel);
@@ -4268,10 +4408,12 @@ impl View for EditorView {
         handled
     }
     fn draw(&self, list: &mut DisplayList, theme: &Theme, _measure: &dyn TextMeasurer) {
-        list.push(DrawCommand::FillRect {
-            rect: self.bounds,
-            color: theme.text_background,
-        });
+        if !self.hooks.no_background {
+            list.push(DrawCommand::FillRect {
+                rect: self.bounds,
+                color: theme.text_background,
+            });
+        }
         let snapshot = self.snapshot();
         let known_lines = snapshot.status().known_lines;
         let selection = self.selection();
@@ -4279,7 +4421,7 @@ impl View for EditorView {
         let caret_line = self.caret_line;
         let view_bottom = self.scroll + f64::from(self.bounds.height.0);
         let view_right = self.bounds.x.0 + self.bounds.width.0;
-        let left = self.bounds.x.0 - self.scroll_x as f32;
+        let left = self.text_left() - self.scroll_x as f32;
         let mut i = self.heights.scroll_to_line(self.scroll).0;
         let mut line_top = self.heights.line_to_scroll(LineIndex(i));
         while i < known_lines && line_top < view_bottom {
@@ -4337,7 +4479,7 @@ impl View for EditorView {
                         break;
                     }
                     if self.wrap {
-                        frame.x = self.bounds.x.0;
+                        frame.x = left;
                         frame.y = self.bounds.y.0 + (line_top + offset - self.scroll) as f32;
                     } else {
                         // A distance from the view, which an f32 holds exactly enough.
@@ -4352,8 +4494,10 @@ impl View for EditorView {
                         segment,
                         self.width(),
                     );
-                    if let Some(layout) = layout {
-                        paint_line_layout(list, &layout, &frame);
+                    if self.paint_composition_here(list, i, Some(segment), theme, view_right) {
+                        // It stands in for this segment until it ends.
+                    } else if let Some(layout) = layout {
+                        self.paint_marked(list, &layout, &frame);
                     } else if let Some(ghost) = self.ghosts.get(&(i, segment)) {
                         self.paint_ghost(list, ghost, &frame);
                     }
@@ -4365,8 +4509,10 @@ impl View for EditorView {
                     line,
                     self.width(),
                 );
-                if let Some(layout) = whole {
-                    paint_line_layout(list, &layout, &frame);
+                if self.paint_composition_here(list, i, None, theme, view_right) {
+                    // It stands in for this line until it ends.
+                } else if let Some(layout) = whole {
+                    self.paint_marked(list, &layout, &frame);
                 } else if let Some(ghost) = self.ghosts.get(&(i, WHOLE)) {
                     self.paint_ghost(list, ghost, &frame);
                 } else if matches!(self.engine.is_long_line(snapshot.as_ref(), line), Ok(true)) {
@@ -4420,7 +4566,9 @@ impl View for EditorView {
         }
     }
     fn layout(&mut self, bounds: Rect, _measure: &dyn TextMeasurer) {
-        self.set_bounds(bounds);
+        self.hooks.outer = bounds;
+        let inner = self.inner_bounds(bounds);
+        self.set_bounds(inner);
     }
     fn widgets(&self) -> Option<Widget> {
         Some(Widget {
@@ -4435,6 +4583,9 @@ impl View for EditorView {
                 read_only: !self.can_edit(),
                 ..Default::default()
             },
+            selection: self.selection_utf16(),
+            range_value: None,
+            description: None,
             children: vec![],
         })
     }

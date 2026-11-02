@@ -59,6 +59,10 @@ pub enum ShellEvent {
     Timer(u32),
     /// Another thread called `ShellWaker::wake`. Several calls can arrive as one event.
     Wake,
+    /// A view asked to end the input method's composition.
+    CancelComposition,
+    /// A view asked for the context menu at this point.
+    ContextMenu(qe_api::Point),
     /// A view asked to run a command, with `ViewRequest::Run`.
     RunCommand(CommandId),
     /// The window was destroyed. The owner quits the message loop after the last one.
@@ -1325,6 +1329,9 @@ impl View for TabStrip {
                 focused: self.focused == Some(hit),
                 ..Default::default()
             },
+            selection: None,
+            range_value: None,
+            description: None,
             children: Vec::new(),
         };
         let mut children = Vec::new();
@@ -1342,6 +1349,9 @@ impl View for TabStrip {
                     focused: self.focused == Some(CaptionHit::Tab(i)),
                     ..Default::default()
                 },
+                selection: None,
+                range_value: None,
+                description: None,
                 children: vec![button(
                     CaptionHit::TabClose(i),
                     "Close tab",
@@ -1381,6 +1391,9 @@ impl View for TabStrip {
                 enabled: true,
                 ..Default::default()
             },
+            selection: None,
+            range_value: None,
+            description: None,
             children,
         })
     }

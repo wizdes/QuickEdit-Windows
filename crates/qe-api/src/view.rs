@@ -1,4 +1,6 @@
-use crate::{CommandId, DisplayList, InputEvent, Rect, TextMeasurer, Theme, Widget, WidgetId};
+use crate::{
+    CommandId, DisplayList, InputEvent, Point, Rect, TextMeasurer, Theme, Widget, WidgetId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handled {
@@ -24,6 +26,10 @@ pub enum ViewRequest {
     CaptureMouse(bool),
     RequestTimer(u32),
     SetFocus(WidgetId),
+    /// Asks the host to end the input method's composition with no text. Esc asks this.
+    CancelComposition,
+    /// Asks the host to open the context menu at this point in window coordinates.
+    ContextMenu(Point),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -49,6 +55,12 @@ impl ViewContext {
     }
     pub fn set_focus(&mut self, widget: WidgetId) {
         self.requests.push(ViewRequest::SetFocus(widget));
+    }
+    pub fn cancel_composition(&mut self) {
+        self.requests.push(ViewRequest::CancelComposition);
+    }
+    pub fn context_menu(&mut self, at: Point) {
+        self.requests.push(ViewRequest::ContextMenu(at));
     }
 }
 

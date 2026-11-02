@@ -17,6 +17,12 @@ pub struct Theme {
     pub map_box_fill: Color,
     pub map_box_outline: Color,
     pub warning: Color,
+    /// Behind each match of a search.
+    pub find_match: Color,
+    /// Behind the match a search stands on.
+    pub current_find_match: Color,
+    /// The wavy line under a misspelled word.
+    pub spelling_underline: Color,
     pub dim_text: Color,
     pub group_header: Color,
     pub tab_background: Color,
@@ -66,6 +72,41 @@ impl Theme {
                 Color::rgb(255, 138, 120)
             } else {
                 Color::rgb(179, 38, 30)
+            },
+            find_match: if dark {
+                Color {
+                    r: 150,
+                    g: 120,
+                    b: 0,
+                    a: 170,
+                }
+            } else {
+                Color {
+                    r: 255,
+                    g: 225,
+                    b: 90,
+                    a: 200,
+                }
+            },
+            current_find_match: if dark {
+                Color {
+                    r: 214,
+                    g: 110,
+                    b: 0,
+                    a: 220,
+                }
+            } else {
+                Color {
+                    r: 255,
+                    g: 160,
+                    b: 40,
+                    a: 220,
+                }
+            },
+            spelling_underline: if dark {
+                Color::rgb(255, 110, 100)
+            } else {
+                Color::rgb(214, 40, 30)
             },
             dim_text: Color { a: 158, ..text },
             group_header: Color { a: 217, ..text },

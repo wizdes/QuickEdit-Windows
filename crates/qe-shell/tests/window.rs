@@ -1440,6 +1440,25 @@ fn the_text_area_cursor_is_routed_and_the_row_keeps_the_arrow() {
 }
 
 #[test]
+fn composition_and_context_menu_requests_reach_the_owner() {
+    let f = fixture(None);
+    let at = qe_api::Point {
+        x: qe_api::Dip(3.0),
+        y: qe_api::Dip(4.0),
+    };
+    f.window
+        .apply_requests(vec![
+            ViewRequest::CancelComposition,
+            ViewRequest::ContextMenu(at),
+        ])
+        .unwrap();
+    assert_eq!(
+        f.events(),
+        vec![ShellEvent::CancelComposition, ShellEvent::ContextMenu(at)]
+    );
+}
+
+#[test]
 fn timers_and_run_requests_reach_the_owner() {
     let f = fixture(None);
     f.window.set_timer(5, 60_000).unwrap();

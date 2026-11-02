@@ -270,3 +270,43 @@ fn windows_command_and_setting_choices_are_kept() {
             .any(|setting| setting.name() == "TextReplacement")
     );
 }
+
+#[test]
+fn hooks_additions_keep_their_meaning() {
+    let mut ctx = ViewContext::default();
+    ctx.cancel_composition();
+    let at = Point {
+        x: Dip(1.0),
+        y: Dip(2.0),
+    };
+    ctx.context_menu(at);
+    assert_eq!(
+        ctx.requests,
+        [ViewRequest::CancelComposition, ViewRequest::ContextMenu(at)]
+    );
+    let states = WidgetStates::default();
+    assert!(!states.has_popup && !states.section);
+    let widget = Widget {
+        id: WidgetId(1),
+        bounds: Rect::default(),
+        role: WidgetRole::ScrollBar,
+        name: "Scroll".into(),
+        value: None,
+        states,
+        selection: Some(1..2),
+        range_value: Some(WidgetRange {
+            minimum: 0.0,
+            maximum: 10.0,
+            value: 5.0,
+        }),
+        description: Some("More".into()),
+        children: vec![],
+    };
+    assert_ne!(widget.role, WidgetRole::List);
+    assert_ne!(widget.role, WidgetRole::ListItem);
+    for kind in [ThemeKind::Light, ThemeKind::Dark] {
+        let theme = Theme::new(kind);
+        assert_ne!(theme.find_match, theme.current_find_match);
+        assert_ne!(theme.spelling_underline, theme.text_background);
+    }
+}

@@ -430,6 +430,9 @@ impl View for DialogFrame {
                 enabled: true,
                 ..Default::default()
             },
+            selection: None,
+            range_value: None,
+            description: None,
             children: self.children.iter().filter_map(|c| c.widgets()).collect(),
         })
     }

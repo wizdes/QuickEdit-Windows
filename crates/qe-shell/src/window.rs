@@ -700,6 +700,14 @@ impl Shared {
                     .queue
                     .borrow_mut()
                     .push_back(ShellEvent::RunCommand(command)),
+                ViewRequest::CancelComposition => self
+                    .queue
+                    .borrow_mut()
+                    .push_back(ShellEvent::CancelComposition),
+                ViewRequest::ContextMenu(at) => self
+                    .queue
+                    .borrow_mut()
+                    .push_back(ShellEvent::ContextMenu(at)),
                 ViewRequest::SetCursor(cursor) => {
                     self.with_state(WM_SETCURSOR, |state| state.content_cursor = cursor);
                 }

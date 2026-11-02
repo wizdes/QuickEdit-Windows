@@ -114,6 +114,9 @@ pub(crate) fn node(
         name: name.into(),
         value,
         states,
+        selection: None,
+        range_value: None,
+        description: None,
         children,
     }
 }

@@ -111,6 +111,7 @@ fn control_type(role: WidgetRole) -> UIA_CONTROLTYPE_ID {
         WidgetRole::Tab => UIA_TabItemControlTypeId,
         WidgetRole::TabList => UIA_TabControlTypeId,
         WidgetRole::Menu => UIA_MenuControlTypeId,
+        WidgetRole::MenuBar => UIA_MenuBarControlTypeId,
         WidgetRole::MenuItem => UIA_MenuItemControlTypeId,
         WidgetRole::TextField => UIA_EditControlTypeId,
         WidgetRole::Table | WidgetRole::List => UIA_ListControlTypeId,
@@ -130,6 +131,7 @@ fn focusable(role: WidgetRole) -> bool {
             | WidgetRole::Group
             | WidgetRole::Cell
             | WidgetRole::Menu
+            | WidgetRole::MenuBar
             | WidgetRole::Dialog
     )
 }

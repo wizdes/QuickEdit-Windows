@@ -10,6 +10,7 @@ pub enum WidgetRole {
     Tab,
     TabList,
     Menu,
+    MenuBar,
     MenuItem,
     TextField,
     Table,

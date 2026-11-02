@@ -36,7 +36,7 @@ Each Mac parity row has one row below. Inventory rows add details from `docs/res
 | P30 | Find, Replace, Next, Previous, selection, and jump. | Keep actions with Ctrl-based keys and F3. | M12 | changed (Windows keys) | no |
 | P31 | Select Line accepts numbers and ranges. | Keep `N-M`, `+N`, and other Mac forms. | M12 | same | no |
 | P32 | Spelling and Grammar menu checks and corrects text. | Keep spelling; omit grammar. | M10 | changed (grammar omitted by decision) | no |
-| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep all except Data Detectors. | M9, M12 | changed (Data Detectors omitted by decision) | no |
+| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M9, M12 | changed (Data Detectors and Text Replacement omitted by decision) | no |
 | P34 | Transform selection to upper, lower, or capitalized. | Keep all three. | M12 | same | no |
 | P35 | Speech reads selected text. | Omit Speech. | M15 | left out (user decision) | no |
 | P36 | Complete uses Option+Esc. | Use Ctrl+Space. | M12 | changed (Windows reserves Alt+Esc) | no |
@@ -68,7 +68,7 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in caret list with Windows keys. | M7, M9, M12 | changed (caret menu and Windows keys) | no |
 | I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in caret list. | M7, M12 | changed (caret menu) | no |
 | I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10 | changed (grammar omitted) | no |
-| I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep all except Data Detectors. | M7, M12 | changed (Data Detectors omitted) | no |
+| I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | no |
 | I07 | Transformations menu has upper, lower, capitalize. | Keep all three in caret list. | M7, M12 | changed (caret menu) | no |
 | I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in caret list. | M7, M9, M13 | changed (caret menu) | no |
 | I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and caret menu) | no |
@@ -81,7 +81,7 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | I16 | Window size starts 90 by 30; fields accept 1–10000. | Keep values and reject junk. | M8 | same | no |
 | I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. | M8 | changed (Windows font) | no |
 | I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10 | changed (grammar omitted) | no |
-| I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep these defaults. | M8, M12 | same | no |
+| I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep the copy, quote and dash defaults. Text Replacement has no setting, because it is left out. | M8, M12 | changed (Text Replacement omitted) | no |
 | I20 | Line numbers start off. | Start them off. | M8, M13 | same | no |
 | I21 | Add .txt starts on; encoding choices are Automatic or named. | Keep these controls. | M3, M8 | same | no |
 | I22 | Keyboard tab has 394×464 panel, 132-wide key column, 18-high rows. | Keep these sizes and the two-column recorder. | M8 | same | no |

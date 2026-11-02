@@ -153,6 +153,18 @@ fn page_down_moves_the_view_with_the_caret() {
 fn horizontal_wheel_scrolls_unwrapped_text() {
     let mut editor = EditorView::from_text("abcdefghijklmnopqrstuvwxyz").unwrap();
     editor.set_wrap(false).unwrap();
+    let measure = DirectWriteLayout::new().unwrap();
+    // The text must be wider than the view, now that scrolling stops at its end.
+    editor.layout(
+        Rect {
+            x: Dip(0.0),
+            y: Dip(0.0),
+            width: Dip(40.0),
+            height: Dip(85.0),
+        },
+        &measure,
+    );
+    editor.poll_layout(&mut ViewContext::default());
     editor.handle(
         &InputEvent {
             time_us: 0,
@@ -744,10 +756,7 @@ fn backspace_at_end_of_long_line_deletes_one_caret_stop() {
 #[test]
 fn mapped_unknown_long_line_paints_its_known_prefix() {
     use std::io::Write;
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "tests/fixtures/generated-known-{}.txt",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("qe-editor-known-{}.txt", std::process::id()));
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {

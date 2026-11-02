@@ -310,8 +310,9 @@ fn real_renderer_paints_a_window_that_is_not_blank() {
         bg,
         "the row starts 1 pixel down, so 40 is in it"
     );
-    assert_eq!(pixel(&image, 300, 41), bg, "the menu bar starts at 41");
-    assert_eq!(pixel(&image, 300, 73), text, "the menu bar stops at 73");
+    // The bar is the active tab's color and the text's, so that the tab joins it.
+    assert_eq!(pixel(&image, 300, 41), text, "the menu bar starts at 41");
+    assert_eq!(pixel(&image, 300, 73), text, "the text starts at 73");
     let log = f.renderer.took();
     assert!(!log.iter().any(|l| l == "render_to_bitmap"), "{log:?}");
 }
@@ -2006,4 +2007,44 @@ fn a_waker_reaches_the_owner_from_another_thread() {
         "a dead window's number can be reused, so the waker must forget it"
     );
     assert!(!waker.wake(), "a window that has gone cannot wake");
+}
+
+/// Hit tests in device pixels above 100%: the bar is client area from its first row to its
+/// last, the row above it keeps its codes, and only the window's edges resize.
+#[test]
+fn the_bar_is_client_area_at_each_scale_above_100_percent() {
+    for dpi in [120u32, 144, 192] {
+        let f = small_fixture(dpi, Logged::new());
+        let client = f.client();
+        let text_top = (f.window.content_rect().unwrap().y.0 * f.scale).round() as i32;
+        let bar_top = text_top - (32.0 * f.scale).round() as i32;
+        for x in [0, 1, client.right / 2, client.right - 1] {
+            for y in [bar_top, bar_top + 1, text_top - 1, text_top] {
+                assert_eq!(f.hit_px(x, y), HTCLIENT, "{dpi}: the bar at {x}, {y}");
+            }
+        }
+        let inside_maximize = client.right - (69.0 * f.scale) as i32;
+        assert_eq!(f.hit_px(inside_maximize, bar_top - 1), HTMAXBUTTON, "{dpi}");
+        assert_eq!(f.hit_px(inside_maximize, bar_top), HTCLIENT, "{dpi}");
+        assert_eq!(f.hit_px(-2, bar_top + 5), HTLEFT, "{dpi}");
+        assert_eq!(f.hit_px(client.right + 2, bar_top + 5), HTRIGHT, "{dpi}");
+    }
+}
+
+/// The active tab's last row and the bar's first row are one color, with no line.
+#[test]
+fn the_active_tab_joins_the_bar_with_no_line_between() {
+    let f = fixture(None);
+    f.send(WM_PAINT, 0, 0);
+    let image = f.renderer.bitmap();
+    let tab = f.window.with_strip(|s| s.tab_rects()[0]).unwrap();
+    let x = (tab.x.0 + 40.0) as u32;
+    let bottom = (tab.y.0 + tab.height.0) as u32;
+    let text_top = f.window.content_rect().unwrap().y.0 as u32;
+    let bar = pixel(&image, x, bottom);
+    assert_eq!(pixel(&image, x, bottom - 1), bar, "the tab's last row");
+    let right = f.client().right as u32 - 20;
+    assert_eq!(pixel(&image, right, text_top - 1), bar, "the bar's far end");
+    let row = pixel(&image, right, bottom - 1);
+    assert_ne!(row, bar, "the rest of the row is the row's own color");
 }

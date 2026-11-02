@@ -2,7 +2,7 @@
 use crate::{UI_MEASURE_TOKEN, UiTokens};
 use qe_api::{
     Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, MouseButton, Point, Rect,
-    TextMeasurer, Theme, View, ViewContext, Widget, WidgetId, WidgetRole, WidgetStates,
+    TextMeasurer, Theme, ThemeKind, View, ViewContext, Widget, WidgetId, WidgetRole, WidgetStates,
 };
 
 pub const MENU_LABELS: [&str; 5] = ["File", "Edit", "Format", "View", "Window"];
@@ -13,6 +13,17 @@ const MNEMONICS: [u16; 5] = [
     b'V' as u16,
     b'W' as u16,
 ];
+/// Sizes are the same in every theme.
+const SIZES: Theme = Theme::new(ThemeKind::Light);
+const VK_F10: u16 = 0x79;
+
+/// Keys that are only half of a chord.
+fn is_modifier_key(virtual_key: u16) -> bool {
+    matches!(
+        virtual_key,
+        0x10 | 0x11 | 0x12 | 0x5b | 0x5c | 0xa0 | 0xa1 | 0xa2 | 0xa3 | 0xa4 | 0xa5
+    )
+}
 
 pub struct MenuBar {
     id: WidgetId,
@@ -58,6 +69,14 @@ impl MenuBar {
         if let Some(i) = self.hover.take() {
             ctx.invalidate(self.labels[i]);
         }
+    }
+    /// The keyboard reached the bar with no key of its own, as F10 from the caret list.
+    pub fn focus_first(&mut self, ctx: &mut ViewContext) {
+        self.change(Some(0), ctx);
+    }
+    /// Something else happened while Alt was down, so its release is no tap.
+    pub fn cancel_alt(&mut self) {
+        self.alt_armed = false;
     }
     pub fn take_open_request(&mut self) -> Option<(usize, Rect)> {
         self.request.take()
@@ -110,12 +129,12 @@ impl MenuBar {
         Widget {
             id: self.id,
             bounds: self.bounds,
-            role: WidgetRole::Menu,
+            role: WidgetRole::MenuBar,
             name: "Menu bar".into(),
             value: None,
+            // The focused label says so, and the bar does not, so that one widget has it.
             states: WidgetStates {
                 enabled: true,
-                focused: self.focused.is_some(),
                 ..Default::default()
             },
             selection: None,
@@ -132,7 +151,8 @@ impl MenuBar {
                     value: None,
                     states: WidgetStates {
                         enabled: true,
-                        focused: self.focused == Some(i),
+                        // While a menu is open, its row or its list has the focus.
+                        focused: self.focused == Some(i) && self.open.is_none(),
                         expanded: self.open == Some(i),
                         has_popup: true,
                         ..Default::default()
@@ -152,9 +172,10 @@ impl View for MenuBar {
     }
     fn layout(&mut self, bounds: Rect, measure: &dyn TextMeasurer) {
         self.bounds = bounds;
-        let mut x = bounds.x.0 + 4.0;
+        let mut x = bounds.x.0 + SIZES.menu_bar_inset.0;
         for (i, label) in MENU_LABELS.iter().enumerate() {
-            let width = measure.measure(label, UI_MEASURE_TOKEN).width.0 + 24.0;
+            let width = measure.measure(label, UI_MEASURE_TOKEN).width.0
+                + SIZES.menu_bar_label_padding.0 * 2.0;
             self.labels[i] = Rect {
                 x: Dip(x),
                 y: bounds.y,
@@ -196,17 +217,28 @@ impl View for MenuBar {
             InputKind::KeyDown {
                 virtual_key,
                 modifiers,
-                ..
+                repeat,
             } => {
                 self.alt_armed = false;
                 if modifiers.ctrl || modifiers.win {
+                    // One rule: a chord, AltGr included, goes back to the text and reaches
+                    // it. A modifier alone is not a chord yet.
+                    if self.focused.is_some() {
+                        if is_modifier_key(virtual_key) {
+                            return Handled::Yes;
+                        }
+                        self.leave(ctx);
+                    }
                     return Handled::No;
                 }
-                if virtual_key == 0x79 {
-                    if self.focused.is_some() {
-                        self.leave(ctx);
-                    } else {
-                        self.change(Some(0), ctx);
+                if virtual_key == VK_F10 && !modifiers.shift && !modifiers.alt {
+                    // A held F10 acts once.
+                    if !repeat {
+                        if self.focused.is_some() {
+                            self.leave(ctx);
+                        } else {
+                            self.change(Some(0), ctx);
+                        }
                     }
                     return Handled::Yes;
                 }
@@ -238,6 +270,9 @@ impl View for MenuBar {
                         }
                         Handled::Yes
                     }
+                    // The rest of a held Enter must not reach the menu it opened, and a
+                    // repeat that arrives first opens nothing.
+                    0x0d if repeat => Handled::Yes,
                     0x28 | 0x0d => {
                         self.show(current, ctx);
                         Handled::Yes
@@ -292,6 +327,7 @@ impl View for MenuBar {
                 button: MouseButton::Left,
                 ..
             } => {
+                self.alt_armed = false;
                 if let Some(i) = self.hit(at) {
                     if self.open == Some(i) {
                         self.leave(ctx);
@@ -309,9 +345,27 @@ impl View for MenuBar {
                     Handled::No
                 }
             }
-            InputKind::MouseDown { at, .. } if self.inside(at) => Handled::Yes,
+            InputKind::MouseDown { at, .. } => {
+                self.alt_armed = false;
+                if self.inside(at) {
+                    Handled::Yes
+                } else {
+                    // The right and middle buttons let go of the focus as the left does.
+                    if self.focused.is_some() {
+                        self.leave(ctx);
+                    }
+                    Handled::No
+                }
+            }
             InputKind::MouseUp { at, .. } if self.inside(at) => Handled::Yes,
-            InputKind::Wheel { at, .. } if self.inside(at) => Handled::Yes,
+            InputKind::Wheel { at, .. } => {
+                self.alt_armed = false;
+                if self.inside(at) {
+                    Handled::Yes
+                } else {
+                    Handled::No
+                }
+            }
             InputKind::Blur => {
                 self.leave(ctx);
                 Handled::No
@@ -323,7 +377,8 @@ impl View for MenuBar {
         let t = UiTokens::from_theme(theme);
         list.push(DrawCommand::FillRect {
             rect: self.bounds,
-            color: theme.tab_background,
+            // The active tab's color, so that the tab joins the bar with no line.
+            color: theme.text_background,
         });
         for (i, label) in MENU_LABELS.iter().enumerate() {
             let r = self.labels[i];
@@ -350,7 +405,7 @@ impl View for MenuBar {
             list.push(DrawCommand::TextRun {
                 text: (*label).into(),
                 at: Point {
-                    x: Dip(r.x.0 + 12.0),
+                    x: Dip(r.x.0 + SIZES.menu_bar_label_padding.0),
                     y: Dip(r.y.0 + (r.height.0 - metrics.height.0) / 2.0 + metrics.baseline.0),
                 },
                 font: t.font.into(),
@@ -359,12 +414,17 @@ impl View for MenuBar {
             });
             if focused {
                 let mnemonic = if i == 2 { 1 } else { 0 };
-                let x = r.x.0 + 12.0 + measure.measure(&label[..mnemonic], t.measure_font).width.0;
+                let x = r.x.0
+                    + SIZES.menu_bar_label_padding.0
+                    + measure.measure(&label[..mnemonic], t.measure_font).width.0;
                 let w = measure
                     .measure(&label[mnemonic..mnemonic + 1], t.measure_font)
                     .width
                     .0;
-                let y = r.y.0 + (r.height.0 - metrics.height.0) / 2.0 + metrics.baseline.0 + 2.0;
+                let y = r.y.0
+                    + (r.height.0 - metrics.height.0) / 2.0
+                    + metrics.baseline.0
+                    + SIZES.menu_bar_underline_offset.0;
                 list.push(DrawCommand::Line {
                     from: Point {
                         x: Dip(x),
@@ -374,7 +434,7 @@ impl View for MenuBar {
                         x: Dip(x + w),
                         y: Dip(y),
                     },
-                    width: Dip(1.0),
+                    width: SIZES.menu_bar_underline_width,
                     color: ink,
                 });
             }

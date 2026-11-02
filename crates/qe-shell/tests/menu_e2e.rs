@@ -8,7 +8,7 @@
 //! cross a window procedure, so that steps note what they find and `finish` reports it.
 use qe_api::{
     Bitmap, CommandId, Dip, DisplayList, DrawCommand, InputKind, PixelRect, Rect, RenderError,
-    Renderer,
+    Renderer, View,
 };
 use qe_render::{BitmapRenderer, TextSettings};
 use qe_shell::{
@@ -25,6 +25,7 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, SetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::BOOL;
 
@@ -290,12 +291,16 @@ impl Script {
 
 /// A hidden window whose owner does just what QuickEdit's owner does.
 fn script(record_system_commands: bool) -> Rc<Script> {
+    script_at(record_system_commands, None)
+}
+fn script_at(record_system_commands: bool, fake_dpi: Option<u32>) -> Rc<Script> {
     ignore_foreground_changes_for_test();
     let window = ShellWindow::create_with(
         WindowConfig {
             cell_width: 8.0,
             line_height: 17.0,
             record_system_commands,
+            fake_dpi,
             ..Default::default()
         },
         Box::new(BitmapRenderer::new(64, 64).unwrap()),
@@ -382,6 +387,7 @@ fn finish(s: &Rc<Script>, steps: Vec<Step>) {
         }
     });
     run_message_loop().unwrap();
+    hold(&[]);
     done.send(()).unwrap();
     watchdog.join().unwrap();
     assert!(
@@ -1312,4 +1318,1409 @@ fn opening_a_menu_with_no_renderers_says_so_and_leaves_the_bar_closed() {
         "{failed:?}"
     );
     assert!(!window.menu_is_open().unwrap());
+}
+
+// The review's findings, each through the real window and message loop. Keys really held
+// use `hold`, which sets this thread's key state, as `GetKeyState` reads it.
+const VK_CTRL: u16 = 0x11;
+const VK_MENU_KEY: u16 = 0x12;
+const VK_SHIFT: u16 = 0x10;
+const REPEAT_UP: isize = 1 | (1 << 30) | (1 << 31);
+
+fn hold(keys: &[u16]) {
+    let mut state = [0u8; 256];
+    for key in keys {
+        state[*key as usize] = 0x80;
+    }
+    // SAFETY: the array lives for the call.
+    unsafe { SetKeyboardState(&state) }.unwrap();
+}
+fn count_focused(widget: &qe_api::Widget) -> usize {
+    usize::from(widget.states.focused) + widget.children.iter().map(count_focused).sum::<usize>()
+}
+fn find_widget<'a>(widget: &'a qe_api::Widget, name: &str) -> Option<&'a qe_api::Widget> {
+    if widget.name == name {
+        return Some(widget);
+    }
+    widget.children.iter().find_map(|c| find_widget(c, name))
+}
+fn focused_name(widget: &qe_api::Widget) -> Option<String> {
+    if widget.states.focused {
+        return Some(widget.name.clone());
+    }
+    widget.children.iter().find_map(focused_name)
+}
+fn center(r: Rect) -> isize {
+    pack(
+        (r.x.0 + r.width.0 / 2.0) as i32,
+        (r.y.0 + r.height.0 / 2.0) as i32,
+    )
+}
+impl Script {
+    fn content_key_downs(&self, vk: u16) -> usize {
+        self.seen
+            .borrow()
+            .iter()
+            .filter(|event| {
+                matches!(event, ShellEvent::ContentInput(input)
+                    if matches!(input.kind, InputKind::KeyDown { virtual_key, .. } if virtual_key == vk))
+            })
+            .count()
+    }
+    fn content_has(&self, wanted: impl Fn(&InputKind) -> bool) -> usize {
+        self.seen
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, ShellEvent::ContentInput(input) if wanted(&input.kind)))
+            .count()
+    }
+    fn tree(&self) -> qe_api::Widget {
+        self.window.widgets().unwrap()
+    }
+    fn tear_offs(&self) -> usize {
+        self.seen
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, ShellEvent::TearOffTab { .. }))
+            .count()
+    }
+    fn plus(&self) -> Rect {
+        let r = self.window.with_strip(|strip| strip.split_rect()).unwrap();
+        Rect {
+            width: Dip(r.width.0 / 2.0),
+            ..r
+        }
+    }
+    fn tab(&self) -> Rect {
+        self.window
+            .with_strip(|strip| strip.tab_rects()[0])
+            .unwrap()
+    }
+    fn caret(&self) -> isize {
+        let r = self.window.with_strip(|strip| strip.split_rect()).unwrap();
+        pack(
+            (r.x.0 + r.width.0 - 6.0) as i32,
+            (r.y.0 + r.height.0 / 2.0) as i32,
+        )
+    }
+    fn click_caret(&self) {
+        self.post(WM_MOUSEMOVE, 0, self.caret());
+        self.post(WM_LBUTTONDOWN, 1, self.caret());
+        self.post(WM_LBUTTONUP, 0, self.caret());
+    }
+    fn alt_down(&self) {
+        self.post(WM_SYSKEYDOWN, VK_ALT, ALT_BIT | 1);
+    }
+    fn alt_up(&self) {
+        self.post(WM_KEYUP, VK_ALT, REPEAT_UP);
+    }
+    /// How the strip paints now. With no press, this shows only its hover.
+    fn strip_paint(&self) -> DisplayList {
+        let theme = self.window.theme().unwrap();
+        self.window
+            .with_strip(|strip| {
+                let mut list = DisplayList::default();
+                strip.draw(&mut list, &theme, &RealMeasurer);
+                list
+            })
+            .unwrap()
+    }
+}
+
+fn a_press_released_on_the_bar_ends_there(part: fn(&Script) -> Rect) {
+    let s = script(false);
+    let steps = vec![
+        step(move |s| {
+            let at = center(part(s));
+            s.post(WM_MOUSEMOVE, 0, at);
+            s.post(WM_LBUTTONDOWN, 1, at);
+        }),
+        step(|s| {
+            s.expect(
+                unsafe { GetCapture() } == s.hwnd,
+                "the press took the mouse",
+            );
+            let on_bar = center(Rect {
+                width: Dip(4.0),
+                ..s.label(4)
+            });
+            s.post(WM_MOUSEMOVE, 1, on_bar);
+            s.post(WM_LBUTTONUP, 0, on_bar);
+        }),
+        step(|s| {
+            s.expect(
+                unsafe { GetCapture() }.is_invalid(),
+                "the release on the bar left the mouse held",
+            );
+            s.seen.borrow_mut().clear();
+            let (x, y) = s.text_point();
+            s.post(WM_MOUSEMOVE, 0, pack(x as i32, y as i32));
+        }),
+        step(|s| {
+            s.expect(s.tear_offs() == 0, "a tab tore off with no button held");
+            s.expect(
+                s.content_has(|kind| matches!(kind, InputKind::MouseMove { .. })) == 1,
+                "the next move did not reach the text",
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_tab_pressed_and_released_on_the_bar_ends_the_press() {
+    a_press_released_on_the_bar_ends_there(Script::tab);
+}
+#[test]
+fn a_plus_pressed_and_released_on_the_bar_ends_the_press() {
+    a_press_released_on_the_bar_ends_there(Script::plus);
+}
+
+#[test]
+fn a_tab_dragged_across_the_bar_still_tears_off_once() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            let at = center(s.tab());
+            s.post(WM_MOUSEMOVE, 0, at);
+            s.post(WM_LBUTTONDOWN, 1, at);
+        }),
+        step(|s| {
+            let tab = s.tab();
+            let bar = s.label(0);
+            let x = tab.x.0 as i32 + 10;
+            s.post(
+                WM_MOUSEMOVE,
+                1,
+                pack(x, (bar.y.0 + bar.height.0) as i32 - 1),
+            );
+        }),
+        step(|s| {
+            s.expect(s.tear_offs() == 1, format!("tear-offs: {}", s.tear_offs()));
+            s.expect(
+                unsafe { GetCapture() }.is_invalid(),
+                "it let go of the mouse",
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn moving_from_a_top_row_button_onto_the_bar_clears_its_hover() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.post(WM_SETFOCUS, 0, 0)),
+        // Sent, not posted, and looked at at once. Windows tells a hidden window right away
+        // that the pointer has left, and that notice would clear the hover by itself.
+        step(|s| {
+            let rest = s.strip_paint();
+            let send = |at: isize| unsafe {
+                SendMessageW(s.hwnd, WM_MOUSEMOVE, Some(WPARAM(0)), Some(LPARAM(at)));
+            };
+            send(center(s.plus()));
+            s.expect(s.strip_paint() != rest, "the hover never showed");
+            send(center(s.label(0)));
+            s.expect(s.strip_paint() == rest, "the top row still shows its hover");
+        }),
+    ];
+    finish(&s, steps);
+}
+
+fn alt_is_no_tap_after(between: fn(&Script)) {
+    let s = script(true);
+    let mut steps = vec![
+        step(|s| s.alt_down()),
+        step(between),
+        step(|s| {
+            hold(&[]);
+            s.alt_up();
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after an Alt that was not a tap");
+    finish(&s, steps);
+}
+#[test]
+fn alt_with_a_left_click_in_the_text_is_no_tap() {
+    alt_is_no_tap_after(|s| s.click_text());
+}
+#[test]
+fn alt_with_a_right_click_in_the_text_is_no_tap() {
+    alt_is_no_tap_after(|s| {
+        let (x, y) = s.text_point();
+        s.post(WM_RBUTTONDOWN, 2, pack(x as i32, y as i32));
+        s.post(WM_RBUTTONUP, 0, pack(x as i32, y as i32));
+    });
+}
+#[test]
+fn alt_with_the_wheel_is_no_tap() {
+    alt_is_no_tap_after(|s| {
+        let mut at = POINT { x: 50, y: 300 };
+        let _ = unsafe { ClientToScreen(s.hwnd, &mut at) };
+        s.post(WM_MOUSEWHEEL, 120 << 16, pack(at.x, at.y));
+    });
+}
+#[test]
+fn alt_with_a_ctrl_chord_is_no_tap() {
+    alt_is_no_tap_after(|s| {
+        hold(&[VK_CTRL, VK_MENU_KEY]);
+        s.post(WM_SYSKEYDOWN, VK_CTRL as usize, ALT_BIT | 1);
+        s.post(WM_SYSKEYDOWN, usize::from(b'K'), ALT_BIT | 1);
+        s.post(WM_SYSKEYUP, usize::from(b'K'), ALT_BIT | REPEAT_UP);
+        s.post(WM_SYSKEYUP, VK_CTRL as usize, ALT_BIT | REPEAT_UP);
+    });
+}
+#[test]
+fn alt_with_a_chord_from_the_key_table_is_no_tap() {
+    alt_is_no_tap_after(|s| {
+        hold(&[VK_MENU_KEY]);
+        s.window
+            .set_key_table(qe_shell::KeyTable {
+                bindings: vec![qe_shell::KeyBinding {
+                    virtual_key: u16::from(b'K'),
+                    modifiers: qe_api::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    action: qe_shell::ShellAction::NewTab,
+                }],
+            })
+            .unwrap();
+        s.post(WM_SYSKEYDOWN, usize::from(b'K'), ALT_BIT | 1);
+        s.post(WM_SYSKEYUP, usize::from(b'K'), ALT_BIT | REPEAT_UP);
+    });
+}
+#[test]
+fn alt_with_a_press_on_the_title_area_is_no_tap() {
+    alt_is_no_tap_after(|s| {
+        let mut at = POINT { x: 300, y: 4 };
+        let _ = unsafe { ClientToScreen(s.hwnd, &mut at) };
+        s.post(WM_NCLBUTTONDOWN, HTCAPTION as usize, pack(at.x, at.y));
+    });
+}
+
+fn no_ime_message_reaches_the_text(open: fn(&Script)) {
+    let s = script(false);
+    let steps = vec![
+        step(open),
+        step(|s| {
+            s.seen.borrow_mut().clear();
+            s.post(WM_IME_STARTCOMPOSITION, 0, 0);
+            s.post(WM_IME_COMPOSITION, 0, 0x800);
+            s.post(WM_IME_ENDCOMPOSITION, 0, 0);
+        }),
+        step(|s| {
+            let ime = s.content_has(|kind| {
+                matches!(
+                    kind,
+                    InputKind::ImeStart | InputKind::ImeUpdate { .. } | InputKind::ImeEnd { .. }
+                )
+            });
+            s.expect(
+                ime == 0,
+                format!("{ime} input method events reached the text"),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn an_input_method_stays_out_of_the_text_behind_an_open_menu() {
+    no_ime_message_reaches_the_text(|s| s.alt_letter(b'F'));
+}
+#[test]
+fn an_input_method_stays_out_of_the_text_while_the_bar_has_focus() {
+    no_ime_message_reaches_the_text(|s| s.alt_tap());
+}
+#[test]
+fn a_composition_that_began_before_the_menu_still_ends_in_the_text() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.post(WM_IME_STARTCOMPOSITION, 0, 0)),
+        step(|s| s.alt_letter(b'F')),
+        step(|s| s.post(WM_IME_ENDCOMPOSITION, 0, 0)),
+        step(|s| {
+            let (start, end) = (
+                s.content_has(|kind| matches!(kind, InputKind::ImeStart)),
+                s.content_has(|kind| matches!(kind, InputKind::ImeEnd { .. })),
+            );
+            s.expect((start, end) == (1, 1), format!("start {start}, end {end}"));
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn shift_f10_goes_to_the_text_and_the_bar_takes_no_focus() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            hold(&[VK_SHIFT]);
+            s.post(WM_SYSKEYDOWN, VK_F10, 1);
+        }),
+        step(|s| {
+            s.expect(s.focused_label().is_none(), "Shift+F10 focused the bar");
+            s.expect(
+                s.content_key_downs(VK_F10 as u16) == 1,
+                "it reached the text",
+            );
+            s.alt_letter(b'F');
+        }),
+        step(|s| s.post(WM_SYSKEYDOWN, VK_F10, 1)),
+        step(|s| s.expect_popups(1, "Shift+F10 with a menu open")),
+    ];
+    finish(&s, steps);
+}
+
+fn a_click_of_this_button_lets_go_of_the_bar(down: u32, up: u32, flag: usize) {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_tap()),
+        step(move |s| {
+            let (x, y) = s.text_point();
+            s.post(down, flag, pack(x as i32, y as i32));
+            s.post(up, 0, pack(x as i32, y as i32));
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after a click with the bar focused");
+    finish(&s, steps);
+}
+#[test]
+fn a_right_click_in_the_text_lets_go_of_the_bar() {
+    a_click_of_this_button_lets_go_of_the_bar(WM_RBUTTONDOWN, WM_RBUTTONUP, 2);
+}
+#[test]
+fn a_middle_click_in_the_text_lets_go_of_the_bar() {
+    a_click_of_this_button_lets_go_of_the_bar(WM_MBUTTONDOWN, WM_MBUTTONUP, 16);
+}
+
+#[test]
+fn a_ctrl_chord_on_the_focused_bar_returns_to_the_text_and_reaches_it() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            hold(&[VK_CTRL]);
+            s.key(usize::from(b'X'));
+        }),
+        step(|s| {
+            s.expect(s.focused_label().is_none(), "the bar kept the focus");
+            s.expect(
+                s.content_key_downs(u16::from(b'X')) == 1,
+                "Ctrl+X reached the text",
+            );
+            hold(&[]);
+            s.key_up(usize::from(b'X'));
+            // Its control character reaches the text as usual, and the owner ignores it.
+            s.seen.borrow_mut().clear();
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after Ctrl+X on the bar");
+    finish(&s, steps);
+}
+#[test]
+fn an_altgr_character_on_the_focused_bar_returns_to_the_text_and_reaches_it() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            hold(&[VK_CTRL, VK_MENU_KEY]);
+            s.post(WM_KEYDOWN, usize::from(b'E'), ALT_BIT | 1);
+            s.post(WM_CHAR, 0x20ac, ALT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect(s.focused_label().is_none(), "the bar kept the focus");
+            s.expect(
+                s.typed().contains(&'\u{20ac}'),
+                format!("typed {:?}", s.typed()),
+            );
+            hold(&[]);
+            s.key_up(usize::from(b'E'));
+            s.seen.borrow_mut().clear();
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after AltGr on the bar");
+    finish(&s, steps);
+}
+#[test]
+fn ctrl_alone_and_plain_keys_stay_with_the_bar() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            hold(&[VK_CTRL]);
+            s.key(VK_CTRL as usize);
+        }),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "Ctrl alone is no chord");
+            s.expect(s.content_key_downs(VK_CTRL) == 0, "the text saw Ctrl");
+            hold(&[]);
+            s.key_up(VK_CTRL as usize);
+            s.key(usize::from(b'X'));
+            s.key_up(usize::from(b'X'));
+        }),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "a plain key stays");
+            s.expect(s.typed().is_empty(), format!("typed {:?}", s.typed()));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_ctrl_chord_from_the_key_table_also_returns_focus_to_the_text() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            hold(&[VK_CTRL]);
+            s.key(usize::from(b'T'));
+        }),
+        step(|s| {
+            let tabs = s
+                .seen
+                .borrow()
+                .iter()
+                .filter(|e| **e == ShellEvent::NewTab)
+                .count();
+            s.expect(tabs == 1, format!("new tabs: {tabs}"));
+            s.expect(s.focused_label().is_none(), "the bar kept the focus");
+            hold(&[]);
+            s.key_up(usize::from(b'T'));
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after Ctrl+T on the bar");
+    finish(&s, steps);
+}
+
+#[test]
+fn a_repeated_enter_on_a_label_opens_nothing() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| s.post(WM_KEYDOWN, VK_ENTER, REPEAT_BIT | 1)),
+        step(|s| {
+            s.expect_popups(0, "a repeated Enter");
+            s.expect(s.focused_label() == Some(0), "the label keeps the focus");
+        }),
+    ];
+    finish(&s, steps);
+}
+fn a_repeat_runs_no_row(vk: usize) {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_letter(b'E')),
+        step(move |s| s.post(WM_KEYDOWN, vk, REPEAT_BIT | 1)),
+        step(|s| {
+            s.expect_popups(1, "a repeat in the menu");
+            s.expect(s.commands().is_empty(), format!("ran {:?}", s.commands()));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_repeated_enter_in_a_menu_runs_no_row() {
+    a_repeat_runs_no_row(VK_ENTER);
+}
+#[test]
+fn a_repeated_space_in_a_menu_runs_no_row() {
+    a_repeat_runs_no_row(VK_SPACE);
+}
+#[test]
+fn a_held_enter_opens_a_label_and_then_does_nothing_more() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| s.key(VK_RIGHT)),
+        step(|s| s.key(VK_ENTER)),
+        step(|s| {
+            s.post(WM_KEYDOWN, VK_ENTER, REPEAT_BIT | 1);
+            s.post(WM_KEYDOWN, VK_ENTER, REPEAT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect_popups(1, "held Enter");
+            s.expect(s.commands().is_empty(), format!("ran {:?}", s.commands()));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_held_letter_that_opens_a_menu_runs_none_of_its_rows() {
+    let s = script(false);
+    // A letter that opens a menu and is also a row's mnemonic in it, when one exists.
+    let group = (0..5)
+        .find(|&group| {
+            let wanted = char::from(letter(group)).to_ascii_lowercase();
+            menu_bar_groups()[group]
+                .submenu
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| {
+                    item.mnemonic
+                        .is_some_and(|m| m.to_ascii_lowercase() == wanted)
+                })
+        })
+        .unwrap_or(0);
+    let vk = usize::from(letter(group));
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(move |s| s.key(vk)),
+        step(move |s| {
+            s.expect_popups(1, "the letter opens its menu");
+            s.post(WM_KEYDOWN, vk, REPEAT_BIT | 1);
+            s.post(WM_KEYDOWN, vk, REPEAT_BIT | 1);
+        }),
+        step(move |s| {
+            s.expect(s.commands().is_empty(), format!("ran {:?}", s.commands()));
+            s.expect_popups(1, "the held letter");
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn a_key_up_that_never_came_does_not_eat_the_next_held_key() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_letter(b'E')),
+        // A command can open a dialog, which then gets this key's release.
+        step(|s| s.key(VK_ENTER)),
+        step(|s| {
+            s.expect(s.commands().len() == 1, "Enter chose the row");
+            s.post(WM_KEYUP, VK_ALT, REPEAT_UP);
+            s.seen.borrow_mut().clear();
+            s.key(VK_ENTER);
+            s.post(WM_KEYDOWN, VK_ENTER, REPEAT_BIT | 1);
+            s.post(WM_KEYDOWN, VK_ENTER, REPEAT_BIT | 1);
+            s.key_up(VK_ENTER);
+        }),
+        step(|s| {
+            let downs = s.content_key_downs(VK_ENTER as u16);
+            s.expect(
+                downs == 3,
+                format!("the text got {downs} key downs, wanted 3"),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn a_held_f10_does_nothing_after_the_first_press() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.post(WM_SYSKEYDOWN, VK_F10, 1)),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "F10 focuses the bar");
+            s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "the first repeat");
+            s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
+        }),
+        step(|s| s.expect(s.focused_label() == Some(0), "the second repeat")),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn f10_with_the_caret_list_open_closes_it_and_focuses_the_bar() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.click_caret()),
+        step(|s| {
+            s.expect_popups(1, "the caret list");
+            s.post(WM_SYSKEYDOWN, VK_F10, 1);
+        }),
+        step(|s| {
+            s.expect_popups(0, "F10 closes the list");
+            s.expect(s.focused_label() == Some(0), "F10 focuses the bar");
+            s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
+            s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "the held F10 does nothing");
+            s.expect(s.content_key_downs(VK_F10 as u16) == 0, "the text saw F10");
+            s.post(WM_SYSKEYUP, VK_F10, REPEAT_UP);
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after F10 from the caret list");
+    finish(&s, steps);
+}
+#[test]
+fn a_held_f10_that_closed_a_bar_menu_reaches_nothing_more() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_letter(b'F')),
+        step(|s| s.post(WM_SYSKEYDOWN, VK_F10, 1)),
+        step(|s| {
+            s.expect_text_has_keys("F10 with File open");
+            s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect_text_has_keys("a repeat of that F10");
+            s.expect(s.content_key_downs(VK_F10 as u16) == 0, "the text saw F10");
+            s.post(WM_SYSKEYUP, VK_F10, REPEAT_UP);
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after a held F10");
+    finish(&s, steps);
+}
+
+#[test]
+fn a_hover_that_a_key_overtook_opens_no_submenu_later() {
+    let s = script(false);
+    let (group, row, _) = group_with_submenu();
+    let delay = UiTokens::sizes().submenu_delay_ms;
+    let steps = vec![
+        step(move |s| s.click_label(group)),
+        step(move |s| {
+            let popup = s.root_popup().unwrap();
+            let model = menu_bar_groups()[group].submenu.clone().unwrap();
+            s.post_to(
+                popup,
+                WM_MOUSEMOVE,
+                0,
+                pack(20, row_middle(&model, row) as i32),
+            );
+            s.key(VK_DOWN);
+        }),
+        wait(delay + 100),
+        step(|s| {
+            s.expect_popups(1, "the key moved off the row");
+            s.key(VK_UP_KEY);
+        }),
+        wait(delay + 100),
+        step(|s| s.expect_popups(1, "the key came back to the row")),
+    ];
+    finish(&s, steps);
+}
+const VK_UP_KEY: usize = 0x26;
+
+#[test]
+fn the_tree_has_a_menu_bar_and_one_focused_widget() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            let tree = s.tree();
+            let bar = find_widget(&tree, "Menu bar").unwrap();
+            s.expect(
+                bar.role == qe_api::WidgetRole::MenuBar,
+                format!("{:?}", bar.role),
+            );
+            s.expect(count_focused(&tree) == 0, "nothing is focused yet");
+            s.alt_tap();
+        }),
+        step(|s| {
+            let tree = s.tree();
+            s.expect(
+                count_focused(&tree) == 1,
+                format!("focused: {}", count_focused(&tree)),
+            );
+            s.expect(
+                focused_name(&tree).as_deref() == Some("File"),
+                "File has the focus",
+            );
+            s.key(VK_RIGHT);
+            s.key(VK_DOWN);
+        }),
+        step(|s| {
+            let tree = s.tree();
+            s.expect(
+                count_focused(&tree) == 1,
+                format!("focused: {}", count_focused(&tree)),
+            );
+            let edit = menu_bar_groups()[1].submenu.clone().unwrap();
+            let first = usable_rows(&edit)[0];
+            s.expect(
+                focused_name(&tree).as_deref() == Some(edit.items[first].label.as_str()),
+                format!("focused {:?}", focused_name(&tree)),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn the_open_menu_is_in_the_tree_with_rows_in_client_places() {
+    let s = script(false);
+    let (group, row, downs) = group_with_submenu();
+    let model = menu_bar_groups()[group].submenu.clone().unwrap();
+    let row_name = model.items[row].label.clone();
+    let closed_name = row_name.clone();
+    let steps = vec![
+        step(move |s| {
+            s.alt_letter(letter(group));
+            for _ in 0..downs {
+                s.key(VK_DOWN);
+            }
+        }),
+        step(move |s| {
+            let tree = s.tree();
+            let label = &find_widget(&tree, "Menu bar").unwrap().children[group];
+            s.expect(label.states.expanded, "the label says it is open");
+            s.expect(label.children.len() == 1, "the label holds the open menu");
+            let menu = &label.children[0];
+            s.expect(menu.role == qe_api::WidgetRole::Menu, "it is a menu");
+            let row = find_widget(menu, &closed_name).unwrap();
+            s.expect(row.states.has_popup, "the row says it has a submenu");
+            s.expect(row.states.focused, "the selected row has the focus");
+            // Rows are in the window's dips, just under the label, whatever the screen.
+            let under = label.bounds.y.0 + label.bounds.height.0;
+            s.expect(
+                (menu.bounds.y.0 - under).abs() <= 1.0,
+                format!(
+                    "the menu at {} and the label's bottom at {under}",
+                    menu.bounds.y.0
+                ),
+            );
+            s.expect(
+                (menu.bounds.x.0 - label.bounds.x.0).abs() <= 1.0,
+                format!(
+                    "the menu's left {} and the label's {}",
+                    menu.bounds.x.0, label.bounds.x.0
+                ),
+            );
+            s.expect(
+                row.bounds.y.0 >= menu.bounds.y.0,
+                "the row is inside the menu",
+            );
+            s.key(VK_RIGHT);
+        }),
+        step(move |s| {
+            let tree = s.tree();
+            let row = find_widget(&tree, &row_name).unwrap();
+            s.expect(row.children.len() == 1, "the open submenu is in the tree");
+            s.expect(
+                count_focused(&tree) == 1,
+                format!("focused: {}", count_focused(&tree)),
+            );
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+        }),
+        step(|s| {
+            let tree = s.tree();
+            let bar = find_widget(&tree, "Menu bar").unwrap();
+            s.expect(
+                bar.children.iter().all(|label| label.children.is_empty()),
+                "a closed menu stays out of the tree",
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn the_caret_list_is_in_the_tree_and_the_strip_gives_up_its_focus() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.click_caret()),
+        step(|s| {
+            s.window.with_strip(|strip| strip.focus_strip()).unwrap();
+            let tree = s.tree();
+            let settings = caret_menu()
+                .items
+                .iter()
+                .find(|i| i.command.is_some())
+                .unwrap()
+                .label
+                .clone();
+            s.expect(
+                find_widget(&tree, &settings).is_some(),
+                "the list's rows are in the tree",
+            );
+            s.expect(
+                count_focused(&tree) == 1,
+                format!("focused: {}", count_focused(&tree)),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn alt_on_a_focused_strip_leaves_one_focus_owner() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            s.window.with_strip(|strip| strip.focus_strip()).unwrap();
+            s.alt_tap();
+        }),
+        step(|s| {
+            let tree = s.tree();
+            s.expect(
+                count_focused(&tree) == 1,
+                format!("focused: {}", count_focused(&tree)),
+            );
+            s.expect(
+                focused_name(&tree).as_deref() == Some("File"),
+                "File has the focus",
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+
+fn press_label_and_release_on_row(group: usize) -> Vec<Step> {
+    vec![
+        step(move |s| {
+            let r = s.label(group);
+            let at = pack(r.x.0 as i32 + 4, r.y.0 as i32 + 10);
+            s.post(WM_MOUSEMOVE, 0, at);
+            s.post(WM_LBUTTONDOWN, 1, at);
+        }),
+        step(move |s| {
+            s.expect_popups(1, "the press opens the menu");
+            let popup = s.root_popup().unwrap();
+            let model = menu_bar_groups()[group].submenu.clone().unwrap();
+            let row = usable_rows(&model)[0];
+            let y = row_middle(&model, row) as i32;
+            s.post_to(popup, WM_MOUSEMOVE, 1, pack(20, y));
+            s.post_to(popup, WM_LBUTTONUP, 0, pack(20, y));
+        }),
+        step(move |s| {
+            let model = menu_bar_groups()[group].submenu.clone().unwrap();
+            let row = usable_rows(&model)[0];
+            s.expect(
+                s.commands() == vec![model.items[row].command.unwrap()],
+                format!("the row under the release runs once: {:?}", s.commands()),
+            );
+        }),
+    ]
+}
+#[test]
+fn a_press_on_a_label_and_a_release_on_a_row_chooses_that_row() {
+    let s = script(false);
+    let mut steps = press_label_and_release_on_row(1);
+    Script::then_typing_reaches_text(&mut steps, "after a press and a release");
+    finish(&s, steps);
+}
+#[test]
+fn a_press_dragged_to_another_label_then_a_release_on_its_row_chooses_that_row() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| {
+            let r = s.label(0);
+            let at = pack(r.x.0 as i32 + 4, r.y.0 as i32 + 10);
+            s.post(WM_MOUSEMOVE, 0, at);
+            s.post(WM_LBUTTONDOWN, 1, at);
+        }),
+        step(|s| {
+            let popup = s.root_popup().unwrap();
+            let r = s.label(1);
+            s.post_to(
+                popup,
+                WM_MOUSEMOVE,
+                1,
+                s.on_popup(popup, r.x.0 + 4.0, r.y.0 + 10.0),
+            );
+        }),
+        step(|s| {
+            s.expect(s.open_label() == Some(1), "the drag switched to Edit");
+            let popup = s.root_popup().unwrap();
+            let model = menu_bar_groups()[1].submenu.clone().unwrap();
+            let y = row_middle(&model, usable_rows(&model)[0]) as i32;
+            s.post_to(popup, WM_MOUSEMOVE, 1, pack(20, y));
+            s.post_to(popup, WM_LBUTTONUP, 0, pack(20, y));
+        }),
+        step(|s| s.expect(s.commands().len() == 1, format!("ran {:?}", s.commands()))),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after a drag across labels");
+    finish(&s, steps);
+}
+#[test]
+fn a_press_on_a_label_released_on_a_submenu_row_chooses_that_row() {
+    let s = script(false);
+    let (group, row, _) = group_with_submenu();
+    let delay = UiTokens::sizes().submenu_delay_ms;
+    let mut steps = vec![
+        step(move |s| {
+            let r = s.label(group);
+            let at = pack(r.x.0 as i32 + 4, r.y.0 as i32 + 10);
+            s.post(WM_MOUSEMOVE, 0, at);
+            s.post(WM_LBUTTONDOWN, 1, at);
+        }),
+        step(move |s| {
+            let popup = s.root_popup().unwrap();
+            let model = menu_bar_groups()[group].submenu.clone().unwrap();
+            s.post_to(
+                popup,
+                WM_MOUSEMOVE,
+                1,
+                pack(20, row_middle(&model, row) as i32),
+            );
+        }),
+        wait(delay + 150),
+        step(move |s| {
+            s.expect_popups(2, "the submenu opened under the held press");
+            let root = s.root_popup().unwrap();
+            let child = s.popups().into_iter().find(|p| *p != root).unwrap();
+            let model = menu_bar_groups()[group].submenu.clone().unwrap();
+            let sub = model.items[row].submenu.clone().unwrap();
+            let first = usable_rows(&sub)
+                .into_iter()
+                .find(|i| sub.items[*i].command.is_some())
+                .expect("a submenu row with a command");
+            let mut at = POINT {
+                x: 20,
+                y: row_middle(&sub, first) as i32,
+            };
+            unsafe {
+                let _ = ClientToScreen(child, &mut at);
+                let _ = ScreenToClient(root, &mut at);
+            }
+            s.post_to(root, WM_MOUSEMOVE, 1, pack(at.x, at.y));
+            s.post_to(root, WM_LBUTTONUP, 0, pack(at.x, at.y));
+        }),
+        step(|s| s.expect(s.commands().len() == 1, format!("ran {:?}", s.commands()))),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after a release on a submenu row");
+    finish(&s, steps);
+}
+#[test]
+fn a_press_on_a_label_released_on_the_label_keeps_the_menu_open_and_runs_nothing() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.click_label(1)),
+        step(|s| {
+            s.expect_popups(1, "the click opens Edit");
+            s.expect(s.commands().is_empty(), "nothing ran");
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn keys_in_one_batch_each_go_where_their_own_moment_says() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            s.key(usize::from(b'X'));
+            s.key(usize::from(b'Y'));
+        }),
+        step(|s| {
+            s.expect(s.focused_label() == Some(0), "the bar keeps the focus");
+            s.expect(s.typed().is_empty(), format!("typed {:?}", s.typed()));
+            s.key_up(usize::from(b'X'));
+            s.key_up(usize::from(b'Y'));
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+        }),
+        step(|s| s.alt_letter(b'E')),
+        step(|s| {
+            s.key(VK_ENTER);
+            s.key(usize::from(b'X'));
+        }),
+        step(|s| {
+            s.expect(s.commands().len() == 1, format!("ran {:?}", s.commands()));
+            s.expect(s.typed() == vec!['x'], format!("typed {:?}", s.typed()));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_dismissed_menu_runs_nothing_for_a_key_already_queued() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_letter(b'E')),
+        step(|s| {
+            let popup = s.root_popup().unwrap();
+            let (x, y) = s.text_point();
+            s.post_to(popup, WM_LBUTTONDOWN, 1, s.on_popup(popup, x, y));
+            s.key(VK_ENTER);
+        }),
+        step(|s| {
+            s.expect(
+                s.commands().is_empty(),
+                format!("closed menu ran {:?}", s.commands()),
+            );
+            s.expect_popups(0, "after the click away");
+            s.expect(s.focused_label().is_none(), "the bar let go");
+            s.expect(s.open_label().is_none(), "no label is open");
+        }),
+    ];
+    finish(&s, steps);
+}
+/// The `rects[depth]` question: a view with fewer levels than its windows.
+#[test]
+fn a_key_queued_behind_a_dismissal_cannot_paint_a_level_that_went_away() {
+    let s = script(false);
+    let mut steps = Vec::new();
+    open_submenu_by_keys(&mut steps);
+    steps.push(step(|s| {
+        let popup = s.root_popup().unwrap();
+        let (x, y) = s.text_point();
+        s.post_to(popup, WM_LBUTTONDOWN, 1, s.on_popup(popup, x, y));
+        s.key(VK_LEFT);
+    }));
+    steps.push(step(|s| s.expect_popups(0, "after the click away")));
+    finish(&s, steps);
+}
+fn alt_chord_keeps_the_menu_open(release_alt_first: bool) {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.click_label(0)),
+        step(move |s| {
+            s.alt_down();
+            s.post(WM_SYSKEYDOWN, usize::from(b'Z'), ALT_BIT | 1);
+            if release_alt_first {
+                s.alt_up();
+                s.post(WM_KEYUP, usize::from(b'Z'), REPEAT_UP);
+            } else {
+                s.post(WM_SYSKEYUP, usize::from(b'Z'), ALT_BIT | REPEAT_UP);
+                s.alt_up();
+            }
+        }),
+        step(|s| s.expect_popups(1, "an Alt chord is no tap")),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn an_alt_chord_released_alt_first_keeps_the_menu_open() {
+    alt_chord_keeps_the_menu_open(true);
+}
+#[test]
+fn an_alt_chord_released_key_first_keeps_the_menu_open() {
+    alt_chord_keeps_the_menu_open(false);
+}
+#[test]
+fn opening_the_caret_list_over_a_bar_menu_closes_the_label() {
+    let s = script(false);
+    let mut steps = vec![
+        step(|s| s.alt_letter(b'F')),
+        step(|s| {
+            s.expect(s.open_label() == Some(0), "File is open");
+            let anchor = s.window.with_strip(|strip| strip.split_rect()).unwrap();
+            s.window.open_menu(caret_menu(), anchor).unwrap();
+            s.expect_popups(1, "the list replaced the menu");
+            s.expect(s.open_label().is_none(), "File still says it is open");
+            s.expect(s.focused_label().is_none(), "File still has the focus");
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+        }),
+    ];
+    Script::then_typing_reaches_text(&mut steps, "after the caret list replaced a menu");
+    finish(&s, steps);
+}
+
+fn this_change_ends_the_menu(change: fn(&Script), submenu: bool) {
+    let s = script(false);
+    let mut steps = Vec::new();
+    if submenu {
+        open_submenu_by_keys(&mut steps);
+    } else {
+        steps.push(step(|s| s.alt_letter(b'F')));
+        steps.push(step(|s| s.expect_popups(1, "Alt+F")));
+    }
+    steps.push(step(change));
+    Script::then_typing_reaches_text(&mut steps, "after the window changed");
+    finish(&s, steps);
+}
+fn dpi_change(s: &Script) {
+    let mut outer = RECT::default();
+    unsafe { GetWindowRect(s.hwnd, &mut outer) }.unwrap();
+    // SAFETY: `outer` lives for the call, as this message's documentation asks.
+    unsafe {
+        SendMessageW(
+            s.hwnd,
+            WM_DPICHANGED,
+            Some(WPARAM(96 | (96 << 16))),
+            Some(LPARAM(&raw const outer as isize)),
+        );
+    }
+}
+#[test]
+fn a_lost_focus_ends_the_menu() {
+    this_change_ends_the_menu(|s| s.post(WM_KILLFOCUS, 0, 0), false);
+}
+#[test]
+fn a_lost_focus_ends_a_submenu_too() {
+    this_change_ends_the_menu(|s| s.post(WM_KILLFOCUS, 0, 0), true);
+}
+#[test]
+fn a_dpi_change_ends_the_menu() {
+    this_change_ends_the_menu(dpi_change, false);
+}
+#[test]
+fn a_size_change_ends_the_menu() {
+    this_change_ends_the_menu(|s| s.post(WM_SIZE, 0, pack(900, 600)), false);
+}
+#[test]
+fn a_move_ends_the_menu() {
+    this_change_ends_the_menu(|s| s.post(WM_MOVE, 0, pack(30, 30)), false);
+}
+#[test]
+fn a_display_change_ends_the_menu() {
+    this_change_ends_the_menu(|s| s.post(WM_DISPLAYCHANGE, 32, pack(1920, 1080)), false);
+}
+#[test]
+fn destroying_the_window_ends_the_menu_with_no_event_after() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_letter(b'F')),
+        step(|s| {
+            s.expect_popups(1, "Alt+F");
+            s.window.destroy().unwrap();
+            s.expect_popups(0, "the window went, and the popups with it");
+        }),
+    ];
+    finish(&s, steps);
+    assert!(s.was_destroyed());
+    assert_eq!(s.popups().len(), 0);
+}
+
+#[test]
+fn a_lost_focus_lets_go_of_the_bar() {
+    let s = script(false);
+    let mut steps = vec![step(|s| s.alt_tap()), step(|s| s.post(WM_KILLFOCUS, 0, 0))];
+    Script::then_typing_reaches_text(&mut steps, "after a lost focus");
+    finish(&s, steps);
+}
+#[test]
+fn a_mouse_opened_menu_selects_no_row_and_a_mnemonic_runs_nothing() {
+    let s = script(false);
+    let model = menu_bar_groups()[0].submenu.clone().unwrap();
+    let letter = model
+        .items
+        .iter()
+        .find_map(|item| item.mnemonic.filter(|_| item.enabled))
+        .expect("a row with a mnemonic");
+    let steps = vec![
+        step(|s| s.click_label(0)),
+        step(move |s| {
+            let tree = s.tree();
+            s.expect(
+                focused_name(&tree).as_deref() == Some("File"),
+                format!(
+                    "no row is selected, but {:?} has the focus",
+                    focused_name(&tree)
+                ),
+            );
+            s.post(WM_CHAR, letter.to_ascii_lowercase() as usize, 1);
+        }),
+        step(|s| {
+            s.expect_popups(1, "a mnemonic in a menu opened by mouse");
+            s.expect(s.commands().is_empty(), format!("ran {:?}", s.commands()));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn hovering_the_open_label_does_not_open_it_again() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.click_label(0)),
+        step(|s| {
+            let popup = s.root_popup().unwrap();
+            let r = s.label(0);
+            let at = s.on_popup(popup, r.x.0 + 6.0, r.y.0 + 10.0);
+            s.post_to(popup, WM_MOUSEMOVE, 0, at);
+            s.post_to(popup, WM_MOUSEMOVE, 0, at);
+        }),
+        step(|s| {
+            s.expect(
+                s.group_opens() == vec![0],
+                format!("opens: {:?}", s.group_opens()),
+            );
+            s.expect_popups(1, "File stays");
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn hovering_a_label_with_no_menu_open_opens_nothing() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.post(WM_MOUSEMOVE, 0, center(s.label(1)))),
+        step(|s| {
+            s.expect(
+                s.group_opens().is_empty(),
+                format!("opens: {:?}", s.group_opens()),
+            );
+            s.expect_popups(0, "a hover");
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_dismissal_notice_from_another_menu_changes_nothing() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_letter(b'F')),
+        step(|s| {
+            s.post(
+                qe_ui::POPUP_DISMISSED_MESSAGE,
+                0x1234,
+                qe_ui::PopupDismissed::OutsideClick as isize,
+            );
+        }),
+        step(|s| {
+            s.expect_popups(1, "a stale notice");
+            s.expect(s.open_label() == Some(0), "File stays open");
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn altgr_with_a_letter_does_not_switch_the_open_menu_or_open_one() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            hold(&[VK_CTRL, VK_MENU_KEY]);
+            s.post(WM_KEYDOWN, usize::from(b'V'), ALT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect_popups(0, "AltGr+V with no menu");
+            s.expect(s.focused_label().is_none(), "the bar takes no focus");
+            hold(&[]);
+            s.alt_letter(b'F');
+        }),
+        step(|s| {
+            hold(&[VK_CTRL, VK_MENU_KEY]);
+            s.post(WM_KEYDOWN, usize::from(b'V'), ALT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect(s.open_label() == Some(0), "AltGr+V switched the menu");
+            s.expect(
+                s.group_opens() == vec![0],
+                format!("opens: {:?}", s.group_opens()),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn alt_tapped_with_ctrl_or_shift_held_does_not_focus_the_bar() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| {
+            hold(&[VK_CTRL, VK_MENU_KEY]);
+            s.alt_down();
+        }),
+        step(|s| {
+            hold(&[VK_CTRL]);
+            s.alt_up();
+        }),
+        step(|s| {
+            s.expect(s.focused_label().is_none(), "Ctrl+Alt is no tap");
+            hold(&[VK_SHIFT, VK_MENU_KEY]);
+            s.alt_down();
+        }),
+        step(|s| {
+            hold(&[VK_SHIFT]);
+            s.alt_up();
+        }),
+        step(|s| s.expect(s.focused_label().is_none(), "Shift+Alt is no tap")),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn leaving_the_bar_tells_the_owner_once_to_focus_the_text() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| {
+            s.key(VK_ESC);
+            s.key_up(VK_ESC);
+        }),
+        step(|s| {
+            let told = s
+                .seen
+                .borrow()
+                .iter()
+                .filter(|event| **event == ShellEvent::FocusContent)
+                .count();
+            s.expect(told == 1, format!("told {told} times"));
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_menu_at_150_percent_opens_under_its_label() {
+    let s = script_at(false, Some(144));
+    let steps = vec![
+        step(|s| {
+            // High on the screen, so that the menu has room to open downward.
+            unsafe {
+                SetWindowPos(
+                    s.hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            }
+            .unwrap();
+            s.alt_letter(b'W');
+        }),
+        step(|s| {
+            s.expect_popups(1, "Alt+W");
+            let r = s.label(4);
+            let mut at = POINT {
+                x: (r.x.0 * 1.5).round() as i32,
+                y: ((r.y.0 + r.height.0) * 1.5).round() as i32,
+            };
+            let _ = unsafe { ClientToScreen(s.hwnd, &mut at) };
+            let mut popup = RECT::default();
+            unsafe { GetWindowRect(s.root_popup().unwrap(), &mut popup) }.unwrap();
+            s.expect(
+                (popup.left - at.x).abs() <= 1 && (popup.top - at.y).abs() <= 1,
+                format!(
+                    "popup at {},{}, wanted {},{}",
+                    popup.left, popup.top, at.x, at.y
+                ),
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+
+#[test]
+fn alt_with_a_lost_focus_is_no_tap() {
+    alt_is_no_tap_after(|s| s.post(WM_KILLFOCUS, 0, 0));
+}
+
+/// A key that opens a menu, held: its repeats must not reach a row by that row's letter.
+#[test]
+fn a_repeat_of_a_letter_runs_no_row_by_its_mnemonic() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.key(VK_DOWN)),
+        step(|s| {
+            let mut row = qe_ui::MenuItem::command("Xylophone", CommandId::About);
+            row.mnemonic = Some('x');
+            let anchor = s.label(0);
+            s.window
+                .open_menu(MenuModel { items: vec![row] }, anchor)
+                .unwrap();
+            s.post(WM_KEYDOWN, usize::from(b'X'), REPEAT_BIT | 1);
+        }),
+        step(|s| {
+            s.expect(s.commands().is_empty(), format!("ran {:?}", s.commands()));
+            s.key(usize::from(b'X'));
+        }),
+        step(|s| {
+            s.expect(
+                s.commands().len() == 1,
+                "a fresh press of the letter does run it",
+            );
+        }),
+    ];
+    finish(&s, steps);
+}
+#[test]
+fn a_stray_character_stays_out_of_the_text_while_the_bar_has_focus() {
+    let s = script(false);
+    let steps = vec![
+        step(|s| s.alt_tap()),
+        step(|s| s.post(WM_CHAR, usize::from(b'q'), 1)),
+        step(|s| {
+            s.expect(s.typed().is_empty(), format!("typed {:?}", s.typed()));
+            s.expect(s.focused_label() == Some(0), "the bar keeps the focus");
+        }),
+    ];
+    finish(&s, steps);
 }

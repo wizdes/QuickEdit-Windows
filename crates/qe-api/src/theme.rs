@@ -33,6 +33,13 @@ pub struct Theme {
     pub top_row_height: Dip,
     /// The flat menu bar below the tabs.
     pub menu_bar_height: Dip,
+    /// The space before the bar's first label.
+    pub menu_bar_inset: Dip,
+    /// The space on each side of a label's text.
+    pub menu_bar_label_padding: Dip,
+    /// How far under the baseline a label's access key underline lies.
+    pub menu_bar_underline_offset: Dip,
+    pub menu_bar_underline_width: Dip,
     pub tab_height: Dip,
     pub caption_button_width: Dip,
     pub map_width: Dip,
@@ -127,6 +134,10 @@ impl Theme {
             font_pt: 10.0,
             top_row_height: Dip(32.0),
             menu_bar_height: Dip(32.0),
+            menu_bar_inset: Dip(4.0),
+            menu_bar_label_padding: Dip(12.0),
+            menu_bar_underline_offset: Dip(2.0),
+            menu_bar_underline_width: Dip(1.0),
             tab_height: Dip(32.0),
             caption_button_width: Dip(46.0),
             map_width: Dip(100.0),

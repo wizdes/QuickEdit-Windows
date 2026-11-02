@@ -192,6 +192,15 @@ impl MenuView {
             thumb_drag: None,
         }
     }
+    /// The press that opened this menu is still held, so its release can choose a row, as
+    /// in native menus.
+    pub fn opened_by_held_press(&mut self) {
+        self.press_began = true;
+    }
+    /// A key the host keeps for itself came while Alt was down, so its release is no tap.
+    pub fn cancel_alt_tap(&mut self) {
+        self.alt = AltKeyTracker::default();
+    }
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
@@ -260,6 +269,10 @@ impl MenuView {
     fn select_row(&mut self, i: usize, c: &mut ViewContext) {
         if self.child_row != Some(i) {
             self.close_child(c);
+        }
+        // A hover's wait ends when anything else moves the selection off its row.
+        if self.pending_submenu.is_some_and(|(row, _)| row != i) {
+            self.pending_submenu = None;
         }
         self.selected = Some(i);
         self.keep_visible(i);
@@ -403,6 +416,8 @@ impl MenuView {
         );
         child.keyboard_opened = self.keyboard_opened;
         child.keys_used = self.keys_used;
+        // A press still held when its submenu opens can end on the submenu's row.
+        child.press_began = self.press_began;
         child.selected = child.first_enabled();
         child.is_submenu = true;
         child.work_area = self.work_area;
@@ -564,6 +579,9 @@ impl View for MenuView {
         if let Some(child) = &mut self.child {
             let h = child.handle(e, c);
             self.after_child(c);
+            if h == Handled::Yes && matches!(e.kind, InputKind::MouseUp { .. }) {
+                self.press_began = false;
+            }
             if h == Handled::Yes || self.closed {
                 return Handled::Yes;
             }
@@ -573,7 +591,11 @@ impl View for MenuView {
             self.keys_used = true;
         }
         match &e.kind {
-            InputKind::KeyDown { virtual_key, .. } => match *virtual_key {
+            InputKind::KeyDown {
+                virtual_key,
+                repeat,
+                ..
+            } => match *virtual_key {
                 UP => {
                     self.move_selection(-1, c);
                     Handled::Yes
@@ -610,8 +632,11 @@ impl View for MenuView {
                     self.end(Ended::Back, c);
                     Handled::Yes
                 }
+                // A held key that opened this menu must not go on to run a row.
                 ENTER | SPACE => {
-                    self.activate(c);
+                    if !*repeat {
+                        self.activate(c);
+                    }
                     Handled::Yes
                 }
                 ESCAPE => {
@@ -903,7 +928,6 @@ impl MenuView {
             let value = if !item.key_text.is_empty() {
                 Some(item.key_text.clone())
             } else if item.submenu.is_some() {
-                // No field says "has a submenu" yet. See the report's qe-api list.
                 Some("Submenu".to_owned())
             } else {
                 None
@@ -920,6 +944,7 @@ impl MenuView {
                     selected,
                     checked: item.checked,
                     expanded: open_child.is_some(),
+                    has_popup: item.submenu.is_some(),
                     ..Default::default()
                 },
                 selection: None,

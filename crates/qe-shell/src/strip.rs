@@ -520,6 +520,10 @@ impl TabStrip {
     }
     /// True once if a change to the tabs ended a press that held the mouse. The window
     /// then releases capture, because no button-up will reach the press.
+    /// True while a press that began on this row holds the mouse.
+    pub fn holds_mouse(&self) -> bool {
+        self.capturing
+    }
     pub fn take_capture_release(&mut self) -> bool {
         std::mem::take(&mut self.release_capture)
     }

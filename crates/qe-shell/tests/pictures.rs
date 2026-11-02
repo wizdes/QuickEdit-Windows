@@ -1,7 +1,12 @@
 //! Every picture and pixel check here goes through the real `qe-render`, with fonts named
 //! directly and fixed text settings.
-use qe_api::{Bitmap, Color, Dip, InputEvent, InputKind, Point, Rect, Theme, ThemeKind, View};
+use qe_api::{
+    Bitmap, Color, Dip, DisplayList, DrawCommand, InputEvent, InputKind, Point, Rect, Renderer,
+    Theme, ThemeKind, View, ViewContext, WidgetId,
+};
+use qe_render::{BitmapRenderer, TextSettings};
 use qe_shell::{CaptionHit, ContrastColors, Tab, TabStrip};
+use qe_ui::MenuBar;
 use std::path::PathBuf;
 
 mod support;
@@ -28,6 +33,8 @@ fn theme_for(name: &str) -> Theme {
             let mut theme = Theme::new(ThemeKind::Dark);
             theme.text_background = c.window;
             theme.tab_background = c.window;
+            theme.tab_selected = c.highlight;
+            theme.map_box_fill = c.highlight_text;
             theme.text = c.window_text;
             theme.dim_text = c.window_text;
             theme.border = c.window_text;
@@ -460,5 +467,94 @@ fn every_pixel_is_opaque_so_that_the_extended_frame_stays_hidden() {
             .filter(|p| p[3] != 255)
             .count();
         assert_eq!(clear, 0, "{name}");
+    }
+}
+
+/// The real row and the real bar together, as the window paints them. Each image shows the
+/// active tab running down into the bar, with the bar's first label focused.
+#[test]
+fn saved_images_of_the_active_tab_joining_the_bar() {
+    const BAR_IMAGE_HEIGHT: f32 = 100.0;
+    for name in ["light", "dark", "contrast"] {
+        let theme = theme_for(name);
+        for dpi in [96u32, 144, 192] {
+            let scale = dpi as f32 / 96.0;
+            let strip = sample(name, false);
+            let row = strip.row_rect();
+            let mut bar = MenuBar::new(WidgetId(700));
+            let top = row.y.0 + row.height.0;
+            bar.layout(
+                rect(0.0, top, WIDTH, theme.menu_bar_height.0),
+                &RealMeasurer,
+            );
+            bar.focus_first(&mut ViewContext::default());
+            let mut list = DisplayList::default();
+            list.push(DrawCommand::FillRect {
+                rect: rect(0.0, 0.0, WIDTH, BAR_IMAGE_HEIGHT),
+                color: theme.text_background,
+            });
+            strip.set_scale(scale);
+            strip.draw(&mut list, &theme, &RealMeasurer);
+            bar.draw(&mut list, &theme, &RealMeasurer);
+            let (w, h) = (
+                (WIDTH * scale).round() as u32,
+                (BAR_IMAGE_HEIGHT * scale).round() as u32,
+            );
+            let mut renderer = BitmapRenderer::new(w, h).unwrap();
+            renderer.set_dpi(dpi).unwrap();
+            renderer
+                .set_text_settings(TextSettings::reference())
+                .unwrap();
+            renderer.begin_frame().unwrap();
+            renderer.draw(&list).unwrap();
+            renderer.end_frame().unwrap();
+            let image = renderer.bitmap().unwrap();
+
+            // Far from any label, the bar has one color: the text's, with no line above it.
+            let x = ((WIDTH - 40.0) * scale) as u32;
+            let (first, last) = (
+                (top * scale).ceil() as u32,
+                ((top + theme.menu_bar_height.0) * scale).floor() as u32 - 1,
+            );
+            let flat = background(theme.text_background);
+            assert_eq!(
+                pixel(&image, x, first),
+                flat,
+                "{name} {dpi}: the bar's first row"
+            );
+            assert_eq!(
+                pixel(&image, x, last),
+                flat,
+                "{name} {dpi}: the bar's last row"
+            );
+            if name != "contrast" {
+                // High contrast fills the active tab with the highlight color instead.
+                let tab = strip.tab_rects()[strip.active()];
+                let tab_x = ((tab.x.0 + tab.width.0 - 8.0) * scale) as u32;
+                let tab_last = ((tab.y.0 + tab.height.0) * scale).ceil() as u32 - 1;
+                assert_eq!(
+                    pixel(&image, tab_x, tab_last),
+                    flat,
+                    "{name} {dpi}: the tab joins"
+                );
+            }
+
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/images")
+                .join(format!("tab-and-bar-{name}-{dpi}.png"));
+            if std::env::var_os("QE_SHELL_UPDATE_IMAGES").is_some() {
+                std::fs::write(&path, encode_png(&image)).unwrap();
+            }
+            let saved = decode_own_png(&std::fs::read(&path).unwrap());
+            let current = raw_pixels(&image);
+            assert_eq!(saved.len(), current.len(), "{}", path.display());
+            let far = saved
+                .iter()
+                .zip(&current)
+                .filter(|(a, b)| a.abs_diff(**b) > 3)
+                .count();
+            // The same 1-in-10,000 allowance as the other saved images, for the same reason.
+            assert!(far <= saved.len() / 10_000, "{}: {far}", path.display());
+        }
     }
 }

@@ -49,8 +49,8 @@ use windows::Win32::UI::HiDpi::{
     GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::Ime::{
-    GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, IME_COMPOSITION_STRING, ImmGetCompositionStringW,
-    ImmGetContext, ImmReleaseContext,
+    CPS_CANCEL, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, IME_COMPOSITION_STRING,
+    ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME, ImmReleaseContext, NI_COMPOSITIONSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
@@ -267,6 +267,8 @@ fn build_theme(dark: bool, contrast: Option<ContrastColors>) -> Theme {
         theme.text_background = c.window;
         theme.tab_background = c.window;
         theme.tab_selected = c.highlight;
+        // `qe-ui` reads text on the highlight color from here, as `SystemPalette::theme` sets it.
+        theme.map_box_fill = c.highlight_text;
         theme.text = c.window_text;
         theme.dim_text = c.window_text;
         theme.border = c.window_text;
@@ -463,6 +465,26 @@ struct State {
     content_cursor: MouseCursor,
     list: DisplayList,
 }
+/// What the bar asks of the owner after an event, and the rule that only one of the bar
+/// and the row has the keyboard.
+fn bar_results(
+    state: &mut State,
+    was_focused: bool,
+    ctx: &mut ViewContext,
+    events: &mut Vec<ShellEvent>,
+) {
+    if let Some((index, anchor)) = state.menu_bar.take_open_request() {
+        events.push(ShellEvent::OpenMenuGroup(index, anchor));
+    }
+    let focused = state.menu_bar.focused().is_some();
+    if was_focused && !focused {
+        events.push(ShellEvent::FocusContent);
+    }
+    if focused && state.strip.focused().is_some() {
+        state.strip.set_focused(None);
+        ctx.invalidate(state.strip.row_rect());
+    }
+}
 impl State {
     fn content_rect(&self) -> ApiRect {
         let row = self.strip.row_rect();
@@ -604,9 +626,12 @@ struct Shared {
     content_buttons: Cell<u8>,
     high_surrogate: Cell<Option<u16>>,
     /// A key the strip or the key table used. Its `WM_CHAR` must not reach the content.
-    swallow_char: Cell<bool>,
     /// A key the key table used. Its key-up must not reach the content either.
     swallow_up: Cell<Option<u16>>,
+    /// The left button went down on this window and has not come up, as far as it knows.
+    left_held: Cell<bool>,
+    /// The owner is answering `OpenMenuGroup`, so the menu it opens belongs to the bar.
+    answering_group: Cell<bool>,
     last_mouse: Cell<POINT>,
     ime_open: Cell<bool>,
     keys: RefCell<KeyTable>,
@@ -827,42 +852,33 @@ impl Shared {
         let result = self.with_state(message, |state| {
             let mut ctx = ViewContext::default();
             let was_focused = state.menu_bar.focused().is_some();
-            let bar_key = match event.kind {
-                InputKind::KeyDown {
-                    virtual_key,
-                    modifiers,
-                    ..
-                } => {
-                    virtual_key == VK_F10.0
-                        || matches!(virtual_key, 0x12 | 0xa4 | 0xa5)
-                        || (modifiers.alt && !modifiers.ctrl)
-                }
-                InputKind::KeyUp { virtual_key, .. } => matches!(virtual_key, 0x12 | 0xa4 | 0xa5),
+            let is_mouse = matches!(
+                event.kind,
                 InputKind::MouseMove { .. }
-                | InputKind::MouseDown { .. }
-                | InputKind::MouseUp { .. }
-                | InputKind::Wheel { .. }
-                | InputKind::Blur => true,
-                _ => false,
-            };
-            let bar_handled = if was_focused || bar_key {
-                state.menu_bar.handle(&event, &mut ctx)
+                    | InputKind::MouseDown { .. }
+                    | InputKind::MouseUp { .. }
+                    | InputKind::Wheel { .. }
+            );
+            // A press that began on the row keeps every mouse event until it ends.
+            let handled = if is_mouse && state.strip.holds_mouse() {
+                match state.strip.handle(&event, &mut ctx) {
+                    Handled::Yes => Handled::Yes,
+                    Handled::No => state.menu_bar.handle(&event, &mut ctx),
+                }
             } else {
-                Handled::No
-            };
-            let bar_open = state.menu_bar.take_open_request();
-            let handled = if bar_handled == Handled::Yes {
-                bar_handled
-            } else {
-                state.strip.handle(&event, &mut ctx)
+                match state.menu_bar.handle(&event, &mut ctx) {
+                    Handled::Yes => {
+                        // The pointer is on the bar now, so nothing on the row is under it.
+                        if matches!(event.kind, InputKind::MouseMove { .. }) {
+                            state.strip.pointer_left(&mut ctx);
+                        }
+                        Handled::Yes
+                    }
+                    Handled::No => state.strip.handle(&event, &mut ctx),
+                }
             };
             let mut events = state.strip.take_events();
-            if let Some((i, anchor)) = bar_open {
-                events.push(ShellEvent::OpenMenuGroup(i, anchor));
-            }
-            if was_focused && state.menu_bar.focused().is_none() {
-                events.push(ShellEvent::FocusContent);
-            }
+            bar_results(state, was_focused, &mut ctx, &mut events);
             (handled, ctx.requests, events)
         });
         let Some((handled, requests, events)) = result else {
@@ -1441,7 +1457,14 @@ impl Shared {
             return false;
         };
         self.swallow_up.set(Some(vk));
-        self.swallow_char.set(true);
+        swallow_char(true);
+        self.bar_action(|bar, ctx| {
+            bar.cancel_alt();
+            // A Ctrl chord goes back to the text, as every other Ctrl chord does.
+            if modifiers().ctrl && bar.focused().is_some() {
+                bar.leave(ctx);
+            }
+        });
         if !repeat {
             match action {
                 ShellAction::NewTab => self.queue.borrow_mut().push_back(ShellEvent::NewTab),
@@ -1451,7 +1474,11 @@ impl Shared {
         true
     }
     fn on_char(&self, unit: u16) {
-        if self.swallow_char.take() {
+        if SWALLOW_CHAR.take() {
+            return;
+        }
+        // Keys that pass the bar let go of it first, so a character here was not for the text.
+        if self.bar_has_focus() {
             return;
         }
         let high = self.high_surrogate.take();
@@ -1495,16 +1522,42 @@ impl Shared {
             let was_focused = state.menu_bar.focused().is_some();
             f(&mut state.menu_bar, &mut ctx);
             let mut events = Vec::new();
-            if let Some((index, anchor)) = state.menu_bar.take_open_request() {
-                events.push(ShellEvent::OpenMenuGroup(index, anchor));
-            }
-            if was_focused && state.menu_bar.focused().is_none() {
-                events.push(ShellEvent::FocusContent);
-            }
+            bar_results(state, was_focused, &mut ctx, &mut events);
             (ctx.requests, events)
         });
         if let Some((requests, events)) = result {
             self.apply(requests, events);
+        }
+    }
+    /// The open menu's tree in client dips. Its own places are on the screen.
+    fn menu_widgets(&self) -> Option<Widget> {
+        let run = self.menu.try_borrow().ok()?;
+        let mut tree = View::widgets(&run.as_ref()?.view)?;
+        let mut origin = POINT::default();
+        if unsafe { ClientToScreen(self.hwnd.get(), &mut origin) }.as_bool() {
+            let scale = self.scale();
+            shift_widgets(&mut tree, origin.x as f32 / scale, origin.y as f32 / scale);
+        }
+        Some(tree)
+    }
+    fn bar_has_focus(&self) -> bool {
+        self.with_state(WM_KEYDOWN, |state| state.menu_bar.focused().is_some())
+            .unwrap_or(false)
+    }
+    /// True when a new composition must not start in the text, because the keys belong to
+    /// a menu or the bar. One that began earlier goes on, so that its text is never lost.
+    fn ime_is_blocked(&self) -> bool {
+        !self.ime_open.get() && (self.menu_active.get() || self.bar_has_focus())
+    }
+    /// Asks the input method to drop what it has. It says no when it has nothing, and the
+    /// messages it sends stay out of the text either way, so its answer changes nothing.
+    fn cancel_ime(&self, hwnd: HWND) {
+        let context = unsafe { ImmGetContext(hwnd) };
+        if !context.is_invalid() {
+            unsafe {
+                let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                let _ = ImmReleaseContext(hwnd, context);
+            }
         }
     }
     fn open_group(&self) -> Option<usize> {
@@ -1514,8 +1567,12 @@ impl Shared {
     /// Opens a menu under `anchor`, in client dips, and returns at once. The menu runs on
     /// the window's normal message loop.
     fn open_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
-        // A switch between labels: the old menu goes, and the bar stays as it is.
+        // A switch between labels: the old menu goes, and the bar stays as it is. Any other
+        // menu, such as the caret list, takes over from the bar.
         self.end_menu(MenuEnd::Silent);
+        if !self.answering_group.get() {
+            self.bar_action(|bar, ctx| bar.leave(ctx));
+        }
         let opened = self.start_menu(model, anchor);
         if let Err(problem) = &opened {
             self.end_menu(MenuEnd::Silent);
@@ -1578,6 +1635,8 @@ impl Shared {
         .ok_or(ShellError::Reentered { message: 0 })?;
         if self.input_is_key.get() {
             view.open_keyboard();
+        } else if self.left_held.get() {
+            view.opened_by_held_press();
         }
         let weak = Rc::downgrade(self);
         let messages: PopupMessages = Rc::new(move |hwnd, msg, w, l| {
@@ -1733,6 +1792,18 @@ impl Shared {
             self.paint_menu();
         }
     }
+    /// The popups can go before their notice arrives. Nothing queued behind that may reach
+    /// a menu the user can no longer see.
+    fn end_if_dismissed(&self) {
+        let dismissed = self.menu_active.get()
+            && self.menu.try_borrow().is_ok_and(|run| {
+                run.as_ref()
+                    .is_some_and(|r| r.windows.dismissed().is_some())
+            });
+        if dismissed {
+            self.end_menu(MenuEnd::Leave);
+        }
+    }
     /// A key while a menu is open. It goes to the menu alone.
     fn menu_key_down(
         &self,
@@ -1747,12 +1818,19 @@ impl Shared {
         // Bit 29 says Alt is down. F10 alone is a system key too, and it has no such bit.
         key_mods.alt |= msg == WM_SYSKEYDOWN && l.0 & (1 << 29) != 0;
         let alt_key = matches!(vk, 0x12 | 0xa4 | 0xa5);
-        self.swallow_char.set(true);
+        if !repeat && self.swallow_up.get() == Some(vk) {
+            self.swallow_up.set(None);
+        }
+        swallow_char(true);
         // AltGr reaches Windows programs as Ctrl plus Alt, and it types into the menu.
         if key_mods.alt && !key_mods.ctrl && !alt_key {
+            // These never reach the view, but Alt's release must not count as a tap.
+            if let Some(run) = self.menu.borrow_mut().as_mut() {
+                run.view.cancel_alt_tap();
+            }
             if vk == VK_F4_KEY || vk == VK_SPACE_KEY {
                 self.end_menu(MenuEnd::Leave);
-                self.swallow_char.set(false);
+                swallow_char(false);
                 return default();
             }
             if let Some(index) = MenuBar::mnemonic_label(vk)
@@ -1766,8 +1844,18 @@ impl Shared {
             }
             return LRESULT(0);
         }
-        if vk == VK_F10.0 {
-            self.end_menu(MenuEnd::Leave);
+        if vk == VK_F10.0 && !key_mods.shift && !key_mods.ctrl {
+            // A held F10 acts once.
+            if repeat {
+                return LRESULT(0);
+            }
+            if self.open_group().is_some() {
+                self.end_menu(MenuEnd::Leave);
+            } else {
+                // From the caret list, the keyboard moves on to the bar.
+                self.end_menu(MenuEnd::Silent);
+                self.bar_action(|bar, ctx| bar.focus_first(ctx));
+            }
             self.swallow_up.set(Some(vk));
             return LRESULT(0);
         }
@@ -1799,8 +1887,9 @@ impl Shared {
             },
             end,
         );
-        // The menu has no use for a letter's key down: its `WM_CHAR` is what counts.
-        self.swallow_char.set(handled == Handled::Yes);
+        // The menu has no use for a letter's key down: its `WM_CHAR` is what counts. A held
+        // letter is not typed again: the key that opened this menu must not run its row.
+        swallow_char(handled == Handled::Yes || repeat);
         if !self.menu_active.get() {
             self.swallow_up.set(Some(vk));
         }
@@ -1828,6 +1917,10 @@ impl Shared {
     /// the menu's own dips: the screen's pixels over the scale.
     fn menu_mouse(&self, hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         self.input_is_key.set(false);
+        if msg == WM_LBUTTONUP {
+            self.left_held.set(false);
+        }
+        self.end_if_dismissed();
         if !self.menu_active.get() {
             return None;
         }
@@ -1920,12 +2013,34 @@ impl Shared {
             }
             _ => {}
         }
+        match msg {
+            WM_LBUTTONDOWN => self.left_held.set(true),
+            WM_LBUTTONUP => self.left_held.set(false),
+            _ => {}
+        }
+        // Some of these take paths that never reach the bar, such as a drag of the title.
+        if matches!(
+            msg,
+            WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_XBUTTONDOWN
+                | WM_NCLBUTTONDOWN
+                | WM_NCRBUTTONDOWN
+                | WM_NCMBUTTONDOWN
+                | WM_NCXBUTTONDOWN
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+        ) {
+            self.with_state(msg, |state| state.menu_bar.cancel_alt());
+        }
+        self.end_if_dismissed();
         if self.menu_active.get() {
             match msg {
                 WM_KEYDOWN | WM_SYSKEYDOWN => return self.menu_key_down(msg, w, l, default),
                 WM_KEYUP | WM_SYSKEYUP => return self.menu_key_up(msg, w),
                 WM_CHAR => {
-                    if !self.swallow_char.take()
+                    if !SWALLOW_CHAR.take()
                         && let Some(c) = char::from_u32(w.0 as u32)
                     {
                         self.menu_event(InputKind::Char(c), MenuEnd::Leave);
@@ -1944,7 +2059,7 @@ impl Shared {
                 WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => return LRESULT(0),
                 // The owner answers a close and must find no menu in the way. The others
                 // leave a popup in the wrong place, or take away what its keys depend on.
-                WM_CLOSE | WM_KILLFOCUS | WM_DPICHANGED | WM_SIZE | WM_MOVE => {
+                WM_CLOSE | WM_KILLFOCUS | WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SIZE | WM_MOVE => {
                     self.end_menu(MenuEnd::Leave);
                 }
                 WM_DESTROY => self.end_menu(MenuEnd::Silent),
@@ -2151,17 +2266,22 @@ impl Shared {
                 LRESULT(0)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
-                // A held key that closed a menu must not go on into the text.
-                if l.0 & (1 << 30) != 0 && self.swallow_up.get() == Some(w.0 as u16) {
-                    self.swallow_char.set(true);
-                    return LRESULT(0);
+                // A held key that closed a menu must not go on into the text. A new press
+                // of that key means its release went elsewhere, such as to a dialog.
+                if self.swallow_up.get() == Some(w.0 as u16) {
+                    if l.0 & (1 << 30) != 0 {
+                        swallow_char(true);
+                        return LRESULT(0);
+                    }
+                    self.swallow_up.set(None);
                 }
                 // Bit 30 says that the key was already down: this is a repeat.
                 if self.on_key_table(w.0 as u16, l.0 & (1 << 30) != 0) {
                     return LRESULT(0);
                 }
                 let mut key_mods = modifiers();
-                key_mods.alt |= msg == WM_SYSKEYDOWN;
+                // Bit 29 says Alt is down. F10 alone is a system key too, and it has no such bit.
+                key_mods.alt |= msg == WM_SYSKEYDOWN && l.0 & (1 << 29) != 0;
                 let (handled, event) = self.input(
                     msg,
                     InputKind::KeyDown {
@@ -2201,6 +2321,11 @@ impl Shared {
                     LRESULT(0)
                 }
             }
+            WM_IME_STARTCOMPOSITION if self.ime_is_blocked() => {
+                self.cancel_ime(hwnd);
+                LRESULT(0)
+            }
+            WM_IME_COMPOSITION if self.ime_is_blocked() => LRESULT(0),
             WM_IME_STARTCOMPOSITION => {
                 self.ime_open.set(true);
                 self.to_content(InputKind::ImeStart);
@@ -2282,12 +2407,12 @@ impl Shared {
         let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         if handled == Handled::Yes {
             if down {
-                self.swallow_char.set(true);
+                swallow_char(true);
             }
             return LRESULT(0);
         }
         if down {
-            self.swallow_char.set(false);
+            swallow_char(false);
         }
         self.queue
             .borrow_mut()
@@ -2317,7 +2442,10 @@ impl Shared {
             let Some(event) = event else {
                 break;
             };
+            self.answering_group
+                .set(matches!(event, ShellEvent::OpenMenuGroup(..)));
             handler(&handle, event);
+            self.answering_group.set(false);
         }
         self.dispatching.set(false);
         let mut slot = self.handler.borrow_mut();
@@ -2325,6 +2453,32 @@ impl Shared {
             *slot = Some(handler);
         }
     }
+}
+
+fn clear_focus(widget: &mut Widget) {
+    widget.states.focused = false;
+    widget.children.iter_mut().for_each(clear_focus);
+}
+/// Moves a tree from one place to another. A row out of view has an empty rectangle, and
+/// it stays empty.
+fn shift_widgets(widget: &mut Widget, dx: f32, dy: f32) {
+    if widget.bounds != ApiRect::default() {
+        widget.bounds.x.0 -= dx;
+        widget.bounds.y.0 -= dy;
+    }
+    for child in &mut widget.children {
+        shift_widgets(child, dx, dy);
+    }
+}
+
+thread_local! {
+    /// The key being handled needs no character. `run_message_loop` then skips translating
+    /// it, so that no character exists to go astray, and an input method never sees the
+    /// key. A loop that translates first still works: `on_char` reads this and eats one.
+    static SWALLOW_CHAR: Cell<bool> = const { Cell::new(false) };
+}
+fn swallow_char(value: bool) {
+    SWALLOW_CHAR.set(value);
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -2361,7 +2515,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             return DefWindowProcW(hwnd, msg, w, l);
         }
         let result = shared.on_message(hwnd, msg, w, l);
+        // The owner's handler may run a nested loop. This key's own answer still counts.
+        let swallow = SWALLOW_CHAR.get();
         shared.dispatch();
+        SWALLOW_CHAR.set(swallow);
         result
     }
 }
@@ -2439,18 +2596,30 @@ impl ShellHandle {
             .map_err(|_| ShellError::Reentered { message: 0 })?;
         Ok(state.theme)
     }
-    /// The top row and menu bar for the screen reader provider.
+    /// The top row, the menu bar and any open menu, for the screen reader provider. An open
+    /// bar menu lies under its label, and the caret list under this tree's root. Every
+    /// place is in client dips, and at most one widget says it has the focus.
     pub fn widgets(&self) -> Result<Widget, ShellError> {
         let shared = self.live()?;
+        let popup = shared.menu_widgets();
         let state = shared
             .state
             .try_borrow()
             .map_err(|_| ShellError::Reentered { message: 0 })?;
-        let mut children = Vec::with_capacity(2);
-        if let Some(strip) = state.strip.widgets() {
+        let mut children = Vec::with_capacity(3);
+        if let Some(mut strip) = state.strip.widgets() {
+            if popup.is_some() {
+                clear_focus(&mut strip);
+            }
             children.push(strip);
         }
-        children.push(state.menu_bar.widgets());
+        let mut bar = state.menu_bar.widgets();
+        match (popup, state.menu_bar.open()) {
+            (Some(menu), Some(open)) => bar.children[open].children.push(menu),
+            (Some(menu), None) => children.push(menu),
+            (None, _) => {}
+        }
+        children.push(bar);
         Ok(Widget {
             id: WidgetId(9_999),
             bounds: ApiRect {
@@ -2482,7 +2651,8 @@ impl ShellHandle {
     }
     /// Opens a menu under `anchor`, in client dips, and returns at once. Call it to answer
     /// `ShellEvent::OpenMenuGroup` and `ShellEvent::OpenCaretList`, with their rectangle.
-    /// It replaces a menu that is open, which is how a switch between labels works.
+    /// It replaces a menu that is open, which is how a switch between labels works. Called
+    /// from outside the answer to `OpenMenuGroup`, it also takes the focus from the bar.
     ///
     /// The menu runs on the window's normal message loop, so the owner's other events keep
     /// coming. A chosen command arrives as `ShellEvent::RunCommand`, after every popup has
@@ -2726,8 +2896,9 @@ impl ShellWindow {
             invalidated: RefCell::new(Vec::new()),
             content_buttons: Cell::new(0),
             high_surrogate: Cell::new(None),
-            swallow_char: Cell::new(false),
             swallow_up: Cell::new(None),
+            left_held: Cell::new(false),
+            answering_group: Cell::new(false),
             last_mouse: Cell::new(POINT::default()),
             ime_open: Cell::new(false),
             keys: RefCell::new(KeyTable::default()),
@@ -2899,9 +3070,23 @@ pub fn run_message_loop() -> Result<i32, ShellError> {
         if result.0 == 0 {
             return Ok(msg.wParam.0 as i32);
         }
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        dispatch_translating(&msg);
+    }
+}
+/// Sends one message on. A key goes to its window first, and is translated only if that
+/// window wants its character. So each queued key decides for itself, however many wait.
+/// A loop of another kind, such as a text service's pump, should end with this call.
+pub fn dispatch_translating(msg: &MSG) {
+    unsafe {
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            SWALLOW_CHAR.set(false);
+            DispatchMessageW(msg);
+            if !SWALLOW_CHAR.take() {
+                let _ = TranslateMessage(msg);
+            }
+        } else {
+            let _ = TranslateMessage(msg);
+            DispatchMessageW(msg);
         }
     }
 }
@@ -2912,6 +3097,24 @@ pub fn quit_message_loop(code: i32) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_high_contrast_theme_gives_the_highlight_its_own_text_color() {
+        let colors = ContrastColors {
+            window: Color::rgb(0, 0, 0),
+            window_text: Color::rgb(255, 255, 255),
+            highlight: Color::rgb(26, 235, 255),
+            highlight_text: Color::rgb(1, 2, 3),
+            gray_text: Color::rgb(63, 242, 63),
+        };
+        for dark in [false, true] {
+            let tokens = qe_ui::UiTokens::from_theme(&build_theme(dark, Some(colors)));
+            assert_eq!(tokens.hover, colors.highlight);
+            assert_eq!(tokens.hover_text, colors.highlight_text);
+        }
+    }
+
     #[test]
     fn existing_window_class_allows_second_window() {
         assert!(super::class_registration_ok(0, 1410));

@@ -446,3 +446,352 @@ fn the_hover_highlight_goes_when_the_pointer_leaves() {
     bar.pointer_left(&mut again);
     assert!(again.requests.is_empty(), "no highlight is left to repaint");
 }
+
+fn laid_out_bar() -> MenuBar {
+    let mut bar = MenuBar::new(WidgetId(100));
+    bar.layout(
+        Rect {
+            x: Dip(0.0),
+            y: Dip(40.0),
+            width: Dip(400.0),
+            height: Dip(32.0),
+        },
+        &Measure,
+    );
+    bar
+}
+fn send_kind(bar: &mut MenuBar, kind: InputKind) -> qe_api::Handled {
+    bar.handle(
+        &InputEvent { time_us: 0, kind },
+        &mut ViewContext::default(),
+    )
+}
+fn plain_key(virtual_key: u16, modifiers: Modifiers, repeat: bool) -> InputKind {
+    InputKind::KeyDown {
+        virtual_key,
+        modifiers,
+        repeat,
+    }
+}
+const ALT_ONLY: Modifiers = Modifiers {
+    alt: true,
+    ctrl: false,
+    shift: false,
+    win: false,
+};
+fn tap_alt(bar: &mut MenuBar) {
+    send_kind(bar, plain_key(0x12, ALT_ONLY, false));
+    send_kind(
+        bar,
+        InputKind::KeyUp {
+            virtual_key: 0x12,
+            modifiers: ALT_ONLY,
+        },
+    );
+}
+
+#[test]
+fn every_size_comes_from_the_theme() {
+    let theme = qe_api::Theme::new(qe_api::ThemeKind::Light);
+    let bar = laid_out_bar();
+    let first = bar.label_rect(0);
+    assert_eq!(first.x, theme.menu_bar_inset);
+    assert_eq!(
+        first.width.0,
+        "File".len() as f32 * 7.0 + theme.menu_bar_label_padding.0 * 2.0
+    );
+    assert_eq!(bar.label_rect(1).x.0, first.x.0 + first.width.0);
+    let mut focused = laid_out_bar();
+    tap_alt(&mut focused);
+    let mut list = qe_api::DisplayList::default();
+    focused.draw(&mut list, &theme, &Measure);
+    let text_x = list.commands.iter().find_map(|c| match c {
+        qe_api::DrawCommand::TextRun { text, at, .. } if &**text == "File" => Some(at.x.0),
+        _ => None,
+    });
+    assert_eq!(text_x, Some(first.x.0 + theme.menu_bar_label_padding.0));
+    let (width, line_y) = list
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            qe_api::DrawCommand::Line { width, from, .. } => Some((width.0, from.y.0)),
+            _ => None,
+        })
+        .expect("the focused label underlines its letter");
+    assert_eq!(width, theme.menu_bar_underline_width.0);
+    let text_y = (32.0 - 16.0) / 2.0 + 40.0 + 12.0;
+    assert_eq!(line_y, text_y + theme.menu_bar_underline_offset.0);
+}
+
+#[test]
+fn the_bar_is_the_color_of_the_active_tab() {
+    for theme in [
+        qe_api::Theme::new(qe_api::ThemeKind::Light),
+        qe_api::Theme::new(qe_api::ThemeKind::Dark),
+    ] {
+        let mut list = qe_api::DisplayList::default();
+        laid_out_bar().draw(&mut list, &theme, &Measure);
+        match &list.commands[0] {
+            qe_api::DrawCommand::FillRect { color, .. } => {
+                assert_eq!(*color, theme.text_background)
+            }
+            other => panic!("the bar starts with {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn only_one_widget_says_focused_and_the_role_is_a_menu_bar() {
+    let mut bar = laid_out_bar();
+    assert_eq!(bar.widgets().role, qe_api::WidgetRole::MenuBar);
+    tap_alt(&mut bar);
+    let tree = bar.widgets();
+    assert!(!tree.states.focused, "the bar itself never says focused");
+    assert_eq!(
+        tree.children
+            .iter()
+            .filter(|label| label.states.focused)
+            .count(),
+        1
+    );
+    // Once a menu opens, its row has the focus, and the label says only that it is open.
+    send_kind(&mut bar, plain_key(0x28, Modifiers::default(), false));
+    let tree = bar.widgets();
+    assert_eq!(bar.focused(), Some(0));
+    assert!(tree.children.iter().all(|label| !label.states.focused));
+    assert!(tree.children[0].states.expanded);
+}
+
+#[test]
+fn shift_f10_and_alt_f10_never_take_the_focus() {
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    for modifiers in [shift, ALT_ONLY] {
+        let mut bar = laid_out_bar();
+        let got = send_kind(&mut bar, plain_key(0x79, modifiers, false));
+        assert_eq!(got, qe_api::Handled::No);
+        assert_eq!(bar.focused(), None);
+    }
+}
+
+#[test]
+fn a_held_f10_or_enter_changes_nothing() {
+    let mut bar = laid_out_bar();
+    send_kind(&mut bar, plain_key(0x79, Modifiers::default(), false));
+    send_kind(&mut bar, plain_key(0x79, Modifiers::default(), true));
+    assert_eq!(bar.focused(), Some(0));
+    send_kind(&mut bar, plain_key(0x0d, Modifiers::default(), true));
+    assert_eq!(bar.take_open_request(), None);
+    send_kind(&mut bar, plain_key(0x0d, Modifiers::default(), false));
+    assert_eq!(bar.take_open_request().map(|v| v.0), Some(0));
+}
+
+#[test]
+fn a_ctrl_chord_lets_go_and_a_lone_ctrl_does_not() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    let altgr = Modifiers {
+        ctrl: true,
+        alt: true,
+        ..Default::default()
+    };
+    let mut bar = laid_out_bar();
+    tap_alt(&mut bar);
+    assert_eq!(
+        send_kind(&mut bar, plain_key(0x11, ctrl, false)),
+        qe_api::Handled::Yes
+    );
+    assert_eq!(bar.focused(), Some(0));
+    assert_eq!(
+        send_kind(&mut bar, plain_key(b'X'.into(), ctrl, false)),
+        qe_api::Handled::No
+    );
+    assert_eq!(bar.focused(), None);
+    tap_alt(&mut bar);
+    assert_eq!(
+        send_kind(&mut bar, plain_key(b'E'.into(), altgr, false)),
+        qe_api::Handled::No
+    );
+    assert_eq!(bar.focused(), None);
+    assert_eq!(bar.take_open_request(), None);
+}
+
+#[test]
+fn any_press_or_wheel_cancels_a_held_alt() {
+    let outside = qe_api::Point {
+        x: Dip(300.0),
+        y: Dip(300.0),
+    };
+    for kind in [
+        InputKind::MouseDown {
+            at: outside,
+            button: qe_api::MouseButton::Left,
+            modifiers: ALT_ONLY,
+        },
+        InputKind::MouseDown {
+            at: outside,
+            button: qe_api::MouseButton::Right,
+            modifiers: ALT_ONLY,
+        },
+        InputKind::Wheel {
+            at: outside,
+            delta_x: 0.0,
+            delta_y: 1.0,
+            modifiers: ALT_ONLY,
+        },
+    ] {
+        let mut bar = laid_out_bar();
+        send_kind(&mut bar, plain_key(0x12, ALT_ONLY, false));
+        send_kind(&mut bar, kind);
+        send_kind(
+            &mut bar,
+            InputKind::KeyUp {
+                virtual_key: 0x12,
+                modifiers: ALT_ONLY,
+            },
+        );
+        assert_eq!(bar.focused(), None);
+    }
+}
+
+#[test]
+fn a_right_or_middle_press_outside_lets_go_of_the_focus() {
+    for button in [qe_api::MouseButton::Right, qe_api::MouseButton::Middle] {
+        let mut bar = laid_out_bar();
+        tap_alt(&mut bar);
+        let got = send_kind(
+            &mut bar,
+            InputKind::MouseDown {
+                at: qe_api::Point {
+                    x: Dip(300.0),
+                    y: Dip(300.0),
+                },
+                button,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert_eq!(got, qe_api::Handled::No, "the press goes on to the text");
+        assert_eq!(bar.focused(), None);
+    }
+}
+
+fn submenu_view() -> qe_ui::MenuView {
+    let child = qe_ui::MenuModel {
+        items: vec![qe_ui::MenuItem::command("Child", CommandId::Quit)],
+    };
+    let mut view = qe_ui::MenuView::new(
+        WidgetId(300),
+        "Test",
+        qe_ui::MenuModel {
+            items: vec![
+                qe_ui::MenuItem::submenu("Parent", child),
+                qe_ui::MenuItem::command("Plain", CommandId::About),
+            ],
+        },
+    );
+    view.layout(
+        Rect {
+            x: Dip(0.0),
+            y: Dip(0.0),
+            width: Dip(200.0),
+            height: Dip(120.0),
+        },
+        &Measure,
+    );
+    view
+}
+fn view_key(view: &mut qe_ui::MenuView, vk: u16, repeat: bool) -> Vec<qe_api::ViewRequest> {
+    let mut ctx = ViewContext::default();
+    view.handle(
+        &InputEvent {
+            time_us: 1,
+            kind: plain_key(vk, Modifiers::default(), repeat),
+        },
+        &mut ctx,
+    );
+    ctx.requests
+}
+
+#[test]
+fn a_key_that_moves_off_a_hovered_row_ends_its_submenu_wait() {
+    let t = qe_ui::UiTokens::sizes();
+    let mut view = submenu_view();
+    view.handle(
+        &InputEvent {
+            time_us: 0,
+            kind: InputKind::MouseMove {
+                at: qe_api::Point {
+                    x: Dip(20.0),
+                    y: Dip(t.inset.0 + t.menu_row.0 / 2.0),
+                },
+            },
+        },
+        &mut ViewContext::default(),
+    );
+    assert!(view.waiting_for_submenu());
+    view_key(&mut view, 0x28, false);
+    assert!(!view.waiting_for_submenu(), "the timer has no more work");
+    view_key(&mut view, 0x26, false);
+    assert_eq!(view.tick(u64::MAX), None, "nothing opens by itself");
+    assert_eq!(view.levels().len(), 1);
+}
+
+#[test]
+fn a_repeated_enter_or_space_in_a_menu_does_nothing() {
+    for vk in [0x0du16, 0x20] {
+        let mut view = submenu_view();
+        view.open_keyboard();
+        view_key(&mut view, 0x28, false);
+        let requests = view_key(&mut view, vk, true);
+        assert!(!view.closed);
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, qe_api::ViewRequest::Run(_)))
+        );
+        assert!(
+            view_key(&mut view, vk, false)
+                .iter()
+                .any(|r| matches!(r, qe_api::ViewRequest::Run(_)))
+        );
+    }
+}
+
+#[test]
+fn a_row_with_a_submenu_says_it_has_a_popup() {
+    let tree = View::widgets(&submenu_view()).unwrap();
+    assert!(tree.children[0].states.has_popup);
+    assert!(!tree.children[1].states.has_popup);
+}
+
+fn command_list(model: &qe_ui::MenuModel, out: &mut Vec<String>) {
+    for item in &model.items {
+        if let Some(command) = item.command {
+            out.push(format!("{command:?}"));
+        }
+        if let Some(submenu) = &item.submenu {
+            command_list(submenu, out);
+        }
+    }
+}
+/// A set would hide a command listed twice, so this counts each one.
+#[test]
+fn no_command_is_listed_twice_or_lost_when_counted() {
+    let mut now = Vec::new();
+    command_list(
+        &qe_ui::MenuModel {
+            items: menu_bar_groups(),
+        },
+        &mut now,
+    );
+    command_list(&caret_menu(), &mut now);
+    let mut before = Vec::new();
+    command_list(&qe_ui::legacy_caret_menu(), &mut before);
+    now.sort();
+    before.sort();
+    assert_eq!(now, before);
+}

@@ -93,7 +93,11 @@ impl MenuRun {
         let wanted = rects.len().max(levels.len());
         levels.resize_with(wanted, || None);
         for (depth, popup) in self.windows.levels().iter().enumerate() {
-            let rect = rects[depth];
+            // A window whose level has gone. Only a dismissed menu can differ like this, and
+            // its window is about to go too.
+            let Some(&rect) = rects.get(depth) else {
+                break;
+            };
             let size = (
                 (rect.width.0 * self.scale).round() as u32,
                 (rect.height.0 * self.scale).round() as u32,

@@ -230,6 +230,8 @@ pub struct PageReport {
     pub media_box: [f64; 4],
     pub glyphs: Vec<PlacedGlyph>,
     pub form_calls: usize,
+    /// The text of each `/ActualText` span, in file order.
+    pub actual_text: Vec<String>,
 }
 
 /// One font as the checker read it.
@@ -557,6 +559,18 @@ fn load_font(
     let mut report = read_cff(&program).map_err(|e| format!("font {base}: {e}"))?;
     report.base_font = base.clone();
     report.program_bytes = program.len();
+    // A reader can use this box to clip. A font with shapes needs one with some area.
+    let Some(Value::Array(font_box)) = descriptor.get("FontBBox") else {
+        return Err(format!("font {base} has no /FontBBox"));
+    };
+    let side = |low: usize, high: usize| {
+        font_box.get(high).and_then(Value::number).unwrap_or(0.0)
+            - font_box.get(low).and_then(Value::number).unwrap_or(0.0)
+    };
+    let has_shapes = report.charstrings.iter().any(|string| string.len() > 1);
+    if has_shapes && (side(0, 2) <= 0.0 || side(1, 3) <= 0.0) {
+        return Err(format!("font {base} has shapes and an empty /FontBBox"));
+    }
     let Some(Value::Array(widths)) = descendant.get("W") else {
         return Err(format!("font {base} has no /W"));
     };
@@ -586,12 +600,26 @@ fn read_to_unicode(map: &[u8]) -> Result<HashMap<u16, String>, String> {
     }
     let mut out = HashMap::new();
     let mut block = false;
+    let (mut claimed, mut held) = (0usize, 0usize);
     for line in text.lines() {
-        if line.ends_with("beginbfchar") {
+        if let Some(count) = line.strip_suffix(" beginbfchar") {
             block = true;
+            held = 0;
+            claimed = count.parse().map_err(|_| "a bfchar block has no count")?;
+            if claimed > 100 {
+                return Err(format!(
+                    "a bfchar block has {claimed} entries, and PDF allows 100"
+                ));
+            }
         } else if line == "endbfchar" {
             block = false;
+            if held != claimed {
+                return Err(format!(
+                    "a bfchar block says {claimed} entries and has {held}"
+                ));
+            }
         } else if block {
+            held += 1;
             let (code, value) = line.split_once(' ').ok_or("a bfchar line is bad")?;
             let code = code.trim_matches(['<', '>']);
             let code = u16::from_str_radix(code, 16).map_err(|_| "a bfchar code is bad")?;
@@ -884,9 +912,13 @@ fn read_content(
     let (mut x, mut y) = (0.0f64, 0.0f64);
     let mut depth = 0i32;
     let mut in_text = false;
+    let mut marked = 0usize;
     loop {
         parser.skip_space();
         let Some(&byte) = content.get(parser.at) else {
+            if marked != 0 {
+                return Err("a marked span has no EMC".into());
+            }
             break;
         };
         let is_operator = byte.is_ascii_alphabetic() || byte == b'\'' || byte == b'"';
@@ -920,6 +952,38 @@ fn read_content(
                     return Err("ET without BT".into());
                 }
                 in_text = false;
+            }
+            "BDC" => {
+                // A span must sit wholly in a text block or wholly outside one.
+                if in_text {
+                    return Err("this writer's marked spans sit outside text blocks".into());
+                }
+                let Some(Value::Text(utf16)) = stack.get(1).and_then(|dict| dict.get("ActualText"))
+                else {
+                    return Err("a marked span has no /ActualText".into());
+                };
+                let (mark, units) = utf16
+                    .split_first_chunk::<2>()
+                    .ok_or("an /ActualText has no byte-order mark")?;
+                if mark != &[0xFE, 0xFF] {
+                    return Err("an /ActualText has no byte-order mark".into());
+                }
+                let units: Vec<u16> = units
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes(*pair))
+                    .collect();
+                out.actual_text.push(
+                    String::from_utf16(&units).map_err(|_| "an /ActualText splits a character")?,
+                );
+                marked += 1;
+            }
+            "EMC" => {
+                if in_text {
+                    return Err("EMC inside a text block".into());
+                }
+                marked = marked.checked_sub(1).ok_or("EMC without BDC")?;
             }
             "Tf" => {
                 let name = stack
@@ -1046,6 +1110,46 @@ mod map_tests {
                 let _ = read_cff(&bad);
             }
         }
+    }
+
+    #[test]
+    fn a_map_block_over_100_entries_or_with_a_wrong_count_is_refused() {
+        let block = |count: usize, entries: usize| {
+            let lines: String = (0..entries)
+                .map(|n| format!("<{n:04X}> <0061>\n"))
+                .collect();
+            format!(
+                "begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n{count} beginbfchar\n{lines}endbfchar\nendcmap\n"
+            )
+        };
+        assert!(read_to_unicode(block(100, 100).as_bytes()).is_ok());
+        let problem = read_to_unicode(block(101, 101).as_bytes()).unwrap_err();
+        assert!(problem.contains("allows 100"), "{problem}");
+        let problem = read_to_unicode(block(3, 4).as_bytes()).unwrap_err();
+        assert!(problem.contains("says 3"), "{problem}");
+    }
+
+    fn content_problem(content: &[u8]) -> String {
+        let file = File {
+            bytes: b"",
+            offsets: Vec::new(),
+        };
+        let none = Value::Dict(HashMap::new());
+        let mut fonts = HashMap::new();
+        let mut page = PageReport::default();
+        read_content(&file, content, &none, &mut fonts, &mut page, &none).unwrap_err()
+    }
+
+    #[test]
+    fn a_marked_span_that_is_not_whole_is_refused() {
+        let span = b"/Span << /ActualText <FEFF0061> >> BDC";
+        assert!(content_problem(span).contains("no EMC"));
+        assert!(content_problem(b"EMC").contains("without BDC"));
+        let mut inside = b"BT ".to_vec();
+        inside.extend_from_slice(span);
+        assert!(content_problem(&inside).contains("outside text blocks"));
+        assert!(content_problem(b"/Span << >> BDC").contains("no /ActualText"));
+        assert!(content_problem(b"/Span << /ActualText <0061> >> BDC").contains("byte-order"));
     }
 
     #[test]

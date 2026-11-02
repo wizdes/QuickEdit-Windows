@@ -20,7 +20,7 @@ let options = PdfOptions {
     tab_width,
     header_and_footer: number_pages_when_printing,
     rewrap: frame.page_wrap() || wrap_to_fit_when_printing,
-    window_width_dips: editor.text_area().width.0,
+    window_width_dips: frame.window_width_at_100_percent(&editor),
     title: display_name,
     date: header_date_now(),
     ..PdfOptions::default()
@@ -28,7 +28,7 @@ let options = PdfOptions {
 let job = export_worker(editor.worker_snapshot(), options, path, Some(wake))?;
 ```
 
-On each wake from the job, a host does two things:
+`is_finished` is true by the last wake, so a host needs no polling. On each wake from the job, a host does two things:
 
 1. If `job.wants_snapshot()` says true, it calls `job.offer_snapshot(editor.worker_snapshot())`. The label can say the file is still being read.
 2. If `job.is_finished()` says true, it calls `job.join()`.
@@ -56,7 +56,21 @@ A mapped file's snapshot holds what its index knew when it was taken. Every line
 
 ## What reaches the PDF's text
 
-The rule is that copying from the PDF gives the document's text, in the store's order within each run.
+The file's own ToUnicode map always gives the document's text, in the store's order within each run. `check_pdf` proves that for every test PDF. What a reader hands back also depends on the reader, so the promise for readers is only what the table below measured.
+
+A left-to-right run that is not plain, such as Devanagari or Thai, also carries its whole text in a `/Span << /ActualText ... >> BDC` span. A reader that honors it does not rebuild the text from where the glyphs sit.
+
+Measured with xpdf `pdftotext` 4.06 (default and `-raw` modes) and MuPDF 2.0, on 2026-11-02:
+
+| Text | xpdf | MuPDF |
+| --- | --- | --- |
+| Latin, CJK, emoji, Devanagari, Thai, one mark on a letter | Exact | Exact |
+| Arabic, Hebrew | Letters exact in default mode, between direction marks U+202B and U+202C. A space can move at a change of direction. `-raw` puts Arabic one letter a line | Exact |
+| Pointed Hebrew | Exact in `-raw`. Default mode moves the marks | Exact |
+| 2 to 8 marks on one letter | Every mark kept, with a space after the stack | Keeps 2 identical marks and drops the rest |
+| 9 or more marks on one letter | Loses marks: 25 of 200 in default mode, 49 of 200 in `-raw` | Keeps 2 identical marks and drops the rest |
+
+Right-to-left runs and stacks over 8 marks have no span, because xpdf then gave worse text: a right-to-left run came out backward, and a letter under 200 marks was lost. Acrobat and Edge were not measured.
 
 - **Tabs:** layout makes no glyph for a tab. Each tab goes in the file as a CID with an empty shape, the width of the tab and a map entry that says tab, so a reader's selection covers it. `pdftotext` turns it into a space or keeps it, as that reader does for any PDF.
 - **Characters that draw nothing:** soft hyphen, zero-width space, the byte-order mark, direction marks and control characters reach the text the same way when layout gives them no glyph. When a glyph holds them, they stay with that glyph's entry.

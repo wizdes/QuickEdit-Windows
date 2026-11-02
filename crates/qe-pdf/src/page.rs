@@ -388,6 +388,14 @@ impl PageBuilder {
                 .any(|piece| piece.is_empty() || piece.len() > MOST_MAP_UNITS)
             && run.offsets.iter().all(|o| o.x.0 == 0.0 && o.y.0 == 0.0)
             && !fonts.has_color(run.font_id).map_err(PdfError::Font)?;
+        // Readers rebuild text from where glyphs sit, and can drop or swap marks that overlap.
+        // So a left-to-right run that is not plain also carries its text whole, in the store's
+        // order. Measured in xpdf: a right-to-left run comes out backward with this, and a
+        // letter under many marks is lost, so those two go without. See the README.
+        let span = !plain && !right_to_left && longest_stack(run) <= MOST_MARKS_IN_A_SPAN;
+        if span {
+            self.begin_actual_text(text);
+        }
         let mut pen = at.0;
         let mut open_font = None;
         for index in 0..count {
@@ -485,7 +493,21 @@ impl PageBuilder {
         if open_font.is_some() {
             self.content.extend_from_slice(b">] TJ\n");
         }
+        if span {
+            self.content.extend_from_slice(b"ET\nEMC\nBT\n");
+        }
         Ok(())
+    }
+
+    /// Opens a marked span with this text. Such a span must not cross a text block's end, and a
+    /// color glyph or a shape ends the block, so the span goes around a block of its own.
+    fn begin_actual_text(&mut self, text: &str) {
+        self.content
+            .extend_from_slice(b"ET\n/Span << /ActualText <FEFF");
+        for unit in text.encode_utf16() {
+            hex16(&mut self.content, unit);
+        }
+        self.content.extend_from_slice(b"> >> BDC\nBT\n");
     }
 
     /// Draws a glyph's shapes at a place, in the middle of a text block.
@@ -715,6 +737,19 @@ impl PageBuilder {
     }
 }
 
+/// The most glyphs with no width in a row that a run may hold and still carry its whole text.
+const MOST_MARKS_IN_A_SPAN: usize = 8;
+
+/// The longest row of glyphs with no width in this run.
+fn longest_stack(run: &LayoutGlyphRun) -> usize {
+    let (mut longest, mut held) = (0, 0);
+    for advance in &run.advances {
+        held = if advance.0 == 0.0 { held + 1 } else { 0 };
+        longest = longest.max(held);
+    }
+    longest
+}
+
 /// Six decimals, for a form's scale, which is a small number.
 fn number6(out: &mut Vec<u8>, value: f64) {
     out.extend_from_slice(format!("{value:.6}").as_bytes());
@@ -728,7 +763,14 @@ struct LaidOutText {
 fn lay_out_text(engine: &DirectWriteLayout, text: &str) -> Result<LaidOutText, PdfError> {
     let one_line: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        // These end a line too, and only the first row is kept, so the tail would be lost.
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let store = StringStore::new(one_line);
     let layout = engine

@@ -706,3 +706,38 @@ fn a_map_drag_beats_a_button_held_since_before_it() {
     );
     assert!(scene.editor.scroll_offset() > before);
 }
+
+// ---- The second review: the tab width ----
+
+#[test]
+fn a_new_tab_width_reaches_the_map_at_once() {
+    let text = "\tx\n".repeat(50);
+    let mut scene = Scene::from_text(&text, 900.0, 400.0);
+    let left = scene.frame.map_area().x.0;
+    let block_x = |scene: &Scene| {
+        scene
+            .list(ThemeKind::Light)
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRects { rects, .. } => Some(rects.clone()),
+                _ => None,
+            })
+            .flatten()
+            .find(|rect| rect.x.0 >= left)
+            .map(|rect| rect.x.0)
+            .unwrap()
+    };
+    let at_eight = block_x(&scene);
+    let mut ctx = ViewContext::default();
+    let jobs = scene.frame.counts().map_jobs;
+    scene
+        .frame
+        .set_tab_width(4, &mut scene.editor, &scene.measure, &mut ctx);
+    assert!(
+        scene.frame.counts().map_jobs > jobs,
+        "the map waited for another call"
+    );
+    scene.settle(&mut Vec::new());
+    assert!(block_x(&scene) < at_eight);
+}

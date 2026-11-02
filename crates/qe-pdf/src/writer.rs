@@ -206,3 +206,56 @@ pub fn verify_on_disk(path: &Path, pages: usize, cancel: &AtomicBool) -> Result<
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small whole file, as `verify_on_disk` expects, with one page.
+    fn good_file(path: &Path) {
+        let mut file = PdfFile::create(path).unwrap();
+        file.object(RESOURCES_ID, b"<< >>").unwrap();
+        file.object(CATALOG_ID, b"<< >>").unwrap();
+        file.object(PAGES_ID, b"<< /Count 1 /Type /Pages /Kids [] >>")
+            .unwrap();
+        file.finish(&PdfOptions::default(), 1).unwrap();
+    }
+
+    #[test]
+    fn the_check_refuses_each_kind_of_damage() {
+        let path = std::env::temp_dir().join(format!("qe-pdf-verify-{}.tmp", std::process::id()));
+        let cancel = AtomicBool::new(false);
+        good_file(&path);
+        verify_on_disk(&path, 1, &cancel).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let find = |what: &[u8]| {
+            bytes
+                .windows(what.len())
+                .rposition(|window| window == what)
+                .unwrap()
+        };
+        let table = find(b"\nxref\n") + 1;
+        let mut moved_entry = bytes.clone();
+        moved_entry[table + 5 + 4 + 20 + 9] ^= 1;
+        let mut moved_object = bytes.clone();
+        moved_object[find(b"\n1 0 obj") + 1] = b'9';
+        let mut no_table = bytes.clone();
+        no_table[table] = b'y';
+        let cut_end = bytes[..bytes.len() - 2].to_vec();
+        for (what, damaged, pages) in [
+            ("an entry that points elsewhere", moved_entry, 1),
+            ("an object that is not its number", moved_object, 1),
+            ("a table that has moved", no_table, 1),
+            ("a cut end", cut_end, 1),
+            ("the wrong page count", bytes.clone(), 2),
+        ] {
+            std::fs::write(&path, &damaged).unwrap();
+            let result = verify_on_disk(&path, pages, &cancel);
+            assert!(
+                matches!(result, Err(PdfError::Check(_))),
+                "{what}: {result:?}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+}

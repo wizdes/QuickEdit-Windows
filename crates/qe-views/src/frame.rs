@@ -142,6 +142,8 @@ pub struct ViewFrame {
     /// The lines the last job read, and how many lines the index knew then. A job that
     /// could not reach its lines is sent again only when the index knows more.
     last_job: Option<(std::ops::Range<usize>, usize)>,
+    /// When the shell's one view timer fires, as far as the frame has seen it asked for.
+    timer_due: Option<f64>,
 
     fade: Fade,
     near: bool,
@@ -195,6 +197,7 @@ impl ViewFrame {
             wake: None,
             problem: None,
             last_job: None,
+            timer_due: None,
             fade: Fade::default(),
             near: false,
             drag_offset: None,
@@ -232,9 +235,17 @@ impl ViewFrame {
     pub fn set_file_bytes(&mut self, bytes: Option<u64>) {
         self.file_bytes = bytes;
     }
-    pub fn set_tab_width(&mut self, width: usize) {
-        self.map_stale |= width != self.tab_width;
+    pub fn set_tab_width(
+        &mut self,
+        width: usize,
+        editor: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) {
+        self.map_stale |= width.max(1) != self.tab_width;
         self.tab_width = width.max(1);
+        self.force_read = true;
+        self.sync(editor, measure, ctx);
     }
     /// A new paper size. With Wrap to Page on, the text wraps again at the new width at once.
     pub fn set_paper(
@@ -418,6 +429,12 @@ impl ViewFrame {
     pub fn map_worker_newest_job(&self) -> u64 {
         self.worker.as_ref().map_or(0, MapWorker::newest_job)
     }
+    /// The text area's width as it would be at 100%, for `PdfOptions::window_width_dips`. A PDF
+    /// uses the font at 100%, and zoom grows the font inside the same text area. So the PDF
+    /// needs the area shrunk by the zoom to break its rows where the screen does.
+    pub fn window_width_at_100_percent(&self, editor: &EditorView) -> f32 {
+        editor.text_area().width.0 / self.scale
+    }
     /// A problem that stopped the map, in plain words.
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()
@@ -523,7 +540,7 @@ impl ViewFrame {
             self.map_due.get_or_insert(now + MAP_REDRAW_SECONDS);
         }
         let waiting = |due: Option<f64>| due.is_some_and(|due| due > now);
-        let read_gutter = self.gutter_w > 0.0 && !waiting(self.gutter_due);
+        let read_gutter = self.gutter_w > 0.0 && (moved || !waiting(self.gutter_due));
         let read_map = self.map_w > 0.0 && (moved || !waiting(self.map_due));
         if read_gutter || read_map {
             self.counts.row_reads += 1;
@@ -1035,9 +1052,18 @@ impl ViewFrame {
         self.rows = finished.rows;
     }
 
-    /// The one timer the shell has, shared with the editor. The shell keeps the last
-    /// request, so the frame adds its request only if it is sooner than any made so far.
-    fn ask_for_timer(&self, now: f64, ctx: &mut ViewContext) {
+    /// The one timer the shell has, shared with the editor. The shell keeps the last request,
+    /// and an earlier call's request is not in this call's `ctx`. So the frame remembers when
+    /// the timer is due, and never asks for later than that. When that timer fires, the
+    /// host's `sync` asks again for whatever the frame still waits for.
+    fn ask_for_timer(&mut self, now: f64, ctx: &mut ViewContext) {
+        let asked_here = ctx.requests.iter().rev().find_map(|request| match request {
+            ViewRequest::RequestTimer(ms) => Some(*ms),
+            _ => None,
+        });
+        if let Some(ms) = asked_here {
+            self.timer_due = Some(now + f64::from(ms) / 1000.0);
+        }
         let mut wait: Option<u32> = None;
         let mut soonest = |ms: u32| wait = Some(wait.map_or(ms, |w: u32| w.min(ms)));
         if self.fade.fading() {
@@ -1052,12 +1078,15 @@ impl ViewFrame {
         let Some(wait) = wait else {
             return;
         };
-        let asked = ctx
-            .requests
-            .iter()
-            .any(|request| matches!(request, ViewRequest::RequestTimer(ms) if *ms <= wait));
-        if !asked {
+        // Asking again for the time still left keeps that timer, and always leaves one running.
+        let left = self
+            .timer_due
+            .filter(|due| *due > now)
+            .map(|due| ((due - now) * 1000.0).ceil() as u32);
+        let wait = left.map_or(wait, |left| left.max(1).min(wait));
+        if asked_here.is_none_or(|ms| ms > wait) {
             ctx.request_timer(wait);
+            self.timer_due = Some(now + f64::from(wait) / 1000.0);
         }
     }
 

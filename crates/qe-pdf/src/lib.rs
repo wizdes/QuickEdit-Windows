@@ -21,7 +21,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
     },
@@ -69,6 +69,8 @@ pub struct PdfOptions {
     pub keep_rows: bool,
     /// What a PDF can hold. Only a test changes these.
     pub limits: PdfLimits,
+    /// Runs on the finished temp file before its check. Only a test sets this.
+    pub after_write: Option<fn(&Path)>,
 }
 
 /// What a PDF can hold.
@@ -103,6 +105,7 @@ impl Default for PdfOptions {
             date: String::new(),
             keep_rows: false,
             limits: PdfLimits::default(),
+            after_write: None,
         }
     }
 }
@@ -435,6 +438,9 @@ fn write_and_replace(
     let mut file = PdfFile::create(temp)?;
     let mut summary = write_document(source, options, cancel, progress, &mut file)?;
     summary.bytes = file.finish(options, summary.pages)?;
+    if let Some(after_write) = options.after_write {
+        after_write(temp);
+    }
     if summary.bytes > options.limits.most_bytes {
         return Err(too_long(
             &options.limits,
@@ -469,7 +475,10 @@ pub struct PdfJob {
     fraction: Arc<AtomicU32>,
     wants: Arc<AtomicBool>,
     offers: Sender<Arc<dyn TextSnapshot>>,
-    handle: JoinHandle<Result<PdfSummary, PdfError>>,
+    /// The result, set before `finished` and before the last wake.
+    result: Arc<Mutex<Option<Result<PdfSummary, PdfError>>>>,
+    finished: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 impl PdfJob {
     /// Stops at the next check: within one line of layout, one glyph of a font, or the wait
@@ -499,16 +508,22 @@ impl PdfJob {
                 .fetch_max(to_fraction(known * WAIT_SHARE), Ordering::Relaxed);
         }
     }
+    /// True once the result is ready. It is true by the time of the last wake, so a host that
+    /// reads it only on a wake always sees the end.
     pub fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+        self.finished.load(Ordering::Acquire)
     }
     /// Waits for the end. Call it after `is_finished` says true, or off the UI thread.
     pub fn join(self) -> Result<PdfSummary, PdfError> {
         // With no more offers coming, a worker that still waits ends now.
         drop(self.offers);
-        self.handle
-            .join()
-            .map_err(|_| PdfError::Write("The PDF export stopped unexpectedly.".into()))?
+        let stopped = || PdfError::Write("The PDF export stopped unexpectedly.".into());
+        self.handle.join().map_err(|_| stopped())?;
+        self.result
+            .lock()
+            .map_err(|_| stopped())?
+            .take()
+            .ok_or_else(stopped)?
     }
 }
 
@@ -565,6 +580,9 @@ pub fn export_worker(
     let wants = Arc::new(AtomicBool::new(false));
     let (offers, inbox) = mpsc::channel();
     let (stop, shown, asking) = (cancel.clone(), fraction.clone(), wants.clone());
+    let result = Arc::new(Mutex::new(None));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (slot, done) = (result.clone(), finished.clone());
     let handle = std::thread::Builder::new()
         .name("qe-pdf-export".into())
         .spawn(move || {
@@ -579,10 +597,16 @@ pub fn export_worker(
             let result = whole.and_then(|source| {
                 export_to_file(source.as_ref(), &options, &path, &stop, &mut report)
             });
+            // In this order: a host that reads `is_finished` on the last wake must see true.
+            match slot.lock() {
+                Ok(mut slot) => *slot = Some(result),
+                // Only a panic while holding this lock poisons it, and the app aborts on panic.
+                Err(mut poisoned) => **poisoned.get_mut() = Some(result),
+            }
+            done.store(true, Ordering::Release);
             if let Some(wake) = wake {
                 wake();
             }
-            result
         })
         .map_err(|problem| PdfError::Write(format!("The PDF export could not start: {problem}")))?;
     Ok(PdfJob {
@@ -590,6 +614,8 @@ pub fn export_worker(
         fraction,
         wants,
         offers,
+        result,
+        finished,
         handle,
     })
 }

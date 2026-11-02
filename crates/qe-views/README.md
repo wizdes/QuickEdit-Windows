@@ -24,10 +24,13 @@ key -> 0.1 s wait -> worker_snapshot -> map worker -> rows -> wake -> sync
 | Pointer leaves the window | `frame.pointer_left(&mut ctx)` |
 | `WM_SETTINGCHANGE` | `frame.set_reduce_motion(system_reduce_motion())` |
 | View menu | `set_line_numbers`, `set_document_map` |
+| Tab width setting | `frame.set_tab_width(width, &mut editor, &measure, &mut ctx)`, as well as the editor's own setting, or the map's tabs stay at 8 |
+| Paper setting | `frame.set_paper(paper, &mut editor, &measure, &mut ctx)` |
+| PDF with "rewrap" off | `frame.window_width_at_100_percent(&editor)` for `PdfOptions::window_width_dips` |
 | Format menu | `set_page_wrap`, with `wrap_menu_title(frame.page_wrap())` as the item's title |
 | Zoom keys and menu | `zoom_in`, `zoom_out`, `actual_size`. `can_zoom_in` and `can_zoom_out` enable the items |
 
-The host applies `ctx.requests` as usual. The shell has one view timer and keeps the last request, so call the frame after the editor with the same `ctx`. The frame then asks only for a timer sooner than the ones already asked for. The frame asks for a timer only while a fade or a 0.1 s wait runs, and with no idle timer. While a mapped file's index cannot yet reach the lines on screen, the frame sends a map job only when the index knows more lines, and at most 10 a second. After a failed index, it sends none.
+The host applies `ctx.requests` as usual. The shell has one view timer and keeps the last request, so call the frame after the editor with the same `ctx`. The frame also remembers when the timer is due from earlier calls, and never asks for later than that. The frame asks for a timer only while a fade or a 0.1 s wait runs, and with no idle timer. While a mapped file's index cannot yet reach the lines on screen, the frame sends a map job only when the index knows more lines, and at most 10 a second. After a failed index, it sends none.
 
 ## Rules copied from the Mac
 

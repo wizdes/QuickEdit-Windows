@@ -168,3 +168,64 @@ fn a_proportional_font_breaks_the_same_way() {
     assert!(pdf.len() > 160, "{}", pdf.len());
     compare(&screen, &pdf, "Segoe UI");
 }
+
+/// "Rewrap off": the PDF keeps the window's own line breaks, whatever the zoom. Zoom makes the
+/// font larger in the same text area, so the PDF's width at 100% must shrink to match.
+#[test]
+fn rewrap_off_keeps_the_screens_breaks_at_every_zoom() {
+    let text = mixed_document();
+    for family in ["Segoe UI", "Cascadia Mono"] {
+        for zoom in [0.5f32, 1.0, 1.5, 2.0] {
+            let mut scene = Scene::new(
+                qe_editor::EditorView::from_text(&text).unwrap(),
+                1000.0,
+                800.0,
+                Paper::LETTER,
+            );
+            let mut ctx = ViewContext::default();
+            scene.editor.set_wrap(true).unwrap();
+            scene
+                .frame
+                .set_base_font(family, 10.0, &mut scene.editor, &scene.measure, &mut ctx)
+                .unwrap();
+            scene
+                .frame
+                .set_zoom(zoom, &mut scene.editor, &scene.measure, &mut ctx)
+                .unwrap();
+            scene.settle(&mut Vec::new());
+            let mut screen = BTreeSet::new();
+            let mut position = 0.0;
+            loop {
+                let mut ctx = ViewContext::default();
+                scene.editor.set_scroll_position(position, &mut ctx);
+                scene.settle(&mut Vec::new());
+                let visible = scene.editor.visible_rows();
+                assert!(visible.complete);
+                screen.extend(visible.rows.iter().map(|row| row.first_byte.0));
+                if scene.editor.scroll_offset() >= scene.editor.max_scroll_position() {
+                    break;
+                }
+                position = scene.editor.scroll_offset() + 500.0;
+            }
+            let folder = output_folder().join(format!("rewrap-off-{}", std::process::id()));
+            std::fs::create_dir_all(&folder).unwrap();
+            let path = folder.join(format!("{family}-{zoom}.pdf"));
+            let summary = export_to_file(
+                &qe_api::testing::StringStore::new(&*text),
+                &PdfOptions {
+                    rewrap: false,
+                    window_width_dips: scene.frame.window_width_at_100_percent(&scene.editor),
+                    font_family: family.into(),
+                    keep_rows: true,
+                    ..PdfOptions::default()
+                },
+                &path,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+            let pdf: BTreeSet<usize> = summary.rows.iter().map(|(_, byte)| byte.0).collect();
+            compare(&screen, &pdf, &format!("{family} at {zoom}"));
+        }
+    }
+}

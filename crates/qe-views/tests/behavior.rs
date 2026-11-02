@@ -1207,3 +1207,72 @@ fn numbers_that_would_overlap_are_skipped() {
     // Ink 7 dips tall on rows 5 dips tall leaves a number on every second row.
     assert_eq!(numbers, vec![1, 3, 5]);
 }
+
+// ---- The second review ----
+
+#[test]
+fn a_scroll_right_after_a_key_shows_the_new_numbers_at_once() {
+    let text: String = (0..3000).map(|n| format!("line {n}\n")).collect();
+    let mut rig = Rig::new(&text, 800.0, 400.0);
+    let mut ctx = ViewContext::default();
+    rig.frame
+        .set_line_numbers(true, &mut rig.editor, &rig.measure, &mut ctx);
+    rig.settle();
+    rig.type_char('x');
+    // 10 ms later, well inside the 0.1 s wait.
+    rig.advance(0.01);
+    let mut ctx = ViewContext::default();
+    rig.editor.set_scroll_position(3000.0, &mut ctx);
+    rig.frame.sync(&mut rig.editor, &rig.measure, &mut ctx);
+    let start = Instant::now();
+    while !rig.editor.visible_rows().complete && start.elapsed() < Duration::from_secs(20) {
+        let mut ctx = ViewContext::default();
+        rig.editor.poll_layout(&mut ctx);
+        rig.frame.sync(&mut rig.editor, &rig.measure, &mut ctx);
+        std::thread::yield_now();
+    }
+    let first = rig.editor.visible_rows().rows[0].line.0 + 1;
+    let shown = rig.frame.labels()[0].number;
+    assert!(
+        shown >= first,
+        "the gutter shows {shown}, and the text starts at {first}"
+    );
+}
+
+/// The shell has one view timer, and a new request replaces it. So a later, longer request must
+/// not push back a sooner one that an earlier call made.
+#[test]
+fn a_frame_timer_never_replaces_a_sooner_one_from_an_earlier_call() {
+    let mut rig = Rig::new("one\ntwo\n", 800.0, 400.0);
+    let mut ctx = ViewContext::default();
+    rig.frame
+        .set_line_numbers(true, &mut rig.editor, &rig.measure, &mut ctx);
+    rig.settle();
+    // The editor asks for 16 ms for its work.
+    let mut ctx = ViewContext::default();
+    ctx.request_timer(16);
+    rig.frame.sync(&mut rig.editor, &rig.measure, &mut ctx);
+    // 5 ms later, a key starts the frame's 0.1 s wait, in a call with no editor timer.
+    rig.advance(0.005);
+    append_away_from_view(&mut rig, "more");
+    let mut ctx = ViewContext::default();
+    rig.frame.sync(&mut rig.editor, &rig.measure, &mut ctx);
+    assert!(
+        !ctx.requests
+            .iter()
+            .any(|request| matches!(request, ViewRequest::RequestTimer(ms) if *ms > 12)),
+        "{:?}",
+        ctx.requests
+    );
+    // Once that timer has passed, the frame asks for what it still waits for.
+    rig.advance(0.02);
+    let mut ctx = ViewContext::default();
+    rig.frame.sync(&mut rig.editor, &rig.measure, &mut ctx);
+    assert!(
+        ctx.requests
+            .iter()
+            .any(|request| matches!(request, ViewRequest::RequestTimer(_))),
+        "{:?}",
+        ctx.requests
+    );
+}

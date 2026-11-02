@@ -2,7 +2,7 @@ use qe_api::{
     ByteOffset, Dip, Layout, LineIndex, Point, TextMeasurer, TextPosition, TextSnapshot, TextStore,
     Utf16Offset, testing::StringStore,
 };
-use qe_layout::{DirectWriteLayout, HeightMap, LineCache, font_face, slice_around};
+use qe_layout::{DirectWriteLayout, HeightMap, LineCache, font_face};
 use std::{
     ops::Range,
     sync::atomic::{AtomicUsize, Ordering},
@@ -65,13 +65,16 @@ fn ascii_fast_path_and_caret_round_trip() {
         .layout_line(&store, LineIndex(0), Dip(1000.0))
         .unwrap();
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].glyph_runs[0].glyph_ids.len(), 7);
+    // A tab draws no glyph, so the row has two runs of 3 glyphs.
+    let runs = &result.rows[0].glyph_runs;
+    assert_eq!(runs.iter().map(|r| r.glyph_ids.len()).sum::<usize>(), 6);
     for stop in &result.rows[0].caret_stops {
-        let point = engine.hit_test_offset(&result, *stop).unwrap();
-        assert_eq!(engine.hit_test_point(&result, point), *stop);
+        let point = engine.hit_test_offset(&result, stop.byte).unwrap();
+        assert_eq!(engine.hit_test_point(&result, point).byte, stop.byte);
     }
-    let tab = &result.rows[0].glyph_runs[0].advances[3];
-    assert!(tab.0 > engine.cell_width().0 * 4.0);
+    let tab = engine.hit_test_offset(&result, ByteOffset(4)).unwrap().x.0
+        - engine.hit_test_offset(&result, ByteOffset(3)).unwrap().x.0;
+    assert!(tab > engine.cell_width().0 * 4.0);
 }
 
 #[test]
@@ -82,8 +85,8 @@ fn ascii_fast_and_shaped_positions_agree() {
     let a = fast.layout_line(&store, LineIndex(0), Dip(1000.0)).unwrap();
     let b = slow.layout_line(&store, LineIndex(0), Dip(1000.0)).unwrap();
     for stop in &a.rows[0].caret_stops {
-        let x_a = fast.hit_test_offset(&a, *stop).unwrap().x.0;
-        let x_b = slow.hit_test_offset(&b, *stop).unwrap().x.0;
+        let x_a = fast.hit_test_offset(&a, stop.byte).unwrap().x.0;
+        let x_b = slow.hit_test_offset(&b, stop.byte).unwrap().x.0;
         assert!((x_a - x_b).abs() < 0.05, "{stop:?}: {x_a} vs {x_b}");
     }
     let width_a: f32 = a.rows[0].glyph_runs[0].advances.iter().map(|v| v.0).sum();
@@ -125,12 +128,19 @@ fn slow_scripts_have_caret_round_trips() {
         }
         for row in &result.rows {
             for stop in &row.caret_stops {
-                let point = engine.hit_test_offset(&result, *stop).unwrap();
-                assert_eq!(
-                    engine.hit_test_point(&result, point),
-                    *stop,
+                let point = engine.hit_test_offset(&result, stop.byte).unwrap();
+                // Where text changes direction, one place on screen belongs to two
+                // bytes. The click tests compare those with DirectWrite. Here the
+                // caret must come back to the same place.
+                let hit = engine.hit_test_point(&result, point);
+                let again = engine.caret_rect(&result, hit.byte, hit.affinity).unwrap();
+                assert!(
+                    (again.x.0 - point.x.0).abs() < 0.01 && again.y == point.y,
                     "{sample} {stop:?}"
                 );
+                if row.visual_stops.is_empty() {
+                    assert_eq!(hit.byte, stop.byte, "{sample} {stop:?}");
+                }
             }
         }
     }
@@ -199,9 +209,9 @@ fn mixed_wrapped_runs_carry_visual_origins_and_levels() {
             assert!(run.range.end <= row.range.end);
         }
         for stop in &row.caret_stops {
-            let point = engine.hit_test_offset(&result, *stop).unwrap();
+            let point = engine.hit_test_offset(&result, stop.byte).unwrap();
             let hit = engine.hit_test_point(&result, point);
-            let again = engine.hit_test_offset(&result, hit).unwrap();
+            let again = engine.caret_rect(&result, hit.byte, hit.affinity).unwrap();
             assert!(
                 (again.x.0 - point.x.0).abs() < 0.01,
                 "row={:?} stop={stop:?}",
@@ -260,13 +270,15 @@ fn fixed_width_columns_round_from_absolute_positions_at_fractional_dpi() {
             let expected = (column as f32 * cell * scale).round() as i32;
             assert_eq!(pixel, expected, "scale={scale} column={column}");
             assert_eq!(
-                engine.hit_test_point(
-                    &result,
-                    Point {
-                        x: point.x,
-                        y: point.y
-                    }
-                ),
+                engine
+                    .hit_test_point(
+                        &result,
+                        Point {
+                            x: point.x,
+                            y: point.y
+                        }
+                    )
+                    .byte,
                 ByteOffset(column)
             );
         }
@@ -294,13 +306,19 @@ fn slice_does_not_read_the_whole_line() {
     );
     assert_eq!(result.rows[0].range.start, ByteOffset(50_000_000));
     assert_eq!(result.rows[0].range.end, ByteOffset(50_000_100));
-    assert_eq!(store.visited.load(Ordering::Relaxed), 100);
+    // Checking that each slice edge cuts no cluster reads 128 bytes on each side
+    // of it, and finding the line's content reads its last 3 bytes.
+    assert!(store.visited.load(Ordering::Relaxed) <= 100 + 2 * 256 + 3);
 }
 
 #[test]
 fn slice_helper_keeps_joined_emoji_together() {
     let store = StringStore::new("abc 👩‍💻 xyz");
-    let range = slice_around(&store, ByteOffset(8), 16).unwrap();
+    let engine = DirectWriteLayout::new().unwrap();
+    let range = engine
+        .slice_around(&store, ByteOffset(8), 16)
+        .unwrap()
+        .unwrap();
     let selected = &store.as_str()[range.start.0..range.end.0];
     assert!(selected.contains("👩‍💻"), "{selected}");
 }
@@ -309,13 +327,14 @@ fn slice_helper_keeps_joined_emoji_together() {
 fn cache_changes_one_line_and_honors_cap() {
     let engine = DirectWriteLayout::new().unwrap();
     let mut store = StringStore::new("abc\ndef\nghi");
-    let mut cache = LineCache::new(1000);
+    // The cap counts all the memory an entry holds, so it must fit 3 real entries.
+    let mut cache = LineCache::new(30_000);
     for i in 0..3 {
         cache
             .get_or_layout(&engine, &store, LineIndex(i), Dip(1000.0))
             .unwrap();
     }
-    assert!(cache.memory_bytes() <= 1000);
+    assert!(cache.memory_bytes() <= 30_000);
     let old = store.snapshot();
     let change = store.replace(ByteOffset(4)..ByteOffset(5), "X").unwrap();
     cache.invalidate(old.as_ref(), &change);
@@ -346,18 +365,18 @@ fn cache_shifts_unchanged_lines_after_newline_insert() {
 
 #[test]
 fn height_map_matches_plain_vec() {
-    let mut map = HeightMap::new(1000, Dip(12.0));
+    let mut map = HeightMap::new(1000, Dip(12.0)).unwrap();
     let mut plain = vec![12.0f32; 1000];
     let mut seed = 7u64;
     for _ in 0..2000 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let i = ((seed >> 32) as usize) % 1000;
         let h = ((seed & 31) + 1) as f32;
-        map.set(LineIndex(i), Dip(h));
+        map.set(LineIndex(i), Dip(h)).unwrap();
         plain[i] = h;
         let n = ((seed >> 16) as usize) % 1001;
         let expected: f32 = plain[..n].iter().sum();
-        assert!((map.line_to_scroll(LineIndex(n)).0 - expected).abs() < 0.05);
+        assert!((map.line_to_scroll(LineIndex(n)) - expected as f64).abs() < 0.05);
         let scroll = expected - 0.1;
         let target = plain
             .iter()
@@ -367,6 +386,6 @@ fn height_map_matches_plain_vec() {
             })
             .take_while(|sum| *sum <= scroll)
             .count();
-        assert_eq!(map.scroll_to_line(Dip(scroll)), LineIndex(target));
+        assert_eq!(map.scroll_to_line(scroll as f64), LineIndex(target));
     }
 }

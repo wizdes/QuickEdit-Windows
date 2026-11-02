@@ -35,17 +35,22 @@ fn fixed_layout_uses_character_boundaries() {
     let line = layout.layout_line(&text, LineIndex(0), Dip(20.0)).unwrap();
     assert_eq!(line.rows.len(), 2);
     assert_eq!(
-        layout.hit_test_point(
-            &line,
-            Point {
-                x: Dip(20.0),
-                y: Dip(0.0)
-            }
-        ),
+        layout
+            .hit_test_point(
+                &line,
+                Point {
+                    x: Dip(20.0),
+                    y: Dip(0.0)
+                }
+            )
+            .byte,
         ByteOffset(5)
     );
     assert_eq!(
-        layout.caret_rect(&line, ByteOffset(1)).unwrap().x,
+        layout
+            .caret_rect(&line, ByteOffset(1), Affinity::After)
+            .unwrap()
+            .x,
         Dip(10.0)
     );
 }
@@ -111,7 +116,7 @@ fn theme_and_display_text_are_stable() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v3\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
+        "display-list-v4\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
     );
 }
 
@@ -125,6 +130,7 @@ fn glyph_run_stable_text_includes_bidi_level() {
         },
         bidi_level: 1,
         font_id: 7,
+        font_em_size: Dip(13.333),
         glyph_ids: vec![42],
         advances: vec![Dip(4.0)],
         offsets: vec![Point::default()],
@@ -132,7 +138,7 @@ fn glyph_run_stable_text_includes_bidi_level() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v3\nglyph 2.000,3.000 1 7 [42] [\"4.000\"] [\"0.000,0.000\"] #000000ff\n"
+        "display-list-v4\nglyph 2.000,3.000 1 7 13.333 [42] [\"4.000\"] [\"0.000,0.000\"] #000000ff\n"
     );
 }
 
@@ -208,4 +214,117 @@ fn all_mac_line_breaks_and_chunk_reads_work() {
 fn replay_rejects_malformed_key_repeat_and_extra_fields() {
     assert!(parse_replay("event\t1\tkey_down\t65\t-\tmaybe").is_err());
     assert!(parse_replay("event\t1\tfocus\textra").is_err());
+}
+
+#[test]
+fn text_and_icon_stable_text_include_their_font_size() {
+    let at = Point {
+        x: Dip(2.0),
+        y: Dip(3.0),
+    };
+    let mut list = DisplayList::default();
+    list.push(DrawCommand::TextRun {
+        at,
+        text: "hi".into(),
+        font: "Segoe UI".into(),
+        font_size: Dip(12.0),
+        color: Color::rgb(0, 0, 0),
+    });
+    list.push(DrawCommand::Icon {
+        at,
+        icon_id: "close".into(),
+        font_size: Dip(10.0),
+        color: Color::rgb(0, 0, 0),
+    });
+    assert_eq!(
+        list.to_stable_text(),
+        "display-list-v4\ntext 2.000,3.000 \"Segoe UI\" 12.000 #000000ff \"hi\"\nicon 2.000,3.000 \"close\" 10.000 #000000ff\n"
+    );
+}
+
+#[test]
+fn a_wrap_point_gives_two_caret_places_by_affinity() {
+    let text = testing::StringStore::new("abcd");
+    let layout = testing::FixedWidthLayout {
+        cell_width: Dip(10.0),
+        row_height: Dip(20.0),
+    };
+    let line = layout.layout_line(&text, LineIndex(0), Dip(20.0)).unwrap();
+    assert_eq!(line.rows.len(), 2);
+    let before = layout
+        .caret_rect(&line, ByteOffset(2), Affinity::Before)
+        .unwrap();
+    let after = layout
+        .caret_rect(&line, ByteOffset(2), Affinity::After)
+        .unwrap();
+    assert_eq!((before.x, before.y), (Dip(20.0), Dip(0.0)));
+    assert_eq!((after.x, after.y), (Dip(0.0), Dip(20.0)));
+    let click = |x, y| {
+        layout.hit_test_point(
+            &line,
+            Point {
+                x: Dip(x),
+                y: Dip(y),
+            },
+        )
+    };
+    assert_eq!(
+        click(0.0, 25.0),
+        HitTest {
+            byte: ByteOffset(2),
+            affinity: Affinity::After
+        }
+    );
+    assert_eq!(
+        click(90.0, 5.0),
+        HitTest {
+            byte: ByteOffset(2),
+            affinity: Affinity::Before
+        }
+    );
+    assert_eq!(
+        layout.caret_rect(&line, ByteOffset(9), Affinity::After),
+        None
+    );
+}
+
+#[test]
+fn hit_tests_on_a_right_to_left_row_use_the_visual_stops() {
+    let row = LayoutRow {
+        range: ByteOffset(0)..ByteOffset(2),
+        y: Dip(0.0),
+        height: Dip(10.0),
+        glyph_runs: vec![],
+        caret_stops: vec![
+            CaretStop {
+                byte: ByteOffset(0),
+                x: Dip(20.0),
+                x_before: Dip(20.0),
+            },
+            CaretStop {
+                byte: ByteOffset(2),
+                x: Dip(0.0),
+                x_before: Dip(0.0),
+            },
+        ],
+        visual_stops: vec![
+            VisualStop {
+                x: Dip(0.0),
+                byte: ByteOffset(2),
+                affinity: Affinity::Before,
+            },
+            VisualStop {
+                x: Dip(20.0),
+                byte: ByteOffset(0),
+                affinity: Affinity::After,
+            },
+        ],
+    };
+    assert_eq!(row.hit_test_x(Dip(4.0)).byte, ByteOffset(2));
+    assert_eq!(row.hit_test_x(Dip(16.0)).byte, ByteOffset(0));
+    assert_eq!(
+        row.hit_test_x(Dip(10.0)).byte,
+        ByteOffset(0),
+        "halfway goes right"
+    );
 }

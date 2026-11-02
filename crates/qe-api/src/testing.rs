@@ -174,26 +174,6 @@ impl Layout for FixedWidthLayout {
         }
         Some(self.layout_content(&content, range.start, line, width))
     }
-    fn hit_test_point(&self, layout: &LineLayout, point: Point) -> ByteOffset {
-        let row = ((point.y.0 / self.row_height.0).floor().max(0.0) as usize)
-            .min(layout.rows.len().saturating_sub(1));
-        let row = &layout.rows[row];
-        let column = (point.x.0 / self.cell_width.0).round().max(0.0) as usize;
-        row.caret_stops[column.min(row.caret_stops.len() - 1)]
-    }
-    fn caret_rect(&self, layout: &LineLayout, byte: ByteOffset) -> Option<Rect> {
-        let row = layout
-            .rows
-            .iter()
-            .find(|r| r.range.contains(&byte) || r.range.end == byte)?;
-        let column = row.caret_stops.iter().position(|stop| *stop == byte)?;
-        Some(Rect {
-            x: Dip(column as f32 * self.cell_width.0),
-            y: row.y,
-            width: Dip(1.0),
-            height: row.height,
-        })
-    }
 }
 
 impl FixedWidthLayout {
@@ -221,11 +201,20 @@ impl FixedWidthLayout {
                 .char_indices()
                 .nth(end)
                 .map_or(content.len(), |(i, _)| i);
+            let stop = |column: usize, byte: usize| {
+                let x = Dip(column as f32 * self.cell_width.0);
+                CaretStop {
+                    byte: ByteOffset(start_offset.0 + byte),
+                    x,
+                    x_before: x,
+                }
+            };
             let mut caret_stops = content[byte_start..byte_end]
                 .char_indices()
-                .map(|(i, _)| ByteOffset(start_offset.0 + byte_start + i))
+                .enumerate()
+                .map(|(column, (i, _))| stop(column, byte_start + i))
                 .collect::<Vec<_>>();
-            caret_stops.push(ByteOffset(start_offset.0 + byte_end));
+            caret_stops.push(stop(end - start, byte_end));
             rows.push(LayoutRow {
                 range: ByteOffset(start_offset.0 + byte_start)
                     ..ByteOffset(start_offset.0 + byte_end),
@@ -233,12 +222,14 @@ impl FixedWidthLayout {
                 height: self.row_height,
                 glyph_runs: vec![],
                 caret_stops,
+                visual_stops: vec![],
             });
         }
         LineLayout {
             line,
             height: Dip(rows.len() as f32 * self.row_height.0),
             rows,
+            partial: false,
         }
     }
 }

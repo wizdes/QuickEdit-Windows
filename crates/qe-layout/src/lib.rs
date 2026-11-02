@@ -1,318 +1,250 @@
 //! Text layout in device-independent pixels.
+//!
+//! # Two paths
+//! Printable ASCII and tabs in a fixed-width font take the fast path, which needs
+//! no DirectWrite call and agrees with shaping on rows and advances. Everything
+//! else is shaped. Ligatures are off for ASCII in fixed-width fonts on both paths,
+//! because the Mac app draws plain fixed-pitch text. Other scripts keep their own
+//! shaping features.
+//!
+//! # Long lines
+//! A line with more than [`LONG_LINE_BYTES`] of content is only ever laid out in
+//! segments of [`SEGMENT_BYTES`] or a little more, cut on grapheme boundaries.
+//! `layout_line` on such a line gives the first segment and sets
+//! `LineLayout::partial`, so it can never do unbounded work. `layout_slice` refuses
+//! a range longer than [`LONG_LINE_BYTES`].
+//!
+//! While scrolling a 100 MB line, the editor does this:
+//! 1. Ask `is_long_line`. If true, call `long_line_map` once and keep the map. It
+//!    has one estimated entry per segment and a few runs of memory.
+//! 2. Give the document's `HeightMap` the line's height with
+//!    `doc.set(line, Dip(map.total_height() as f32))`.
+//! 3. For a scroll offset `y` inside the line, call `map.scroll_to_line(y)` to get
+//!    the segment. Its top is `map.line_to_scroll(segment)`.
+//! 4. Call `LineCache::get_or_layout_segment` for that segment and for the next
+//!    ones until the window is full. Draw each at its top minus `y`.
+//! 5. After each cold layout, call `map.set(segment, engine.segment_extent(&layout))`,
+//!    then update the document map again, so the estimate becomes real as you go.
+//! 6. Hit test with the segment's own layout. Find it with `scroll_to_line` for a
+//!    click, or with `segment_at` for a caret byte.
+//!
+//! With wrap off, the same map holds widths instead of heights and the segments
+//! sit side by side, so steps 3 to 6 work along x.
+//! After an edit inside the line, make a new map.
+//!
+//! Known limits of long lines: a wrapped row ends at each segment edge. Shaping
+//! and text direction are worked out per segment, so a joined letter at an edge
+//! takes its end form. A cluster longer than 1 KiB can be cut at an edge. A tab
+//! with no tab in the 1 KiB before its segment assumes one cell per byte since
+//! the line start.
+//!
+//! # Slices
+//! `layout_slice_from_column` keeps tabs on the same stops as the text before the
+//! slice. Text direction cannot be kept: DirectWrite resolves it from the slice
+//! alone, so digits after a Hebrew word that the slice cut off can change order.
+//!
+//! # Threads
+//! `DirectWriteLayout`, `LineLayout` and hit tests are safe to use from any thread.
+//! Microsoft does not document `IDWriteTextFormat` as thread-safe, so each thread
+//! makes its own. A hit test reads only the `LineLayout`.
 #![allow(hidden_glob_reexports)]
-use qe_api::{
-    ByteOffset, Dip, Layout, LayoutGlyphRun, LayoutRow, LineIndex, LineLayout, Point, Rect,
-    TextChange, TextMeasurer, TextMetrics, TextSnapshot,
-};
+
+// `#[implement]` writes paths that start at `windows_core`. This crate stands in
+// for that crate, inside this crate only, so that it needs no extra dependency.
 extern crate self as windows_core;
-use std::ffi::c_void;
-use std::result::Result;
+#[allow(unused_imports)]
+pub(crate) use windows::core::*;
+
+mod cache;
+mod fonts;
+mod heights;
+mod segments;
+mod shaped;
+mod wrap;
+
+pub use cache::LineCache;
+pub use fonts::{font_face, loaded_font_count};
+pub use heights::{HeightError, HeightMap};
+pub use segments::{LONG_LINE_BYTES, SEGMENT_BYTES};
+
+use fonts::{Font, family_exists, font};
+use qe_api::{
+    ByteOffset, CaretStop, Dip, Layout, LayoutGlyphRun, LayoutRow, LineIndex, LineLayout, Point,
+    TextMeasurer, TextMetrics, TextSnapshot,
+};
+use segments::{LINE_ENDINGS, content_range, read};
 use std::{
-    collections::{HashMap, VecDeque},
-    hash::{Hash, Hasher},
+    fmt,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock},
+    result::Result,
+    sync::{Arc, Mutex},
 };
-pub use windows::core::*;
-use windows::{
-    Win32::Graphics::DirectWrite::*,
-    core::{BOOL, PCWSTR, implement},
-};
+use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL};
 
-type CollectedRun = (u32, u32, u32, Vec<u16>, Vec<Dip>, Vec<Point>, Point, u8);
-static FACES: OnceLock<Mutex<Vec<IDWriteFontFace>>> = OnceLock::new();
-fn register_face(face: &IDWriteFontFace) -> u32 {
-    let mut faces = FACES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("font face registry poisoned");
-    if let Some(at) = faces.iter().position(|f| f.as_raw() == face.as_raw()) {
-        return at as u32 + 1;
-    }
-    faces.push(face.clone());
-    faces.len() as u32
-}
-/// Resolve the face of a DirectWrite glyph run.
-pub fn font_face(font_id: u32) -> Option<IDWriteFontFace> {
-    FACES
-        .get()?
-        .lock()
-        .ok()?
-        .get(font_id.checked_sub(1)? as usize)
-        .cloned()
-}
-#[implement(IDWriteTextRenderer)]
-struct RunCollector {
-    runs: Arc<Mutex<Vec<CollectedRun>>>,
-}
-impl IDWritePixelSnapping_Impl for RunCollector_Impl {
-    fn IsPixelSnappingDisabled(&self, _: *const c_void) -> windows::core::Result<BOOL> {
-        Ok(BOOL(1))
-    }
-    fn GetCurrentTransform(
-        &self,
-        _: *const c_void,
-        out: *mut DWRITE_MATRIX,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            *out = DWRITE_MATRIX {
-                m11: 1.0,
-                m12: 0.0,
-                m21: 0.0,
-                m22: 1.0,
-                dx: 0.0,
-                dy: 0.0,
-            };
-        }
-        Ok(())
-    }
-    fn GetPixelsPerDip(&self, _: *const c_void) -> windows::core::Result<f32> {
-        Ok(1.0)
-    }
-}
-impl IDWriteTextRenderer_Impl for RunCollector_Impl {
-    fn DrawGlyphRun(
-        &self,
-        _: *const c_void,
-        x: f32,
-        y: f32,
-        _: DWRITE_MEASURING_MODE,
-        run: *const DWRITE_GLYPH_RUN,
-        desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-        _: windows::core::Ref<windows::core::IUnknown>,
-    ) -> windows::core::Result<()> {
-        let run = unsafe { &*run };
-        let desc = unsafe { &*desc };
-        let n = run.glyphCount as usize;
-        let ids = unsafe { std::slice::from_raw_parts(run.glyphIndices, n) }.to_vec();
-        let advances = unsafe { std::slice::from_raw_parts(run.glyphAdvances, n) }
-            .iter()
-            .copied()
-            .map(Dip)
-            .collect();
-        let offsets = if run.glyphOffsets.is_null() {
-            vec![Point::default(); n]
-        } else {
-            unsafe { std::slice::from_raw_parts(run.glyphOffsets, n) }
-                .iter()
-                .map(|o| Point {
-                    x: Dip(o.advanceOffset),
-                    y: Dip(o.ascenderOffset),
-                })
-                .collect()
-        };
-        let font_id = (*run.fontFace).as_ref().map(register_face).unwrap_or(0);
-        self.this
-            .runs
-            .lock()
-            .map_err(|_| {
-                windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32))
-            })?
-            .push((
-                desc.textPosition,
-                desc.stringLength,
-                font_id,
-                ids,
-                advances,
-                offsets,
-                Point {
-                    x: Dip(x),
-                    y: Dip(y),
-                },
-                run.bidiLevel as u8,
-            ));
-        Ok(())
-    }
-    fn DrawUnderline(
-        &self,
-        _: *const c_void,
-        _: f32,
-        _: f32,
-        _: *const DWRITE_UNDERLINE,
-        _: windows::core::Ref<windows::core::IUnknown>,
-    ) -> windows::core::Result<()> {
-        Ok(())
-    }
-    fn DrawStrikethrough(
-        &self,
-        _: *const c_void,
-        _: f32,
-        _: f32,
-        _: *const DWRITE_STRIKETHROUGH,
-        _: windows::core::Ref<windows::core::IUnknown>,
-    ) -> windows::core::Result<()> {
-        Ok(())
-    }
-    fn DrawInlineObject(
-        &self,
-        _: *const c_void,
-        _: f32,
-        _: f32,
-        _: windows::core::Ref<IDWriteInlineObject>,
-        _: BOOL,
-        _: BOOL,
-        _: windows::core::Ref<windows::core::IUnknown>,
-    ) -> windows::core::Result<()> {
-        Ok(())
-    }
-}
+/// The default editor fonts, in the order they are tried.
+pub const DEFAULT_FONTS: [&str; 2] = ["Cascadia Mono", "Consolas"];
+const DEFAULT_POINTS: f32 = 10.0;
 
-static FACTORY: OnceLock<Result<IDWriteFactory, String>> = OnceLock::new();
-fn factory() -> Result<&'static IDWriteFactory, String> {
-    FACTORY
-        .get_or_init(|| unsafe {
-            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+/// Why layout could not do what was asked.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayoutError {
+    /// This font family is not installed.
+    MissingFont(String),
+    /// None of these font families is installed.
+    NoFontFound(Vec<String>),
+    NoFontCollection,
+    DirectWrite {
+        call: &'static str,
+        message: String,
+    },
+    /// A lock was left broken by a panic on another thread.
+    Poisoned(&'static str),
+    NoSuchLine(LineIndex),
+    NoSuchSegment {
+        line: LineIndex,
+        index: usize,
+    },
+    /// The range is outside the text, is not on character edges, or holds a line
+    /// ending.
+    BadRange(Range<ByteOffset>),
+    /// A slice is longer than `LONG_LINE_BYTES`. Use segments.
+    SliceTooLong {
+        bytes: usize,
+        limit: usize,
+    },
+    /// A slice edge falls inside a cluster. `Layout` callers can use
+    /// `DirectWriteLayout::slice_around` to pick a safe range.
+    CutCluster(ByteOffset),
+    Height(HeightError),
 }
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-
-struct Font {
-    format: IDWriteTextFormat,
-    id: u32,
-    ascii: [u16; 128],
-    fixed_width: bool,
-    advance: f32,
-    height: f32,
-    baseline: f32,
-    family: String,
-}
-#[derive(Clone, Eq, PartialEq, Hash)]
-struct FontKey {
-    family: String,
-    size: u32,
-    weight: i32,
-}
-static FONTS: OnceLock<Mutex<HashMap<FontKey, Arc<Font>>>> = OnceLock::new();
-fn font(family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<Arc<Font>, String> {
-    let key = FontKey {
-        family: family.into(),
-        size: size.to_bits(),
-        weight: weight.0,
-    };
-    let cache = FONTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(f) = cache.lock().map_err(|e| e.to_string())?.get(&key) {
-        return Ok(f.clone());
-    }
-    let f = factory()?;
-    let mut collection = None;
-    unsafe {
-        f.GetSystemFontCollection(&mut collection, false)
-            .map_err(|e| e.to_string())?;
-    }
-    let collection = collection.ok_or("no font collection")?;
-    let mut index = 0;
-    let mut exists = BOOL(0);
-    let mut chosen = family.to_owned();
-    unsafe {
-        collection
-            .FindFamilyName(PCWSTR(wide(&chosen).as_ptr()), &mut index, &mut exists)
-            .map_err(|e| e.to_string())?;
-    }
-    if !exists.as_bool() {
-        // Segoe UI is the system UI fallback. The first installed family covers
-        // systems where that name is unavailable.
-        chosen = "Segoe UI".into();
-        unsafe {
-            collection
-                .FindFamilyName(PCWSTR(wide(&chosen).as_ptr()), &mut index, &mut exists)
-                .map_err(|e| e.to_string())?;
-        }
-        if !exists.as_bool() {
-            index = 0;
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFont(family) => write!(f, "font family {family:?} is not installed"),
+            Self::NoFontFound(families) => write!(f, "none of {families:?} is installed"),
+            Self::NoFontCollection => write!(f, "DirectWrite gave no system font collection"),
+            Self::DirectWrite { call, message } => write!(f, "{call} failed: {message}"),
+            Self::Poisoned(what) => write!(f, "{what} lock is broken"),
+            Self::NoSuchLine(line) => write!(f, "no line {}", line.0),
+            Self::NoSuchSegment { line, index } => {
+                write!(f, "line {} has no segment {index}", line.0)
+            }
+            Self::BadRange(range) => write!(f, "bad text range {range:?}"),
+            Self::SliceTooLong { bytes, limit } => {
+                write!(f, "a slice of {bytes} bytes is over the {limit} byte limit")
+            }
+            Self::CutCluster(at) => write!(f, "byte {} is inside a cluster", at.0),
+            Self::Height(error) => error.fmt(f),
         }
     }
-    let font_obj = unsafe {
-        collection
-            .GetFontFamily(index)
-            .map_err(|e| e.to_string())?
-            .GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)
-            .map_err(|e| e.to_string())?
-    };
-    let face = unsafe { font_obj.CreateFontFace().map_err(|e| e.to_string())? };
-    let fixed_width = font_obj
-        .cast::<IDWriteFont1>()
-        .ok()
-        .is_some_and(|f| unsafe { f.IsMonospacedFont().as_bool() });
-    let format = unsafe {
-        f.CreateTextFormat(
-            PCWSTR(wide(&chosen).as_ptr()),
-            None,
-            weight,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            PCWSTR(wide("en-US").as_ptr()),
-        )
-        .map_err(|e| e.to_string())?
-    };
-    let points: Vec<u32> = (0..128).collect();
-    let mut ascii = [0; 128];
-    unsafe {
-        face.GetGlyphIndices(points.as_ptr(), 128, ascii.as_mut_ptr())
-            .map_err(|e| e.to_string())?;
+}
+impl std::error::Error for LayoutError {}
+
+/// Which font an engine ended up with, when the caller gave a list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontChoice {
+    /// The first family the caller asked for.
+    pub requested: String,
+    /// The family in use.
+    pub used: String,
+}
+impl FontChoice {
+    /// True when the first choice was not installed.
+    pub fn is_fallback(&self) -> bool {
+        self.requested != self.used
     }
-    let mut fm = DWRITE_FONT_METRICS::default();
-    let mut gm = DWRITE_GLYPH_METRICS::default();
-    unsafe {
-        face.GetMetrics(&mut fm);
-        face.GetDesignGlyphMetrics(&ascii[32], 1, &mut gm, false)
-            .map_err(|e| e.to_string())?;
-    }
-    let scale = size / fm.designUnitsPerEm as f32;
-    let result = Arc::new(Font {
-        format,
-        id: register_face(&face),
-        ascii,
-        fixed_width,
-        advance: gm.advanceWidth as f32 * scale,
-        height: (fm.ascent as f32 + fm.descent as f32 + fm.lineGap as f32) * scale,
-        baseline: fm.ascent as f32 * scale,
-        family: chosen,
-    });
-    cache
-        .lock()
-        .map_err(|e| e.to_string())?
-        .insert(key, result.clone());
-    Ok(result)
 }
 
-#[derive(Clone)]
-struct Stop {
-    byte: ByteOffset,
-    x: f32,
-    row: usize,
+/// A measure that could not use the font it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeasureFallback {
+    pub requested: String,
+    pub used: String,
 }
-#[derive(Default)]
-struct HitMap {
-    map: HashMap<u64, Vec<Stop>>,
-    order: VecDeque<u64>,
+
+/// What `measure_with_font` found: real sizes, and any font it had to replace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measured {
+    pub metrics: TextMetrics,
+    pub fallback: Option<MeasureFallback>,
 }
+
 pub struct DirectWriteLayout {
     font: Arc<Font>,
+    choice: FontChoice,
     wrap: bool,
     force_shaping: bool,
     tab_width: usize,
-    hits: Mutex<HitMap>,
+    last_error: Mutex<Option<LayoutError>>,
+    last_fallback: Mutex<Option<MeasureFallback>>,
 }
-impl DirectWriteLayout {
-    pub fn new() -> Result<Self, String> {
-        Self::with_font("Cascadia Mono", 10.0, DWRITE_FONT_WEIGHT_NORMAL)
+
+/// Splits a font token such as "Segoe UI 9". A name that exists as written is a
+/// family, even when it ends in a number. Otherwise a final number is a point size.
+pub(crate) fn parse_font_token(token: &str, exists: impl Fn(&str) -> bool) -> (&str, Option<f32>) {
+    if exists(token) {
+        return (token, None);
     }
+    let split = token
+        .rsplit_once(' ')
+        .and_then(|(family, value)| value.parse::<f32>().ok().map(|size| (family, size)))
+        .filter(|(family, size)| !family.is_empty() && size.is_finite() && *size > 0.0);
+    match split {
+        Some((family, points)) => (family, Some(points)),
+        None => (token, None),
+    }
+}
+
+impl DirectWriteLayout {
+    /// The default font: Cascadia Mono, then Consolas. `font_choice` says which
+    /// one was used, and `with_default_font` returns the same answer directly.
+    pub fn new() -> Result<Self, LayoutError> {
+        Self::with_default_font().map(|(engine, _)| engine)
+    }
+    pub fn with_default_font() -> Result<(Self, FontChoice), LayoutError> {
+        Self::with_first_installed(&DEFAULT_FONTS, DEFAULT_POINTS, DWRITE_FONT_WEIGHT_NORMAL)
+    }
+    /// The first installed family of a list, and a value that says which one it was.
+    pub fn with_first_installed(
+        families: &[&str],
+        points: f32,
+        weight: DWRITE_FONT_WEIGHT,
+    ) -> Result<(Self, FontChoice), LayoutError> {
+        for family in families {
+            match Self::with_font(family, points, weight) {
+                Ok(mut engine) => {
+                    let choice = FontChoice {
+                        requested: families[0].to_owned(),
+                        used: (*family).to_owned(),
+                    };
+                    engine.choice = choice.clone();
+                    return Ok((engine, choice));
+                }
+                Err(LayoutError::MissingFont(_)) => continue,
+                Err(other) => return Err(other),
+            }
+        }
+        Err(LayoutError::NoFontFound(
+            families.iter().map(|f| (*f).to_owned()).collect(),
+        ))
+    }
+    /// A named font. A family that is not installed is an error.
     pub fn with_font(
         family: &str,
         points: f32,
         weight: DWRITE_FONT_WEIGHT,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, LayoutError> {
         Ok(Self {
             font: font(family, points * 96.0 / 72.0, weight)?,
+            choice: FontChoice {
+                requested: family.to_owned(),
+                used: family.to_owned(),
+            },
             wrap: true,
             force_shaping: false,
             tab_width: 8,
-            hits: Mutex::new(HitMap::default()),
+            last_error: Mutex::new(None),
+            last_fallback: Mutex::new(None),
         })
     }
     pub fn with_wrap(mut self, value: bool) -> Self {
@@ -330,382 +262,278 @@ impl DirectWriteLayout {
     pub fn font_family(&self) -> &str {
         &self.font.family
     }
+    pub fn font_choice(&self) -> &FontChoice {
+        &self.choice
+    }
     pub fn cell_width(&self) -> Dip {
         Dip(self.font.advance)
     }
-    fn remember(&self, layout: &LineLayout, stops: Vec<Stop>) {
-        if let Ok(mut h) = self.hits.lock() {
-            let key = signature(layout);
-            if !h.map.contains_key(&key) {
-                h.order.push_back(key);
-            }
-            h.map.insert(key, stops);
-            while h.order.len() > 128 {
-                if let Some(k) = h.order.pop_front() {
-                    h.map.remove(&k);
+    /// The reason the last `Layout` call on this engine returned `None`. The trait
+    /// can only return `None`, so the reason waits here. The `try_` methods return it.
+    pub fn last_error(&self) -> Option<LayoutError> {
+        self.last_error.lock().ok()?.clone()
+    }
+    /// The last font that `TextMeasurer::measure` had to replace. That trait returns
+    /// only sizes. `measure_with_font` returns this value directly.
+    pub fn last_measure_fallback(&self) -> Option<MeasureFallback> {
+        self.last_fallback.lock().ok()?.clone()
+    }
+    pub(crate) fn font(&self) -> &Font {
+        &self.font
+    }
+    pub(crate) fn font_uid(&self) -> u64 {
+        self.font.uid
+    }
+    pub(crate) fn wrap_enabled(&self) -> bool {
+        self.wrap
+    }
+    pub(crate) fn forced_shaping(&self) -> bool {
+        self.force_shaping
+    }
+    pub(crate) fn tab_width(&self) -> usize {
+        self.tab_width
+    }
+    fn record<T>(&self, result: Result<T, LayoutError>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if let Ok(mut last) = self.last_error.lock() {
+                    *last = Some(error);
                 }
+                None
             }
         }
     }
-    fn rebase_hits(&self, old: &LineLayout, new: &LineLayout, delta: isize) {
-        if let Ok(mut hits) = self.hits.lock()
-            && let Some(mut stops) = hits.map.get(&signature(old)).cloned()
-        {
-            for stop in &mut stops {
-                stop.byte = ByteOffset(
-                    stop.byte
-                        .0
-                        .checked_add_signed(delta)
-                        .expect("valid cached byte shift"),
-                );
-            }
-            let key = signature(new);
-            if !hits.map.contains_key(&key) {
-                hits.order.push_back(key);
-            }
-            hits.map.insert(key, stops);
-            while hits.order.len() > 128 {
-                if let Some(k) = hits.order.pop_front() {
-                    hits.map.remove(&k);
-                }
-            }
+    /// Like `Layout::layout_line`, with the reason for a failure.
+    pub fn try_layout_line(
+        &self,
+        text: &dyn TextSnapshot,
+        line: LineIndex,
+        width: Dip,
+    ) -> Result<LineLayout, LayoutError> {
+        if self.is_long_line(text, line)? {
+            return self.layout_segment(text, line, 0, width);
         }
+        let content = content_range(text, line)?;
+        let s = read(text, content.clone())?;
+        self.layout_text(&s, content.start, line, width, 0, false)
     }
-    fn content(
+    /// Like `Layout::layout_slice`, with tabs placed as if the slice started at
+    /// this column. The positions in the result still start at the slice's left edge.
+    pub fn layout_slice_from_column(
+        &self,
+        text: &dyn TextSnapshot,
+        range: Range<ByteOffset>,
+        width: Dip,
+        start_column: usize,
+    ) -> Result<LineLayout, LayoutError> {
+        if range.start > range.end || range.end > text.len_bytes() {
+            return Err(LayoutError::BadRange(range));
+        }
+        let bytes = range.end.0 - range.start.0;
+        if bytes > LONG_LINE_BYTES {
+            return Err(LayoutError::SliceTooLong {
+                bytes,
+                limit: LONG_LINE_BYTES,
+            });
+        }
+        let line = text
+            .byte_to_position(range.start)
+            .ok_or_else(|| LayoutError::BadRange(range.clone()))?
+            .line;
+        let s = read(text, range.clone())?;
+        if s.contains(LINE_ENDINGS) {
+            return Err(LayoutError::BadRange(range));
+        }
+        let content = content_range(text, line)?;
+        self.check_edge(text, &content, range.start)?;
+        self.check_edge(text, &content, range.end)?;
+        self.layout_text(&s, range.start, line, width, start_column, true)
+    }
+    pub(crate) fn layout_text(
         &self,
         s: &str,
         start: ByteOffset,
         line: LineIndex,
         width: Dip,
-    ) -> Option<LineLayout> {
-        let width_needed = s.as_bytes().iter().fold(0.0, |x, ch| {
-            if *ch == b'\t' {
-                let step = self.font.advance * self.tab_width as f32;
-                ((x / step).floor() + 1.0) * step
-            } else {
-                x + self.font.advance
-            }
-        });
-        if !self.force_shaping
-            && self.font.fixed_width
-            && s.is_ascii()
-            && (!self.wrap || width_needed <= width.0)
-        {
-            self.fast(s.as_bytes(), start, line)
+        start_column: usize,
+        partial: bool,
+    ) -> Result<LineLayout, LayoutError> {
+        let fast = !self.force_shaping
+            && self.font.fast_ok
+            && s.bytes().all(|b| b == b'\t' || (0x20..0x7F).contains(&b));
+        let lead = start_column % self.tab_width;
+        if fast && let Some(rows) = self.fast_rows(s.as_bytes(), width, lead) {
+            Ok(self.fast(s.as_bytes(), &rows, start, line, lead, partial))
         } else {
-            self.slow(s, start, line, width)
+            shaped::shape(self, s, start, line, width, start_column, partial)
         }
     }
-    fn fast(&self, s: &[u8], start: ByteOffset, line: LineIndex) -> Option<LineLayout> {
-        let mut ids = Vec::with_capacity(s.len());
-        let mut advances = Vec::with_capacity(s.len());
-        let mut stops = Vec::with_capacity(s.len() + 1);
-        let mut bytes = Vec::with_capacity(s.len() + 1);
-        let mut x = 0.0;
-        for (i, ch) in s.iter().copied().enumerate() {
-            let byte = ByteOffset(start.0 + i);
-            stops.push(Stop { byte, x, row: 0 });
-            bytes.push(byte);
-            ids.push(self.font.ascii[ch as usize]);
-            let a = if ch == b'\t' {
-                let step = self.font.advance * self.tab_width as f32;
-                ((x / step).floor() + 1.0) * step - x
-            } else {
-                self.font.advance
-            };
-            advances.push(Dip(a));
-            x += a;
+    /// The column after one character. `lead` is the slice's start column within
+    /// its tab stop.
+    fn next_column(&self, byte: u8, column: usize, lead: usize) -> usize {
+        if byte == b'\t' {
+            (column + lead) / self.tab_width * self.tab_width + self.tab_width - lead
+        } else {
+            column + 1
         }
-        let end = ByteOffset(start.0 + s.len());
-        stops.push(Stop {
-            byte: end,
-            x,
-            row: 0,
-        });
-        bytes.push(end);
-        let result = LineLayout {
-            line,
-            height: Dip(self.font.height),
-            rows: vec![LayoutRow {
-                range: start..end,
-                y: Dip(0.0),
-                height: Dip(self.font.height),
-                glyph_runs: vec![LayoutGlyphRun {
-                    range: start..end,
-                    origin: Point {
-                        x: Dip(0.0),
-                        y: Dip(self.font.baseline),
-                    },
-                    bidi_level: 0,
-                    font_id: self.font.id,
-                    glyph_ids: ids,
-                    advances,
-                    offsets: vec![Point::default(); s.len()],
-                }],
-                caret_stops: bytes,
-            }],
-        };
-        self.remember(&result, stops);
-        Some(result)
     }
-    fn slow(&self, s: &str, start: ByteOffset, line: LineIndex, width: Dip) -> Option<LineLayout> {
-        let utf16: Vec<u16> = s.encode_utf16().collect();
-        let l = unsafe {
-            factory()
-                .ok()?
-                .CreateTextLayout(
-                    &utf16,
-                    &self.font.format,
-                    if self.wrap {
-                        width.0.max(1.0)
-                    } else {
-                        1_000_000.0
-                    },
-                    1_000_000.0,
-                )
-                .ok()?
-        };
-        unsafe {
-            l.SetWordWrapping(if self.wrap {
-                DWRITE_WORD_WRAPPING_WRAP
-            } else {
-                DWRITE_WORD_WRAPPING_NO_WRAP
-            })
-            .ok()?;
-            l.SetIncrementalTabStop(self.font.advance * self.tab_width as f32)
-                .ok()?;
+    fn fast(
+        &self,
+        s: &[u8],
+        rows_end: &[usize],
+        start: ByteOffset,
+        line: LineIndex,
+        lead: usize,
+        partial: bool,
+    ) -> LineLayout {
+        let cell = self.font.advance_exact;
+        let height = self.font.height as f64;
+        let mut rows = Vec::with_capacity(rows_end.len());
+        let mut begin = 0;
+        for (index, &end) in rows_end.iter().enumerate() {
+            let y = index as f64 * height;
+            rows.push(self.fast_row(&s[begin..end], start.0 + begin, y, cell, lead));
+            begin = end;
         }
-        let mut tm = DWRITE_TEXT_METRICS::default();
-        unsafe {
-            l.GetMetrics(&mut tm).ok()?;
-        }
-        let mut count = 0;
-        let mut lm = vec![DWRITE_LINE_METRICS::default(); tm.lineCount.max(1) as usize];
-        unsafe {
-            l.GetLineMetrics(Some(&mut lm), &mut count).ok()?;
-        }
-        lm.truncate(count as usize);
-        let mut cc = 0;
-        let mut cm = vec![DWRITE_CLUSTER_METRICS::default(); utf16.len().max(1)];
-        unsafe {
-            l.GetClusterMetrics(Some(&mut cm), &mut cc).ok()?;
-        }
-        cm.truncate(cc as usize);
-        let mut clusters = vec![0usize];
-        let mut unit = 0;
-        for c in &cm {
-            unit += c.length as usize;
-            clusters.push(unit);
-        }
-        let mut boundaries = vec![(0usize, start)];
-        unit = 0;
-        for (at, ch) in s.char_indices() {
-            unit += ch.len_utf16();
-            boundaries.push((unit, ByteOffset(start.0 + at + ch.len_utf8())));
-        }
-        let mut rows = Vec::new();
-        let mut stops = Vec::new();
-        let mut first_unit = 0;
-        let mut y = 0.0;
-        for (ri, m) in lm.iter().enumerate() {
-            let last_unit = first_unit + m.length as usize;
-            let first = boundaries.iter().find(|b| b.0 == first_unit)?.1;
-            let last = boundaries.iter().find(|b| b.0 == last_unit)?.1;
-            let mut caret_stops = Vec::new();
-            for &(u, byte) in &boundaries {
-                if u < first_unit || u > last_unit || !clusters.contains(&u) {
-                    continue;
-                }
-                let mut x = 0.0;
-                let mut py = 0.0;
-                let mut hit = DWRITE_HIT_TEST_METRICS::default();
-                let trailing = u == last_unit && u > first_unit;
-                let at = if trailing { u - 1 } else { u };
-                if unsafe { l.HitTestTextPosition(at as u32, trailing, &mut x, &mut py, &mut hit) }
-                    .is_ok()
-                {
-                    caret_stops.push(byte);
-                    stops.push(Stop { byte, x, row: ri });
-                }
-            }
-            if !caret_stops.contains(&first) {
-                caret_stops.insert(0, first);
-            }
-            if !caret_stops.contains(&last) {
-                caret_stops.push(last);
-            }
-            rows.push(LayoutRow {
-                range: first..last,
-                y: Dip(y),
-                height: Dip(m.height),
-                glyph_runs: Vec::new(),
-                caret_stops,
-            });
-            first_unit = last_unit;
-            y += m.height;
-        }
-        if rows.is_empty() {
-            return self.fast(b"", start, line);
-        }
-        let collected = Arc::new(Mutex::new(Vec::new()));
-        let renderer: IDWriteTextRenderer = RunCollector {
-            runs: collected.clone(),
-        }
-        .into();
-        unsafe {
-            l.Draw(None, &renderer, 0.0, 0.0).ok()?;
-        }
-        for (at, len, font_id, ids, advances, offsets, origin, bidi_level) in
-            collected.lock().ok()?.iter()
-        {
-            if let Some(row) = rows
-                .iter_mut()
-                .find(|r| origin.y.0 >= r.y.0 && origin.y.0 <= r.y.0 + r.height.0)
-            {
-                let first = boundaries
-                    .iter()
-                    .rev()
-                    .find(|b| b.0 <= *at as usize)
-                    .map(|b| b.1)
-                    .unwrap_or(start);
-                let last = boundaries
-                    .iter()
-                    .find(|b| b.0 >= (*at + *len) as usize)
-                    .map(|b| b.1)
-                    .unwrap_or(row.range.end);
-                row.glyph_runs.push(LayoutGlyphRun {
-                    range: first..last,
-                    origin: *origin,
-                    bidi_level: *bidi_level,
-                    font_id: *font_id,
-                    glyph_ids: ids.clone(),
-                    advances: advances.clone(),
-                    offsets: offsets.clone(),
-                });
-            }
-        }
-        let result = LineLayout {
+        LineLayout {
             line,
+            height: Dip((rows.len() as f64 * height) as f32),
             rows,
-            height: Dip(y),
-        };
-        self.remember(&result, stops);
-        Some(result)
-    }
-}
-fn signature(l: &LineLayout) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for r in &l.rows {
-        r.range.start.hash(&mut h);
-        r.range.end.hash(&mut h);
-        r.caret_stops.hash(&mut h);
-        r.height.0.to_bits().hash(&mut h);
-        for run in &r.glyph_runs {
-            run.glyph_ids.hash(&mut h);
-            for advance in &run.advances {
-                advance.0.to_bits().hash(&mut h);
-            }
+            partial,
         }
     }
-    h.finish()
+    /// Where each row ends. `None` when only shaping can answer: a line with tabs
+    /// that must wrap. DirectWrite sums tab stops in `f32`, so a row that just fits
+    /// can go either way, and a line that needs no wrap does not depend on this.
+    fn fast_rows(&self, s: &[u8], width: Dip, lead: usize) -> Option<Vec<usize>> {
+        if !self.wrap {
+            return Some(vec![s.len()]);
+        }
+        let widest_possible = s.len().saturating_mul(self.tab_width);
+        let max_columns = wrap::columns_that_fit(self.font.advance, width.0, widest_possible);
+        let mut column = 0;
+        let mut has_tab = false;
+        let fits = s.iter().all(|&b| {
+            has_tab |= b == b'\t';
+            column = self.next_column(b, column, lead);
+            b == b' ' || b == b'\t' || column <= max_columns
+        });
+        if fits {
+            return Some(vec![s.len()]);
+        }
+        if has_tab || s.contains(&b'\t') {
+            return None;
+        }
+        Some(wrap::wrap_rows(s, &wrap::break_points(s), max_columns))
+    }
+    fn fast_row(&self, s: &[u8], offset: usize, y: f64, cell: f64, lead: usize) -> LayoutRow {
+        let mut stops = Vec::with_capacity(s.len() + 1);
+        let mut glyph_runs = Vec::with_capacity(1);
+        let baseline = Dip((y + self.font.baseline as f64) as f32);
+        let advance = Dip(self.font.advance);
+        let mut column = 0;
+        // x comes from the column each time, so no error builds up along a row.
+        let x_of = |column: usize| Dip((column as f64 * cell) as f32);
+        let mut at = 0;
+        while at < s.len() {
+            if s[at] == b'\t' {
+                // A tab draws no glyph, as in shaping. It only moves the next run.
+                stops.push(CaretStop {
+                    byte: ByteOffset(offset + at),
+                    x: x_of(column),
+                    x_before: x_of(column),
+                });
+                column = self.next_column(b'\t', column, lead);
+                at += 1;
+                continue;
+            }
+            let run_end = s[at..]
+                .iter()
+                .position(|b| *b == b'\t')
+                .map_or(s.len(), |n| at + n);
+            let count = run_end - at;
+            let first_column = column;
+            let mut ids = Vec::with_capacity(count);
+            for (i, &byte) in s[at..run_end].iter().enumerate() {
+                stops.push(CaretStop {
+                    byte: ByteOffset(offset + at + i),
+                    x: x_of(column),
+                    x_before: x_of(column),
+                });
+                ids.push(self.font.ascii[byte as usize]);
+                column += 1;
+            }
+            glyph_runs.push(LayoutGlyphRun {
+                range: ByteOffset(offset + at)..ByteOffset(offset + run_end),
+                origin: Point {
+                    x: x_of(first_column),
+                    y: baseline,
+                },
+                bidi_level: 0,
+                font_id: self.font.id,
+                font_em_size: Dip(self.font.em_size),
+                glyph_ids: ids,
+                advances: vec![advance; count],
+                offsets: vec![Point::default(); count],
+            });
+            at = run_end;
+        }
+        let end = ByteOffset(offset + s.len());
+        stops.push(CaretStop {
+            byte: end,
+            x: x_of(column),
+            x_before: x_of(column),
+        });
+        let start = ByteOffset(offset);
+        LayoutRow {
+            range: start..end,
+            y: Dip(y as f32),
+            height: Dip(self.font.height),
+            glyph_runs,
+            caret_stops: stops,
+            visual_stops: Vec::new(),
+        }
+    }
+    /// The real size of text in the named font, and any font that had to replace it.
+    /// A token is a family, a family and a point size such as "Segoe UI 9", or a
+    /// family whose own name ends in a number. A missing family uses this engine's
+    /// font, and the result says so.
+    pub fn measure_with_font(&self, text: &str, font_token: &str) -> Result<Measured, LayoutError> {
+        let lookup_error = Mutex::new(None);
+        let (family, points) = parse_font_token(font_token, |name| {
+            family_exists(name).unwrap_or_else(|e| {
+                if let Ok(mut slot) = lookup_error.lock() {
+                    *slot = Some(e);
+                }
+                false
+            })
+        });
+        if let Some(error) = lookup_error
+            .into_inner()
+            .map_err(|_| LayoutError::Poisoned("font lookup"))?
+        {
+            return Err(error);
+        }
+        let em_size = points.map_or(self.font.em_size, |p| p * 96.0 / 72.0);
+        let (selected, fallback) = match font(family, em_size, DWRITE_FONT_WEIGHT_NORMAL) {
+            Ok(selected) => (selected, None),
+            Err(LayoutError::MissingFont(_)) => (
+                font(&self.font.family, em_size, DWRITE_FONT_WEIGHT_NORMAL)?,
+                Some(MeasureFallback {
+                    requested: family.to_owned(),
+                    used: self.font.family.clone(),
+                }),
+            ),
+            Err(other) => return Err(other),
+        };
+        Ok(Measured {
+            metrics: shaped::measure_text(&selected, text)?,
+            fallback,
+        })
+    }
 }
 
-/// Pick a bounded slice around a byte offset using DirectWrite cluster edges.
-/// Returns `None` if one cluster is wider than the requested window.
-pub fn slice_around(
-    text: &dyn TextSnapshot,
-    byte: ByteOffset,
-    max_bytes: usize,
-) -> Option<Range<ByteOffset>> {
-    if max_bytes == 0 {
-        return None;
-    }
-    let line = text.byte_to_position(byte)?.line;
-    let line_range = text.line_range(line)?;
-    if byte < line_range.start || byte > line_range.end {
-        return None;
-    }
-    let context = max_bytes.max(64);
-    let mut left = byte.0.saturating_sub(context).max(line_range.start.0);
-    let mut right = byte.0.saturating_add(context).min(line_range.end.0);
-    while left < byte.0 && text.byte_to_utf16(ByteOffset(left)).is_none() {
-        left += 1;
-    }
-    while right > byte.0 && text.byte_to_utf16(ByteOffset(right)).is_none() {
-        right -= 1;
-    }
-    let mut s = String::new();
-    if !text.visit_chunks(ByteOffset(left)..ByteOffset(right), &mut |part| {
-        s.push_str(part)
-    }) {
-        return None;
-    }
-    let trimmed = s.trim_end_matches(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}']);
-    right = left + trimmed.len();
-    if byte.0 > right {
-        return None;
-    }
-    let utf16: Vec<u16> = trimmed.encode_utf16().collect();
-    if utf16.is_empty() {
-        return Some(ByteOffset(left)..ByteOffset(right));
-    }
-    let layout = unsafe {
-        factory()
-            .ok()?
-            .CreateTextLayout(
-                &utf16,
-                &font(
-                    "Cascadia Mono",
-                    10.0 * 96.0 / 72.0,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                )
-                .ok()?
-                .format,
-                1_000_000.0,
-                1_000_000.0,
-            )
-            .ok()?
-    };
-    let mut count = 0;
-    let mut clusters = vec![DWRITE_CLUSTER_METRICS::default(); utf16.len()];
-    unsafe {
-        layout
-            .GetClusterMetrics(Some(&mut clusters), &mut count)
-            .ok()?;
-    }
-    clusters.truncate(count as usize);
-    let mut utf16_to_byte = HashMap::new();
-    let mut unit = 0usize;
-    utf16_to_byte.insert(0, left);
-    for (at, ch) in trimmed.char_indices() {
-        unit += ch.len_utf16();
-        utf16_to_byte.insert(unit, left + at + ch.len_utf8());
-    }
-    let mut boundaries = Vec::new();
-    unit = 0;
-    if left == line_range.start.0 {
-        boundaries.push(left);
-    }
-    for cluster in &clusters {
-        unit += cluster.length as usize;
-        if let Some(&b) = utf16_to_byte.get(&unit) {
-            boundaries.push(b);
-        }
-    }
-    if right < line_range.end.0 {
-        boundaries.pop();
-    }
-    let desired_left = byte.0.saturating_sub(max_bytes / 2);
-    let start = *boundaries
-        .iter()
-        .filter(|&&b| b <= byte.0 && b >= desired_left)
-        .min()?;
-    let end = *boundaries
-        .iter()
-        .filter(|&&b| b >= byte.0 && b <= start.saturating_add(max_bytes))
-        .max()?;
-    Some(ByteOffset(start)..ByteOffset(end))
-}
 impl Layout for DirectWriteLayout {
     fn layout_line(
         &self,
@@ -713,17 +541,7 @@ impl Layout for DirectWriteLayout {
         line: LineIndex,
         width: Dip,
     ) -> Option<LineLayout> {
-        let range = text.line_range(line)?;
-        let mut s = String::new();
-        if !text.visit_chunks(range.clone(), &mut |c| s.push_str(c)) {
-            return None;
-        }
-        self.content(
-            s.trim_end_matches(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}']),
-            range.start,
-            line,
-            width,
-        )
+        self.record(self.try_layout_line(text, line, width))
     }
     fn layout_slice(
         &self,
@@ -731,298 +549,51 @@ impl Layout for DirectWriteLayout {
         range: Range<ByteOffset>,
         width: Dip,
     ) -> Option<LineLayout> {
-        if range.start > range.end || range.end > text.len_bytes() {
-            return None;
-        }
-        let line = text.byte_to_position(range.start)?.line;
-        let mut s = String::new();
-        if !text.visit_chunks(range.clone(), &mut |c| s.push_str(c))
-            || s.contains(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}'])
-        {
-            return None;
-        }
-        self.content(&s, range.start, line, width)
-    }
-    fn hit_test_point(&self, l: &LineLayout, p: Point) -> ByteOffset {
-        let ri = l
-            .rows
-            .iter()
-            .position(|r| p.y.0 < r.y.0 + r.height.0)
-            .unwrap_or(l.rows.len().saturating_sub(1));
-        let Ok(h) = self.hits.lock() else {
-            return l.rows[ri].range.start;
-        };
-        h.map
-            .get(&signature(l))
-            .and_then(|v| {
-                v.iter()
-                    .filter(|s| s.row == ri)
-                    .min_by(|a, b| (a.x - p.x.0).abs().total_cmp(&(b.x - p.x.0).abs()))
-                    .map(|s| s.byte)
-            })
-            .unwrap_or(l.rows[ri].range.start)
-    }
-    fn caret_rect(&self, l: &LineLayout, byte: ByteOffset) -> Option<Rect> {
-        let h = self.hits.lock().ok()?;
-        let s = h.map.get(&signature(l))?.iter().find(|s| s.byte == byte)?;
-        let r = l.rows.get(s.row)?;
-        Some(Rect {
-            x: Dip(s.x),
-            y: r.y,
-            width: Dip(1.0),
-            height: r.height,
-        })
+        self.record(self.layout_slice_from_column(text, range, width, 0))
     }
 }
+
 impl TextMeasurer for DirectWriteLayout {
+    /// See `measure_with_font`. A DirectWrite failure gives zero sizes and is kept
+    /// in `last_error`.
     fn measure(&self, text: &str, font_token: &str) -> TextMetrics {
-        // A token may end in a point size, such as "Segoe UI 9". A family-only
-        // token keeps the configured size. Unknown families use Segoe UI, then
-        // the first installed system family. A failed lookup keeps this font.
-        let (family, size) = font_token
-            .rsplit_once(' ')
-            .and_then(|(family, value)| value.parse::<f32>().ok().map(|size| (family, size)))
-            .filter(|(family, size)| !family.is_empty() && size.is_finite() && *size > 0.0)
-            .map(|(family, points)| (family, points * 96.0 / 72.0))
-            .unwrap_or((font_token, unsafe { self.font.format.GetFontSize() }));
-        let selected =
-            font(family, size, DWRITE_FONT_WEIGHT_NORMAL).unwrap_or_else(|_| self.font.clone());
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        let width = factory()
-            .ok()
-            .and_then(|f| unsafe {
-                f.CreateTextLayout(&utf16, &selected.format, 1_000_000.0, 1_000_000.0)
-                    .ok()
-            })
-            .and_then(|l| {
-                let mut m = DWRITE_TEXT_METRICS::default();
-                unsafe { l.GetMetrics(&mut m).ok()? };
-                Some(m.widthIncludingTrailingWhitespace)
-            })
-            .unwrap_or(0.0);
-        TextMetrics {
-            width: Dip(width),
-            height: Dip(selected.height),
-            baseline: Dip(selected.baseline),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct CacheKey {
-    line: usize,
-    width: u32,
-    font: usize,
-    text: u64,
-}
-/// Bounded cache of displayed lines. A key only hashes one line.
-pub struct LineCache {
-    cap: usize,
-    used: usize,
-    entries: HashMap<CacheKey, (LineLayout, usize)>,
-    order: VecDeque<CacheKey>,
-}
-impl LineCache {
-    pub fn new(memory_cap: usize) -> Self {
-        Self {
-            cap: memory_cap,
-            used: 0,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-    pub fn memory_bytes(&self) -> usize {
-        self.used
-    }
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
-        self.used = 0;
-    }
-    pub fn get_or_layout(
-        &mut self,
-        engine: &DirectWriteLayout,
-        text: &dyn TextSnapshot,
-        line: LineIndex,
-        width: Dip,
-    ) -> Option<LineLayout> {
-        let range = text.line_range(line)?;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        if !text.visit_chunks(range.clone(), &mut |part| part.hash(&mut h)) {
-            return None;
-        }
-        let key = CacheKey {
-            line: line.0,
-            width: width.0.to_bits(),
-            font: Arc::as_ptr(&engine.font) as usize,
-            text: h.finish(),
-        };
-        if let Some((layout, _)) = self.entries.get_mut(&key) {
-            let old = layout.clone();
-            if let Some(first) = layout.rows.first()
-                && first.range.start != range.start
-            {
-                let delta = range.start.0 as isize - first.range.start.0 as isize;
-                for row in &mut layout.rows {
-                    row.range.start.0 = row.range.start.0.checked_add_signed(delta)?;
-                    row.range.end.0 = row.range.end.0.checked_add_signed(delta)?;
-                    for byte in &mut row.caret_stops {
-                        byte.0 = byte.0.checked_add_signed(delta)?;
-                    }
-                    for run in &mut row.glyph_runs {
-                        run.range.start.0 = run.range.start.0.checked_add_signed(delta)?;
-                        run.range.end.0 = run.range.end.0.checked_add_signed(delta)?;
-                    }
-                }
-                engine.rebase_hits(&old, layout, delta);
-            }
-            let result = layout.clone();
-            self.touch(key);
-            return Some(result);
-        }
-        let result = engine.layout_line(text, line, width)?;
-        let size: usize = result
-            .rows
-            .iter()
-            .map(|r| {
-                128 + r.caret_stops.len() * 8
-                    + r.glyph_runs
-                        .iter()
-                        .map(|g| g.glyph_ids.len() * 18)
-                        .sum::<usize>()
-            })
-            .sum();
-        if size <= self.cap {
-            self.used += size;
-            self.entries.insert(key, (result.clone(), size));
-            self.touch(key);
-            self.trim();
-        }
-        Some(result)
-    }
-    fn touch(&mut self, key: CacheKey) {
-        self.order.retain(|k| *k != key);
-        self.order.push_back(key);
-    }
-    fn trim(&mut self) {
-        while self.used > self.cap {
-            if let Some(k) = self.order.pop_front() {
-                if let Some((_, n)) = self.entries.remove(&k) {
-                    self.used -= n;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-    /// The old snapshot identifies the touched lines; later keys move by the line delta.
-    pub fn invalidate(&mut self, old: &dyn TextSnapshot, change: &TextChange) {
-        let Some(first) = old
-            .byte_to_position(change.replaced.start)
-            .map(|p| p.line.0)
-        else {
-            self.clear();
-            return;
-        };
-        let Some(last) = old.byte_to_position(change.replaced.end).map(|p| p.line.0) else {
-            self.clear();
-            return;
-        };
-        let mut moved = HashMap::new();
-        let mut order = VecDeque::new();
-        let mut used = 0;
-        for key in &self.order {
-            if key.line >= first && key.line <= last {
-                continue;
-            }
-            let Some((mut layout, n)) = self.entries.remove(key) else {
-                continue;
+        let Some(measured) = self.record(self.measure_with_font(text, font_token)) else {
+            return TextMetrics {
+                width: Dip(0.0),
+                height: Dip(0.0),
+                baseline: Dip(0.0),
             };
-            let mut k = *key;
-            if k.line > last {
-                let next = k.line as isize + change.line_count_delta;
-                if next < 0 {
-                    continue;
-                }
-                k.line = next as usize;
-                layout.line = LineIndex(k.line);
-            }
-            used += n;
-            order.push_back(k);
-            moved.insert(k, (layout, n));
+        };
+        if let Some(fallback) = measured.fallback
+            && let Ok(mut last) = self.last_fallback.lock()
+        {
+            *last = Some(fallback);
         }
-        self.entries = moved;
-        self.order = order;
-        self.used = used;
+        measured.metrics
     }
 }
 
-/// Measured line heights are stored as changes from one estimated height.
-pub struct HeightMap {
-    estimate: f32,
-    heights: Vec<Option<f32>>,
-    tree: Vec<f64>,
-}
-impl HeightMap {
-    pub fn new(lines: usize, estimate: Dip) -> Self {
-        Self {
-            estimate: estimate.0,
-            heights: vec![None; lines],
-            tree: vec![0.0; lines + 1],
-        }
-    }
-    pub fn len(&self) -> usize {
-        self.heights.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.heights.is_empty()
-    }
-    pub fn set(&mut self, line: LineIndex, height: Dip) -> bool {
-        let Some(slot) = self.heights.get_mut(line.0) else {
-            return false;
-        };
-        let previous = slot.unwrap_or(self.estimate);
-        *slot = Some(height.0);
-        let mut i = line.0 + 1;
-        while i < self.tree.len() {
-            self.tree[i] += (height.0 - previous) as f64;
-            i += i & (!i + 1);
-        }
-        true
-    }
-    fn extra(&self, mut count: usize) -> f64 {
-        let mut sum = 0.0;
-        while count > 0 {
-            sum += self.tree[count];
-            count &= count - 1;
-        }
-        sum
-    }
-    pub fn line_to_scroll(&self, line: LineIndex) -> Dip {
-        let n = line.0.min(self.len());
-        Dip((n as f64 * self.estimate as f64 + self.extra(n)) as f32)
-    }
-    pub fn scroll_to_line(&self, scroll: Dip) -> LineIndex {
-        let mut at = 0;
-        let mut delta = 0.0;
-        let mut bit = self.len().next_power_of_two();
-        while bit != 0 {
-            let next = at + bit;
-            if next <= self.len() {
-                let candidate = next as f64 * self.estimate as f64 + delta + self.tree[next];
-                if candidate <= scroll.0 as f64 {
-                    at = next;
-                    delta += self.tree[next];
-                }
-            }
-            bit >>= 1;
-        }
-        LineIndex(at.min(self.len().saturating_sub(1)))
+#[cfg(test)]
+mod tests {
+    use super::parse_font_token;
+
+    #[test]
+    fn family_names_ending_in_a_number_are_not_sizes() {
+        let installed = |name: &str| name == "Font 7" || name == "Segoe UI";
+        assert_eq!(parse_font_token("Font 7", installed), ("Font 7", None));
+        assert_eq!(
+            parse_font_token("Font 7 12", installed),
+            ("Font 7", Some(12.0))
+        );
+        assert_eq!(
+            parse_font_token("Segoe UI 9", installed),
+            ("Segoe UI", Some(9.0))
+        );
+        assert_eq!(parse_font_token("Segoe UI", installed), ("Segoe UI", None));
+        assert_eq!(parse_font_token("Other 0", installed), ("Other 0", None));
+        assert_eq!(
+            parse_font_token("Other NaN", installed),
+            ("Other NaN", None)
+        );
     }
 }

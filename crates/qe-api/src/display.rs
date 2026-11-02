@@ -32,24 +32,33 @@ pub enum DrawCommand {
         width: Dip,
         color: Color,
     },
+    /// `at` is the start of the text on its baseline, the same as `GlyphRun`. To
+    /// center text in a box, use `TextMeasurer`: `at.y` is the box top, plus half
+    /// of the box height minus `TextMetrics::height`, plus `TextMetrics::baseline`.
     TextRun {
         at: Point,
         text: String,
         font: String,
+        font_size: Dip,
         color: Color,
     },
+    /// `at` is the start of the glyph's baseline. `font_em_size` is the size to
+    /// draw the glyph ids at.
     GlyphRun {
         at: Point,
         bidi_level: u8,
         font_id: u32,
+        font_em_size: Dip,
         glyph_ids: Vec<u16>,
         advances: Vec<Dip>,
         offsets: Vec<Point>,
         color: Color,
     },
+    /// `at` is the start of the icon on its baseline, the same as `TextRun`.
     Icon {
-        at: Rect,
+        at: Point,
         icon_id: String,
+        font_size: Dip,
         color: Color,
     },
     PushClip(Rect),
@@ -69,7 +78,7 @@ impl DisplayList {
     }
     /// Versioned, stable text for saved replay expectations. Floats use fixed 3 decimals.
     pub fn to_stable_text(&self) -> String {
-        let mut out = String::from("display-list-v3\n");
+        let mut out = String::from("display-list-v4\n");
         for command in &self.commands {
             out.push_str(&format_command(command));
             out.push('\n');
@@ -137,11 +146,13 @@ fn format_command(c: &DrawCommand) -> String {
             at,
             text,
             font,
+            font_size,
             color: c,
         } => format!(
-            "text {} {} {} {}",
+            "text {} {} {:.3} {} {}",
             point(at),
             quoted(font),
+            font_size.0,
             color(c),
             quoted(text)
         ),
@@ -149,15 +160,17 @@ fn format_command(c: &DrawCommand) -> String {
             at,
             bidi_level,
             font_id,
+            font_em_size,
             glyph_ids,
             advances,
             offsets,
             color: c,
         } => format!(
-            "glyph {} {} {} {:?} {:?} {:?} {}",
+            "glyph {} {} {} {:.3} {:?} {:?} {:?} {}",
             point(at),
             bidi_level,
             font_id,
+            font_em_size.0,
             glyph_ids,
             advances
                 .iter()
@@ -169,8 +182,15 @@ fn format_command(c: &DrawCommand) -> String {
         DrawCommand::Icon {
             at,
             icon_id,
+            font_size,
             color: c,
-        } => format!("icon {} {} {}", rect(at), quoted(icon_id), color(c)),
+        } => format!(
+            "icon {} {} {:.3} {}",
+            point(at),
+            quoted(icon_id),
+            font_size.0,
+            color(c)
+        ),
         DrawCommand::PushClip(r) => format!("push-clip {}", rect(r)),
         DrawCommand::PopClip => "pop-clip".into(),
         DrawCommand::PushOpacity(a) => format!("push-opacity {a:.3}"),

@@ -125,7 +125,7 @@ fn pixels(sample: &str, family: &str) -> Vec<u8> {
             .collect();
         let native = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face)),
-            fontEmSize: 10.0 * 96.0 / 72.0,
+            fontEmSize: run.font_em_size.0,
             glyphCount: run.glyph_ids.len() as u32,
             glyphIndices: run.glyph_ids.as_ptr(),
             glyphAdvances: advances.as_ptr(),

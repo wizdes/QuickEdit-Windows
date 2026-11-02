@@ -4,7 +4,10 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextMetrics {
     pub width: Dip,
+    /// The height of all rows of the text, using the fonts that really draw it.
     pub height: Dip,
+    /// The distance from the top of the text down to its first baseline: the line
+    /// ascent. `DrawCommand::TextRun` takes its position on the baseline.
     pub baseline: Dip,
 }
 

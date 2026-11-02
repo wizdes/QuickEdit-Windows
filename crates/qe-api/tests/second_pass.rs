@@ -28,7 +28,11 @@ fn slice_layout_reads_only_requested_bytes() {
     assert_eq!(result.line, LineIndex(0));
     assert_eq!(result.rows[0].range, ByteOffset(2)..ByteOffset(7));
     assert_eq!(
-        result.rows[0].caret_stops,
+        result.rows[0]
+            .caret_stops
+            .iter()
+            .map(|s| s.byte)
+            .collect::<Vec<_>>(),
         vec![ByteOffset(2), ByteOffset(6), ByteOffset(7)]
     );
     assert!(
@@ -89,7 +93,7 @@ fn added_draw_commands_have_stable_text() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v3\nfill-rects [1.000,2.000,3.000,4.000;1.000,2.000,3.000,4.000] #010203ff\nstroke-rect 1.000,2.000,3.000,4.000 5.000 0.500 #010203ff\nwavy-underline 1.000,2.000 1.000,2.000 #010203ff\n"
+        "display-list-v4\nfill-rects [1.000,2.000,3.000,4.000;1.000,2.000,3.000,4.000] #010203ff\nstroke-rect 1.000,2.000,3.000,4.000 5.000 0.500 #010203ff\nwavy-underline 1.000,2.000 1.000,2.000 #010203ff\n"
     );
 }
 

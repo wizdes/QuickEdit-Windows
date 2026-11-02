@@ -19,6 +19,7 @@ encodings! {
     Utf32 => "UTF-32",
     Utf32Le => "UTF-32 LE",
     Utf32Be => "UTF-32 BE",
+    Windows874 => "Windows-874",
     Windows1250 => "Windows-1250",
     Windows1251 => "Windows-1251",
     Windows1252 => "Windows-1252",

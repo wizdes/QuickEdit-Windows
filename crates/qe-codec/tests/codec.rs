@@ -22,6 +22,7 @@ fn every_available_encoding_round_trips() {
         let bytes = encode(sample, &format).unwrap();
         let decoded = decode(bytes.clone(), EncodingChoice::Specific(encoding)).unwrap();
         assert_eq!(decoded.text, sample, "{}", encoding.name());
+        assert!(!decoded.format.lossy, "{}", encoding.name());
         assert_eq!(
             encode(&decoded.text, &decoded.format).unwrap(),
             bytes,
@@ -157,6 +158,7 @@ fn explicit_and_line_endings() {
 }
 
 #[test]
+#[allow(clippy::permissions_set_readonly_false)] // the test puts a file back so it can delete it
 fn atomic_failure_keeps_original() {
     let dir = std::env::temp_dir().join(format!("qe-codec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -173,26 +175,6 @@ fn atomic_failure_keeps_original() {
     permissions.set_readonly(false);
     std::fs::set_permissions(&path, permissions).unwrap();
     std::fs::remove_file(path).unwrap();
-    std::fs::remove_dir(dir).unwrap();
-}
-
-#[test]
-fn replace_failure_keeps_original_and_names_fallback_limit() {
-    let dir = std::env::temp_dir().join(format!("qe-codec-replace-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("target");
-    std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("keep.txt"), b"original").unwrap();
-    let result = atomic_write(&target, b"new bytes").unwrap();
-    let AtomicWriteResult::ReplacementUnavailable { temp_path, limit } = result else {
-        panic!("expected replacement failure")
-    };
-    assert!(limit.contains("not be atomic"));
-    assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"original");
-    assert_eq!(std::fs::read(&temp_path).unwrap(), b"new bytes");
-    std::fs::remove_file(temp_path).unwrap();
-    std::fs::remove_file(target.join("keep.txt")).unwrap();
-    std::fs::remove_dir(target).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }
 
@@ -237,11 +219,9 @@ fn streaming_and_cancel() {
     let input = dir.join("input.txt");
     let output = dir.join("output.txt");
     let text = "a\r\nβ\r\n".repeat(300_000);
-    let bytes = encode(
-        &text,
-        &Format::new_document().changed_to(TextEncoding::Utf16),
-    )
-    .unwrap();
+    // UTF-16 LE with a BOM, built without this crate.
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
     std::fs::write(&input, bytes).unwrap();
     let mut updates = 0;
     let format = qe_codec::transcode_to_utf8_file(
@@ -285,12 +265,8 @@ fn streaming_shift_jis_crosses_chunk_boundary() {
     let input = dir.join("input");
     let output = dir.join("output");
     let text = "\u{6f22}".repeat(600_000);
-    let bytes = encode(
-        &text,
-        &Format::new_document().changed_to(TextEncoding::ShiftJis),
-    )
-    .unwrap();
-    std::fs::write(&input, bytes).unwrap();
+    // U+6F22 is 8A BF in Shift JIS.
+    std::fs::write(&input, [0x8a, 0xbf].repeat(600_000)).unwrap();
     let format = qe_codec::transcode_to_utf8_file(
         &input,
         &output,

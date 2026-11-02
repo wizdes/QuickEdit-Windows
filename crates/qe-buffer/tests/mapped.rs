@@ -6,7 +6,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 fn temp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("qe-buffer-{}-{name}", std::process::id()))
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("qe-buffer-{}-{name}", std::process::id()))
 }
 
 #[test]

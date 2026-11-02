@@ -1,346 +1,82 @@
-//! UTF-8 text storage with immutable tree nodes.
+//! UTF-8 text storage. See `README.md` in this crate for the rules and limits.
 //!
-//! `MappedStore` is a read-only ReadFile store, not a live memory mapping.
-//! Windows blocks file truncation while a live mapping exists. Lookups use a
-//! 256 KiB page cache; background indexing reads at most 4 MiB per scan.
+//! - `PieceStore` is the editable store: an immutable balanced tree of small text
+//!   leaves, so a snapshot is a cheap copy of the root.
+//! - `UndoHistory` records edits to a `PieceStore` as swaps of tree slices.
+//! - `MappedStore` is the read-only store for very large files. It uses ReadFile
+//!   and not a live memory mapping, because a live mapping stops other apps from
+//!   truncating the file.
 use qe_api::{
     ByteOffset, EditError, LineIndex, TextChange, TextPosition, TextSnapshot, TextStore,
     Utf16Offset,
 };
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const CHUNK: usize = 4096;
-#[derive(Clone, Copy, Default)]
-struct Sum {
-    bytes: usize,
-    units: usize,
-    breaks: usize,
-    first_lf: bool,
-    last_cr: bool,
-}
-impl Sum {
-    fn add(self, b: Self) -> Self {
-        if self.bytes == 0 {
-            return b;
-        }
-        if b.bytes == 0 {
-            return self;
-        }
-        Self {
-            bytes: self.bytes + b.bytes,
-            units: self.units + b.units,
-            breaks: self.breaks + b.breaks - usize::from(self.last_cr && b.first_lf),
-            first_lf: self.first_lf,
-            last_cr: b.last_cr,
-        }
-    }
-}
-fn measure(s: &str) -> Sum {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the runtime feature check above guards every AVX2 instruction.
-        return unsafe { measure_avx2(s) };
-    }
-    measure_plain(s)
+#[cfg(windows)]
+mod mapped;
+mod measure;
+mod tree;
+mod undo;
+
+#[cfg(windows)]
+pub use mapped::{IndexTiming, MappedStore, Notify};
+pub use tree::TreeShape;
+pub use undo::{DEFAULT_UNDO_LIMIT_BYTES, UndoHistory};
+
+use measure::Sum;
+#[cfg(windows)]
+use measure::measure;
+use tree::{Kind, Node, Tree, byte_at, from_text, is_boundary, prefix, splice, split, visit};
+use undo::Edit;
+
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_stamp() -> u64 {
+    NEXT_STAMP.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn measure_avx2(s: &str) -> Sum {
-    use std::arch::x86_64::*;
-    let bytes = s.as_bytes();
-    let cr = _mm256_set1_epi8(b'\r' as i8);
-    let lf = _mm256_set1_epi8(b'\n' as i8);
-    let mut at = 0;
-    let mut breaks = 0;
-    let mut previous_cr = false;
-    while at + 32 <= bytes.len() {
-        // SAFETY: the loop checks that 32 bytes remain.
-        let block = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(at).cast()) };
-        if _mm256_movemask_epi8(block) != 0 {
-            return measure_plain(s);
-        }
-        let cr_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, cr)) as u32;
-        let lf_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, lf)) as u32;
-        breaks += cr_mask.count_ones() as usize + lf_mask.count_ones() as usize;
-        breaks -= (cr_mask & (lf_mask >> 1)).count_ones() as usize;
-        breaks -= usize::from(previous_cr && (lf_mask & 1) != 0);
-        previous_cr = cr_mask & (1 << 31) != 0;
-        at += 32;
-    }
-    for &b in &bytes[at..] {
-        if b >= 128 {
-            return measure_plain(s);
-        }
-        if b == b'\r' || (b == b'\n' && !previous_cr) {
-            breaks += 1;
-        }
-        previous_cr = b == b'\r';
-    }
-    Sum {
-        bytes: s.len(),
-        units: s.len(),
-        breaks,
-        first_lf: s.starts_with('\n'),
-        last_cr: previous_cr,
-    }
-}
-
-fn measure_plain(s: &str) -> Sum {
-    if s.is_ascii() {
-        let mut breaks = 0;
-        let mut previous_cr = false;
-        let bytes = s.as_bytes();
-        let mut at = 0;
-        while at + 8 <= bytes.len() {
-            let word = u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
-            let cr = word ^ u64::from_ne_bytes([b'\r'; 8]);
-            let lf = word ^ u64::from_ne_bytes([b'\n'; 8]);
-            let has_zero =
-                |x: u64| (x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080) != 0;
-            if !has_zero(cr) && !has_zero(lf) {
-                previous_cr = false;
-                at += 8;
-                continue;
-            }
-            for &b in &bytes[at..at + 8] {
-                if b == b'\r' || (b == b'\n' && !previous_cr) {
-                    breaks += 1;
-                }
-                previous_cr = b == b'\r';
-            }
-            at += 8;
-        }
-        for &b in &bytes[at..] {
-            if b == b'\r' || (b == b'\n' && !previous_cr) {
-                breaks += 1;
-            }
-            previous_cr = b == b'\r';
-        }
-        return Sum {
-            bytes: s.len(),
-            units: s.len(),
-            breaks,
-            first_lf: s.starts_with('\n'),
-            last_cr: previous_cr,
-        };
-    }
-    let mut units = 0;
-    let mut breaks = 0;
-    let mut previous_cr = false;
-    for c in s.chars() {
-        units += c.len_utf16();
-        if matches!(c, '\r' | '\u{85}' | '\u{2028}' | '\u{2029}') || (c == '\n' && !previous_cr) {
-            breaks += 1;
-        }
-        previous_cr = c == '\r';
-    }
-    Sum {
-        bytes: s.len(),
-        units,
-        breaks,
-        first_lf: s.starts_with('\n'),
-        last_cr: previous_cr,
-    }
-}
+/// The editable store. Each real edit makes a new stamp, unique in the process,
+/// which is how `UndoHistory` notices an edit it did not record.
 #[derive(Clone)]
-struct Piece {
-    text: Arc<str>,
-    start: usize,
-    end: usize,
-}
-impl Piece {
-    fn get(&self) -> &str {
-        &self.text[self.start..self.end]
-    }
-}
-enum Kind {
-    Leaf(Piece),
-    Branch(Arc<Node>, Arc<Node>),
-}
-struct Node {
-    kind: Kind,
-    sum: Sum,
-    height: u8,
-}
-type Tree = Option<Arc<Node>>;
-fn leaf(p: Piece) -> Arc<Node> {
-    Arc::new(Node {
-        sum: measure(p.get()),
-        kind: Kind::Leaf(p),
-        height: 1,
-    })
-}
-fn branch(a: Arc<Node>, b: Arc<Node>) -> Arc<Node> {
-    Arc::new(Node {
-        sum: a.sum.add(b.sum),
-        height: a.height.max(b.height) + 1,
-        kind: Kind::Branch(a, b),
-    })
-}
-fn join(a: Tree, b: Tree) -> Tree {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some(a), Some(b)) => {
-            if a.height > b.height + 1
-                && let Kind::Branch(ref l, ref r) = a.kind
-            {
-                let mid = join(Some(r.clone()), Some(b)).unwrap();
-                if mid.height > l.height + 1
-                    && let Kind::Branch(ref ml, ref mr) = mid.kind
-                {
-                    return Some(branch(branch(l.clone(), ml.clone()), mr.clone()));
-                }
-                return Some(branch(l.clone(), mid));
-            }
-            if b.height > a.height + 1
-                && let Kind::Branch(ref l, ref r) = b.kind
-            {
-                let mid = join(Some(a), Some(l.clone())).unwrap();
-                if mid.height > r.height + 1
-                    && let Kind::Branch(ref ml, ref mr) = mid.kind
-                {
-                    return Some(branch(ml.clone(), branch(mr.clone(), r.clone())));
-                }
-                return Some(branch(mid, r.clone()));
-            }
-            Some(branch(a, b))
-        }
-    }
-}
-fn split(tree: Tree, at: usize) -> (Tree, Tree) {
-    let Some(n) = tree else { return (None, None) };
-    if at == 0 {
-        return (None, Some(n));
-    }
-    if at >= n.sum.bytes {
-        return (Some(n), None);
-    }
-    match &n.kind {
-        Kind::Leaf(p) => (
-            Some(leaf(Piece {
-                text: p.text.clone(),
-                start: p.start,
-                end: p.start + at,
-            })),
-            Some(leaf(Piece {
-                text: p.text.clone(),
-                start: p.start + at,
-                end: p.end,
-            })),
-        ),
-        Kind::Branch(l, r) => {
-            if at < l.sum.bytes {
-                let (a, b) = split(Some(l.clone()), at);
-                (a, join(b, Some(r.clone())))
-            } else {
-                let (a, b) = split(Some(r.clone()), at - l.sum.bytes);
-                (join(Some(l.clone()), a), b)
-            }
-        }
-    }
-}
-fn from_text(text: Arc<str>) -> Tree {
-    let mut parts = Vec::with_capacity(text.len() / CHUNK + 1);
-    let mut start = 0;
-    while start < text.len() {
-        let mut end = (start + CHUNK).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        parts.push(leaf(Piece {
-            text: text.clone(),
-            start,
-            end,
-        }));
-        start = end;
-    }
-    fn build(p: &[Arc<Node>]) -> Tree {
-        match p.len() {
-            0 => None,
-            1 => Some(p[0].clone()),
-            n => Some(branch(
-                build(&p[..n / 2]).unwrap(),
-                build(&p[n / 2..]).unwrap(),
-            )),
-        }
-    }
-    build(&parts)
-}
-fn prefix(tree: &Tree, at: usize) -> Option<Sum> {
-    let n = tree.as_ref()?;
-    if at > n.sum.bytes {
-        return None;
-    }
-    if at == n.sum.bytes {
-        return Some(n.sum);
-    }
-    match &n.kind {
-        Kind::Leaf(p) => p.get().get(..at).map(measure),
-        Kind::Branch(l, r) => {
-            if at <= l.sum.bytes {
-                prefix(&Some(l.clone()), at)
-            } else {
-                Some(l.sum.add(prefix(&Some(r.clone()), at - l.sum.bytes)?))
-            }
-        }
-    }
-}
-fn byte_at(tree: &Tree, at: usize) -> Option<u8> {
-    let n = tree.as_ref()?;
-    match &n.kind {
-        Kind::Leaf(p) => p.get().as_bytes().get(at).copied(),
-        Kind::Branch(l, r) => {
-            if at < l.sum.bytes {
-                byte_at(&Some(l.clone()), at)
-            } else {
-                byte_at(&Some(r.clone()), at - l.sum.bytes)
-            }
-        }
-    }
-}
-fn visit(tree: &Tree, start: usize, end: usize, f: &mut dyn FnMut(&str)) {
-    let Some(n) = tree else {
-        return;
-    };
-    if start == end {
-        return;
-    }
-    match &n.kind {
-        Kind::Leaf(p) => f(&p.get()[start..end]),
-        Kind::Branch(l, r) => {
-            if start < l.sum.bytes {
-                visit(&Some(l.clone()), start, end.min(l.sum.bytes), f);
-            }
-            if end > l.sum.bytes {
-                visit(
-                    &Some(r.clone()),
-                    start.saturating_sub(l.sum.bytes),
-                    end - l.sum.bytes,
-                    f,
-                );
-            }
-        }
-    }
-}
-#[derive(Clone, Default)]
 pub struct PieceStore {
     root: Tree,
     revision: u64,
+    stamp: u64,
 }
+
+impl Default for PieceStore {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
 impl PieceStore {
     pub fn new(text: &str) -> Self {
         Self {
-            root: from_text(Arc::from(text)),
+            root: from_text(text),
             revision: 0,
+            stamp: fresh_stamp(),
         }
     }
-    /// Converts UTF-8 and builds balanced chunks on a worker thread.
+    /// Converts UTF-8 and builds the tree on a worker thread. The error means the
+    /// OS refused to start the thread; the bytes are lost in that case, so the
+    /// caller must still hold the file.
     pub fn build_async(
         bytes: Vec<u8>,
-    ) -> std::thread::JoinHandle<Result<Self, std::string::FromUtf8Error>> {
-        std::thread::spawn(move || String::from_utf8(bytes).map(|s| Self::new(&s)))
+    ) -> std::io::Result<std::thread::JoinHandle<Result<Self, std::string::FromUtf8Error>>> {
+        std::thread::Builder::new()
+            .name("qe-buffer-build".into())
+            .spawn(move || String::from_utf8(bytes).map(|s| Self::new(&s)))
+    }
+    /// Walks the whole tree, checks every balance and sum rule, and gives its
+    /// shape. It takes time in proportion to the tree, so it is for tests.
+    pub fn check_tree(&self) -> Result<TreeShape, String> {
+        tree::check(&self.root)
+    }
+    pub(crate) fn stamp(&self) -> u64 {
+        self.stamp
     }
     fn sum(&self) -> Sum {
         self.root.as_ref().map_or(Sum::default(), |n| n.sum)
@@ -362,8 +98,8 @@ impl PieceStore {
         }
         fn find(n: &Node, mut rank: usize, next_lf: bool, base: usize) -> Option<usize> {
             match &n.kind {
-                Kind::Leaf(p) => {
-                    let mut chars = p.get().char_indices().peekable();
+                Kind::Leaf(text) => {
+                    let mut chars = text.char_indices().peekable();
                     while let Some((at, c)) = chars.next() {
                         let next = chars.peek().is_some_and(|(_, c)| *c == '\n')
                             || (chars.peek().is_none() && next_lf);
@@ -390,7 +126,93 @@ impl PieceStore {
         }
         find(self.root.as_ref()?, line, false, 0)
     }
+    pub(crate) fn check_range(&self, range: &Range<ByteOffset>) -> Result<(), EditError> {
+        if range.start > range.end
+            || !is_boundary(&self.root, range.start.0)
+            || !is_boundary(&self.root, range.end.0)
+        {
+            return Err(EditError::InvalidRange);
+        }
+        Ok(())
+    }
+    pub(crate) fn no_change(&self, range: Range<ByteOffset>) -> TextChange {
+        TextChange {
+            replaced: range,
+            new_len: 0,
+            line_count_delta: 0,
+            revision: self.revision,
+        }
+    }
+    /// Makes the edit and gives back the removed text as a tree. The range must
+    /// have passed `check_range`.
+    pub(crate) fn splice_text(
+        &mut self,
+        range: Range<ByteOffset>,
+        text: &str,
+    ) -> (TextChange, Tree) {
+        let before = self.line_count();
+        let (left, rest) = split(self.root.clone(), range.start.0);
+        let (removed, right) = split(rest, range.end.0 - range.start.0);
+        self.root = splice(left, from_text(text), right);
+        self.revision += 1;
+        self.stamp = fresh_stamp();
+        let change = TextChange {
+            replaced: range,
+            new_len: text.len(),
+            line_count_delta: self.line_count() as isize - before as isize,
+            revision: self.revision,
+        };
+        (change, removed)
+    }
+    /// Swaps each edit with the text in the document, on a copy of the root. The
+    /// store changes only when every edit worked.
+    pub(crate) fn swap_edits(
+        &mut self,
+        edits: &[Edit],
+        backwards: bool,
+    ) -> Result<(Vec<Edit>, Vec<TextChange>), EditError> {
+        let mut root = self.root.clone();
+        let mut revision = self.revision;
+        let mut swapped = Vec::with_capacity(edits.len());
+        let mut changes = Vec::with_capacity(edits.len());
+        let lines = |t: &Tree| t.as_ref().map_or(1, |n| n.sum.breaks + 1) as isize;
+        let mut step = |e: &Edit| -> Result<(), EditError> {
+            let end = e.start + e.len_in_doc;
+            if !is_boundary(&root, e.start) || !is_boundary(&root, end) {
+                return Err(EditError::InvalidRange);
+            }
+            let before = lines(&root);
+            let (left, rest) = split(root.clone(), e.start);
+            let (taken, right) = split(rest, e.len_in_doc);
+            root = splice(left, e.other.clone(), right);
+            let new_len = e.other.as_ref().map_or(0, |n| n.sum.bytes);
+            revision += 1;
+            changes.push(TextChange {
+                replaced: ByteOffset(e.start)..ByteOffset(end),
+                new_len,
+                line_count_delta: lines(&root) - before,
+                revision,
+            });
+            swapped.push(Edit {
+                start: e.start,
+                len_in_doc: new_len,
+                other: taken,
+            });
+            Ok(())
+        };
+        if backwards {
+            edits.iter().rev().try_for_each(&mut step)?;
+            swapped.reverse();
+        } else {
+            edits.iter().try_for_each(&mut step)?;
+        }
+        self.root = root;
+        self.revision = revision;
+        self.stamp = fresh_stamp();
+        Ok((swapped, changes))
+    }
 }
+
 impl TextSnapshot for PieceStore {
     fn revision(&self) -> u64 {
         self.revision
@@ -414,17 +236,16 @@ impl TextSnapshot for PieceStore {
         if utf16.0 > self.sum().units {
             return None;
         }
-        if self.root.is_none() {
+        let Some(mut n) = self.root.as_ref() else {
             return Some(ByteOffset(0));
-        }
-        let mut n = self.root.as_ref().unwrap();
+        };
         let mut units = utf16.0;
         let mut base = 0;
         loop {
             match &n.kind {
-                Kind::Leaf(p) => {
+                Kind::Leaf(text) => {
                     let mut count = 0;
-                    for (i, c) in p.get().char_indices() {
+                    for (i, c) in text.char_indices() {
                         if count == units {
                             return Some(ByteOffset(base + i));
                         }
@@ -433,7 +254,7 @@ impl TextSnapshot for PieceStore {
                             return None;
                         }
                     }
-                    return (count == units).then_some(ByteOffset(base + p.get().len()));
+                    return (count == units).then_some(ByteOffset(base + text.len()));
                 }
                 Kind::Branch(l, r) => {
                     if units <= l.sum.units {
@@ -470,147 +291,35 @@ impl TextSnapshot for PieceStore {
         let end = self.line_start(line.0 + 1).unwrap_or(self.sum().bytes);
         Some(ByteOffset(start)..ByteOffset(end))
     }
+    /// Gives no callback and returns false for a range that is backwards, past the
+    /// end, or has an end inside a character. An empty valid range gives no callback
+    /// and returns true. `MappedStore` follows the same rule.
     fn visit_chunks(&self, range: Range<ByteOffset>, f: &mut dyn FnMut(&str)) -> bool {
-        if range.start > range.end
-            || range.end.0 > self.sum().bytes
-            || self.byte_to_utf16(range.start).is_none()
-            || self.byte_to_utf16(range.end).is_none()
-        {
+        if self.check_range(&range).is_err() {
             return false;
         }
-        visit(&self.root, range.start.0, range.end.0, f);
+        if let Some(n) = &self.root {
+            visit(n, range.start.0, range.end.0, f);
+        }
         true
     }
     fn is_read_only(&self) -> bool {
         false
     }
 }
+
 impl TextStore for PieceStore {
     fn snapshot(&self) -> Arc<dyn TextSnapshot> {
         Arc::new(self.clone())
     }
+    /// An empty edit changes nothing: no new revision and no new stamp. This call
+    /// frees removed text on the spot. An editor goes through `UndoHistory`, which
+    /// keeps that text and frees it a little at a time.
     fn replace(&mut self, range: Range<ByteOffset>, text: &str) -> Result<TextChange, EditError> {
-        if range.start > range.end
-            || range.end.0 > self.sum().bytes
-            || self.byte_to_utf16(range.start).is_none()
-            || self.byte_to_utf16(range.end).is_none()
-        {
-            return Err(EditError::InvalidRange);
+        self.check_range(&range)?;
+        if range.start == range.end && text.is_empty() {
+            return Ok(self.no_change(range));
         }
-        let before = self.line_count();
-        let (left, rest) = split(self.root.clone(), range.start.0);
-        let (_, right) = split(rest, range.end.0 - range.start.0);
-        self.root = join(join(left, from_text(Arc::from(text))), right);
-        self.revision += 1;
-        Ok(TextChange {
-            replaced: range,
-            new_len: text.len(),
-            line_count_delta: self.line_count() as isize - before as isize,
-            revision: self.revision,
-        })
+        Ok(self.splice_text(range, text).0)
     }
 }
-
-struct Edit {
-    start: usize,
-    old: String,
-    new: String,
-}
-struct Group {
-    edits: Vec<Edit>,
-}
-
-/// Stores changed text only. Consecutive typing is one undo step.
-#[derive(Default)]
-pub struct UndoHistory {
-    undo: Vec<Group>,
-    redo: Vec<Group>,
-    typing_end: Option<usize>,
-}
-impl UndoHistory {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn break_group(&mut self) {
-        self.typing_end = None;
-    }
-    pub fn cursor_moved(&mut self) {
-        self.break_group();
-    }
-    pub fn save_point(&mut self) {
-        self.break_group();
-    }
-    pub fn undo_groups(&self) -> usize {
-        self.undo.len()
-    }
-    pub fn memory_bytes(&self) -> usize {
-        self.undo
-            .iter()
-            .chain(&self.redo)
-            .flat_map(|g| &g.edits)
-            .map(|e| e.old.len() + e.new.len() + std::mem::size_of::<Edit>())
-            .sum()
-    }
-    pub fn replace(
-        &mut self,
-        store: &mut PieceStore,
-        range: Range<ByteOffset>,
-        text: &str,
-        typing: bool,
-    ) -> Result<TextChange, EditError> {
-        let mut old = String::new();
-        if !store.visit_chunks(range.clone(), &mut |s| old.push_str(s)) {
-            return Err(EditError::InvalidRange);
-        }
-        let change = store.replace(range.clone(), text)?;
-        let continuous = typing && old.is_empty() && self.typing_end == Some(range.start.0);
-        if !continuous {
-            self.undo.push(Group { edits: Vec::new() });
-        }
-        self.undo.last_mut().unwrap().edits.push(Edit {
-            start: range.start.0,
-            old,
-            new: text.to_owned(),
-        });
-        self.typing_end = if typing && range.start == range.end {
-            Some(range.start.0 + text.len())
-        } else {
-            None
-        };
-        self.redo.clear();
-        Ok(change)
-    }
-    pub fn undo(&mut self, store: &mut PieceStore) -> Result<bool, EditError> {
-        self.break_group();
-        let Some(group) = self.undo.pop() else {
-            return Ok(false);
-        };
-        for e in group.edits.iter().rev() {
-            store.replace(
-                ByteOffset(e.start)..ByteOffset(e.start + e.new.len()),
-                &e.old,
-            )?;
-        }
-        self.redo.push(group);
-        Ok(true)
-    }
-    pub fn redo(&mut self, store: &mut PieceStore) -> Result<bool, EditError> {
-        self.break_group();
-        let Some(group) = self.redo.pop() else {
-            return Ok(false);
-        };
-        for e in &group.edits {
-            store.replace(
-                ByteOffset(e.start)..ByteOffset(e.start + e.old.len()),
-                &e.new,
-            )?;
-        }
-        self.undo.push(group);
-        Ok(true)
-    }
-}
-
-#[cfg(windows)]
-mod mapped;
-#[cfg(windows)]
-pub use mapped::MappedStore;

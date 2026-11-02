@@ -135,10 +135,10 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | W01 | Mac has native window chrome. | Use a Windows Terminal-style top row. | M6 | changed (user decision) | no |
 | W02 | Mac hides tab bar at one tab. | Always show one tab. | M6 | changed (user decision) | no |
 | W03 | Mac has a new-tab action. | Show `+` beside tabs. | M6 | changed (Windows top row) | no |
-| W04 | Mac has a menu bar. | Show caret button beside `+`. | M6 | changed (Windows top row) | no |
+| W04 | Mac has a menu bar. | Show a menu bar under the tabs, like Notepad. The caret button stays beside `+`. | M6 | changed (Windows top row; user decision 2026-11-02) | no |
 | W05 | Mac window buttons use macOS. | Show Windows buttons and support Snap Layouts. | M6 | changed (Windows window controls) | no |
-| W06 | Mac menus live in menu bar. | Put every retained menu in caret list. | M7 | changed (user decision) | no |
-| W07 | Mac Alt does not open a caret list. | Alt opens caret list. | M7 | changed (user decision) | no |
+| W06 | Mac menus live in menu bar. | Put each retained menu group in the menu bar under the tabs. The caret keeps About, Settings and Quit. | M7 | changed (user decision 2026-11-02) | no |
+| W07 | Mac Alt does not open a caret list. | Alt or F10 focuses the menu bar, and Alt+letter opens a menu. | M7 | changed (user decision 2026-11-02) | no |
 | W08 | Mac keys mainly use Cmd. | Use Ctrl, Ctrl+H, F3, Alt+F4, Ctrl+Space, F11; allow changes. | M8, M12 | changed (Windows keys and user decision) | no |
 | W09 | Mac opens external files in document windows. | Explorer and second launches add tabs to last used window. | M14 | changed (user decision) | no |
 | W10 | Mac uses Mac distribution. | Install and update through Microsoft Store. | M15 | changed (user decision) | no |

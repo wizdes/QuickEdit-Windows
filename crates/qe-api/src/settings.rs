@@ -11,7 +11,7 @@ macro_rules! settings {
         pub enum SettingKey { $($name,)* }
         impl SettingKey {
             pub const ALL: &'static [Self] = &[$(Self::$name,)*];
-            pub fn mac_default(self) -> SettingValue { match self { $(Self::$name => $default,)* } }
+            pub fn default_value(self) -> SettingValue { match self { $(Self::$name => $default,)* } }
             pub const fn name(self) -> &'static str { match self { $(Self::$name => stringify!($name),)* } }
         }
     };
@@ -20,14 +20,13 @@ settings! {
     ShowPageBreaks => SettingValue::Bool(false);
     WindowWidthCharacters => SettingValue::Integer(90);
     WindowHeightLines => SettingValue::Integer(30);
-    PlainTextFont => SettingValue::Text("System fixed-pitch 13 pt");
+    PlainTextFont => SettingValue::Text("Cascadia Mono 10");
     KeyboardShortcuts => SettingValue::Text("");
     CheckSpellingWhileTyping => SettingValue::Bool(false);
     CorrectSpellingAutomatically => SettingValue::Bool(false);
     SmartCopyPaste => SettingValue::Bool(true);
     SmartQuotes => SettingValue::Bool(false);
     SmartDashes => SettingValue::Bool(false);
-    TextReplacement => SettingValue::Text("system");
     ShowLineNumbers => SettingValue::Bool(false);
     ShowDocumentMap => SettingValue::Bool(true);
     AddTxtExtension => SettingValue::Bool(true);

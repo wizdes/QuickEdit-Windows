@@ -9,3 +9,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+qe-api.workspace = true
+windows.workspace = true

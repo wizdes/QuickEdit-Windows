@@ -2,23 +2,29 @@
 
 mod command;
 mod display;
+mod encoding;
 mod input;
 mod layout;
+mod render;
 mod replay;
 mod settings;
 pub mod testing;
 mod text;
 mod theme;
+mod view;
 mod widget;
 
 pub use command::*;
 pub use display::*;
+pub use encoding::*;
 pub use input::*;
 pub use layout::*;
+pub use render::*;
 pub use replay::*;
 pub use settings::*;
 pub use text::*;
 pub use theme::*;
+pub use view::*;
 pub use widget::*;
 
 /// A device-independent pixel.

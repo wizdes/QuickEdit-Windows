@@ -9,3 +9,19 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+qe-api.workspace = true
+qe-buffer.workspace = true
+qe-codec.workspace = true
+qe-layout.workspace = true
+qe-render.workspace = true
+qe-shell.workspace = true
+qe-ui.workspace = true
+qe-settings.workspace = true
+qe-editor.workspace = true
+qe-ime.workspace = true
+qe-spell.workspace = true
+qe-a11y.workspace = true
+qe-tools.workspace = true
+qe-views.workspace = true
+qe-pdf.workspace = true
+windows.workspace = true

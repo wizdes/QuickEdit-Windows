@@ -1,6 +1,7 @@
 //! Slow reference implementations for tests in other crates.
 use crate::*;
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct StringStore {
@@ -107,6 +108,9 @@ impl TextSnapshot for StringStore {
 }
 
 impl TextStore for StringStore {
+    fn snapshot(&self) -> Arc<dyn TextSnapshot> {
+        Arc::new(self.clone())
+    }
     fn replace(&mut self, range: Range<ByteOffset>, text: &str) -> Result<TextChange, EditError> {
         if self.read_only {
             return Err(EditError::ReadOnly);
@@ -143,41 +147,32 @@ impl Layout for FixedWidthLayout {
         let mut s = String::new();
         text.visit_chunks(range.clone(), &mut |chunk| s.push_str(chunk));
         let content = s.trim_end_matches(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}']);
-        let columns = content.chars().count();
-        let per_row = if self.cell_width.0 > 0.0 {
-            (width.0 / self.cell_width.0).floor().max(1.0) as usize
-        } else {
-            1
-        };
-        let mut rows = Vec::new();
-        for start in (0..columns.max(1)).step_by(per_row) {
-            let end = (start + per_row).min(columns);
-            let byte_start = content
-                .char_indices()
-                .nth(start)
-                .map_or(content.len(), |(i, _)| i);
-            let byte_end = content
-                .char_indices()
-                .nth(end)
-                .map_or(content.len(), |(i, _)| i);
-            let mut caret_stops = content[byte_start..byte_end]
-                .char_indices()
-                .map(|(i, _)| ByteOffset(range.start.0 + byte_start + i))
-                .collect::<Vec<_>>();
-            caret_stops.push(ByteOffset(range.start.0 + byte_end));
-            rows.push(LayoutRow {
-                range: ByteOffset(range.start.0 + byte_start)..ByteOffset(range.start.0 + byte_end),
-                y: Dip(rows.len() as f32 * self.row_height.0),
-                height: self.row_height,
-                glyph_runs: vec![],
-                caret_stops,
-            });
+        Some(self.layout_content(content, range.start, line, width))
+    }
+    fn layout_slice(
+        &self,
+        text: &dyn TextSnapshot,
+        range: Range<ByteOffset>,
+        width: Dip,
+    ) -> Option<LineLayout> {
+        if range.start > range.end || range.end > text.len_bytes() {
+            return None;
         }
-        Some(LineLayout {
-            line,
-            height: Dip(rows.len() as f32 * self.row_height.0),
-            rows,
-        })
+        let line = text.byte_to_position(range.start)?.line;
+        if text.byte_to_position(range.end)?.line != line {
+            return None;
+        }
+        let mut content = String::new();
+        if !text.visit_chunks(range.clone(), &mut |chunk| content.push_str(chunk)) {
+            return None;
+        }
+        if content
+            .chars()
+            .any(|c| matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+        {
+            return None;
+        }
+        Some(self.layout_content(&content, range.start, line, width))
     }
     fn hit_test_point(&self, layout: &LineLayout, point: Point) -> ByteOffset {
         let row = ((point.y.0 / self.row_height.0).floor().max(0.0) as usize)
@@ -198,5 +193,69 @@ impl Layout for FixedWidthLayout {
             width: Dip(1.0),
             height: row.height,
         })
+    }
+}
+
+impl FixedWidthLayout {
+    fn layout_content(
+        &self,
+        content: &str,
+        start_offset: ByteOffset,
+        line: LineIndex,
+        width: Dip,
+    ) -> LineLayout {
+        let columns = content.chars().count();
+        let per_row = if self.cell_width.0 > 0.0 {
+            (width.0 / self.cell_width.0).floor().max(1.0) as usize
+        } else {
+            1
+        };
+        let mut rows = Vec::new();
+        for start in (0..columns.max(1)).step_by(per_row) {
+            let end = (start + per_row).min(columns);
+            let byte_start = content
+                .char_indices()
+                .nth(start)
+                .map_or(content.len(), |(i, _)| i);
+            let byte_end = content
+                .char_indices()
+                .nth(end)
+                .map_or(content.len(), |(i, _)| i);
+            let mut caret_stops = content[byte_start..byte_end]
+                .char_indices()
+                .map(|(i, _)| ByteOffset(start_offset.0 + byte_start + i))
+                .collect::<Vec<_>>();
+            caret_stops.push(ByteOffset(start_offset.0 + byte_end));
+            rows.push(LayoutRow {
+                range: ByteOffset(start_offset.0 + byte_start)
+                    ..ByteOffset(start_offset.0 + byte_end),
+                y: Dip(rows.len() as f32 * self.row_height.0),
+                height: self.row_height,
+                glyph_runs: vec![],
+                caret_stops,
+            });
+        }
+        LineLayout {
+            line,
+            height: Dip(rows.len() as f32 * self.row_height.0),
+            rows,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FixedTextMeasurer {
+    pub char_width: Dip,
+    pub height: Dip,
+    pub baseline: Dip,
+}
+
+impl TextMeasurer for FixedTextMeasurer {
+    fn measure(&self, text: &str, _font: &str) -> TextMetrics {
+        TextMetrics {
+            width: Dip(text.chars().count() as f32 * self.char_width.0),
+            height: self.height,
+            baseline: self.baseline,
+        }
     }
 }

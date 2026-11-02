@@ -13,3 +13,6 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+qe-api.workspace = true
+qe-docs.workspace = true
+windows.workspace = true

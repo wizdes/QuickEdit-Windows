@@ -33,6 +33,14 @@ pub trait Layout: Send + Sync {
         line: LineIndex,
         width: Dip,
     ) -> Option<LineLayout>;
+    /// Lays out only this slice of one line, for very long lines. The byte range
+    /// must fall on character boundaries.
+    fn layout_slice(
+        &self,
+        text: &dyn TextSnapshot,
+        range: Range<ByteOffset>,
+        width: Dip,
+    ) -> Option<LineLayout>;
     fn hit_test_point(&self, layout: &LineLayout, point: Point) -> ByteOffset;
     fn caret_rect(&self, layout: &LineLayout, byte: ByteOffset) -> Option<Rect>;
     fn hit_test_offset(&self, layout: &LineLayout, byte: ByteOffset) -> Option<Point> {

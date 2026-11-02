@@ -111,7 +111,7 @@ fn theme_and_display_text_are_stable() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v1\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
+        "display-list-v2\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
     );
 }
 
@@ -126,14 +126,17 @@ fn settings_and_menu_paths_cover_all_entries() {
         assert!(command.menu_path().contains('/'));
     }
     assert_eq!(
-        SettingKey::PlainTextFont.mac_default(),
-        SettingValue::Text("System fixed-pitch 13 pt")
+        SettingKey::PlainTextFont.default_value(),
+        SettingValue::Text("Cascadia Mono 10")
     );
     assert_eq!(
-        SettingKey::WindowWidthCharacters.mac_default(),
+        SettingKey::WindowWidthCharacters.default_value(),
         SettingValue::Integer(90)
     );
-    assert_eq!(SettingKey::TabWidth.mac_default(), SettingValue::Integer(8));
+    assert_eq!(
+        SettingKey::TabWidth.default_value(),
+        SettingValue::Integer(8)
+    );
     assert!(SettingKey::ALL.len() >= 19);
 }
 

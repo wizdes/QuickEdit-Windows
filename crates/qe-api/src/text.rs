@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteOffset(pub usize);
@@ -47,5 +48,7 @@ pub trait TextSnapshot: Send + Sync {
 
 /// Mutable edit side. UI code owns this; readers use a separate immutable snapshot.
 pub trait TextStore: TextSnapshot {
+    /// Returns an immutable view that stays unchanged after later edits.
+    fn snapshot(&self) -> Arc<dyn TextSnapshot>;
     fn replace(&mut self, range: Range<ByteOffset>, text: &str) -> Result<TextChange, EditError>;
 }

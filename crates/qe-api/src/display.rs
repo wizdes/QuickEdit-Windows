@@ -6,6 +6,21 @@ pub enum DrawCommand {
         rect: Rect,
         color: Color,
     },
+    FillRects {
+        rects: Vec<Rect>,
+        color: Color,
+    },
+    StrokeRect {
+        rect: Rect,
+        radius: Dip,
+        width: Dip,
+        color: Color,
+    },
+    WavyUnderline {
+        from: Point,
+        to: Point,
+        color: Color,
+    },
     RoundedRect {
         rect: Rect,
         radius: Dip,
@@ -53,7 +68,7 @@ impl DisplayList {
     }
     /// Versioned, stable text for saved replay expectations. Floats use fixed 3 decimals.
     pub fn to_stable_text(&self) -> String {
-        let mut out = String::from("display-list-v1\n");
+        let mut out = String::from("display-list-v2\n");
         for command in &self.commands {
             out.push_str(&format_command(command));
             out.push('\n');
@@ -80,6 +95,26 @@ fn quoted(s: &str) -> String {
 fn format_command(c: &DrawCommand) -> String {
     match c {
         DrawCommand::FillRect { rect: r, color: c } => format!("fill {} {}", rect(r), color(c)),
+        DrawCommand::FillRects { rects, color: c } => format!(
+            "fill-rects [{}] {}",
+            rects.iter().map(rect).collect::<Vec<_>>().join(";"),
+            color(c)
+        ),
+        DrawCommand::StrokeRect {
+            rect: r,
+            radius,
+            width,
+            color: c,
+        } => format!(
+            "stroke-rect {} {:.3} {:.3} {}",
+            rect(r),
+            radius.0,
+            width.0,
+            color(c)
+        ),
+        DrawCommand::WavyUnderline { from, to, color: c } => {
+            format!("wavy-underline {} {} {}", point(from), point(to), color(c))
+        }
         DrawCommand::RoundedRect {
             rect: r,
             radius,

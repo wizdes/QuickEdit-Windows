@@ -11,4 +11,4 @@ workspace = true
 [dependencies]
 qe-api.workspace = true
 qe-editor.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_Globalization", "Win32_System_Com", "Win32_System_Ole", "Win32_Foundation", "Win32_System_LibraryLoader"] }

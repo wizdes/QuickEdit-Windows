@@ -1,6 +1,9 @@
 use qe_api::{Bitmap, Color, Dip, DisplayList, DrawCommand, Point, Rect, Renderer};
-use qe_render::BitmapRenderer;
+use qe_render::{BitmapRenderer, TextSettings};
 use std::{fs, path::PathBuf};
+
+mod support;
+const GLYPH_FONT: u32 = 4;
 
 fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect {
@@ -49,18 +52,20 @@ fn scene(dark: bool) -> DisplayList {
         at: point(22.0, 29.0),
         text: "QuickEdit".into(),
         font: "Cascadia Mono".into(),
+        font_size: Dip(13.33),
         color: ink,
     });
-    for (x, id) in [
-        (181.0, "E710"),
-        (212.0, "E96E"),
-        (296.0, "E921"),
-        (327.0, "E922"),
-        (358.0, "E8BB"),
+    for (x, id, size) in [
+        (181.0, "E710", 12.0),
+        (212.0, "E96E", 12.0),
+        (296.0, "E921", 10.0),
+        (327.0, "E922", 10.0),
+        (358.0, "E8BB", 10.0),
     ] {
         list.push(DrawCommand::Icon {
-            at: rect(x, 8.0, 24.0, 24.0),
+            at: point(x, 26.0),
             icon_id: id.into(),
+            font_size: Dip(size),
             color: ink,
         });
     }
@@ -121,14 +126,25 @@ fn scene(dark: bool) -> DisplayList {
         at: point(12.0, 159.0),
         text: "Cascadia Mono 0123456789".into(),
         font: "Cascadia Mono".into(),
+        font_size: Dip(13.33),
         color: ink,
     });
     list.push(DrawCommand::TextRun {
-        at: point(310.0, 159.0),
+        at: point(345.0, 159.0),
         text: "😀".into(),
         font: "Segoe UI Emoji".into(),
+        font_size: Dip(13.33),
         color: Color::rgb(0, 0, 0),
     });
+    // The same path that shaped text takes, with its glyph ids looked up here.
+    list.push(support::glyph_run(
+        GLYPH_FONT,
+        "Cascadia Mono",
+        15.0,
+        "GlyphRun gjpq",
+        point(215.0, 159.0),
+        ink,
+    ));
     list
 }
 
@@ -137,10 +153,33 @@ fn text_draws_at_125_and_175_percent() {
     for (dpi, width, height) in [(120, 500, 225), (168, 700, 315)] {
         let mut renderer = BitmapRenderer::new(width, height).unwrap();
         renderer.set_dpi(dpi).unwrap();
+        renderer.register_font(GLYPH_FONT, "Cascadia Mono").unwrap();
         let image = renderer
             .render_to_bitmap(&scene(false), width, height)
             .unwrap();
         assert!(image.bgra.as_chunks::<4>().0.iter().any(|p| p[0] < 20));
+        // The orange fill also has a dark blue channel, so it cannot prove text. This
+        // scene has only text, and its ink must grow with the scale.
+        let s = dpi as f32 / 96.0;
+        let mut text = DisplayList::default();
+        text.push(DrawCommand::FillRect {
+            rect: rect(0.0, 0.0, 400.0, 180.0),
+            color: Color::rgb(255, 255, 255),
+        });
+        text.push(DrawCommand::TextRun {
+            at: point(12.0, 40.0),
+            text: "Cascadia Mono 0123456789".into(),
+            font: "Cascadia Mono".into(),
+            font_size: Dip(13.33),
+            color: Color::rgb(0, 0, 0),
+        });
+        let drawn = renderer.render_to_bitmap(&text, width, height).unwrap();
+        let found = support::ink_box(&drawn, support::WHITE).expect("no text was drawn");
+        let wide = found.2 - found.0;
+        assert!(
+            (wide as f32 - 190.0 * s).abs() < 12.0 * s,
+            "dpi {dpi}: the text is {wide} pixels wide"
+        );
     }
 }
 fn crc(data: &[u8]) -> u32 {
@@ -254,6 +293,10 @@ fn saved_images_at_three_dpis() {
             };
             let mut renderer = BitmapRenderer::new(w, h).unwrap();
             renderer.set_dpi(dpi).unwrap();
+            renderer
+                .set_text_settings(TextSettings::reference())
+                .unwrap();
+            renderer.register_font(GLYPH_FONT, "Cascadia Mono").unwrap();
             let image = renderer.render_to_bitmap(&scene(dark), w, h).unwrap();
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/images")

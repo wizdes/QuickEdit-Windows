@@ -1,177 +1,202 @@
-//! DirectWrite draws glyphs into a GDI bitmap. Shapes use the same bitmap.
+//! One 32-bit bitmap holds the window's pixels. Shapes and text write to it directly,
+//! and GDI copies it to the window. No GPU DLL loads. See README.md for the rules.
+#![allow(hidden_glob_reexports)]
+
+// `#[implement]` writes paths that start at `windows_core`. This crate stands in
+// for that crate, inside this crate only, so that it needs no extra dependency.
+extern crate self as windows_core;
+#[allow(unused_imports)]
+pub(crate) use windows::core::*;
+
+mod geom;
+mod shapes;
+mod text;
+
+use geom::{Area, Regions};
 use qe_api::{Bitmap, Color, Dip, DisplayList, DrawCommand, Point, Rect, RenderError, Renderer};
-use std::{collections::HashMap, mem, ptr, sync::Arc};
-use windows::{
-    Win32::{
-        Foundation::{COLORREF, HWND},
-        Graphics::{DirectWrite::*, Gdi::*},
-    },
-    core::{BOOL, Interface, PCWSTR},
+use shapes::{Corners, Surface};
+use std::{mem, result::Result};
+use text::{RunRef, Text};
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    Graphics::{DirectWrite::*, Gdi::*},
 };
 
-fn error(e: impl std::fmt::Display) -> RenderError {
+pub(crate) fn error(e: impl std::fmt::Display) -> RenderError {
     RenderError::new(e.to_string())
 }
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-#[derive(Clone, Copy, Debug)]
-struct Area {
-    x: i32,
-    y: i32,
-    r: i32,
-    b: i32,
-}
-impl Area {
-    fn full(w: u32, h: u32) -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            r: w as i32,
-            b: h as i32,
-        }
-    }
-    fn new(v: Rect, scale: f32) -> Self {
-        Self {
-            x: (v.x.0 * scale).floor() as i32,
-            y: (v.y.0 * scale).floor() as i32,
-            r: ((v.x.0 + v.width.0) * scale).ceil() as i32,
-            b: ((v.y.0 + v.height.0) * scale).ceil() as i32,
-        }
-    }
-    fn clip(self, other: Self) -> Self {
-        Self {
-            x: self.x.max(other.x),
-            y: self.y.max(other.y),
-            r: self.r.min(other.r),
-            b: self.b.min(other.b),
-        }
-    }
-    fn valid(self) -> bool {
-        self.x < self.r && self.y < self.b
-    }
-}
 
-/// M9 can register its layout font IDs through this small interface.
+/// Names a font for each font ID that `GlyphRun` commands use. A `GlyphRun` carries
+/// its own size. For faces that have no family name to look up, such as fallback
+/// fonts from qe-layout, use `BitmapRenderer::register_font_face`.
 pub trait FontRegistry {
-    fn font(&self, id: u32) -> Option<(&str, f32)>;
+    fn font(&self, id: u32) -> Option<&str>;
 }
 
-struct GlyphDraw<'a> {
-    at: Point,
-    face: IDWriteFontFace,
-    em: f32,
-    ids: &'a [u16],
-    advances: &'a [f32],
-    offsets: &'a [DWRITE_GLYPH_OFFSET],
-    bidi: u8,
-    color: Color,
-    clip: Area,
-    color_glyphs: bool,
+/// How text turns into coverage and blends. `BitmapRenderer` starts with the system's
+/// values for the primary monitor. Tests with saved images use `reference`, because
+/// the system's values can differ between accounts and PCs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextSettings {
+    pub gamma: f32,
+    pub enhanced_contrast: f32,
+    pub cleartype_level: f32,
+    pub geometry: DWRITE_PIXEL_GEOMETRY,
+    pub mode: DWRITE_RENDERING_MODE,
 }
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct GlyphKey {
-    family: String,
-    glyph: u16,
-    dpi: u32,
-    color: Color,
+impl TextSettings {
+    /// Fixed values that do not depend on this PC.
+    pub fn reference() -> Self {
+        Self {
+            gamma: 2.2,
+            enhanced_contrast: 1.0,
+            cleartype_level: 1.0,
+            geometry: DWRITE_PIXEL_GEOMETRY_RGB,
+            mode: DWRITE_RENDERING_MODE_NATURAL,
+        }
+    }
 }
-struct GlyphImage {
-    left: i32,
-    top: i32,
-    width: usize,
-    height: usize,
-    coverage: Vec<u8>,
-    on_white: Vec<u8>,
+
+/// What the current frame did, for tests and benchmarks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    pub regions: usize,
+    pub pixels: u64,
+    pub glyphs_rasterized: u64,
+    pub glyphs_drawn: u64,
 }
 
 pub struct BitmapRenderer {
-    factory: IDWriteFactory,
     target: IDWriteBitmapRenderTarget,
-    params: IDWriteRenderingParams,
+    surface: Surface,
+    text: Text,
+    corners: Corners,
     width: u32,
     height: u32,
     capacity_width: u32,
     capacity_height: u32,
     dpi: u32,
-    pending: Vec<Area>,
-    damage: Vec<Area>,
-    scrolled: Vec<Area>,
-    fonts: HashMap<String, IDWriteFontFace>,
-    ids: HashMap<u32, (String, f32)>,
-    shaped: HashMap<(String, String), (Vec<u16>, Vec<f32>)>,
-    glyph_cache: HashMap<GlyphKey, Arc<GlyphImage>>,
-    white_background: bool,
+    /// Waiting for the next frame.
+    pending: Regions,
+    /// What each draw of this frame paints.
+    frame: Regions,
+    /// Changed pixels that the window has not received yet.
+    damage: Regions,
+    errors: Vec<RenderError>,
+    stats: FrameStats,
+    clips: Vec<Area>,
+    opacities: Vec<f32>,
 }
+
+fn surface_of(
+    target: &IDWriteBitmapRenderTarget,
+    width: u32,
+    height: u32,
+) -> Result<Surface, RenderError> {
+    let dc = unsafe { target.GetMemoryDC() };
+    let object = unsafe { GetCurrentObject(dc, OBJ_BITMAP) };
+    let mut dib: DIBSECTION = unsafe { mem::zeroed() };
+    let size = unsafe {
+        GetObjectW(
+            object,
+            mem::size_of::<DIBSECTION>() as i32,
+            Some((&mut dib as *mut DIBSECTION).cast()),
+        )
+    };
+    if size < mem::size_of::<DIBSECTION>() as i32
+        || dib.dsBm.bmBits.is_null()
+        || dib.dsBm.bmBitsPixel != 32
+    {
+        return Err(error("DirectWrite did not give a 32-bit DIB"));
+    }
+    Ok(Surface {
+        bits: dib.dsBm.bmBits.cast(),
+        stride: dib.dsBm.bmWidthBytes as isize,
+        width: width as i32,
+        height: height as i32,
+    })
+}
+fn to_rect(a: Area) -> RECT {
+    RECT {
+        left: a.x,
+        top: a.y,
+        right: a.r,
+        bottom: a.b,
+    }
+}
+fn fade(mut c: Color, opacity: f32) -> Color {
+    c.a = (f32::from(c.a) * opacity).round().clamp(0.0, 255.0) as u8;
+    c
+}
+fn parse_icon(id: &str) -> Option<u32> {
+    let digits = id
+        .strip_prefix("U+")
+        .or_else(|| id.strip_prefix("0x"))
+        .unwrap_or(id);
+    u32::from_str_radix(digits, 16).ok()
+}
+
+const ICON_FONT: &str = "Segoe Fluent Icons";
+
 impl BitmapRenderer {
     pub fn new(width: u32, height: u32) -> Result<Self, RenderError> {
         if width == 0 || height == 0 {
             return Err(error("empty bitmap"));
         }
-        let factory: IDWriteFactory =
-            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).map_err(error)? };
-        let interop = unsafe { factory.GetGdiInterop().map_err(error)? };
-        let capacity_width = width.next_multiple_of(256) + 64;
+        let text = Text::new()?;
+        let capacity_width = width.next_multiple_of(256);
         let capacity_height = height.next_multiple_of(128);
         let target = unsafe {
-            interop
+            text.gdi_interop()?
                 .CreateBitmapRenderTarget(None, capacity_width, capacity_height)
                 .map_err(error)?
         };
-        let params = unsafe { factory.CreateRenderingParams().map_err(error)? };
-        let result = Self {
-            factory,
+        let surface = surface_of(&target, capacity_width, capacity_height)?;
+        let mut pending = Regions::default();
+        pending.add(Area::full(width, height));
+        Ok(Self {
             target,
-            params,
+            surface,
+            text,
+            corners: Corners::default(),
             width,
             height,
             capacity_width,
             capacity_height,
             dpi: 96,
-            pending: Vec::new(),
-            damage: vec![Area::full(width, height)],
-            scrolled: Vec::new(),
-            fonts: HashMap::new(),
-            ids: HashMap::new(),
-            shaped: HashMap::new(),
-            glyph_cache: HashMap::new(),
-            white_background: false,
-        };
-        result.bits()?;
-        Ok(result)
+            pending,
+            frame: Regions::default(),
+            damage: Regions::default(),
+            errors: Vec::new(),
+            stats: FrameStats::default(),
+            clips: Vec::new(),
+            opacities: Vec::new(),
+        })
     }
-    fn bits(&self) -> Result<(*mut u8, isize), RenderError> {
-        let dc = unsafe { self.target.GetMemoryDC() };
-        let obj = unsafe { GetCurrentObject(dc, OBJ_BITMAP) };
-        let mut dib: DIBSECTION = unsafe { mem::zeroed() };
-        let n = unsafe {
-            GetObjectW(
-                obj,
-                mem::size_of::<DIBSECTION>() as i32,
-                Some((&mut dib as *mut DIBSECTION).cast()),
-            )
-        };
-        if n < mem::size_of::<DIBSECTION>() as i32
-            || dib.dsBm.bmBits.is_null()
-            || dib.dsBm.bmBitsPixel != 32
-        {
-            return Err(error("DirectWrite did not give a 32-bit DIB"));
-        }
-        Ok((dib.dsBm.bmBits.cast(), dib.dsBm.bmWidthBytes as isize))
+    fn full(&self) -> Area {
+        Area::full(self.width, self.height)
+    }
+    fn scale64(&self) -> f64 {
+        f64::from(self.dpi) / 96.0
+    }
+    /// Device pixels per dip.
+    pub fn scale(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+    pub fn text_settings(&self) -> TextSettings {
+        self.text.settings()
+    }
+    /// Changes how text is made. All text draws through the same path, whatever the
+    /// settings are. This does not ask for a repaint.
+    pub fn set_text_settings(&mut self, settings: TextSettings) -> Result<(), RenderError> {
+        self.text.set_settings(settings)
     }
     pub fn bitmap(&self) -> Result<Bitmap, RenderError> {
-        if !unsafe { GdiFlush() }.as_bool() {
-            return Err(error("GdiFlush failed"));
-        }
-        let (bits, stride) = self.bits()?;
         let mut bgra = vec![0; self.width as usize * self.height as usize * 4];
-        for y in 0..self.height as usize {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bits.offset(y as isize * stride),
-                    bgra.as_mut_ptr().add(y * self.width as usize * 4),
-                    self.width as usize * 4,
-                );
+        for (y, row) in bgra.chunks_exact_mut(self.width as usize * 4).enumerate() {
+            let pixels = self.surface.span(y as i32, 0, self.width as i32);
+            for (out, p) in row.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+                *out = p.to_le_bytes();
             }
         }
         Ok(Bitmap {
@@ -180,153 +205,159 @@ impl BitmapRenderer {
             bgra,
         })
     }
+    /// Asks the next frame to repaint this rectangle. An empty or off-screen
+    /// rectangle asks for nothing.
     pub fn invalidate(&mut self, rect: Rect) {
-        let a = Area::new(rect, self.scale()).clip(Area::full(self.width, self.height));
-        if a.valid() {
-            self.pending.push(a);
-        }
+        let area = Area::outward(rect, self.scale64()).clip(self.full());
+        self.pending.add(area);
     }
-    fn scale(&self) -> f32 {
-        self.dpi as f32 / 96.0
+    /// Asks the next frame to repaint the whole bitmap. With nothing pending, a frame
+    /// does nothing.
+    pub fn invalidate_all(&mut self) {
+        self.pending.clear();
+        self.pending.add(self.full());
     }
     pub fn back_buffer_bytes(&self) -> usize {
         self.capacity_width as usize * self.capacity_height as usize * 4
     }
-    pub fn present(&self, hwnd: HWND) -> Result<(), RenderError> {
+    /// Copies everything changed since the last successful present to the window. A
+    /// failure keeps the changes, so the next present still copies them.
+    pub fn present(&mut self, hwnd: HWND) -> Result<(), RenderError> {
         let dc = unsafe { GetDC(Some(hwnd)) };
         if dc.0.is_null() {
             return Err(error("GetDC failed"));
         }
-        let src = unsafe { self.target.GetMemoryDC() };
-        let full = Area::full(self.width, self.height);
-        let result = self
-            .damage
-            .iter()
-            .copied()
-            .chain(if self.damage.is_empty() {
-                Some(full)
-            } else {
-                None
-            })
-            .try_for_each(|a| unsafe {
-                BitBlt(
-                    dc,
-                    a.x,
-                    a.y,
-                    a.r - a.x,
-                    a.b - a.y,
-                    Some(src),
-                    a.x,
-                    a.y,
-                    SRCCOPY,
-                )
-                .map_err(error)
-            });
-        let flushed = unsafe { GdiFlush() }.as_bool();
+        let result = self.present_to_dc(dc);
         unsafe {
             ReleaseDC(Some(hwnd), dc);
         }
-        result?;
-        if !flushed {
+        result
+    }
+    /// `present` for a device context that the caller already holds.
+    pub fn present_to_dc(&mut self, dc: HDC) -> Result<(), RenderError> {
+        for i in 0..self.damage.list.len() {
+            self.copy_area(dc, self.damage.list[i])?;
+        }
+        if !unsafe { GdiFlush() }.as_bool() {
+            return Err(error("GdiFlush failed"));
+        }
+        self.damage.clear();
+        Ok(())
+    }
+    /// Copies any rectangle of device pixels to the window, with no new draw. WM_PAINT
+    /// uses this with the rectangle from `BeginPaint`. Pending changes stay pending.
+    pub fn present_rect(&self, hwnd: HWND, rect: RECT) -> Result<(), RenderError> {
+        let dc = unsafe { GetDC(Some(hwnd)) };
+        if dc.0.is_null() {
+            return Err(error("GetDC failed"));
+        }
+        let result = self.present_rect_to_dc(dc, rect);
+        unsafe {
+            ReleaseDC(Some(hwnd), dc);
+        }
+        result
+    }
+    /// `present_rect` for a device context that the caller already holds, such as the
+    /// one from `BeginPaint`.
+    pub fn present_rect_to_dc(&self, dc: HDC, rect: RECT) -> Result<(), RenderError> {
+        let area = Area {
+            x: rect.left,
+            y: rect.top,
+            r: rect.right,
+            b: rect.bottom,
+        }
+        .clip(self.full());
+        self.copy_area(dc, area)?;
+        if !unsafe { GdiFlush() }.as_bool() {
             return Err(error("GdiFlush failed"));
         }
         Ok(())
     }
-    pub fn scroll(&mut self, rect: Rect, dy: Dip) -> Result<(), RenderError> {
-        let a = Area::new(rect, self.scale()).clip(Area::full(self.width, self.height));
-        let shift = (dy.0 * self.scale()).round() as i32;
-        if !a.valid() || shift == 0 {
+    fn copy_area(&self, dc: HDC, a: Area) -> Result<(), RenderError> {
+        if !a.valid() {
             return Ok(());
         }
-        let amount = shift.unsigned_abs().min((a.b - a.y) as u32) as i32;
-        if !unsafe { GdiFlush() }.as_bool() {
-            return Err(error("GdiFlush failed before scroll"));
+        let source = unsafe { self.target.GetMemoryDC() };
+        unsafe {
+            BitBlt(
+                dc,
+                a.x,
+                a.y,
+                a.r - a.x,
+                a.b - a.y,
+                Some(source),
+                a.x,
+                a.y,
+                SRCCOPY,
+            )
+            .map_err(error)
         }
-        let (bits, stride) = self.bits()?;
-        if amount < a.b - a.y {
-            let rows = a.b - a.y - amount;
-            for i in 0..rows {
-                let row = if shift > 0 { rows - 1 - i } else { i };
-                let src = if shift > 0 {
-                    a.y + row
-                } else {
-                    a.y + amount + row
-                };
-                let dst = if shift > 0 {
-                    a.y + amount + row
-                } else {
-                    a.y + row
-                };
-                unsafe {
-                    ptr::copy(
-                        bits.offset(src as isize * stride + a.x as isize * 4),
-                        bits.offset(dst as isize * stride + a.x as isize * 4),
-                        (a.r - a.x) as usize * 4,
-                    );
-                }
-            }
+    }
+    /// The rectangles of device pixels that `present` would copy now.
+    pub fn damage_rects(&self) -> Vec<RECT> {
+        self.damage.list.iter().copied().map(to_rect).collect()
+    }
+    /// Moves the pixels of `rect` by `dy` dips.
+    ///
+    /// Rule: pixels can only move by whole device pixels, and the list drawn next has
+    /// positions that may round differently after any other shift. So a `dy` that is a
+    /// whole number of device pixels copies rows and repaints only the revealed strip.
+    /// Any other `dy` copies nothing and repaints all of `rect`. That is always right
+    /// and never drifts, but it costs a repaint. For speed, keep the scroll position on
+    /// whole device pixels: `dy = pixels / scale()`, or use `scroll_pixels`.
+    pub fn scroll(&mut self, rect: Rect, dy: Dip) -> Result<(), RenderError> {
+        let device = f64::from(dy.0) * self.scale64();
+        if device == 0.0 {
+            return Ok(());
         }
-        self.pending.push(if shift > 0 {
+        let whole = device.round();
+        if whole != 0.0 && (device - whole).abs() < 1.0 / 256.0 {
+            return self.scroll_pixels(rect, whole as i32);
+        }
+        let area = Area::snapped(rect, self.scale64()).clip(self.full());
+        self.pending.add(area);
+        Ok(())
+    }
+    /// Moves the pixels of `rect` by `dy` device pixels. It repaints only the part that
+    /// the move reveals, and moves any rectangles already waiting for a repaint.
+    pub fn scroll_pixels(&mut self, rect: Rect, dy: i32) -> Result<(), RenderError> {
+        let area = Area::snapped(rect, self.scale64()).clip(self.full());
+        if !area.valid() || dy == 0 {
+            return Ok(());
+        }
+        let height = area.b - area.y;
+        let amount = dy.saturating_abs().min(height);
+        let shift = if dy > 0 { amount } else { -amount };
+        if amount < height {
+            self.surface.copy_rows(area, shift);
+        }
+        self.pending.scroll(area, shift);
+        self.frame.scroll(area, shift);
+        self.pending.add(if shift > 0 {
             Area {
-                b: a.y + amount,
-                ..a
+                b: area.y + amount,
+                ..area
             }
         } else {
             Area {
-                y: a.b - amount,
-                ..a
+                y: area.b - amount,
+                ..area
             }
         });
-        self.scrolled.push(a);
+        self.damage.add(area);
         Ok(())
     }
-    fn font(&mut self, name: &str) -> Result<IDWriteFontFace, RenderError> {
-        if let Some(face) = self.fonts.get(name) {
-            return Ok(face.clone());
-        }
-        let mut collection = None;
-        unsafe {
-            self.factory
-                .GetSystemFontCollection(&mut collection, false)
-                .map_err(error)?;
-        }
-        let collection = collection.ok_or_else(|| error("font collection missing"))?;
-        let mut index = 0;
-        let mut exists = BOOL(0);
-        let name_w = wide(name);
-        unsafe {
-            collection
-                .FindFamilyName(PCWSTR(name_w.as_ptr()), &mut index, &mut exists)
-                .map_err(error)?;
-        }
-        if !exists.as_bool() {
-            return Err(error(format!("font not installed: {name}")));
-        }
-        let face = unsafe {
-            collection
-                .GetFontFamily(index)
-                .map_err(error)?
-                .GetFirstMatchingFont(
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
-                )
-                .map_err(error)?
-                .CreateFontFace()
-                .map_err(error)?
-        };
-        self.fonts.insert(name.to_owned(), face.clone());
-        Ok(face)
-    }
-    pub fn register_font(
-        &mut self,
-        id: u32,
-        family: &str,
-        size_pt: f32,
-    ) -> Result<(), RenderError> {
-        self.font(family)?;
-        self.ids.insert(id, (family.to_owned(), size_pt));
+    /// Gives a font ID the first matching face of an installed family.
+    pub fn register_font(&mut self, id: u32, family: &str) -> Result<(), RenderError> {
+        let face = self.text.family(family)?;
+        self.text.register_id(id, face);
         Ok(())
+    }
+    /// Gives a font ID this exact face. qe-layout's `font_face(font_id)` returns such a
+    /// face, including fonts that fallback chose.
+    pub fn register_font_face(&mut self, id: u32, face: &IDWriteFontFace) {
+        let face = self.text.intern(face);
+        self.text.register_id(id, face);
     }
     pub fn register_fonts(
         &mut self,
@@ -334,465 +365,89 @@ impl BitmapRenderer {
         ids: &[u32],
     ) -> Result<(), RenderError> {
         for &id in ids {
-            let (family, size) = registry
+            let family = registry
                 .font(id)
-                .ok_or_else(|| error(format!("font ID {id} missing")))?;
-            self.register_font(id, family, size)?;
+                .ok_or_else(|| error(format!("font ID {id} is missing from the registry")))?;
+            self.register_font(id, family)?;
         }
         Ok(())
     }
-    fn blend(
-        &self,
-        x: i32,
-        y: i32,
-        c: Color,
-        coverage: f32,
-        clip: Area,
-    ) -> Result<(), RenderError> {
-        if x < clip.x || x >= clip.r || y < clip.y || y >= clip.b {
-            return Ok(());
-        }
-        let (bits, stride) = self.bits()?;
-        let p = unsafe { bits.offset(y as isize * stride + x as isize * 4) };
-        let a = (c.a as f32 * coverage).round().clamp(0.0, 255.0) as u32;
-        unsafe {
-            for (i, v) in [c.b, c.g, c.r].iter().enumerate() {
-                *p.add(i) =
-                    ((u32::from(*v) * a + u32::from(*p.add(i)) * (255 - a) + 127) / 255) as u8;
-            }
-            *p.add(3) = 255;
-        }
-        Ok(())
+    /// Problems from the last `draw`. Each one is listed once, and everything else in
+    /// the list was still drawn.
+    pub fn draw_errors(&self) -> &[RenderError] {
+        &self.errors
     }
-    fn fill(&self, r: Rect, c: Color, clip: Area) -> Result<(), RenderError> {
-        let a = Area::new(r, self.scale()).clip(clip);
-        if !a.valid() {
-            return Ok(());
-        }
-        let (bits, stride) = self.bits()?;
-        let alpha = u32::from(c.a);
-        if alpha == 255 && a.r - a.x >= 32 {
-            let packed = u32::from_le_bytes([c.b, c.g, c.r, 255]);
-            let row = vec![packed; (a.r - a.x) as usize];
-            for y in a.y..a.b {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        row.as_ptr().cast::<u8>(),
-                        bits.offset(y as isize * stride + a.x as isize * 4),
-                        row.len() * 4,
-                    );
-                }
-            }
-            return Ok(());
-        }
-        for y in a.y..a.b {
-            for x in a.x..a.r {
-                let p = unsafe { bits.offset(y as isize * stride + x as isize * 4) };
-                unsafe {
-                    if alpha == 255 {
-                        *p = c.b;
-                        *p.add(1) = c.g;
-                        *p.add(2) = c.r;
-                        *p.add(3) = 255;
-                    } else {
-                        for (i, v) in [c.b, c.g, c.r].iter().enumerate() {
-                            *p.add(i) = ((u32::from(*v) * alpha
-                                + u32::from(*p.add(i)) * (255 - alpha)
-                                + 127)
-                                / 255) as u8;
-                        }
-                        *p.add(3) = 255;
-                    }
-                }
-            }
-        }
-        Ok(())
+    pub fn frame_stats(&self) -> FrameStats {
+        self.stats
     }
-    fn round(
-        &self,
-        r: Rect,
-        radius: f32,
-        stroke: f32,
-        c: Color,
-        clip: Area,
-    ) -> Result<(), RenderError> {
-        let s = self.scale();
-        let a = Area::new(r, s).clip(clip);
-        let x = r.x.0 * s;
-        let y = r.y.0 * s;
-        let right = (r.x.0 + r.width.0) * s;
-        let bottom = (r.y.0 + r.height.0) * s;
-        let rad = (radius * s).max(0.0).min((right - x).min(bottom - y) / 2.0);
-        let w = stroke * s;
-        for py in a.y..a.b {
-            for px in a.x..a.r {
-                let mut hits = 0;
-                for oy in [0.25, 0.75] {
-                    for ox in [0.25, 0.75] {
-                        let fx = px as f32 + ox;
-                        let fy = py as f32 + oy;
-                        if inside(fx, fy, x, y, right, bottom, rad)
-                            && (stroke == 0.0
-                                || !inside(
-                                    fx,
-                                    fy,
-                                    x + w,
-                                    y + w,
-                                    right - w,
-                                    bottom - w,
-                                    (rad - w).max(0.0),
-                                ))
-                        {
-                            hits += 1;
-                        }
-                    }
-                }
-                if hits > 0 {
-                    self.blend(px, py, c, hits as f32 / 4.0, clip)?;
-                }
-            }
-        }
-        Ok(())
+    pub fn glyph_cache_bytes(&self) -> usize {
+        self.text.glyph_bytes()
     }
-    fn line(
-        &self,
-        from: Point,
-        to: Point,
-        width: f32,
-        c: Color,
-        clip: Area,
-    ) -> Result<(), RenderError> {
-        let s = self.scale();
-        let (x0, y0, x1, y1) = (from.x.0 * s, from.y.0 * s, to.x.0 * s, to.y.0 * s);
-        let half = (width * s).max(1.0) / 2.0;
-        let a = Area {
-            x: (x0.min(x1) - half - 1.0).floor() as i32,
-            y: (y0.min(y1) - half - 1.0).floor() as i32,
-            r: (x0.max(x1) + half + 1.0).ceil() as i32,
-            b: (y0.max(y1) + half + 1.0).ceil() as i32,
-        }
-        .clip(clip);
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let len = dx * dx + dy * dy;
-        for py in a.y..a.b {
-            for px in a.x..a.r {
-                let mut hits = 0;
-                for oy in [0.25, 0.75] {
-                    for ox in [0.25, 0.75] {
-                        let x = px as f32 + ox;
-                        let y = py as f32 + oy;
-                        let t = if len > 0.0 {
-                            ((x - x0) * dx + (y - y0) * dy) / len
-                        } else {
-                            0.0
-                        }
-                        .clamp(0.0, 1.0);
-                        let ex = x - x0 - t * dx;
-                        let ey = y - y0 - t * dy;
-                        if ex * ex + ey * ey <= half * half {
-                            hits += 1;
-                        }
-                    }
-                }
-                if hits > 0 {
-                    self.blend(px, py, c, hits as f32 / 4.0, clip)?;
-                }
-            }
-        }
-        Ok(())
+    pub fn glyph_cache_entries(&self) -> usize {
+        self.text.glyph_entries()
     }
-    fn glyphs(&self, args: GlyphDraw<'_>) -> Result<(), RenderError> {
-        let GlyphDraw {
-            at,
-            face,
-            em,
-            ids,
-            advances,
-            offsets,
-            bidi,
-            color,
-            clip,
-            color_glyphs,
-        } = args;
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let dc = unsafe { self.target.GetMemoryDC() };
-        let saved = unsafe { SaveDC(dc) };
-        if saved == 0 {
-            return Err(error("SaveDC failed"));
-        }
-        let result = (|| {
-            if unsafe { IntersectClipRect(dc, clip.x, clip.y, clip.r, clip.b) }.0 == ERROR {
-                return Err(error("IntersectClipRect failed"));
-            }
-            let mut run = DWRITE_GLYPH_RUN {
-                fontFace: mem::ManuallyDrop::new(Some(face)),
-                fontEmSize: em,
-                glyphCount: ids.len() as u32,
-                glyphIndices: ids.as_ptr(),
-                glyphAdvances: advances.as_ptr(),
-                glyphOffsets: offsets.as_ptr(),
-                isSideways: BOOL(0),
-                bidiLevel: u32::from(bidi),
-            };
-            let ink = COLORREF(
-                u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16),
-            );
-            let drawn = (|| {
-                if color_glyphs {
-                    let f2: IDWriteFactory2 = self.factory.cast().map_err(error)?;
-                    let layers = unsafe {
-                        f2.TranslateColorGlyphRun(
-                            at.x.0,
-                            at.y.0,
-                            &run,
-                            None,
-                            DWRITE_MEASURING_MODE_NATURAL,
-                            None,
-                            0,
-                        )
-                        .map_err(error)?
-                    };
-                    while unsafe { layers.MoveNext().map_err(error)? }.as_bool() {
-                        let layer = unsafe { &*layers.GetCurrentRun().map_err(error)? };
-                        let rgb = if layer.paletteIndex == u16::MAX {
-                            ink
-                        } else {
-                            COLORREF(
-                                ((layer.runColor.r * 255.0) as u32)
-                                    | (((layer.runColor.g * 255.0) as u32) << 8)
-                                    | (((layer.runColor.b * 255.0) as u32) << 16),
-                            )
-                        };
-                        unsafe {
-                            self.target
-                                .DrawGlyphRun(
-                                    layer.baselineOriginX,
-                                    layer.baselineOriginY,
-                                    DWRITE_MEASURING_MODE_NATURAL,
-                                    &layer.glyphRun,
-                                    &self.params,
-                                    rgb,
-                                    None,
-                                )
-                                .map_err(error)?;
-                        }
-                    }
-                    Ok(())
-                } else {
-                    unsafe {
-                        self.target
-                            .DrawGlyphRun(
-                                at.x.0,
-                                at.y.0,
-                                DWRITE_MEASURING_MODE_NATURAL,
-                                &run,
-                                &self.params,
-                                ink,
-                                None,
-                            )
-                            .map_err(error)
-                    }
-                }
-            })();
-            unsafe { mem::ManuallyDrop::drop(&mut run.fontFace) };
-            drawn
-        })();
-        let restored = unsafe { RestoreDC(dc, saved) };
-        if !restored.as_bool() {
-            return Err(error("RestoreDC failed"));
-        }
-        result
+    /// The most bytes of glyph coverage to keep. The default is 32 MiB. Over the limit,
+    /// the glyphs unused for longest leave first.
+    pub fn set_glyph_cache_limit(&mut self, bytes: usize) {
+        self.text.set_glyph_limit(bytes);
     }
-    fn cached_glyph(
-        &mut self,
-        family: &str,
-        face: &IDWriteFontFace,
-        glyph: u16,
-        color: Color,
-    ) -> Result<Arc<GlyphImage>, RenderError> {
-        let key = GlyphKey {
-            family: family.to_owned(),
-            glyph,
-            dpi: self.dpi,
-            color,
+    fn report(&mut self, problem: RenderError) {
+        if !self.errors.contains(&problem) {
+            self.errors.push(problem);
+        }
+    }
+    fn device(&self, p: Point) -> (f64, f64) {
+        let s = self.scale64();
+        (f64::from(p.x.0) * s, f64::from(p.y.0) * s)
+    }
+    fn wavy(&mut self, from: Point, to: Point, c: Color, clip: Area) {
+        let dx = to.x.0 - from.x.0;
+        let count = ((dx.abs() / 2.0).ceil() as usize).min(1 << 20);
+        let s = self.scale64();
+        let half = s.max(1.0) / 2.0;
+        let start = self.device(from);
+        let delta = (f64::from(dx) * s, f64::from(to.y.0 - from.y.0) * s);
+        let point = |j: usize| {
+            let t = j as f64 / count.max(1) as f64;
+            let wave = (t * f64::from(dx) * 1.5).sin() * 1.25 * s;
+            (start.0 + delta.0 * t, start.1 + delta.1 * t + wave)
         };
-        if let Some(image) = self.glyph_cache.get(&key) {
-            return Ok(image.clone());
-        }
-        let dc = unsafe { self.target.GetMemoryDC() };
-        let x = self.width as i32;
-        if !unsafe { PatBlt(dc, x, 0, 64, 64, WHITENESS) }.as_bool() {
-            return Err(error("glyph cache clear failed"));
-        }
-        let advance = 0.0f32;
-        let offset = DWRITE_GLYPH_OFFSET::default();
-        let run = DWRITE_GLYPH_RUN {
-            fontFace: mem::ManuallyDrop::new(Some(face.clone())),
-            fontEmSize: 10.0 * 96.0 / 72.0,
-            glyphCount: 1,
-            glyphIndices: &glyph,
-            glyphAdvances: &advance,
-            glyphOffsets: &offset,
-            isSideways: BOOL(0),
-            bidiLevel: 0,
-        };
-        let s = self.scale();
-        let draw = unsafe {
-            self.target
-                .DrawGlyphRun(
-                    (x as f32 + 16.0) / s,
-                    48.0 / s,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                    &run,
-                    &self.params,
-                    COLORREF(0),
-                    None,
-                )
-                .map_err(error)
-        };
-        let mut run = run;
-        unsafe { mem::ManuallyDrop::drop(&mut run.fontFace) };
-        draw?;
-        if !unsafe { GdiFlush() }.as_bool() {
-            return Err(error("glyph cache flush failed"));
-        }
-        let (bits, stride) = self.bits()?;
-        let mut coverage = vec![0u8; 64 * 64 * 3];
-        let mut min_x = 64;
-        let mut min_y = 64;
-        let mut max_x = 0;
-        let mut max_y = 0;
-        for py in 0..64 {
-            for px in 0..64 {
-                let p = unsafe { bits.offset(py as isize * stride + (x + px) as isize * 4) };
-                let i = (py * 64 + px) as usize * 3;
-                for channel in 0..3 {
-                    coverage[i + channel] = 255 - unsafe { *p.add(channel) };
-                }
-                if coverage[i..i + 3].iter().any(|v| *v > 0) {
-                    min_x = min_x.min(px);
-                    min_y = min_y.min(py);
-                    max_x = max_x.max(px + 1);
-                    max_y = max_y.max(py + 1);
-                }
-            }
-        }
-        let (width, height) = (
-            (max_x - min_x).max(0) as usize,
-            (max_y - min_y).max(0) as usize,
+        // Coverage reaches half a line width past the wave, plus a pixel.
+        let reach = 1.25 * s + half + 1.0;
+        let (top, bottom) = (
+            start.1.min(start.1 + delta.1) - reach,
+            start.1.max(start.1 + delta.1) + reach,
         );
-        let mut cropped = Vec::with_capacity(width * height * 3);
-        for py in min_y..max_y {
-            let start = (py * 64 + min_x) as usize * 3;
-            cropped.extend_from_slice(&coverage[start..start + width * 3]);
+        if bottom < f64::from(clip.y) || top > f64::from(clip.b) {
+            return;
         }
-        let mut on_white = Vec::with_capacity(width * height * 4);
-        for rgb in cropped.as_chunks::<3>().0 {
-            on_white.extend_from_slice(&[255 - rgb[0], 255 - rgb[1], 255 - rgb[2], 255]);
-        }
-        let image = Arc::new(GlyphImage {
-            left: min_x - 16,
-            top: min_y - 48,
-            width,
-            height,
-            coverage: cropped,
-            on_white,
-        });
-        if self.glyph_cache.len() >= 4096 {
-            self.glyph_cache.clear();
-        }
-        self.glyph_cache.insert(key, image.clone());
-        Ok(image)
-    }
-    fn draw_cached_text(
-        &mut self,
-        at: Point,
-        font: (&str, &IDWriteFontFace),
-        ids: &[u16],
-        advances: &[f32],
-        color: Color,
-        clip: Area,
-    ) -> Result<(), RenderError> {
-        let (family, face) = font;
-        let (bits, stride) = self.bits()?;
-        let s = self.scale();
-        let mut pen = at.x.0 * s;
-        let base = (at.y.0 * s).round() as i32;
-        for (&glyph, &advance) in ids.iter().zip(advances) {
-            let image = self.cached_glyph(family, face, glyph, color)?;
-            let left = pen.round() as i32 + image.left;
-            let top = base + image.top;
-            let fast = self.white_background
-                && color == Color::rgb(0, 0, 0)
-                && image.left >= 0
-                && image.left + image.width as i32 <= (advance * s).round() as i32;
-            if fast {
-                for y in 0..image.height {
-                    let dst_y = top + y as i32;
-                    if dst_y < clip.y || dst_y >= clip.b {
-                        continue;
-                    }
-                    let start = left.max(clip.x);
-                    let end = (left + image.width as i32).min(clip.r);
-                    if start >= end {
-                        continue;
-                    }
-                    let source = (y * image.width + (start - left) as usize) * 4;
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            image.on_white.as_ptr().add(source),
-                            bits.offset(dst_y as isize * stride + start as isize * 4),
-                            (end - start) as usize * 4,
-                        );
-                    }
-                }
-                pen += advance * s;
+        for i in 0..count {
+            let (a, b) = (point(i), point(i + 1));
+            if a.0.max(b.0) + reach < f64::from(clip.x) || a.0.min(b.0) - reach > f64::from(clip.r)
+            {
                 continue;
             }
-            for y in 0..image.height {
-                let dst_y = top + y as i32;
-                if dst_y < clip.y || dst_y >= clip.b {
-                    continue;
-                }
-                for x in 0..image.width {
-                    let dst_x = left + x as i32;
-                    if dst_x < clip.x || dst_x >= clip.r {
-                        continue;
-                    }
-                    let src = (y * image.width + x) * 3;
-                    let p = unsafe { bits.offset(dst_y as isize * stride + dst_x as isize * 4) };
-                    for channel in 0..3 {
-                        let alpha = (u32::from(image.coverage[src + channel]) * u32::from(color.a)
-                            + 127)
-                            / 255;
-                        let ink = [color.b, color.g, color.r][channel];
-                        unsafe {
-                            *p.add(channel) = ((u32::from(ink) * alpha
-                                + u32::from(*p.add(channel)) * (255 - alpha)
-                                + 127)
-                                / 255) as u8;
-                            *p.add(3) = 255;
-                        }
-                    }
-                }
-            }
-            pen += advance * s;
+            shapes::soft_line(self.surface, a, b, half, c, clip);
         }
-        Ok(())
     }
+    /// Draws one command. `DrawCommand` has no catch-all arm here, so a new command
+    /// cannot be dropped silently: it stops this file from compiling.
     fn command(&mut self, cmd: &DrawCommand, clip: Area, opacity: f32) -> Result<(), RenderError> {
-        let fade = |mut c: Color| {
-            c.a = (c.a as f32 * opacity).round().clamp(0.0, 255.0) as u8;
-            c
-        };
+        let s = self.scale64();
         match cmd {
-            DrawCommand::FillRect { rect, color } => self.fill(*rect, fade(*color), clip),
+            DrawCommand::FillRect { rect, color } => {
+                shapes::fill(
+                    self.surface,
+                    Area::snapped(*rect, s),
+                    fade(*color, opacity),
+                    clip,
+                );
+                Ok(())
+            }
             DrawCommand::FillRects { rects, color } => {
+                let c = fade(*color, opacity);
                 for r in rects {
-                    self.fill(*r, fade(*color), clip)?;
+                    shapes::fill(self.surface, Area::snapped(*r, s), c, clip);
                 }
                 Ok(())
             }
@@ -800,310 +455,282 @@ impl BitmapRenderer {
                 rect,
                 radius,
                 color,
-            } => self.round(*rect, radius.0, 0.0, fade(*color), clip),
+            } => {
+                self.corners.rounded(
+                    self.surface,
+                    Area::snapped(*rect, s),
+                    (f64::from(radius.0) * s) as f32,
+                    0,
+                    fade(*color, opacity),
+                    clip,
+                );
+                Ok(())
+            }
             DrawCommand::StrokeRect {
                 rect,
                 radius,
                 width,
                 color,
-            } => self.round(*rect, radius.0, width.0, fade(*color), clip),
+            } => {
+                if width.0 > 0.0 {
+                    let stroke = ((f64::from(width.0) * s).round() as i32).max(1);
+                    self.corners.rounded(
+                        self.surface,
+                        Area::snapped(*rect, s),
+                        (f64::from(radius.0) * s) as f32,
+                        stroke,
+                        fade(*color, opacity),
+                        clip,
+                    );
+                }
+                Ok(())
+            }
             DrawCommand::Line {
                 from,
                 to,
                 width,
                 color,
-            } => self.line(*from, *to, width.0, fade(*color), clip),
-            DrawCommand::WavyUnderline { from, to, color } => {
-                let n = ((to.x.0 - from.x.0).abs() / 2.0).ceil() as usize;
-                for i in 0..n {
-                    let point = |j: usize| {
-                        let t = j as f32 / n.max(1) as f32;
-                        Point {
-                            x: Dip(from.x.0 + (to.x.0 - from.x.0) * t),
-                            y: Dip(from.y.0
-                                + (to.y.0 - from.y.0) * t
-                                + (t * (to.x.0 - from.x.0) * 1.5).sin() * 1.25),
-                        }
-                    };
-                    self.line(point(i), point(i + 1), 1.0, fade(*color), clip)?;
+            } => {
+                if width.0 > 0.0 {
+                    let (a, b) = (self.device(*from), self.device(*to));
+                    let half = (f64::from(width.0) * s).max(1.0) / 2.0;
+                    let c = fade(*color, opacity);
+                    if !shapes::axis_line(self.surface, a, b, half, c, clip) {
+                        shapes::soft_line(self.surface, a, b, half, c, clip);
+                    }
                 }
+                Ok(())
+            }
+            DrawCommand::WavyUnderline { from, to, color } => {
+                self.wavy(*from, *to, fade(*color, opacity), clip);
                 Ok(())
             }
             DrawCommand::GlyphRun {
                 at,
                 bidi_level,
                 font_id,
+                font_em_size,
                 glyph_ids,
                 advances,
                 offsets,
                 color,
             } => {
-                let (name, size) = self
-                    .ids
-                    .get(font_id)
-                    .ok_or_else(|| error(format!("font ID {font_id} missing")))?
-                    .clone();
-                let face = self.font(&name)?;
+                let face = self
+                    .text
+                    .face_of_id(*font_id)
+                    .ok_or_else(|| error(format!("font ID {font_id} is not registered")))?;
                 if advances.len() != glyph_ids.len() || offsets.len() != glyph_ids.len() {
-                    return Err(error("glyph run lengths differ"));
+                    return Err(error("the array lengths of a glyph run differ"));
                 }
-                let adv: Vec<f32> = advances.iter().map(|d| d.0).collect();
-                let off: Vec<DWRITE_GLYPH_OFFSET> = offsets
-                    .iter()
-                    .map(|p| DWRITE_GLYPH_OFFSET {
-                        advanceOffset: p.x.0,
-                        ascenderOffset: -p.y.0,
-                    })
-                    .collect();
-                self.glyphs(GlyphDraw {
-                    at: *at,
-                    face,
-                    em: size * 96.0 / 72.0,
-                    ids: glyph_ids,
-                    advances: &adv,
-                    offsets: &off,
-                    bidi: *bidi_level,
-                    color: fade(*color),
+                let origin = self.device(*at);
+                self.text.draw_run(
+                    self.surface,
                     clip,
-                    color_glyphs: name == "Segoe UI Emoji",
-                })
+                    s,
+                    origin,
+                    RunRef {
+                        face,
+                        em: font_em_size.0,
+                        bidi: *bidi_level,
+                        ids: glyph_ids,
+                        advances,
+                        offsets,
+                    },
+                    fade(*color, opacity),
+                )
             }
             DrawCommand::TextRun {
                 at,
                 text,
                 font,
+                font_size,
                 color,
             } => {
-                let face = self.font(font)?;
-                let key = (font.clone(), text.clone());
-                if !self.shaped.contains_key(&key) {
-                    let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
-                    let mut ids = vec![0; cps.len()];
-                    if !ids.is_empty() {
-                        unsafe {
-                            face.GetGlyphIndices(cps.as_ptr(), cps.len() as u32, ids.as_mut_ptr())
-                                .map_err(error)?;
-                        }
-                    }
-                    let mut fm = DWRITE_FONT_METRICS::default();
-                    unsafe { face.GetMetrics(&mut fm) };
-                    let mut gm = vec![DWRITE_GLYPH_METRICS::default(); ids.len()];
-                    if !ids.is_empty() {
-                        unsafe {
-                            face.GetDesignGlyphMetrics(
-                                ids.as_ptr(),
-                                ids.len() as u32,
-                                gm.as_mut_ptr(),
-                                false,
-                            )
-                            .map_err(error)?;
-                        }
-                    }
-                    let em = 10.0 * 96.0 / 72.0;
-                    let adv: Vec<f32> = gm
-                        .iter()
-                        .map(|g| g.advanceWidth as f32 * em / fm.designUnitsPerEm as f32)
-                        .collect();
-                    if self.shaped.len() >= 2048 {
-                        self.shaped.clear();
-                    }
-                    self.shaped.insert(key.clone(), (ids, adv));
-                }
-                let (ids, adv) = self
-                    .shaped
-                    .get(&key)
-                    .ok_or_else(|| error("shape cache missing"))?
-                    .clone();
-                let ink = fade(*color);
-                if font == "Segoe UI Emoji" {
-                    let em = 10.0 * 96.0 / 72.0;
-                    let off = vec![DWRITE_GLYPH_OFFSET::default(); ids.len()];
-                    self.glyphs(GlyphDraw {
-                        at: *at,
-                        face,
-                        em,
-                        ids: &ids,
-                        advances: &adv,
-                        offsets: &off,
-                        bidi: 0,
-                        color: ink,
-                        clip,
-                        color_glyphs: true,
-                    })
-                } else {
-                    self.draw_cached_text(*at, (font, &face), &ids, &adv, ink, clip)
-                }
-            }
-            DrawCommand::Icon { at, icon_id, color } => {
-                let value = u32::from_str_radix(
-                    icon_id.trim_start_matches("U+").trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(error)?;
-                let ch = char::from_u32(value).ok_or_else(|| error("invalid icon"))?;
-                self.command(
-                    &DrawCommand::TextRun {
-                        at: Point {
-                            x: at.x,
-                            y: Dip(at.y.0 + at.height.0 * 0.8),
-                        },
-                        text: ch.to_string(),
-                        font: "Segoe Fluent Icons".into(),
-                        color: *color,
-                    },
+                let shaped = self.text.shape(font, font_size.0, text)?;
+                let origin = self.device(*at);
+                self.text.draw_shaped(
+                    self.surface,
                     clip,
-                    opacity,
+                    s,
+                    origin,
+                    &shaped,
+                    fade(*color, opacity),
                 )
             }
-            _ => Ok(()),
+            DrawCommand::Icon {
+                at,
+                icon_id,
+                font_size,
+                color,
+            } => {
+                let point =
+                    parse_icon(icon_id).ok_or_else(|| error(format!("bad icon id {icon_id:?}")))?;
+                let face = self.text.family(ICON_FONT)?;
+                let glyph = self.text.icon_glyph(face, point)?;
+                if glyph == 0 {
+                    return Err(error(format!("icon {icon_id:?} is not in {ICON_FONT}")));
+                }
+                let origin = self.device(*at);
+                self.text.draw_run(
+                    self.surface,
+                    clip,
+                    s,
+                    origin,
+                    RunRef {
+                        face,
+                        em: font_size.0,
+                        bidi: 0,
+                        ids: &[glyph],
+                        advances: &[Dip(0.0)],
+                        offsets: &[Point {
+                            x: Dip(0.0),
+                            y: Dip(0.0),
+                        }],
+                    },
+                    fade(*color, opacity),
+                )
+            }
+            DrawCommand::PushClip(_)
+            | DrawCommand::PopClip
+            | DrawCommand::PushOpacity(_)
+            | DrawCommand::PopOpacity => Ok(()),
         }
     }
-    fn intersects(&self, cmd: &DrawCommand, clip: Area) -> bool {
-        let s = self.scale();
-        let bounds = match cmd {
-            DrawCommand::FillRect { rect, .. }
-            | DrawCommand::RoundedRect { rect, .. }
-            | DrawCommand::StrokeRect { rect, .. } => Some(Area::new(*rect, s)),
-            DrawCommand::TextRun { at, .. } | DrawCommand::GlyphRun { at, .. } => Some(Area {
-                x: (at.x.0 * s).floor() as i32,
-                y: ((at.y.0 - 15.0) * s).floor() as i32,
-                r: self.width as i32,
-                b: ((at.y.0 + 5.0) * s).ceil() as i32,
-            }),
-            DrawCommand::Icon { at, .. } => Some(Area::new(*at, s)),
-            DrawCommand::Line { from, to, .. } | DrawCommand::WavyUnderline { from, to, .. } => {
-                Some(Area {
-                    x: (from.x.0.min(to.x.0) * s - 4.0).floor() as i32,
-                    y: (from.y.0.min(to.y.0) * s - 4.0).floor() as i32,
-                    r: (from.x.0.max(to.x.0) * s + 4.0).ceil() as i32,
-                    b: (from.y.0.max(to.y.0) * s + 4.0).ceil() as i32,
-                })
+    fn paint(&mut self, list: &DisplayList, area: Area) {
+        let (mut clips, mut opacities) =
+            (mem::take(&mut self.clips), mem::take(&mut self.opacities));
+        clips.clear();
+        opacities.clear();
+        clips.push(area);
+        opacities.push(1.0f32);
+        let s = self.scale64();
+        for cmd in &list.commands {
+            let clip = clips[clips.len() - 1];
+            let opacity = opacities[opacities.len() - 1];
+            match cmd {
+                DrawCommand::PushClip(r) => clips.push(clip.clip(Area::snapped(*r, s))),
+                DrawCommand::PopClip => {
+                    if clips.len() == 1 {
+                        self.report(error("clip stack underflow"));
+                    } else {
+                        clips.pop();
+                    }
+                }
+                DrawCommand::PushOpacity(a) => opacities.push(opacity * a.clamp(0.0, 1.0)),
+                DrawCommand::PopOpacity => {
+                    if opacities.len() == 1 {
+                        self.report(error("opacity stack underflow"));
+                    } else {
+                        opacities.pop();
+                    }
+                }
+                _ => {
+                    if clip.valid()
+                        && opacity > 0.0
+                        && let Err(problem) = self.command(cmd, clip, opacity)
+                    {
+                        self.report(problem);
+                    }
+                }
             }
-            _ => None,
-        };
-        bounds.is_none_or(|b| b.clip(clip).valid())
+        }
+        if clips.len() != 1 {
+            self.report(error("the clip stack does not balance"));
+        }
+        if opacities.len() != 1 {
+            self.report(error("the opacity stack does not balance"));
+        }
+        self.clips = clips;
+        self.opacities = opacities;
     }
-}
-fn inside(x: f32, y: f32, left: f32, top: f32, right: f32, bottom: f32, r: f32) -> bool {
-    if x < left || x >= right || y < top || y >= bottom {
-        return false;
+    /// Moves what is pending into this frame's regions.
+    fn take_pending(&mut self) {
+        for i in 0..self.pending.list.len() {
+            let area = self.pending.list[i];
+            self.frame.add(area);
+        }
+        self.pending.clear();
     }
-    let dx = x - x.clamp(left + r, right - r);
-    let dy = y - y.clamp(top + r, bottom - r);
-    dx * dx + dy * dy <= r * r
 }
 
 impl Renderer for BitmapRenderer {
+    /// Starts a frame. Each `draw` in it paints what was pending at this point, plus
+    /// anything invalidated before that `draw`.
     fn begin_frame(&mut self) -> Result<(), RenderError> {
-        self.damage = mem::take(&mut self.scrolled);
+        self.stats = FrameStats::default();
+        self.frame.clear();
+        self.take_pending();
         Ok(())
     }
+    /// Paints `list` inside the frame's regions, and does nothing when there are none.
+    /// A bad command does not stop the others. All problems come back at the end as one
+    /// `Err`, and `draw_errors` lists them. The pixels are still valid to present.
+    ///
+    /// The list must paint an opaque background over each region, because a translucent
+    /// command blends with whatever the region holds.
     fn draw(&mut self, list: &DisplayList) -> Result<(), RenderError> {
-        let regions = if self.pending.is_empty() {
-            vec![Area::full(self.width, self.height)]
-        } else {
-            mem::take(&mut self.pending)
-        };
-        for area in regions {
-            let mut clips = vec![area];
-            let mut opacity = vec![1.0f32];
-            self.white_background = false;
-            for cmd in &list.commands {
-                match cmd {
-                    DrawCommand::PushClip(r) => {
-                        let c = clips
-                            .last()
-                            .copied()
-                            .unwrap_or(area)
-                            .clip(Area::new(*r, self.scale()));
-                        clips.push(c);
-                    }
-                    DrawCommand::PopClip => {
-                        if clips.len() == 1 {
-                            return Err(error("clip stack underflow"));
-                        }
-                        clips.pop();
-                    }
-                    DrawCommand::PushOpacity(a) => {
-                        opacity.push(opacity.last().copied().unwrap_or(1.0) * a.clamp(0.0, 1.0))
-                    }
-                    DrawCommand::PopOpacity => {
-                        if opacity.len() == 1 {
-                            return Err(error("opacity stack underflow"));
-                        }
-                        opacity.pop();
-                    }
-                    _ => {
-                        let clip = *clips.last().unwrap_or(&area);
-                        if self.intersects(cmd, clip) {
-                            self.command(cmd, clip, *opacity.last().unwrap_or(&1.0))?;
-                            match cmd {
-                                DrawCommand::FillRect { rect, color }
-                                    if *color == Color::rgb(255, 255, 255) && {
-                                        let a = Area::new(*rect, self.scale());
-                                        a.x <= area.x
-                                            && a.y <= area.y
-                                            && a.r >= area.r
-                                            && a.b >= area.b
-                                    } =>
-                                {
-                                    self.white_background = true
-                                }
-                                DrawCommand::TextRun { .. } | DrawCommand::GlyphRun { .. } => {}
-                                _ => self.white_background = false,
-                            }
-                        }
-                    }
-                }
-            }
-            if clips.len() != 1 || opacity.len() != 1 {
-                return Err(error("unbalanced display list stacks"));
-            }
-            self.damage.push(area);
+        self.take_pending();
+        self.errors.clear();
+        self.text.next_draw();
+        self.text.counts = Default::default();
+        let regions = mem::take(&mut self.frame.list);
+        for area in regions.iter().copied() {
+            self.paint(list, area);
+            self.damage.add(area);
         }
-        Ok(())
+        self.stats.regions = regions.len();
+        self.stats.pixels = regions.iter().map(|a| a.pixels()).sum();
+        self.stats.glyphs_rasterized += self.text.counts.rasterized;
+        self.stats.glyphs_drawn += self.text.counts.drawn;
+        self.frame.list = regions;
+        if self.errors.is_empty() {
+            return Ok(());
+        }
+        let parts: Vec<&str> = self.errors.iter().map(|e| e.message.as_str()).collect();
+        Err(RenderError::new(format!(
+            "the rest of the list was drawn, except: {}",
+            parts.join("; ")
+        )))
     }
     fn end_frame(&mut self) -> Result<(), RenderError> {
-        if !unsafe { GdiFlush() }.as_bool() {
-            return Err(error("GdiFlush failed"));
-        }
+        self.frame.clear();
         Ok(())
     }
     fn resize(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
         if width == 0 || height == 0 {
             return Err(error("empty bitmap"));
         }
-        if width + 64 > self.capacity_width || height > self.capacity_height {
-            let w = width.max(self.capacity_width).next_multiple_of(256) + 64;
+        if width > self.capacity_width || height > self.capacity_height {
+            let w = width.max(self.capacity_width).next_multiple_of(256);
             let h = height.max(self.capacity_height).next_multiple_of(128);
             unsafe {
                 self.target.Resize(w, h).map_err(error)?;
             }
             self.capacity_width = w;
             self.capacity_height = h;
-            self.bits()?;
+            self.surface = surface_of(&self.target, w, h)?;
         }
         self.width = width;
         self.height = height;
-        self.pending.clear();
-        self.scrolled.clear();
-        self.damage = vec![Area::full(width, height)];
+        self.damage.clear();
+        self.frame.clear();
+        self.invalidate_all();
         Ok(())
     }
     fn set_dpi(&mut self, dpi: u32) -> Result<(), RenderError> {
         if dpi == 0 {
             return Err(error("zero DPI"));
         }
-        self.dpi = dpi;
-        self.scrolled.clear();
-        unsafe {
-            self.target
-                .SetPixelsPerDip(dpi as f32 / 96.0)
-                .map_err(error)?;
+        if dpi != self.dpi {
+            self.dpi = dpi;
+            self.frame.clear();
+            self.invalidate_all();
         }
-        self.damage = vec![Area::full(self.width, self.height)];
         Ok(())
     }
+    /// For tests and export only: this builds a new renderer on each call, so its
+    /// glyph cache starts cold. It draws through the same code as live drawing, with
+    /// this renderer's text settings, DPI and fonts.
     fn render_to_bitmap(
         &mut self,
         list: &DisplayList,
@@ -1111,21 +738,10 @@ impl Renderer for BitmapRenderer {
         height: u32,
     ) -> Result<Bitmap, RenderError> {
         let mut other = Self::new(width, height)?;
+        other.set_text_settings(self.text.settings())?;
         other.set_dpi(self.dpi)?;
-        other.params = unsafe {
-            other
-                .factory
-                .CreateCustomRenderingParams(
-                    2.2,
-                    1.0,
-                    1.0,
-                    DWRITE_PIXEL_GEOMETRY_RGB,
-                    DWRITE_RENDERING_MODE_NATURAL,
-                )
-                .map_err(error)?
-        };
-        for (id, (name, size)) in &self.ids {
-            other.register_font(*id, name, *size)?;
+        for (id, face) in self.text.registered() {
+            other.register_font_face(id, &face);
         }
         other.begin_frame()?;
         other.draw(list)?;

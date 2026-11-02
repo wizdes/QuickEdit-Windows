@@ -1,10 +1,11 @@
-//! Cases from the two reviews of M12. Each names its finding. `Window` follows `WIRING.md`
-//! line for line, so that these also prove the wiring example works as written.
+//! Cases from the reviews of M12. Each names its finding. `Window` follows the event path, the
+//! layout, the key pairs and `Resize` in `WIRING.md`. It has no key table or menu, so it calls
+//! `run_command` directly.
 use qe_api::{
     ByteOffset, CommandId, Dip, Handled, InputEvent, InputKind, Modifiers, MouseButton, Point,
     Rect, View, ViewContext, Widget, testing::FixedTextMeasurer,
 };
-use qe_editor::{DecorationKind, EditorView};
+use qe_editor::{DecorationKind, EditorView, FileLoad, LoadOptions, LoadResult, LoadedFile};
 use qe_tools::{
     BarStop, FindOptions, MatchKind, Matcher, PanelStop, ToolsFocus, ToolsHost, is_cluster_edge,
     transform_text,
@@ -37,6 +38,7 @@ struct Window {
     view: EditorView,
     tools: ToolsHost,
     ctx: ViewContext,
+    size: Rect,
 }
 impl Window {
     fn new(text: &str) -> Self {
@@ -47,6 +49,7 @@ impl Window {
             view,
             tools: ToolsHost::with_clipboard(MemoryClipboard::shared()),
             ctx: ViewContext::default(),
+            size: area(),
         };
         w.relayout();
         w.settle_view();
@@ -54,7 +57,7 @@ impl Window {
     }
     fn relayout(&mut self) {
         let m = measure();
-        let rest = self.tools.layout(area(), &m);
+        let rest = self.tools.layout(self.size, &m);
         self.view.layout(rest, &m);
     }
     /// One input event, as `WIRING.md` has it. Commands come from the test by `command`.
@@ -111,6 +114,35 @@ impl Window {
                 return;
             }
             assert!(start.elapsed() < Duration::from_secs(60), "did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    /// A window resize, as `WIRING.md` has it: through the event path, then a new layout.
+    fn resize(&mut self, width: f32, height: f32) {
+        self.size.width = Dip(width);
+        self.size.height = Dip(height);
+        let handled = self.event(InputKind::Resize {
+            width: Dip(width),
+            height: Dip(height),
+        });
+        assert_eq!(handled, Handled::No, "Resize is for the host");
+        self.relayout();
+    }
+    /// A key as Windows sends it: `KeyDown`, then its `Char`, then `KeyUp`.
+    fn pair(&mut self, virtual_key: u16, c: char) {
+        self.key(virtual_key);
+        self.event(InputKind::Char(c));
+        self.event(InputKind::KeyUp {
+            virtual_key,
+            modifiers: Modifiers::default(),
+        });
+    }
+    /// Polls until no job runs, for a file whose index has stopped.
+    fn settle_stopped(&mut self) {
+        let start = Instant::now();
+        while !self.tools.is_quiet() {
+            self.poll();
+            assert!(start.elapsed() < Duration::from_secs(20), "it still waits");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -178,7 +210,8 @@ impl Window {
     fn replace_bar(&mut self, query: &str, with: &str) {
         self.command(CommandId::FindReplace);
         self.typed(with);
-        self.command(CommandId::Find);
+        let field = self.tools.bar().find.bounds;
+        self.click(field);
         self.typed(query);
         self.settle();
     }
@@ -333,11 +366,15 @@ fn f2_a_step_with_the_bar_closed_leaves_nothing_stale() {
 
 fn assert_idle_and_marks_show(w: &mut Window) {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(300) {
+    while start.elapsed() < Duration::from_millis(300) || !w.tools.is_quiet() {
         w.poll();
+        // Time for the work on a busy PC. A scan that started again and again never gets quiet.
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "a worker still runs"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(w.tools.is_quiet(), "a worker still runs");
     let (workers, marks) = (w.tools.workers_started(), w.tools.marks_set());
     for _ in 0..200 {
         w.poll();
@@ -909,4 +946,794 @@ fn still_matches_reads_the_neighbors() {
     assert!(cat.still_matches(snapshot.as_ref(), r(5, 8), &never));
     let e = Matcher::new("e", FindOptions::default()).unwrap();
     assert!(!e.still_matches(snapshot.as_ref(), r(9, 10), &never));
+}
+
+// ---- Second review, finding 2: the Complete list with real key pairs ----
+
+const SPACE: u16 = 0x20;
+const LEFT: u16 = 0x25;
+
+fn with_complete_list() -> Window {
+    let mut w = Window::new("foobar fo");
+    w.select(9, 9);
+    w.command(CommandId::Complete);
+    w.settle();
+    assert_eq!(w.tools.complete_words().unwrap(), ["foobar"]);
+    w
+}
+
+#[test]
+fn r2_f2_tab_and_enter_take_the_word_and_type_nothing() {
+    for (key, c) in [(TAB, '\t'), (ENTER, '\r')] {
+        let mut w = with_complete_list();
+        w.pair(key, c);
+        w.settle();
+        assert_eq!(w.text(), "foobar foobar", "{key:#x}");
+        assert_eq!(w.tools.focus(), ToolsFocus::Editor);
+        // The next key is a plain key again.
+        w.pair(TAB, '\t');
+        assert_eq!(w.text(), "foobar foobar\t", "{key:#x}");
+    }
+}
+
+#[test]
+fn r2_f2_space_closes_the_list_and_types_a_space() {
+    let mut w = with_complete_list();
+    w.pair(SPACE, ' ');
+    w.settle();
+    assert_eq!(w.text(), "foobar fo ");
+    assert!(w.tools.complete_words().is_none());
+}
+
+#[test]
+fn r2_f2_backspace_closes_the_list_and_deletes_one_character() {
+    let mut w = with_complete_list();
+    w.pair(BACK, '\u{8}');
+    w.settle();
+    assert_eq!(w.text(), "foobar f");
+    assert!(w.tools.complete_words().is_none());
+}
+
+#[test]
+fn r2_f2_no_other_key_is_lost() {
+    // An arrow that is not for the list moves the caret.
+    let mut w = with_complete_list();
+    w.key(LEFT);
+    w.settle();
+    assert!(w.tools.complete_words().is_none());
+    assert_eq!(w.selection(), (8, 8));
+    // A function key and a Ctrl chord close it and go on to the host's key table.
+    for (key, ctrl) in [(0x72, false), (0x53, true)] {
+        let mut w = with_complete_list();
+        let modifiers = Modifiers {
+            ctrl,
+            ..Modifiers::default()
+        };
+        let handled = w.event(InputKind::KeyDown {
+            virtual_key: key,
+            modifiers,
+            repeat: false,
+        });
+        assert_eq!(handled, Handled::No, "{key:#x}");
+        assert!(w.tools.complete_words().is_none(), "{key:#x}");
+    }
+    // A letter goes in, and the list looks again.
+    let mut w = with_complete_list();
+    w.pair(0x4f, 'o');
+    w.settle();
+    assert_eq!(w.text(), "foobar foo");
+    assert_eq!(w.tools.complete_words().unwrap(), ["foobar"]);
+    // Esc closes it and changes nothing.
+    let mut w = with_complete_list();
+    w.pair(ESC, '\u{1b}');
+    w.settle();
+    assert_eq!(w.text(), "foobar fo");
+    assert!(w.tools.complete_words().is_none());
+}
+
+#[test]
+fn r2_f2_a_key_that_closes_a_panel_or_list_does_not_type_its_character_elsewhere() {
+    // Space on the panel's close button: the text stays as it is.
+    let mut w = Window::new("one two");
+    w.command(CommandId::SelectLine);
+    w.key(TAB);
+    w.key(TAB);
+    assert_eq!(w.tools.panel().keyboard, Some(PanelStop::Close));
+    w.pair(SPACE, ' ');
+    assert!(!w.tools.is_select_line_open());
+    assert_eq!(w.text(), "one two");
+    // A Space on the options list chooses a row, and no space goes in the field.
+    let mut w = Window::new("one two");
+    w.find("one");
+    let options = w.tools.bar().options.bounds;
+    w.click(options);
+    assert_eq!(w.tools.focus(), ToolsFocus::List);
+    w.key(0x28);
+    w.pair(SPACE, ' ');
+    assert_eq!(w.tools.bar().find.text, "one");
+    assert_eq!(w.text(), "one two");
+    // A real space in a field still goes in.
+    let mut w = Window::new("one two");
+    w.command(CommandId::Find);
+    w.pair(0x4f, 'o');
+    w.pair(SPACE, ' ');
+    w.pair(0x54, 't');
+    assert_eq!(w.tools.bar().find.text, "o t");
+}
+
+// ---- Second review, finding 3: an index that stops ----
+
+fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("qe-tools-review-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+/// A mapped file with a bad byte at 2,400,000, with its index stopped there.
+fn view_with_a_stopped_index(name: &str) -> EditorView {
+    let mut bytes = b"needle line\n".repeat(400_000);
+    bytes[2_400_000] = 0xff;
+    view_with_a_stopped_index_of(name, &bytes)
+}
+fn view_with_a_stopped_index_of(name: &str, bytes: &[u8]) -> EditorView {
+    let path = temp_file(name, bytes);
+    let options = LoadOptions {
+        force_read_only: true,
+        ..Default::default()
+    };
+    let quiet: qe_tools::Wake = std::sync::Arc::new(|| {});
+    let mut load = FileLoad::start(&path, options, quiet).unwrap();
+    let start = Instant::now();
+    let loaded = loop {
+        if let Some(result) = load.poll() {
+            break result;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "the load hung");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let LoadResult::Loaded(LoadedFile::ReadOnly(store)) = loaded else {
+        panic!("the file must open read-only");
+    };
+    let mut view = EditorView::from_text("").unwrap();
+    view.adopt(LoadedFile::ReadOnly(store)).unwrap();
+    let start = Instant::now();
+    while view.store_status().failure.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no failure came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    view
+}
+
+#[test]
+fn r2_f3_a_search_ends_with_a_final_count_when_the_index_stops() {
+    let mut w = Window::with_view(view_with_a_stopped_index("count.txt"));
+    let known = w.view.store_status().known_bytes.0;
+    assert!(known < 4_800_000, "the index stopped at {known}");
+    w.command(CommandId::Find);
+    w.typed("needle");
+    let start = Instant::now();
+    while !w.tools.match_count().1 {
+        w.poll();
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the search never ended"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (count, done) = w.tools.match_count();
+    assert!(done);
+    assert_eq!(count, (known / 12) as u64, "all that could be read");
+    let status = w.tools.status().unwrap_or("");
+    assert!(status.contains("could not be read"), "{status:?}");
+    assert!(
+        w.tools.bar().count.text.contains("found"),
+        "{}",
+        w.tools.bar().count.text
+    );
+    w.settle_stopped();
+}
+
+#[test]
+fn r2_f3_a_match_just_before_the_stopped_place_is_found() {
+    let mut bytes = b"plain line\n".repeat(440_000);
+    bytes[2_399_990..2_399_996].copy_from_slice(b"needle");
+    bytes[2_400_000] = 0xff;
+    let mut w = Window::with_view(view_with_a_stopped_index_of("edge.txt", &bytes));
+    w.command(CommandId::Find);
+    w.typed("needle");
+    let start = Instant::now();
+    while !(w.tools.is_quiet() && w.tools.match_count().1) {
+        w.poll();
+        assert!(start.elapsed() < Duration::from_secs(20), "it never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(w.tools.match_count(), (1, true));
+    assert_eq!(w.selection(), (2_399_990, 2_399_996));
+}
+
+#[test]
+fn r2_f3_a_step_stops_waiting_and_says_why() {
+    let mut w = Window::with_view(view_with_a_stopped_index("step.txt"));
+    w.command(CommandId::Find);
+    w.typed("no such text");
+    let start = Instant::now();
+    while !w.tools.is_quiet() {
+        w.poll();
+        assert!(start.elapsed() < Duration::from_secs(20), "it still waits");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!w.tools.is_step_waiting_for_test());
+    let status = w.tools.status().unwrap_or("");
+    assert!(status.contains("could not be read"), "{status:?}");
+    // F3 afterwards says so too, with no wait.
+    w.command(CommandId::FindNext);
+    let start = Instant::now();
+    while !w.tools.is_quiet() {
+        w.poll();
+        assert!(start.elapsed() < Duration::from_secs(20), "F3 still waits");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(w.tools.take_beep());
+}
+
+#[test]
+fn r2_f3_select_line_past_a_stopped_index_says_why() {
+    let mut w = Window::with_view(view_with_a_stopped_index("lines.txt"));
+    w.command(CommandId::SelectLine);
+    w.typed("399999");
+    w.key(ENTER);
+    let start = Instant::now();
+    while !w.tools.is_idle() {
+        w.poll();
+        assert!(start.elapsed() < Duration::from_secs(20), "it still waits");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let warning = w.view.warning().unwrap_or("").to_string();
+    assert!(warning.contains("could not be read"), "{warning:?}");
+}
+
+// ---- Second review, finding 4: Resize and DpiChange ----
+
+#[test]
+fn r2_f4_resize_leaves_the_bar_room_and_reaches_a_panel_with_the_keys() {
+    // The bar open, the panel with the keys, the alert, a list, and all closed.
+    for state in 0..5 {
+        let mut w = Window::new("one\ntwo\nthree\n");
+        match state {
+            0 => {}
+            1 => w.command(CommandId::Find),
+            2 => w.command(CommandId::SelectLine),
+            3 => {
+                w.command(CommandId::SelectLine);
+                w.typed("abc");
+                w.key(ENTER);
+                assert_eq!(w.tools.focus(), ToolsFocus::Alert);
+            }
+            _ => {
+                w.find("one");
+                let options = w.tools.bar().options.bounds;
+                w.click(options);
+                assert_eq!(w.tools.focus(), ToolsFocus::List);
+            }
+        }
+        let bar = if state == 1 || state == 4 { 32.0 } else { 0.0 };
+        assert_eq!(w.view.text_area().y.0, bar, "state {state}");
+        let resize = InputEvent {
+            time_us: 0,
+            kind: InputKind::Resize {
+                width: Dip(1000.0),
+                height: Dip(700.0),
+            },
+        };
+        assert!(!w.tools.event_for_editor(&resize), "state {state}");
+        w.resize(1000.0, 700.0);
+        let inner = w.view.text_area();
+        assert_eq!(inner.y.0, bar, "state {state}");
+        assert_eq!(inner.height.0, 700.0 - bar, "state {state}");
+        assert_eq!(inner.width.0, 1000.0, "state {state}");
+        assert_ne!(
+            w.tools.focus(),
+            ToolsFocus::List,
+            "a list does not outlive its place"
+        );
+        let shrink = w.event(InputKind::DpiChange { dpi: 144 });
+        assert_eq!(shrink, Handled::No, "state {state}");
+    }
+}
+
+#[test]
+fn r2_f4_the_panel_moves_with_the_window() {
+    let mut w = Window::new("one");
+    w.command(CommandId::SelectLine);
+    let before = w.tools.panel().frame;
+    w.resize(1000.0, 700.0);
+    let after = w.tools.panel().frame;
+    assert!(
+        after.x.0 > before.x.0,
+        "centered again: {before:?} {after:?}"
+    );
+}
+
+// ---- Second review, finding 5: one focused widget, and lists close on Blur ----
+
+#[test]
+fn r2_f5_only_one_widget_reports_focus_under_a_list_or_alert() {
+    let mut w = Window::new("one two");
+    w.find("one");
+    let options = w.tools.bar().options.bounds;
+    w.click(options);
+    assert_eq!(w.tools.focus(), ToolsFocus::List);
+    assert_eq!(w.focused_widgets(), 1, "the options list");
+    w.key(ESC);
+    assert_eq!(w.focused_widgets(), 1, "back in the bar");
+
+    let mut w = Window::new("one two");
+    w.command(CommandId::SelectLine);
+    w.typed("abc");
+    w.key(ENTER);
+    assert_eq!(w.tools.focus(), ToolsFocus::Alert);
+    assert_eq!(w.focused_widgets(), 1, "the alert");
+
+    let mut w = with_complete_list();
+    assert_eq!(w.focused_widgets(), 1, "the Complete list");
+    w.key(ESC);
+    assert_eq!(w.focused_widgets(), 0, "the text has it");
+}
+
+#[test]
+fn r2_f5_lists_close_when_the_window_loses_the_keyboard() {
+    let mut w = Window::new("one two");
+    w.find("one");
+    let options = w.tools.bar().options.bounds;
+    w.click(options);
+    w.event(InputKind::Blur);
+    assert_ne!(w.tools.focus(), ToolsFocus::List);
+    assert_eq!(w.focused_widgets(), 0, "the field heard the window's Blur");
+    w.event(InputKind::Focus);
+    assert_eq!(w.focused_widgets(), 1);
+
+    let mut w = with_complete_list();
+    w.event(InputKind::Blur);
+    assert!(w.tools.complete_words().is_none());
+    assert!(!w.view_has_focus());
+    w.event(InputKind::Focus);
+    assert!(w.view_has_focus());
+}
+
+// ---- Second review, finding 6: where the panel sits ----
+
+#[test]
+fn r2_f6_the_panel_and_its_alert_sit_below_the_bars_rows() {
+    let mut w = Window::new("one");
+    w.command(CommandId::FindReplace);
+    w.command(CommandId::SelectLine);
+    let bar = w.tools.bar().bounds;
+    let bottom = bar.y.0 + bar.height.0;
+    assert_eq!(bar.height.0, 64.0);
+    assert!(
+        w.tools.panel().frame.y.0 >= bottom,
+        "{:?}",
+        w.tools.panel().frame
+    );
+    w.typed("abc");
+    w.key(ENTER);
+    let alert = w.tools.widgets().pop().unwrap().bounds;
+    assert!(alert.y.0 >= bottom, "{alert:?}");
+    // It moves when the bar opens under it, and back when the bar closes.
+    let mut w = Window::new("one");
+    w.command(CommandId::SelectLine);
+    let alone = w.tools.panel().frame.y.0;
+    w.command(CommandId::Find);
+    assert!(w.tools.panel().frame.y.0 >= 32.0 + alone - 0.5);
+    w.key(ESC);
+    assert!(!w.tools.is_bar_open());
+    assert_eq!(w.tools.panel().frame.y.0, alone);
+}
+
+#[test]
+fn r2_f6_a_revealed_selection_is_not_under_the_panel() {
+    // Short enough not to wrap, and wide enough to reach under the panel.
+    let line = "x".repeat(60);
+    let text = (0..300)
+        .map(|i| format!("{i:03} {line}\n"))
+        .collect::<String>();
+    let mut w = Window::new(&text);
+    w.command(CommandId::SelectLine);
+    let frame = w.tools.panel().frame;
+    // Scroll so that line 101 is under the panel, then select it with the Select button.
+    let start = ByteOffset(100 * (line.len() + 5));
+    w.view.run_host(
+        qe_editor::HostCommand::Select {
+            range: start..start,
+            reveal: true,
+        },
+        &mut w.ctx,
+    );
+    w.settle_view();
+    let rect = w.view.range_rects(start..start).unwrap()[0].rect;
+    let scroll = w.view.scroll_offset();
+    w.view.run_host(
+        qe_editor::HostCommand::ScrollTo(scroll + f64::from(rect.y.0 - frame.y.0 - 8.0)),
+        &mut w.ctx,
+    );
+    w.settle_view();
+    let rect = w.view.range_rects(start..start).unwrap()[0].rect;
+    assert!(
+        rect.y.0 < frame.y.0 + frame.height.0 && rect.y.0 >= frame.y.0,
+        "the setup: {rect:?} is under {frame:?}"
+    );
+    w.typed("101");
+    let select = w.tools.panel().select.bounds;
+    w.click(select);
+    w.settle();
+    assert!(
+        w.tools.is_select_line_open(),
+        "the Select button leaves it open"
+    );
+    let selection = w.view.selection();
+    assert!(selection.start < selection.end);
+    let rects = w.view.range_rects(selection).unwrap();
+    assert!(!rects.is_empty());
+    for found in rects {
+        let (top, bottom) = (found.rect.y.0, found.rect.y.0 + found.rect.height.0);
+        assert!(
+            found.rect.x.0 + found.rect.width.0 > frame.x.0,
+            "the setup: it reaches across"
+        );
+        assert!(
+            bottom <= frame.y.0 || top >= frame.y.0 + frame.height.0,
+            "{:?} is under {frame:?}",
+            found.rect
+        );
+    }
+}
+
+#[test]
+fn r2_f6_a_step_also_keeps_its_match_out_from_under_the_panel() {
+    let line = "x".repeat(150);
+    let text = (0..300)
+        .map(|i| {
+            let word = if i == 101 { "needle" } else { "plain" };
+            format!("{} {word} {line}\n", "y".repeat(50))
+        })
+        .collect::<String>();
+    let mut w = Window::new(&text);
+    w.find("needle");
+    w.command(CommandId::SelectLine);
+    let frame = w.tools.panel().frame;
+    let at = w.view.selection().start;
+    let scroll = w.view.scroll_offset();
+    let rect = w.view.range_rects(at..at).unwrap()[0].rect;
+    w.view.run_host(
+        qe_editor::HostCommand::ScrollTo(scroll + f64::from(rect.y.0 - frame.y.0 - 8.0)),
+        &mut w.ctx,
+    );
+    w.settle_view();
+    w.command(CommandId::FindPrevious);
+    w.settle();
+    let selection = w.view.selection();
+    let found = w.view.range_rects(selection).unwrap()[0].rect;
+    assert!(
+        found.y.0 >= frame.y.0 + frame.height.0,
+        "{found:?} under {frame:?}"
+    );
+}
+
+#[test]
+fn r2_f6_esc_in_the_panel_closes_it() {
+    let mut w = Window::new("one");
+    w.command(CommandId::SelectLine);
+    w.pair(ESC, '\u{1b}');
+    assert!(!w.tools.is_select_line_open());
+    assert_eq!(w.tools.focus(), ToolsFocus::Editor);
+    assert_eq!(w.text(), "one");
+}
+
+// ---- Second review, finding 7: rows ----
+
+#[test]
+fn r2_f7_find_shows_one_row_and_replace_shows_two() {
+    let mut w = Window::new("one");
+    w.command(CommandId::FindReplace);
+    assert!(w.tools.bar().replacing);
+    assert_eq!(w.tools.bar().bounds.height.0, 64.0);
+    assert_eq!(w.view.text_area().y.0, 64.0);
+    w.key(ESC);
+    w.command(CommandId::Find);
+    assert!(!w.tools.bar().replacing, "after closing");
+    assert_eq!(w.tools.bar().bounds.height.0, 32.0);
+    assert_eq!(w.view.text_area().y.0, 32.0);
+    w.command(CommandId::FindReplace);
+    assert_eq!(w.view.text_area().y.0, 64.0);
+    w.command(CommandId::Find);
+    assert!(!w.tools.bar().replacing, "with the bar open");
+    assert_eq!(w.view.text_area().y.0, 32.0);
+    assert_eq!(w.tools.focus(), ToolsFocus::Bar(BarStop::Find));
+}
+
+// ---- Second review, finding 8: Capitalize ----
+
+#[test]
+fn r2_f8_capitalize_uses_title_forms() {
+    let cases = [
+        // Georgian has no title form, so it stays.
+        ("\u{10d2}\u{10d0}\u{10db}", "\u{10d2}\u{10d0}\u{10db}"),
+        // Greek with a small iota has its own title letter.
+        ("\u{1f80}b", "\u{1f88}b"),
+        ("\u{1f97}b", "\u{1f9f}b"),
+        ("\u{1fa3}b", "\u{1fab}b"),
+        ("\u{1fb3}b", "\u{1fbc}b"),
+        ("\u{1fc3}b", "\u{1fcc}b"),
+        ("\u{1ff3}b", "\u{1ffc}b"),
+        // These keep the small iota as a mark.
+        ("\u{1fb2}b", "\u{1fba}\u{345}b"),
+        ("\u{1fb4}b", "\u{386}\u{345}b"),
+        ("\u{1fb7}b", "\u{391}\u{342}\u{345}b"),
+        ("\u{1fc7}b", "\u{397}\u{342}\u{345}b"),
+        ("\u{1ff7}b", "\u{3a9}\u{342}\u{345}b"),
+        // A letter that starts with an apostrophe capitalizes the letter after it.
+        ("\u{149}a", "\u{2bc}Na"),
+        // What worked already.
+        ("\u{df}a", "Ssa"),
+        ("\u{fb01}a", "Fia"),
+        ("\u{1c6}a", "\u{1c5}a"),
+        ("\u{587}a", "\u{535}\u{582}a"),
+        ("hello WORLD", "Hello World"),
+    ];
+    for (text, want) in cases {
+        let got = transform_text(text, qe_tools::Transform::Capitalize).unwrap();
+        assert_eq!(got, want, "{text:?}");
+    }
+}
+
+// ---- Second review, finding 9: menu commands while a field has the keys ----
+
+#[test]
+fn r2_f9_edit_commands_from_the_menu_reach_the_field_that_has_the_keys() {
+    let mut w = Window::new("document");
+    let m = measure();
+    // With the text in charge, they are the host's.
+    for command in [
+        CommandId::Undo,
+        CommandId::Cut,
+        CommandId::Copy,
+        CommandId::Paste,
+    ] {
+        let got = w.tools.run_command(command, &mut w.view, &m, &mut w.ctx);
+        assert_eq!(got, Handled::No, "{command:?}");
+    }
+    w.command(CommandId::Find);
+    w.typed("hello");
+    let run = |w: &mut Window, command| {
+        let got = w.tools.run_command(command, &mut w.view, &m, &mut w.ctx);
+        assert_eq!(got, Handled::Yes, "{command:?}");
+    };
+    run(&mut w, CommandId::SelectAll);
+    run(&mut w, CommandId::Copy);
+    run(&mut w, CommandId::Cut);
+    assert_eq!(w.tools.bar().find.text, "");
+    assert_eq!(w.tools.query(), "", "Cut changes the search too");
+    run(&mut w, CommandId::Paste);
+    run(&mut w, CommandId::Paste);
+    assert_eq!(w.tools.bar().find.text, "hellohello");
+    assert_eq!(w.tools.query(), "hellohello");
+    run(&mut w, CommandId::Undo);
+    assert_ne!(w.tools.bar().find.text, "hellohello");
+    assert_eq!(w.text(), "document", "the document took none of them");
+    assert_eq!(
+        w.tools.command_state(CommandId::Copy, &w.view),
+        Some((true, false))
+    );
+
+    // A button has nothing to cut, and the document is not changed behind the user's back.
+    w.key(TAB);
+    assert!(!matches!(w.tools.focus(), ToolsFocus::Bar(BarStop::Find)));
+    run(&mut w, CommandId::Cut);
+    assert_eq!(w.text(), "document");
+    assert_eq!(
+        w.tools.command_state(CommandId::Cut, &w.view),
+        Some((false, false))
+    );
+
+    // The panel's field too.
+    let mut w = Window::new("document");
+    w.command(CommandId::SelectLine);
+    w.typed("12");
+    let run = |w: &mut Window, command| {
+        w.tools.run_command(command, &mut w.view, &m, &mut w.ctx);
+    };
+    run(&mut w, CommandId::SelectAll);
+    run(&mut w, CommandId::Cut);
+    assert_eq!(w.tools.panel().field.text, "");
+    assert_eq!(w.text(), "document");
+}
+
+// ---- Second review: its uncertain concerns 1, 3 and 4 ----
+
+#[test]
+fn r2_c1_a_found_match_waits_behind_keys_that_would_move_it() {
+    let text = format!("{}\nabc", "\u{4e2d}".repeat(400));
+    let at = text.len() - 3;
+    let mut w = Window::new("");
+    let m = measure();
+    let narrow = Rect {
+        x: Dip(0.0),
+        y: Dip(0.0),
+        width: Dip(300.0),
+        height: Dip(600.0),
+    };
+    let mut cold = EditorView::from_text(&text).unwrap();
+    cold.layout(narrow, &m);
+    cold.test_pause_workers(true);
+    let end = InputEvent {
+        time_us: 0,
+        kind: InputKind::KeyDown {
+            virtual_key: 0x23,
+            modifiers: Modifiers::default(),
+            repeat: false,
+        },
+    };
+    cold.handle(&end, &mut w.ctx);
+    let letter = InputEvent {
+        time_us: 0,
+        kind: InputKind::Char('x'),
+    };
+    cold.handle(&letter, &mut w.ctx);
+    assert_eq!(cold.queued_input_count(), 2);
+    w.tools
+        .view_switched(Some(&mut w.view), &mut cold, &mut w.ctx);
+    w.tools
+        .run_command(CommandId::Find, &mut cold, &m, &mut w.ctx);
+    w.tools.set_query_for_test("abc", &mut cold, &m, &mut w.ctx);
+    // The step ends while the keys wait, and nothing selected yet.
+    std::thread::sleep(Duration::from_millis(100));
+    for _ in 0..20 {
+        w.tools.poll(&mut cold, &m, &mut w.ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cold.queued_input_count(), 2);
+    cold.test_pause_workers(false);
+    let start = Instant::now();
+    while !w.tools.is_quiet() || cold.queued_input_count() > 0 || cold.pending_layout() {
+        cold.poll_layout(&mut w.ctx);
+        w.tools.poll(&mut cold, &m, &mut w.ctx);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "it stayed waiting"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let result = cold.text().unwrap();
+    let selection = cold.selection();
+    assert_eq!(result.get(selection.start.0..selection.end.0), Some("abc"));
+    assert_eq!(selection.start.0, at + 1, "one letter went in before it");
+}
+
+#[test]
+fn r2_c3_a_complete_result_opens_no_list_once_the_keyboard_has_moved() {
+    let mut w = Window::new("foobar fo");
+    w.select(9, 9);
+    w.command(CommandId::Complete);
+    w.command(CommandId::Find);
+    w.settle();
+    assert!(w.tools.complete_words().is_none());
+    assert_eq!(w.tools.focus(), ToolsFocus::Bar(BarStop::Find));
+    // Or the window itself lost it.
+    let mut w = Window::new("foobar fo");
+    w.select(9, 9);
+    w.command(CommandId::Complete);
+    w.event(InputKind::Blur);
+    w.settle();
+    assert!(w.tools.complete_words().is_none());
+}
+
+#[test]
+fn r2_c4_an_entry_waiting_for_the_index_ends_when_the_field_changes() {
+    let mut w = Window::new("one\ntwo\nthree\n");
+    w.command(CommandId::SelectLine);
+    w.typed("3");
+    w.tools.set_pending_lines_for_test("2", true);
+    w.settle();
+    assert_eq!(w.selection(), (0, 0), "the old entry selects nothing");
+    assert!(w.tools.is_select_line_open());
+    // The same entry still goes on.
+    w.tools.set_pending_lines_for_test("3", true);
+    w.settle();
+    assert_eq!(w.selection(), (8, 14));
+    assert!(!w.tools.is_select_line_open());
+}
+
+// ---- Second review: what survived its break run ----
+
+#[test]
+fn r2_a_mark_scan_for_old_text_is_not_used() {
+    // A transform and a mark scan end together, so one poll sees both.
+    let text = format!(
+        "{}\nx x x\n{}",
+        "\u{131}".repeat(20),
+        "\u{131}".repeat(40_000)
+    );
+    let mut w = Window::new(&text);
+    let m = measure();
+    w.command(CommandId::Find);
+    w.select(0, text.len());
+    w.tools
+        .run_command(CommandId::UpperCase, &mut w.view, &m, &mut w.ctx);
+    w.tools.set_query_for_test("x", &mut w.view, &m, &mut w.ctx);
+    let start = Instant::now();
+    while !w.tools.transform_and_marks_done_for_test() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the workers did not end"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before = w.view.revision();
+    w.view.poll_layout(&mut w.ctx);
+    w.tools.poll(&mut w.view, &m, &mut w.ctx);
+    assert_ne!(
+        w.view.revision(),
+        before,
+        "the transform went in during this poll"
+    );
+    let now = w.text();
+    for mark in w.view.decorations(DecorationKind::FindMatch) {
+        let got = now.get(mark.start.0..mark.end.0);
+        assert_eq!(
+            got.map(str::to_lowercase),
+            Some("x".to_string()),
+            "{mark:?}"
+        );
+    }
+}
+
+#[test]
+fn r2_a_search_start_inside_an_edit_goes_to_the_edits_start() {
+    let mut w = Window::new("hello world cat");
+    w.select(5, 5);
+    w.command(CommandId::Find);
+    w.edit(2, 8, "cat");
+    w.poll();
+    w.typed("cat");
+    w.settle();
+    assert_eq!(w.selection(), (2, 5));
+}
+
+#[test]
+fn r2_typing_after_a_step_searches_from_that_step() {
+    let mut w = Window::new("cat dog cat dog");
+    w.find("cat");
+    assert_eq!(w.selection(), (0, 3));
+    w.command(CommandId::FindNext);
+    w.settle();
+    assert_eq!(w.selection(), (8, 11));
+    w.typed(" d");
+    w.settle();
+    assert_eq!(w.selection(), (8, 13));
+}
+
+#[test]
+fn r2_a_waiting_step_looks_once_more_when_the_index_stops_and_says_why() {
+    let mut w = Window::with_view(view_with_a_stopped_index("wait.txt"));
+    w.command(CommandId::Find);
+    w.typed("no such text");
+    w.settle_stopped();
+    w.tools
+        .set_step_waiting_for_test(qe_tools::Direction::Forward, ByteOffset(0)..ByteOffset(0));
+    w.settle_stopped();
+    assert!(!w.tools.is_step_waiting_for_test());
+    let status = w.tools.status().unwrap_or("");
+    assert!(status.contains("could not be read"), "{status:?}");
+}
+
+#[test]
+fn r2_replace_all_leaves_the_caret_after_the_last_replacement() {
+    let mut w = Window::new("cat x cat y");
+    w.replace_bar("cat", "elephant");
+    let all = w.tools.bar().replace_all.bounds;
+    w.click(all);
+    w.settle();
+    assert_eq!(w.text(), "elephant x elephant y");
+    assert_eq!(w.selection(), (19, 19));
 }

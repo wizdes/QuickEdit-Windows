@@ -244,6 +244,7 @@ const TOKENS: &[(&str, &str)] = &[
     ("\u{3c3}", "\u{3c3}"),
     ("\u{3c2}", "\u{3c3}"),
     ("\u{131}", "\u{131}"),
+    ("e", "e"),
     ("i", "i"),
     ("I", "i"),
     ("e\u{301}", "e\u{301}"),
@@ -944,9 +945,16 @@ fn a_mapped_file_is_searched_with_pieces_and_across_their_edges() {
 }
 
 /// As a mapped snapshot does: it reads only up to `known`, and past that it gives nothing.
+fn stop_failure() -> qe_api::StoreFailure {
+    qe_api::StoreFailure {
+        message: "a bad byte".to_string(),
+        valid_up_to: ByteOffset(0),
+    }
+}
 struct Pinned {
     text: Arc<String>,
     known: usize,
+    stopped: bool,
 }
 impl TextSnapshot for Pinned {
     fn revision(&self) -> u64 {
@@ -985,7 +993,7 @@ impl TextSnapshot for Pinned {
             known_utf16: Utf16Offset(0),
             known_lines: 1,
             complete: self.known == self.text.len(),
-            failure: None,
+            failure: self.stopped.then(stop_failure),
         }
     }
     fn visit_chunks(&self, range: Range<ByteOffset>, f: &mut dyn FnMut(&str)) -> bool {
@@ -1015,6 +1023,7 @@ fn a_search_goes_on_as_the_index_grows_and_finds_a_match_across_its_edge() {
         Arc::new(Pinned {
             text: text.clone(),
             known,
+            stopped: false,
         })
     };
     // The first index edge falls inside the first match.
@@ -1050,6 +1059,7 @@ fn a_waiting_search_cancels_at_once() {
         Arc::new(Pinned {
             text: text.clone(),
             known: 10,
+            stopped: false,
         }),
         Matcher::new("needle", FindOptions::default()).unwrap(),
         ByteOffset(0)..ByteOffset(1000),
@@ -1066,7 +1076,11 @@ fn a_waiting_search_cancels_at_once() {
 #[test]
 fn a_step_does_not_wrap_or_say_not_found_while_indexing() {
     let text = Arc::new("needle xxxxxxxxxxxxxxx".to_string());
-    let snapshot = Pinned { text, known: 10 };
+    let snapshot = Pinned {
+        text,
+        known: 10,
+        stopped: false,
+    };
     let matcher = Matcher::new("needle", FindOptions::default()).unwrap();
     let cancel = AtomicBool::new(false);
     let from = ByteOffset(8)..ByteOffset(8);
@@ -1075,4 +1089,256 @@ fn a_step_does_not_wrap_or_say_not_found_while_indexing() {
         found, None,
         "the match behind the caret waits for the whole text"
     );
+}
+
+// ---- Second review, finding 1: Find Previous at a block edge ----
+
+/// Every start that matches, in order, overlaps included, with the word rules worked out on
+/// whole tokens. It uses no rule from the crate.
+fn all_starts_model(tokens: &[usize], query: &str, kind: MatchKind) -> Vec<Range<usize>> {
+    let word = |t: usize| {
+        TOKENS[t]
+            .0
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+    };
+    let mut starts = Vec::with_capacity(tokens.len() + 1);
+    let mut at = 0;
+    for &t in tokens {
+        starts.push(at);
+        at += TOKENS[t].0.len();
+    }
+    starts.push(at);
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        let mut left = query;
+        let mut j = i;
+        while !left.is_empty() && j < tokens.len() {
+            match left.strip_prefix(TOKENS[tokens[j]].0) {
+                Some(rest) => {
+                    left = rest;
+                    j += 1;
+                }
+                None => break,
+            }
+        }
+        if !left.is_empty() {
+            continue;
+        }
+        let before = i > 0 && word(tokens[i - 1]);
+        let after = j < tokens.len() && word(tokens[j]);
+        let good = match kind {
+            MatchKind::Contains => true,
+            MatchKind::StartsWith => !before,
+            MatchKind::EndsWith => !after,
+            MatchKind::FullWord => !before && !after,
+        };
+        if good {
+            out.push(starts[i]..starts[j]);
+        }
+    }
+    out
+}
+
+#[test]
+fn backward_steps_match_a_plain_model_at_random_places() {
+    let mut seed = 0x51_7c_c1_b7_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let queries = [
+        ("a", MatchKind::FullWord),
+        ("ab", MatchKind::FullWord),
+        ("a", MatchKind::EndsWith),
+        ("b", MatchKind::StartsWith),
+        ("e", MatchKind::Contains),
+        ("\r", MatchKind::Contains),
+        ("\n", MatchKind::Contains),
+        ("\u{1f1fa}", MatchKind::Contains),
+        ("\u{1f1fa}\u{1f1f8}", MatchKind::Contains),
+        ("\u{4e2d}a", MatchKind::Contains),
+    ];
+    let mut compared = 0;
+    let mut found = 0;
+    for piece in [4096, 7] {
+        let mut tokens = Vec::new();
+        let mut text = String::new();
+        while text.len() < 120_000 {
+            let t = next() % TOKENS.len();
+            tokens.push(t);
+            text.push_str(TOKENS[t].0);
+        }
+        let mut places = Vec::with_capacity(tokens.len() + 1);
+        let mut at = 0;
+        for &t in &tokens {
+            places.push(at);
+            at += TOKENS[t].0.len();
+        }
+        places.push(at);
+        let store = Pieces::new(&text, piece);
+        for (query, kind) in queries {
+            let want = all_starts_model(&tokens, query, kind);
+            let matcher = Matcher::new(query, options(false, kind)).unwrap();
+            for step in 0..120 {
+                let limit = if step == 0 {
+                    text.len()
+                } else {
+                    places[next() % places.len()]
+                };
+                let got = last_match(
+                    &store,
+                    &matcher,
+                    ByteOffset(0),
+                    ByteOffset(limit),
+                    &NOT_CANCELLED,
+                )
+                .unwrap()
+                .map(|r| r.start.0..r.end.0);
+                let expect = want.iter().rfind(|r| r.end <= limit).cloned();
+                found += usize::from(expect.is_some());
+                assert_eq!(
+                    got, expect,
+                    "{query:?} {kind:?} up to {limit}, piece {piece}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(
+        compared >= 2000 && found > 500,
+        "{compared} compared, {found} found"
+    );
+}
+
+#[test]
+fn find_previous_selects_no_false_match_at_a_block_edge() {
+    let exact = options(false, MatchKind::Contains);
+    let word = options(false, MatchKind::FullWord);
+    let cases = [
+        ("foobar ", "foo", word),
+        ("e\u{301} ", "e", exact),
+        ("x\r\n", "\r", exact),
+        ("\u{1f1f8}\u{1f1fa}", "\u{1f1fa}\u{1f1f8}", exact),
+    ];
+    for (unit, query, kind) in cases {
+        for pad in 0..unit.len() {
+            let text = format!("{}{}", unit.repeat(200_000 / unit.len()), " ".repeat(pad));
+            let store = Pieces::new(&text, 4096);
+            let matcher = Matcher::new(query, kind).unwrap();
+            let got = last_match(
+                &store,
+                &matcher,
+                ByteOffset(0),
+                ByteOffset(text.len()),
+                &NOT_CANCELLED,
+            );
+            assert_eq!(got.unwrap(), None, "{query:?}, pad {pad}");
+        }
+    }
+}
+
+#[test]
+fn backward_blocks_keep_a_match_on_their_edge_and_what_stands_before_it() {
+    let word = options(false, MatchKind::FullWord);
+    let exact = options(false, MatchKind::Contains);
+    let len = 40_000;
+    let edge = len - 16 * 1024;
+    let needle = Matcher::new("needle", exact).unwrap();
+    let cat = Matcher::new("cat", word).unwrap();
+    for offset in edge - 100..edge + 90 {
+        let mut text = " ".repeat(len);
+        text.replace_range(offset..offset + 6, "needle");
+        let store = Pieces::new(&text, 4096);
+        let got = last_match(
+            &store,
+            &needle,
+            ByteOffset(0),
+            ByteOffset(len),
+            &NOT_CANCELLED,
+        );
+        let got = got.unwrap().map(|r| r.start.0);
+        assert_eq!(got, Some(offset), "the edge cuts this match");
+
+        let mut text = " ".repeat(len);
+        text.replace_range(offset..offset + 4, "xcat");
+        let store = Pieces::new(&text, 4096);
+        let got = last_match(&store, &cat, ByteOffset(0), ByteOffset(len), &NOT_CANCELLED);
+        assert_eq!(
+            got.unwrap(),
+            None,
+            "the block must keep the x before it, at {offset}"
+        );
+    }
+}
+
+#[test]
+fn a_match_that_runs_past_the_end_of_the_range_is_refused() {
+    let store = Pieces::new("xx abcdef yy", 3);
+    let matcher = Matcher::new("abcd", options(false, MatchKind::Contains)).unwrap();
+    let cut = first_match(
+        &store,
+        &matcher,
+        ByteOffset(0)..ByteOffset(5),
+        &NOT_CANCELLED,
+    );
+    assert_eq!(cut.unwrap(), None);
+    let whole = first_match(
+        &store,
+        &matcher,
+        ByteOffset(0)..ByteOffset(7),
+        &NOT_CANCELLED,
+    );
+    assert_eq!(whole.unwrap(), Some(ByteOffset(3)..ByteOffset(7)));
+}
+
+#[test]
+fn a_waiting_search_ends_with_what_can_be_read_when_the_index_stops() {
+    // The match stands in the last bytes, which wait for the text after them.
+    let mut text = "y".repeat(5000);
+    text.push_str("needle");
+    let known = text.len() + 4;
+    text.push_str(&"y".repeat(5000));
+    let text = Arc::new(text);
+    let job = FindJob::start(
+        Arc::new(Pinned {
+            text: text.clone(),
+            known,
+            stopped: false,
+        }),
+        Matcher::new("needle", FindOptions::default()).unwrap(),
+        ByteOffset(0)..ByteOffset(text.len()),
+        QUEUE_LIMIT,
+        None,
+    );
+    wait_until("the worker to ask for more", || {
+        job.waiting_past().is_some()
+    });
+    assert_eq!(job.count(), 0);
+    let stopped = |failed: bool| -> Arc<dyn TextSnapshot> {
+        Arc::new(Pinned {
+            text: text.clone(),
+            known,
+            stopped: failed,
+        })
+    };
+    // No more text and no failure: the worker goes on waiting.
+    let mut offered = false;
+    job.feed_with(&stopped(false).status(), || {
+        offered = true;
+        stopped(false)
+    });
+    assert!(
+        !offered,
+        "an offer here would wake the worker for nothing, again and again"
+    );
+    assert_eq!(job.waiting_past(), Some(known as u64));
+    assert_eq!(job.state(), JobState::Running);
+    // The index stops: it judges the last bytes and ends.
+    job.feed_with(&stopped(true).status(), || stopped(true));
+    wait_until("the end", || job.state() == JobState::Finished);
+    assert_eq!(job.count(), 1);
 }

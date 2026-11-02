@@ -30,9 +30,31 @@ fn push(out: &mut String, c: char) -> Result<(), String> {
     Ok(())
 }
 
+/// Unicode's title form. The standard library has only the upper form, so this starts from that
+/// and handles the letters where the two differ.
 fn title_case(c: char, out: &mut String) -> Result<(), String> {
     // The four digraphs have their own title forms, and `ß` titles as `Ss`.
     match c {
+        // Georgian has upper case letters but no title form.
+        '\u{10d0}'..='\u{10fa}' | '\u{10fd}'..='\u{10ff}' => push(out, c),
+        // Greek with a small iota: its title letter is 8 past the small one, and is its own.
+        '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+            push(out, char::from_u32(c as u32 + 8).unwrap_or(c))
+        }
+        '\u{1f88}'..='\u{1f8f}'
+        | '\u{1f98}'..='\u{1f9f}'
+        | '\u{1fa8}'..='\u{1faf}'
+        | '\u{1fbc}'
+        | '\u{1fcc}'
+        | '\u{1ffc}' => push(out, c),
+        '\u{1fb3}' => push(out, '\u{1fbc}'),
+        '\u{1fc3}' => push(out, '\u{1fcc}'),
+        '\u{1ff3}' => push(out, '\u{1ffc}'),
+        // An apostrophe and a letter: the letter is the one that takes the capital.
+        '\u{149}' => {
+            push(out, '\u{2bc}')?;
+            push(out, 'N')
+        }
         '\u{1c4}'..='\u{1c6}' => push(out, '\u{1c5}'),
         '\u{1c7}'..='\u{1c9}' => push(out, '\u{1c8}'),
         '\u{1ca}'..='\u{1cc}' => push(out, '\u{1cb}'),
@@ -41,6 +63,9 @@ fn title_case(c: char, out: &mut String) -> Result<(), String> {
             for (i, upper) in c.to_uppercase().enumerate() {
                 if i == 0 {
                     push(out, upper)?;
+                } else if upper == '\u{399}' {
+                    // The small iota of a letter such as `ᾷ` stays a mark in the title form.
+                    push(out, '\u{345}')?;
                 } else {
                     for lower in upper.to_lowercase() {
                         push(out, lower)?;

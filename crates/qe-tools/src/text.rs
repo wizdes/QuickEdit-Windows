@@ -8,10 +8,9 @@ pub fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || is_extend(c)
 }
 
-/// True for a character that joins the character before it. This table is the common part
-/// of Unicode's Grapheme_Extend and SpacingMark, and it is not complete. The `graphemes`
-/// feature puts `unicode-segmentation` in its place once the root lock file lists it for
-/// this crate. `WIRING.md` has the lines.
+/// True for a mark that belongs to the word before it. This table is the common part of
+/// Unicode's Grapheme_Extend and SpacingMark, and it is not complete. It decides words only.
+/// Where a match may start or end comes from `unicode-segmentation`.
 pub fn is_extend(c: char) -> bool {
     matches!(c as u32,
         0x300..=0x36f | 0x483..=0x489 | 0x591..=0x5bd | 0x5bf | 0x5c1..=0x5c2 | 0x5c4..=0x5c5
@@ -112,24 +111,16 @@ impl FlagRun {
         let (Some(before), Some(after)) = (head.chars().next_back(), tail.chars().next()) else {
             return false;
         };
-        if before == '\r' && after == '\n' {
-            return false;
-        }
         if is_regional(before) && is_regional(after) {
             return !self.odd_before(text, at);
         }
-        joins_nothing(text, at, before, after)
+        joins_nothing(text, at)
     }
 }
 
-#[cfg(not(feature = "graphemes"))]
-fn joins_nothing(_text: &str, _at: usize, before: char, after: char) -> bool {
-    !is_extend(after) && before != '\u{200d}'
-}
 /// The full Unicode rule. Text before the buffer can only matter in rare emoji sequences, and
 /// the buffer always keeps some bytes before a candidate.
-#[cfg(feature = "graphemes")]
-fn joins_nothing(text: &str, at: usize, _before: char, _after: char) -> bool {
+fn joins_nothing(text: &str, at: usize) -> bool {
     use unicode_segmentation::GraphemeCursor;
     GraphemeCursor::new(at, text.len(), true)
         .is_boundary(text, 0)

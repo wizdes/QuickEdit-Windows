@@ -195,14 +195,7 @@ const SCENES: [(&str, Build); 6] = [
 ];
 
 fn image_dir() -> PathBuf {
-    // The runner package sits one folder below the crate until root removes it.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let here = manifest.join("tests/images");
-    if here.exists() {
-        here
-    } else {
-        manifest.join("../tests/images")
-    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/images")
 }
 
 #[test]

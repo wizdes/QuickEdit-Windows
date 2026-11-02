@@ -39,6 +39,10 @@ const MARK_MARGIN: usize = 16 * 1024;
 const STEP_QUEUE: usize = 64;
 /// The longest selection that Use Selection for Find takes.
 const SELECTION_FOR_FIND: usize = 64 * 1024;
+/// A selection up to this size is checked against the panel row by row.
+const PANEL_CHECK_BYTES: usize = 4096;
+/// Room left between the panel and a selection scrolled out from under it.
+const PANEL_GAP: f32 = 4.0;
 /// The bytes before the caret that a typing check needs.
 pub const TYPING_CONTEXT_BYTES: usize = 8;
 const OPTION_IGNORE_CASE: &str = "ignore-case";
@@ -66,6 +70,8 @@ struct StepResult {
     revision: u64,
     direction: Direction,
     complete: bool,
+    /// True when the index had stopped before this looked, so it saw all it ever can.
+    stopped: Option<String>,
     known: usize,
     from: Range<ByteOffset>,
 }
@@ -134,6 +140,13 @@ pub struct ToolsHost {
     complete_again: Option<u64>,
     pending_lines: Option<(String, bool)>,
     pending_center: bool,
+    /// The selection was revealed with the panel open, and may be under it.
+    pending_clear: bool,
+    /// A step found its match while keys waited, so it looks again once they have run.
+    step_after_keys: Option<Direction>,
+    /// The `Char` of a `KeyDown` that closed something, which must not reach what is under it.
+    swallow_char: Option<char>,
+    window_active: bool,
     beep: bool,
     last_replaced: Option<u64>,
     workers_started: u64,
@@ -185,6 +198,10 @@ impl ToolsHost {
             complete_again: None,
             pending_lines: None,
             pending_center: false,
+            pending_clear: false,
+            step_after_keys: None,
+            swallow_char: None,
+            window_active: true,
             beep: false,
             last_replaced: None,
             workers_started: 0,
@@ -279,6 +296,8 @@ impl ToolsHost {
             && self.complete_again.is_none()
             && self.pending_lines.is_none()
             && !self.pending_center
+            && !self.pending_clear
+            && self.step_after_keys.is_none()
     }
     /// True when no worker runs and no result waits, with the bar open or not.
     pub fn is_quiet(&self) -> bool {
@@ -294,6 +313,8 @@ impl ToolsHost {
             && self.complete_again.is_none()
             && self.pending_lines.is_none()
             && !self.pending_center
+            && !self.pending_clear
+            && self.step_after_keys.is_none()
     }
     #[doc(hidden)]
     pub fn set_step_waiting_for_test(&mut self, direction: Direction, from: Range<ByteOffset>) {
@@ -316,6 +337,22 @@ impl ToolsHost {
     #[doc(hidden)]
     pub fn replace_waits_for_test(&self) -> bool {
         self.replace_ready.is_some()
+    }
+    /// True when a transform and a mark scan have both ended and neither was looked at.
+    #[doc(hidden)]
+    pub fn transform_and_marks_done_for_test(&self) -> bool {
+        self.transform_job
+            .as_ref()
+            .is_some_and(|run| run.worker.is_done())
+            && self
+                .visible
+                .as_ref()
+                .is_some_and(|scan| scan.job.state() == JobState::Finished)
+    }
+    /// Sets an entry that waits for the index, for tests.
+    #[doc(hidden)]
+    pub fn set_pending_lines_for_test(&mut self, input: &str, close: bool) {
+        self.pending_lines = Some((input.to_string(), close));
     }
     /// Sets the options with no list open, for tests.
     #[doc(hidden)]
@@ -379,6 +416,16 @@ impl ToolsHost {
             selection.start < selection.end
         };
         let large = view.store_status().known_bytes.0 as u64 > crate::SUBSTITUTION_LIMIT_BYTES;
+        if matches!(
+            command,
+            C::Undo | C::Redo | C::Cut | C::Copy | C::Paste | C::SelectAll
+        ) {
+            return match self.focus() {
+                ToolsFocus::Editor => None,
+                _ if self.field_has_keys() => Some((true, false)),
+                _ => Some((false, false)),
+            };
+        }
         Some(match command {
             C::Find | C::FindNext | C::FindPrevious | C::SelectLine | C::JumpToSelection => {
                 (true, false)
@@ -414,8 +461,8 @@ impl ToolsHost {
             C::SelectLine => {
                 self.panel.show(ctx);
                 self.bar.set_focus(None, ctx);
-                self.panel.place(self.area, measure);
-                ctx.invalidate(self.panel.bounds);
+                self.place_all(measure);
+                ctx.invalidate(self.panel.frame);
             }
             // Complete is for the text, so it does nothing while a field has the keyboard.
             C::Complete if self.focus() != ToolsFocus::Editor => {}
@@ -426,12 +473,62 @@ impl ToolsHost {
             C::SmartCopyPaste => self.substitutions.smart_copy ^= true,
             C::SmartQuotes => self.substitutions.quotes ^= true,
             C::SmartDashes => self.substitutions.dashes ^= true,
+            C::Undo | C::Redo | C::Cut | C::Copy | C::Paste | C::SelectAll => {
+                return self.field_command(command, view, measure, ctx);
+            }
             _ => return Handled::No,
         }
         self.sync_view_focus(view, ctx);
         Handled::Yes
     }
 
+    fn field_has_keys(&self) -> bool {
+        match self.focus() {
+            ToolsFocus::Bar(stop) => matches!(stop, BarStop::Find | BarStop::Replace),
+            ToolsFocus::SelectLine => self.panel.keyboard == Some(PanelStop::Field),
+            _ => false,
+        }
+    }
+    /// An edit command from the menu. The window's key table takes these keys first, so this is
+    /// also how Ctrl+C reaches a field. It goes to the field with the keyboard, as its key
+    /// would. With the keyboard on a button or a list it does nothing, so that it never changes
+    /// a document the user is not looking at. With the keyboard in the text it is the host's.
+    fn field_command(
+        &mut self,
+        command: CommandId,
+        view: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) -> Handled {
+        use CommandId as C;
+        if self.focus() == ToolsFocus::Editor {
+            return Handled::No;
+        }
+        if !self.field_has_keys() {
+            return Handled::Yes;
+        }
+        let virtual_key = match command {
+            C::Undo | C::Redo => 0x5a,
+            C::Cut => 0x58,
+            C::Copy => 0x43,
+            C::Paste => 0x56,
+            _ => 0x41,
+        };
+        let event = InputEvent {
+            time_us: 0,
+            kind: InputKind::KeyDown {
+                virtual_key,
+                modifiers: qe_api::Modifiers {
+                    ctrl: true,
+                    shift: command == C::Redo,
+                    ..Default::default()
+                },
+                repeat: false,
+            },
+        };
+        self.route_input(&event, view, measure, ctx);
+        Handled::Yes
+    }
     fn snapshot_wake(&self) -> Option<Wake> {
         self.wake.clone()
     }
@@ -455,10 +552,10 @@ impl ToolsHost {
     ) {
         let opening = !self.bar.open;
         let editable = view.can_edit();
-        self.layout_changed |= opening || (replacing && !self.bar.replacing);
+        self.layout_changed |= opening || replacing != self.bar.replacing;
         self.panel.set_keyboard(None, ctx);
         self.bar.open = true;
-        self.bar.replacing = replacing || self.bar.replacing;
+        self.bar.replacing = replacing;
         self.bar.replace.enabled = editable;
         self.bar.replace_one.enabled = editable;
         self.bar.replace_all.enabled = editable;
@@ -513,6 +610,7 @@ impl ToolsHost {
         }
         self.step_queue.clear();
         self.step_waiting = None;
+        self.step_after_keys = None;
         self.covered = None;
         self.scanned_for = None;
     }
@@ -584,7 +682,7 @@ impl ToolsHost {
             self.beep = true;
             return;
         }
-        if self.step.is_some() {
+        if self.step.is_some() || self.step_after_keys.is_some() {
             if self.step_queue.len() < STEP_QUEUE {
                 self.step_queue.push_back(direction);
             }
@@ -597,6 +695,7 @@ impl ToolsHost {
     fn start_step(&mut self, direction: Direction, from: Range<ByteOffset>, view: &mut EditorView) {
         // This step is newer than any that waits for the index.
         self.step_waiting = None;
+        self.step_after_keys = None;
         let Some(matcher) = self.matcher() else {
             return;
         };
@@ -609,12 +708,16 @@ impl ToolsHost {
             self.snapshot_wake(),
             move |cancel| {
                 let asked = from.clone();
+                let stopped = snapshot.status().failure.map(|failure| {
+                    stopped_message(readable_len(snapshot.as_ref()), &failure.message)
+                });
                 let found = find_step(snapshot.as_ref(), &matcher, from, direction, wrap, cancel);
                 let status = snapshot.status();
                 match found {
                     Ok(result) => Ok(StepResult {
                         found: result.map(|(found, _)| found),
                         complete: status.complete,
+                        stopped,
                         known: readable_len(snapshot.as_ref()),
                         from: asked,
                         revision,
@@ -649,7 +752,19 @@ impl ToolsHost {
             self.start_step(result.direction, from, view);
             return;
         }
+        // Keys that wait run before anything this asks for, and they may move the text. So
+        // nothing is selected until they have run, and then this looks again.
+        if view.queued_input_count() > 0 {
+            self.step_after_keys = Some(result.direction);
+            return;
+        }
         // A mapped file still indexing: no match yet is not "not found". Look again as it grows.
+        if result.found.is_none()
+            && let Some(message) = &result.stopped
+        {
+            self.fail(format!("No match in what could be read. {message}"), view);
+            return;
+        }
         if result.found.is_none() && !result.complete {
             self.step_waiting = Some((result.direction, result.from, result.known));
             return;
@@ -683,6 +798,52 @@ impl ToolsHost {
             self.covered = None;
             self.scanned_for = None;
             self.refresh_marks(view);
+        }
+        self.reveal_clear_of_panel(view, ctx);
+    }
+    fn reveal_clear_of_panel(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        if self.panel.open {
+            self.pending_clear = true;
+            self.keep_selection_clear(view, ctx);
+        }
+    }
+    /// Scrolls a selection out from under the panel, which stays where it is. Text can only move
+    /// down as far as the top of the document, so a selection in the first lines may stay under
+    /// it.
+    fn keep_selection_clear(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        if !self.panel.open {
+            self.pending_clear = false;
+            return;
+        }
+        if view.queued_input_count() > 0 {
+            return;
+        }
+        let selection = view.selection();
+        // A long selection is judged by the row it starts on, so this does not grow with it.
+        let short = selection.end.0 - selection.start.0 <= PANEL_CHECK_BYTES;
+        let range = if short {
+            selection.clone()
+        } else {
+            selection.start..selection.start
+        };
+        let Ok(rects) = view.range_rects(range) else {
+            self.pending_clear = view.pending_layout();
+            return;
+        };
+        self.pending_clear = false;
+        let frame = self.panel.frame;
+        let bottom = frame.y.0 + frame.height.0;
+        let under = rects.iter().map(|r| r.rect).find(|r| {
+            let rows = r.y.0 < bottom && r.y.0 + r.height.0 > frame.y.0;
+            let across = r.x.0 < frame.x.0 + frame.width.0 && r.x.0 + r.width.0 > frame.x.0;
+            rows && (across || !short)
+        });
+        if let Some(rect) = under {
+            let scroll = view.scroll_offset();
+            let target = (scroll - f64::from(bottom + PANEL_GAP - rect.y.0)).max(0.0);
+            if target < scroll {
+                view.run_host(HostCommand::ScrollTo(target), ctx);
+            }
         }
     }
     fn set_current_mark(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
@@ -982,6 +1143,8 @@ impl ToolsHost {
                 if close {
                     self.panel.hide(ctx);
                     ctx.invalidate(self.area);
+                } else {
+                    self.reveal_clear_of_panel(view, ctx);
                 }
             }
             Err(LineError::Invalid) => {
@@ -1005,6 +1168,15 @@ impl ToolsHost {
             }
         }
     }
+    fn alert_bounds(&self) -> Rect {
+        let width = 340.0_f32.min(self.area.width.0.max(200.0));
+        Rect {
+            x: Dip(self.area.x.0 + ((self.area.width.0 - width) / 2.0).max(0.0)),
+            y: Dip(self.area.y.0 + self.bar.height() + 24.0),
+            width: Dip(width),
+            height: Dip(116.0),
+        }
+    }
     fn show_line_error(&mut self, input: &str, ctx: &mut ViewContext) {
         self.beep = true;
         let title = line_error_message(input);
@@ -1013,13 +1185,7 @@ impl ToolsHost {
             format!("{title}\n{LINE_SUGGESTION}"),
             vec!["OK".to_string()],
         );
-        let width = 340.0_f32.min(self.area.width.0.max(200.0));
-        let bounds = Rect {
-            x: Dip(self.area.x.0 + ((self.area.width.0 - width) / 2.0).max(0.0)),
-            y: Dip(self.area.y.0 + 24.0),
-            width: Dip(width),
-            height: Dip(116.0),
-        };
+        let bounds = self.alert_bounds();
         self.alert = Some(DialogFrame::from_alert(WidgetId(12010), &model, bounds));
         ctx.invalidate(bounds);
     }
@@ -1189,7 +1355,10 @@ impl ToolsHost {
         measure: &dyn TextMeasurer,
         ctx: &mut ViewContext,
     ) {
-        if result.revision != view.revision() {
+        if result.revision != view.revision()
+            || self.focus() != ToolsFocus::Editor
+            || !self.window_active
+        {
             return;
         }
         if result.words.is_empty() {
@@ -1265,6 +1434,25 @@ impl ToolsHost {
         let Some(list) = self.list.as_mut() else {
             return Handled::No;
         };
+        // A key that is not for the list closes it and goes on: nothing typed is lost. Letters
+        // stay, because their `Char` decides what happens.
+        if list.complete.is_some()
+            && let InputKind::KeyDown {
+                virtual_key,
+                modifiers,
+                ..
+            } = &event.kind
+        {
+            let lone_modifier = matches!(*virtual_key, 0x10..=0x12 | 0x5b | 0x5c);
+            let leaves = modifiers.ctrl
+                || modifiers.alt
+                || matches!(*virtual_key, 0x08 | 0x20 | 0x25 | 0x27 | 0x2e | 0x70..=0x87);
+            if leaves && !lone_modifier {
+                self.list = None;
+                ctx.invalidate(self.area);
+                return Handled::No;
+            }
+        }
         // Tab takes the row, as on the Mac.
         let tab = matches!(
             event.kind,
@@ -1388,12 +1576,39 @@ impl ToolsHost {
         measure: &dyn TextMeasurer,
         ctx: &mut ViewContext,
     ) -> Handled {
+        let swallow = self.swallow_char.take();
+        if let InputKind::Char(c) = event.kind
+            && swallow == Some(c)
+        {
+            return Handled::Yes;
+        }
+        // A pointer that moves between a key and its character changes nothing about it.
+        if matches!(event.kind, InputKind::MouseMove { .. }) {
+            self.swallow_char = swallow;
+        }
+        let before = self.focus();
         let handled = self.route_input(event, view, measure, ctx);
+        // Windows sends a key's `Char` after its `KeyDown`. If Tab moved the keyboard, its tab must
+        // not land in the text. The text and the fields ignore what other closing keys send.
+        if handled == Handled::Yes
+            && before != ToolsFocus::Editor
+            && self.focus() != before
+            && let InputKind::KeyDown {
+                virtual_key,
+                modifiers,
+                ..
+            } = &event.kind
+            && !modifiers.ctrl
+            && !modifiers.alt
+        {
+            self.swallow_char = (*virtual_key == 0x09).then_some('\t');
+        }
         self.sync_view_focus(view, ctx);
         handled
     }
     /// True when an event that `handle_input` left goes on to the editor. The mouse, the wheel
-    /// and window events always do. Keys do only while the text has the keyboard.
+    /// always do. Keys do only while the text has the keyboard. `Resize` never does: the host
+    /// calls `layout`, because the view's area is what the bar leaves, not the whole window.
     pub fn event_for_editor(&self, event: &InputEvent) -> bool {
         match event.kind {
             InputKind::KeyDown { .. }
@@ -1404,6 +1619,7 @@ impl ToolsHost {
             | InputKind::ImeEnd { .. }
             | InputKind::Focus
             | InputKind::Blur => self.focus() == ToolsFocus::Editor,
+            InputKind::Resize { .. } => false,
             _ => true,
         }
     }
@@ -1432,8 +1648,24 @@ impl ToolsHost {
         measure: &dyn TextMeasurer,
         ctx: &mut ViewContext,
     ) -> Handled {
+        match event.kind {
+            // A list stands where it opened, so it does not outlive the window's old size.
+            InputKind::Resize { .. } => {
+                self.list = None;
+                return Handled::No;
+            }
+            InputKind::DpiChange { .. } => return Handled::No,
+            _ => {}
+        }
         // The window gained or lost the keyboard: whichever control has it hears this.
         if matches!(event.kind, InputKind::Focus | InputKind::Blur) {
+            self.window_active = event.kind == InputKind::Focus;
+            if !self.window_active && self.list.take().is_some() {
+                ctx.invalidate(self.area);
+            }
+            if let Some(alert) = self.alert.as_mut() {
+                alert.handle(event, ctx);
+            }
             if let Some(stop) = self.panel.keyboard {
                 self.panel.control(stop).handle(event, ctx);
                 return Handled::Yes;
@@ -1632,6 +1864,7 @@ impl ToolsHost {
             self.step = None;
             self.on_step(result, view, ctx);
             if self.step.is_none()
+                && self.step_after_keys.is_none()
                 && let Some(next) = self.step_queue.pop_front()
             {
                 self.typed_search = false;
@@ -1639,9 +1872,20 @@ impl ToolsHost {
                 self.start_step(next, from, view);
             }
         }
+        if view.queued_input_count() == 0
+            && let Some(direction) = self.step_after_keys.take()
+        {
+            let from = if self.typed_search {
+                self.anchor..self.anchor
+            } else {
+                view.selection()
+            };
+            self.start_step(direction, from, view);
+        }
         if let Some((direction, from, past)) = self.step_waiting.clone() {
             let status = view.store_status();
-            if status.complete || status.known_bytes.0 > past {
+            // A stopped index gets one more look, which says why if it finds nothing.
+            if status.complete || status.failure.is_some() || status.known_bytes.0 > past {
                 self.start_step(direction, from, view);
             }
         }
@@ -1698,11 +1942,17 @@ impl ToolsHost {
                 self.complete_again = None;
             }
         }
-        if let Some((input, close)) = self.pending_lines.take() {
+        // An entry the user has since changed is no longer what was asked for.
+        if let Some((input, close)) = self.pending_lines.take()
+            && input == self.panel.field.text
+        {
             self.submit_lines(input, close, view, ctx);
         }
         if self.pending_center {
             self.center_selection(view, ctx);
+        }
+        if self.pending_clear {
+            self.keep_selection_clear(view, ctx);
         }
         if !self.bar.open {
             return;
@@ -1772,8 +2022,16 @@ impl ToolsHost {
             match job.state() {
                 JobState::Running => {}
                 JobState::Finished => {
+                    // The count may have grown since the look above.
+                    self.count = job.count();
                     self.count_done = true;
                     self.count_job = None;
+                    let status = view.store_status();
+                    if let Some(failure) = status.failure {
+                        let message = stopped_message(status.known_bytes.0, &failure.message);
+                        let count = grouped(self.count);
+                        self.fail(format!("{count} found. {message}"), view);
+                    }
                 }
                 JobState::Cancelled => self.count_job = None,
                 JobState::Failed(message) => {
@@ -1841,6 +2099,7 @@ impl ToolsHost {
         self.complete_again = None;
         self.pending_lines = None;
         self.pending_center = false;
+        self.pending_clear = false;
         self.list = None;
         self.current = None;
         let mut old_view = old;
@@ -1888,8 +2147,20 @@ impl ToolsHost {
             };
             self.bar.place(bounds, measure);
         }
+        // The panel and its message stand below the bar's rows.
+        let used = self.bar.height();
+        let below = Rect {
+            x: self.area.x,
+            y: Dip(self.area.y.0 + used),
+            width: self.area.width,
+            height: Dip((self.area.height.0 - used).max(0.0)),
+        };
         if self.panel.open {
-            self.panel.place(self.area, measure);
+            self.panel.place(below, measure);
+        }
+        let bounds = self.alert_bounds();
+        if let Some(alert) = self.alert.as_mut() {
+            alert.layout(bounds, measure);
         }
     }
     /// Paints the bar, the panel, its message and any open list. Nothing while all are closed.
@@ -1913,14 +2184,27 @@ impl ToolsHost {
     }
     /// What a screen reader sees of the tools.
     pub fn widgets(&self) -> Vec<Widget> {
+        // Only what has the keyboard reports focus, and a list or a message is on top.
+        let covered = self.list.is_some() || self.alert.is_some();
         let mut out: Vec<Widget> = [self.bar.widget(), self.panel.widget()]
             .into_iter()
             .flatten()
+            .map(|widget| {
+                if covered {
+                    without_focus(widget)
+                } else {
+                    widget
+                }
+            })
             .collect();
         if let Some(alert) = &self.alert
             && let Some(widget) = alert.widgets()
         {
-            out.push(widget);
+            out.push(if self.list.is_some() {
+                without_focus(widget)
+            } else {
+                widget
+            });
         }
         if let Some(open) = &self.list
             && let Some(widget) = open.menu.widgets()
@@ -1929,6 +2213,19 @@ impl ToolsHost {
         }
         out
     }
+}
+
+fn without_focus(mut widget: Widget) -> Widget {
+    widget.states.focused = false;
+    widget.children = widget.children.into_iter().map(without_focus).collect();
+    widget
+}
+
+fn stopped_message(known: usize, reason: &str) -> String {
+    format!(
+        "The file could not be read past byte {}: {reason}",
+        grouped(known as u64)
+    )
 }
 
 fn lookup_message(error: &LookupError) -> String {

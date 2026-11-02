@@ -3,7 +3,7 @@
 use crate::text::{
     FlagRun, align_down, align_up, flags_odd_before, fold_char, is_word, read_failure, readable_len,
 };
-use qe_api::{ByteOffset, TextSnapshot};
+use qe_api::{ByteOffset, StoreStatus, TextSnapshot};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -274,7 +274,9 @@ pub fn scan_forward(
     let readable = readable_len(snapshot);
     let start = range.start.0;
     let wanted_end = range.end.0.min(snapshot.len_bytes().0);
-    let more_to_come = wanted_end > readable;
+    // A stopped index gives no more text, so what stands at the end is judged now. Otherwise the
+    // last candidates would wait for text that never comes.
+    let more_to_come = wanted_end > readable && snapshot.status().failure.is_none();
     let end = wanted_end.min(readable);
     if start >= end {
         return if more_to_come {
@@ -435,7 +437,9 @@ pub fn last_match(
         let mut best = None;
         if !buf.is_empty() {
             matcher.scan_text(&buf, from, buf.len() - 1, true, &mut flags, &mut |s, e| {
-                if low + e <= limit {
+                // Only up to `high` has the bytes after it that the rules read. The block after
+                // this one covers any match past that place.
+                if low + e <= high {
                     best = Some(low + s..low + e);
                 }
                 true
@@ -455,6 +459,12 @@ pub fn last_match(
         high = next_high;
         block = (block * 2).min(most);
     }
+}
+
+/// True when the index has finished, or has stopped and will not grow.
+fn all_known(snapshot: &dyn TextSnapshot) -> bool {
+    let status = snapshot.status();
+    status.complete || status.failure.is_some()
 }
 
 /// Which way a step goes.
@@ -480,8 +490,9 @@ pub fn find_step(
             if let Some(found) = first_match(snapshot, matcher, selection.end..len, cancel)? {
                 return Ok(Some((found, false)));
             }
-            // Going round waits until the whole text is known, or it would skip matches.
-            if !wrap || !snapshot.status().complete {
+            // Going round waits until all the text that will ever be known is known, or it
+            // would skip matches.
+            if !wrap || !all_known(snapshot) {
                 return Ok(None);
             }
             let reach = ByteOffset(selection.end.0.saturating_add(matcher.max_bytes).min(len.0));
@@ -493,7 +504,7 @@ pub fn find_step(
             {
                 return Ok(Some((found, false)));
             }
-            if !wrap || !snapshot.status().complete {
+            if !wrap || !all_known(snapshot) {
                 return Ok(None);
             }
             let floor = ByteOffset(selection.start.0.saturating_sub(matcher.max_bytes));
@@ -667,13 +678,18 @@ impl FindJob {
         }
         self.shared.newer_came.notify_all();
     }
-    /// Calls `offer_snapshot` if the worker waits and the store knows more than it read.
+    /// Calls `offer_snapshot` if the worker waits and the store knows more than it read, or
+    /// has stopped, so that the worker finishes with what can be read.
     pub fn feed(&self, view: &qe_editor::EditorView) {
-        if let Some(past) = self.waiting_past() {
-            let status = view.store_status();
-            if status.complete || status.known_bytes.0 as u64 > past {
-                self.offer_snapshot(view.worker_snapshot());
-            }
+        self.feed_with(&view.store_status(), || view.worker_snapshot());
+    }
+    /// `feed`, with the store's answers passed in.
+    #[doc(hidden)]
+    pub fn feed_with(&self, status: &StoreStatus, newer: impl FnOnce() -> Arc<dyn TextSnapshot>) {
+        if let Some(past) = self.waiting_past()
+            && (status.complete || status.failure.is_some() || status.known_bytes.0 as u64 > past)
+        {
+            self.offer_snapshot(newer());
         }
     }
     /// All matches counted so far, also those past the queue's limit.

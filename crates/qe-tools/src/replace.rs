@@ -146,6 +146,11 @@ impl<T: Send + 'static> Worker<T> {
         }
         Self { slot, cancel }
     }
+    /// True once the result has come, for tests.
+    #[doc(hidden)]
+    pub fn is_done(&self) -> bool {
+        self.slot.lock().is_ok_and(|slot| slot.is_some())
+    }
     /// The result, once it has come.
     pub fn take(&self) -> Option<Result<T, String>> {
         self.slot.lock().ok()?.take()

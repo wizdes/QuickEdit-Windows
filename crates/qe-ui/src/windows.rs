@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{
     COLORREF, E_FAIL, E_INVALIDARG, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT,
     RECT, WPARAM,
@@ -1363,6 +1364,7 @@ pub unsafe fn read_full_text_block(memory: HGLOBAL) -> Result<String, String> {
         text
     }
 }
+const CANCELLED: &str = "The copy was replaced by a newer one.";
 /// A movable memory block this code still owns.
 struct OwnedBlock(HGLOBAL);
 // SAFETY: a movable global block is a process-wide handle, not tied to a thread. Nothing
@@ -1420,7 +1422,12 @@ impl std::fmt::Debug for PreparedClipboardText {
 }
 /// Writes `text` as UTF-16 into a new block. With `count`, the block starts with that
 /// count and has no end zero; without it, the text ends in a zero.
-fn fill_block(block: &OwnedBlock, text: &str, count: Option<u64>) -> Result<(), String> {
+fn fill_block(
+    block: &OwnedBlock,
+    text: &str,
+    count: Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     // SAFETY: `prepare_clipboard_text` sized the block for the header or the end zero,
     // and one unit for each unit of `text`. Nothing else can reach the block yet.
     unsafe {
@@ -1433,27 +1440,44 @@ fn fill_block(block: &OwnedBlock, text: &str, count: Option<u64>) -> Result<(), 
             (pointer as *mut u64).write_unaligned(count);
             to = pointer.add(8) as *mut u16;
         }
-        for unit in text.encode_utf16() {
+        let mut stopped = false;
+        for (written, unit) in text.encode_utf16().enumerate() {
+            // Each 256 KiB of text takes well under a millisecond.
+            if written & 0x3_ffff == 0 && cancel.load(Ordering::Acquire) {
+                stopped = true;
+                break;
+            }
             to.write_unaligned(unit);
             to = to.add(1);
         }
-        if count.is_none() {
+        if count.is_none() && !stopped {
             to.write_unaligned(0);
         }
         let _ = GlobalUnlock(block.0);
+        if stopped {
+            return Err(CANCELLED.to_string());
+        }
     }
     Ok(())
 }
 /// Makes the memory blocks for `text`. Safe to run on any thread.
 pub fn prepare_clipboard_text(text: &str) -> Result<PreparedClipboardText, String> {
+    prepare_clipboard_text_unless(text, &AtomicBool::new(false))
+}
+/// The same, but it stops soon after `cancel` turns true, frees what it made, and
+/// returns an error that nobody needs to read.
+pub fn prepare_clipboard_text_unless(
+    text: &str,
+    cancel: &AtomicBool,
+) -> Result<PreparedClipboardText, String> {
     let units = text.encode_utf16().count();
     let too_big = || "This text is too large for the clipboard.".to_string();
     let bytes = units.checked_mul(2).ok_or_else(too_big)?;
     let block = OwnedBlock::allocate(bytes.checked_add(2).ok_or_else(too_big)?)?;
-    fill_block(&block, text, None)?;
+    fill_block(&block, text, None, cancel)?;
     let full = if text.as_bytes().contains(&0) {
         let full = OwnedBlock::allocate(bytes.checked_add(8).ok_or_else(too_big)?)?;
-        fill_block(&full, text, Some(units as u64))?;
+        fill_block(&full, text, Some(units as u64), cancel)?;
         Some(full)
     } else {
         None
@@ -1513,30 +1537,32 @@ impl SystemClipboard {
         Ok(())
     }
 }
+/// Which format a Paste reads: the private one if it is there, or else plain text. With
+/// no name for the private format, nobody can have written it, so plain text is safe.
+#[doc(hidden)]
+pub fn clipboard_read_format(
+    full: Option<u32>,
+    plain: u32,
+    available: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    full.filter(|format| available(*format))
+        .or_else(|| available(plain).then_some(plain))
+}
 impl ClipboardAccess for SystemClipboard {
     fn read_text(&self) -> Result<Option<String>, String> {
-        let full_format = full_text_format()?;
-        // SAFETY: plain queries.
-        let (full, plain) = unsafe {
-            (
-                IsClipboardFormatAvailable(full_format).is_ok(),
-                IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)).is_ok(),
-            )
-        };
-        if !full && !plain {
+        let full_format = full_text_format().ok();
+        let plain = u32::from(CF_UNICODETEXT.0);
+        // SAFETY: a plain query.
+        let available = |format| unsafe { IsClipboardFormatAvailable(format) }.is_ok();
+        let Some(format) = clipboard_read_format(full_format, plain, available) else {
             return Ok(None);
-        }
+        };
         let _open = OpenedClipboard::open()?;
         // SAFETY: the clipboard is open, so the data stays valid until it closes.
         unsafe {
-            let format = if full {
-                full_format
-            } else {
-                u32::from(CF_UNICODETEXT.0)
-            };
             let handle = GetClipboardData(format)
                 .map_err(|e| format!("could not read the clipboard: {e}"))?;
-            if full {
+            if format != plain {
                 read_full_text_block(HGLOBAL(handle.0)).map(Some)
             } else {
                 read_text_block(HGLOBAL(handle.0)).map(Some)

@@ -50,6 +50,9 @@ pub struct LoadOptions {
     /// A lower size limit, so a test can grow a file past it cheaply.
     #[doc(hidden)]
     pub test_editable_limit: Option<u64>,
+    /// Makes the room check fail above this many bytes, as a PC short of memory would.
+    #[doc(hidden)]
+    pub test_room_limit: Option<usize>,
 }
 
 pub struct FileLoad {
@@ -222,7 +225,15 @@ fn load(path: &PathBuf, options: &LoadOptions, cancel: &AtomicBool, wake: Notify
     if cancel.load(Ordering::Acquire) {
         return LoadResult::Cancelled;
     }
-    if let Err(message) = check_room_for_tree(path, text.len()) {
+    let short_of_room = options
+        .test_room_limit
+        .is_some_and(|limit| text.len() > limit);
+    let room = if short_of_room {
+        check_room_for_tree(path, usize::MAX / 2)
+    } else {
+        check_room_for_tree(path, text.len())
+    };
+    if let Err(message) = room {
         return LoadResult::Failed(message);
     }
     let store = PieceStore::new(&text);

@@ -11,5 +11,5 @@
 - qe-buffer: add `PieceStore::try_new`, using `try_reserve` for each leaf. Today the load checks for room first, but another program can take that memory, and the app then aborts and other tabs lose unsaved text.
 - Paste decodes and inserts on the UI thread: 247 ms to decode 100 MiB and 1,252 ms for 512 MiB, plus `store.splice_text`. It needs a way to build the tree on a worker.
 - Word keys stop at a gap over 256 KiB, so a very long gap can take several key presses. Check this against the Mac.
-- `qe-editor` test `p12_a_dropped_page_key_says_so` failed once in a mutation run, and the cause was not found. It then passed 36 parallel runs and 6 full suite runs.
+- `qe-editor` test `p12_a_dropped_page_key_says_so` failed in 3 mutation runs that had nothing to do with it. The likely cause, not proven, is that background reads brought the page into memory first. Its setup now looks for a place where the key really waits, and it has passed 5 of 5 full runs since. Watch for it.
 - Not compared on a Mac: undo selecting the restored text, the fourth click, Backspace on a cluster, double-click and word keys on emoji.

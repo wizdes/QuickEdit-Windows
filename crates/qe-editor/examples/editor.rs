@@ -73,8 +73,8 @@ impl Clipboard for SystemClipboard {
         self.0.write_text(value)
     }
     fn preparer(&self) -> Option<ClipboardPreparer> {
-        Some(Arc::new(|text| {
-            let prepared = qe_ui::prepare_clipboard_text(text)?;
+        Some(Arc::new(|text, cancel| {
+            let prepared = qe_ui::prepare_clipboard_text_unless(text, cancel)?;
             Ok(Box::new(prepared) as Box<dyn std::any::Any + Send>)
         }))
     }
@@ -647,8 +647,17 @@ fn run_key_bench(
 }
 
 fn main() -> Result<(), String> {
-    let process_start = process_creation()?;
     let args = parse_args()?;
+    // Only the timers use this, so its failure must not stop the program from opening.
+    let process_start = match process_creation() {
+        Ok(start) => start,
+        Err(problem) => {
+            if args.timings {
+                eprintln!("{problem}. The times below count from the start of main.");
+            }
+            Instant::now()
+        }
+    };
     if args.help {
         println!("{HELP}");
         return Ok(());

@@ -52,11 +52,19 @@ The Mac's source does not override these, so they come from what `NSTextView` do
 
 - **The view keeps its place.** A change of width, wrap or font remembers the byte at the top row and goes back to it when the layouts arrive. If the caret was on screen before, it stays on screen. A minimized window keeps its scroll and lays out nothing.
 - **Commands wait in line.** `run` uses the same queue as keys, so a menu Paste cannot pass a waiting End.
-- **An index that is still running.** Select All and Ctrl+End wait for it, in order. After 2 s they take the known end and show a warning that says how much they cover.
+- **An index that is still running.** Select All and Ctrl+End wait for it, in order. After 2 s they take the known end and show a warning that says how much they cover. The warning goes when the selection changes or when it covers the whole file. Each key that waits has its own 2 s, and no input waits more than 6 s, however many keys wait in front of it.
 - **Warnings.** A warning has a background so that it reads over text. The next edit or Esc clears it. Esc does nothing else in this crate.
-- **Dragging.** Drag scrolling follows a clock, one step for each 16 ms, not the number of events.
+- **Dragging.** Drag scrolling follows real time, one step for each 16 ms, with the rest carried over. It does not depend on the timer's spacing or the number of events. Time inside the view earns nothing, and a stall earns at most 8 steps.
+- **A replaced Copy.** A newer Copy, Cut or `adopt` tells the old copy to stop. Its thread frees its own memory.
 - **Word moves.** One key reads at most 4 runs of text, and looks back at most 1 MiB for flags, so its cost has a limit.
 - **The clipboard.** `Clipboard::preparer` lets a big Copy do its slow part on the copy's thread. The UI thread only hands over the finished blocks. A Paste still decodes the text on the UI thread.
+
+## What M14's Save must do
+
+No Save exists yet. These two points would lose text if a Save ignored them.
+
+- **Flush the input queue before reading text.** Typing can wait up to 6 s behind a Home, an End or a Select All. `text()` and `is_at_save_point` do not see it.
+- **Wait for a running Cut's copy, or keep it.** `adopt` cancels a running copy. So Cut, then Save, then Open would lose the cut text with no message, because the save removes the reason to refuse `adopt`.
 
 ## Running it
 

@@ -453,6 +453,23 @@ fn prepared_text_can_be_made_on_another_thread_and_dropped_there() {
     std::thread::spawn(move || drop(prepared)).join().unwrap();
 }
 #[test]
+fn a_cancelled_prepare_stops_and_makes_nothing() {
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    assert!(prepare_clipboard_text_unless(&"x".repeat(1 << 22), &cancel).is_err());
+    assert!(prepare_clipboard_text_unless("a", &cancel).is_err());
+}
+#[test]
+fn a_failed_format_name_still_reads_plain_text() {
+    let plain = 13;
+    assert_eq!(clipboard_read_format(None, plain, |_| true), Some(plain));
+    assert_eq!(clipboard_read_format(None, plain, |_| false), None);
+    assert_eq!(clipboard_read_format(Some(99), plain, |_| true), Some(99));
+    assert_eq!(
+        clipboard_read_format(Some(99), plain, |format| format == plain),
+        Some(plain)
+    );
+}
+#[test]
 fn a_full_text_block_whose_count_does_not_fit_is_refused() {
     use windows::Win32::Foundation::GlobalFree;
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};

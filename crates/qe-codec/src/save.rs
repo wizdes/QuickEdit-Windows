@@ -5,20 +5,24 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher, RandomState};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIRECTORY, ERROR_FILE_EXISTS,
-    ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION, ERROR_NOT_SUPPORTED,
-    ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANT_RESOLVE_FILENAME,
+    ERROR_DIRECTORY, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION,
+    ERROR_LOCK_VIOLATION, ERROR_NOT_A_REPARSE_POINT, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, HLOCAL, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SetSecurityDescriptorControl,
+    SECURITY_ATTRIBUTES, SetFileSecurityW, SetSecurityDescriptorControl,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
@@ -29,7 +33,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 
 /// About 10 tries over 500 ms, for a scanner or indexer that holds a file briefly.
 const TRIES: u32 = 10;
@@ -152,6 +156,12 @@ trait SaveEnv {
     fn random(&mut self) -> u64 {
         RandomState::new().build_hasher().finish()
     }
+    fn write_temp(&mut self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        file.write_all(bytes)
+    }
+    fn flush_temp(&mut self, file: &mut File) -> std::io::Result<()> {
+        file.sync_all()
+    }
     /// The temp file exists and no byte has been written.
     fn temp_created(&mut self, _temp: &Path) {}
     /// All bytes are on disk and the temp file is closed.
@@ -165,7 +175,7 @@ impl SaveEnv for RealEnv {}
 
 /// How to tell whether a file is still the file it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FileState {
+pub(crate) struct FileState {
     volume: u32,
     index: u64,
     size: u64,
@@ -175,6 +185,26 @@ impl FileState {
     fn same_file(&self, other: &Self) -> bool {
         self.volume == other.volume && self.index == other.index
     }
+    /// Same size and same time. This survives a rename on a file system whose file
+    /// numbers come from a folder slot, where `same_file` does not.
+    fn same_content_stamp(&self, other: &Self) -> bool {
+        self.size == other.size && self.written == other.written
+    }
+}
+fn handle_state(handle: HANDLE) -> Result<FileState, u32> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open and `info` is a live struct of the right type.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|e| win32_code(&e))?;
+    let join = |high: u32, low: u32| (u64::from(high) << 32) | u64::from(low);
+    Ok(FileState {
+        volume: info.dwVolumeSerialNumber,
+        index: join(info.nFileIndexHigh, info.nFileIndexLow),
+        size: join(info.nFileSizeHigh, info.nFileSizeLow),
+        written: join(
+            info.ftLastWriteTime.dwHighDateTime,
+            info.ftLastWriteTime.dwLowDateTime,
+        ),
+    })
 }
 /// `None` when nothing is at that path. An open for no access works even while
 /// another program holds the file with no sharing.
@@ -200,24 +230,87 @@ fn file_state(path: &Path) -> Result<Option<FileState>, u32> {
             return if missing { Ok(None) } else { Err(code) };
         }
     };
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `handle` is open and `info` is a live struct of the right type.
-    let result = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    let state = handle_state(handle);
     // SAFETY: `handle` is open and is not used again.
     if let Err(e) = unsafe { CloseHandle(handle) } {
         return Err(win32_code(&e));
     }
-    result.map_err(|e| win32_code(&e))?;
-    let join = |high: u32, low: u32| (u64::from(high) << 32) | u64::from(low);
-    Ok(Some(FileState {
-        volume: info.dwVolumeSerialNumber,
-        index: join(info.nFileIndexHigh, info.nFileIndexLow),
-        size: join(info.nFileSizeHigh, info.nFileSizeLow),
-        written: join(
-            info.ftLastWriteTime.dwHighDateTime,
-            info.ftLastWriteTime.dwLowDateTime,
-        ),
-    }))
+    state.map(Some)
+}
+/// The path for an error, but only if something is there. A check that fails is not
+/// proof that the file went, so that case still names it.
+fn if_on_disk(path: &Path) -> Option<PathBuf> {
+    match file_state(path) {
+        Ok(None) => None,
+        Ok(Some(_)) | Err(_) => Some(friendly(path)),
+    }
+}
+
+/// A file being read from start to end by a copy or a decode. Any change to it gives
+/// `SourceChanged`, so a caller cannot use a mix of two versions, or a partial one.
+///
+/// Reads stop as soon as the file is longer or shorter than it was at the open, so
+/// a file that grows cannot use up memory or carry a progress count past its total.
+pub(crate) struct WatchedSource {
+    file: File,
+    /// The `\\?\` form, so that the check works on any path `File::open` accepts.
+    path: PathBuf,
+    start: FileState,
+    position: u64,
+}
+impl WatchedSource {
+    pub(crate) fn open(input: &Path) -> Result<Self, CodecError> {
+        let file = File::open(input)?;
+        let handle = HANDLE(file.as_raw_handle());
+        let start =
+            handle_state(handle).map_err(|code| std::io::Error::from_raw_os_error(code as i32))?;
+        Ok(Self {
+            file,
+            path: verbatim(&std::path::absolute(input)?),
+            start,
+            position: 0,
+        })
+    }
+    pub(crate) fn size(&self) -> u64 {
+        self.start.size
+    }
+    pub(crate) fn shown_path(&self) -> PathBuf {
+        friendly(&self.path)
+    }
+    fn changed(&self) -> CodecError {
+        CodecError::SourceChanged {
+            path: self.shown_path(),
+            leftover: None,
+        }
+    }
+    pub(crate) fn seek_to(&mut self, position: u64) -> Result<(), CodecError> {
+        self.file.seek(SeekFrom::Start(position))?;
+        self.position = position;
+        Ok(())
+    }
+    /// Reads at most `buffer.len()` bytes. Zero means the end of an unchanged file.
+    pub(crate) fn read(&mut self, buffer: &mut [u8]) -> Result<usize, CodecError> {
+        let n = self.file.read(buffer)?;
+        let now = self.position + n as u64;
+        if now > self.start.size || (n == 0 && now != self.start.size) {
+            return Err(self.changed());
+        }
+        self.position = now;
+        if n == 0 {
+            self.confirm_unchanged()?;
+        }
+        Ok(n)
+    }
+    /// Compares the size, the time and the file behind the name with the open.
+    pub(crate) fn confirm_unchanged(&self) -> Result<(), CodecError> {
+        let held = handle_state(HANDLE(self.file.as_raw_handle()));
+        let named = file_state(&self.path);
+        if held == Ok(self.start) && named == Ok(Some(self.start)) {
+            Ok(())
+        } else {
+            Err(self.changed())
+        }
+    }
 }
 
 /// The target's access rules, ready to give to a new file.
@@ -281,18 +374,61 @@ fn read_access_rules(path: &Path) -> Result<Option<AccessRules>, u32> {
     Ok(Some(rules))
 }
 
-/// Deletes a file of ours and returns its path if it could not go. A scanner may
-/// hold a new file for a moment, so this tries a few times.
-fn delete_ours(path: &Path) -> Option<PathBuf> {
-    for attempt in 0..3 {
-        match fs::remove_file(path) {
-            Ok(()) => return None,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(_) if attempt < 2 => std::thread::sleep(TRY_DELAY),
-            Err(_) => {}
+/// Gives the owner of a file of ours the full right to it. A temp file carries a copy
+/// of the document's rules, and those may not let this user delete it. The creator
+/// owns the file and may always change its rules. Returns false if that failed.
+fn allow_owner_to_delete(path: &Path) -> bool {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the strings outlive the calls, and the descriptor is freed once.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from("D:P(A;;FA;;;OW)"),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .is_err()
+        {
+            return false;
         }
+        let set = SetFileSecurityW(
+            PCWSTR(wide_path(path).as_ptr()),
+            DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+        .as_bool();
+        LocalFree(Some(HLOCAL(descriptor.0)));
+        set
     }
-    Some(friendly(path))
+}
+/// Deletes a file of ours and returns the Windows code if it could not go. A scanner
+/// may hold a new file for a moment, so this tries a few times. If its own rules are
+/// the obstacle, this changes them first. The file holds nothing the caller still wants.
+fn try_delete(path: &Path) -> Result<(), u32> {
+    let mut widened = false;
+    let mut attempt = 0;
+    loop {
+        let error = match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => e,
+        };
+        if io_code(&error) == ERROR_ACCESS_DENIED.0 && !widened {
+            widened = true;
+            if allow_owner_to_delete(path) {
+                continue;
+            }
+        }
+        attempt += 1;
+        if attempt == 3 {
+            return Err(io_code(&error));
+        }
+        std::thread::sleep(TRY_DELAY);
+    }
+}
+/// `try_delete`, for a caller that only needs the path of a file that stayed.
+fn delete_ours(path: &Path) -> Option<PathBuf> {
+    try_delete(path).err().map(|_| friendly(path))
 }
 
 /// Maps a Windows code to the error for a save whose original is in the state
@@ -395,21 +531,40 @@ fn new_file_in_real_folder(absolute: &Path) -> std::io::Result<Resolved> {
 /// A link to nothing. The save creates the file the link names if that file's
 /// folder exists; otherwise the error names both paths.
 fn resolve_dangling_link(link: &Path) -> Result<Resolved, CodecError> {
+    let missing = |target: &Path| CodecError::DanglingLink {
+        link: friendly(link),
+        target: friendly(target),
+    };
     let mut current = link.to_path_buf();
     for _ in 0..64 {
-        let Ok(next) = fs::read_link(&current) else {
-            break;
+        let next = match fs::read_link(&current) {
+            Ok(next) => next,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || io_code(&e) == ERROR_NOT_A_REPARSE_POINT.0 =>
+            {
+                return new_file_in_real_folder(&current).map_err(|_| missing(&current));
+            }
+            Err(e) => return Err(save_error(io_code(&e), &current, true, None)),
         };
+        // Windows starts from the real folder that holds the link and removes each `..`
+        // in the link's text as text, even after a folder that is itself a link. Measured
+        // on this PC: with `hop` a link to a far folder, a link with target `hop\..\a.txt`
+        // opens the `a.txt` beside the link. `canonicalize` gives a `\\?\` path, and `join`
+        // on such a path removes `..` the same way. It keeps an absolute target as it is.
         let joined = match current.parent() {
-            Some(folder) => folder.join(next),
+            Some(folder) => match fs::canonicalize(folder) {
+                Ok(real) => real.join(next),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(missing(&folder.join(next)));
+                }
+                Err(e) => return Err(save_error(io_code(&e), folder, true, None)),
+            },
             None => next,
         };
-        current = std::path::absolute(joined)?;
+        current = joined;
     }
-    new_file_in_real_folder(&current).map_err(|_| CodecError::DanglingLink {
-        link: friendly(link),
-        target: friendly(&current),
-    })
+    Err(save_error(ERROR_CANT_RESOLVE_FILENAME.0, link, true, None))
 }
 /// The checks that come before any byte is written. Returns the state to compare
 /// against later, and the rules a temp file must have.
@@ -428,6 +583,22 @@ fn preflight_existing(target: &Path) -> Result<(FileState, Option<AccessRules>),
         && code != ERROR_LOCK_VIOLATION.0
     {
         return Err(save_error(code, target, true, None));
+    }
+    // ReplaceFileW must rename the target. Without that right the swap can never work,
+    // so this stops here, before a temp file exists. Saving in place instead could lose
+    // the text in a crash, so there is no such route.
+    if let Some(code) = probe_access(target, DELETE.0)
+        && code != ERROR_SHARING_VIOLATION.0
+        && code != ERROR_LOCK_VIOLATION.0
+    {
+        return Err(if code == ERROR_ACCESS_DENIED.0 {
+            CodecError::NotReplaceable {
+                path: friendly(target),
+                code,
+            }
+        } else {
+            save_error(code, target, true, None)
+        });
     }
     let state = match file_state(target) {
         Ok(Some(state)) => state,
@@ -526,13 +697,17 @@ fn commit_replace(
         }
     };
     let placeholder = file_state(&backup).ok().flatten();
-    let result = retry_replace(target, temp, &backup, env);
-    match result {
-        Ok(()) => Ok(match delete_ours(&backup) {
-            None => AtomicWriteResult::Replaced,
-            Some(backup) => AtomicWriteResult::ReplacedBackupKept { backup },
-        }),
-        Err(code) => Err(after_failed_replace(
+    match retry_replace(target, temp, &backup, before, env) {
+        Swap::Done => after_good_replace(target, &backup, before),
+        Swap::TargetChanged => {
+            let error = CodecError::TargetChanged {
+                path: friendly(target),
+                new_text: if_on_disk(temp),
+                other_version: None,
+            };
+            Err(with_leftover(error, delete_ours(&backup)))
+        }
+        Swap::Failed(code) => Err(after_failed_replace(
             target,
             temp,
             &backup,
@@ -543,21 +718,68 @@ fn commit_replace(
         )),
     }
 }
+/// The swap worked. What now has the backup's name is what the target held at the
+/// swap. If that is not the file this save started from, another program wrote in
+/// the instant after the last check, and the backup is the only copy of its bytes.
+fn after_good_replace(
+    target: &Path,
+    backup: &Path,
+    before: FileState,
+) -> Result<AtomicWriteResult, CodecError> {
+    match file_state(backup) {
+        Ok(Some(state)) if state.same_content_stamp(&before) => {}
+        Ok(None) => return Ok(AtomicWriteResult::Replaced),
+        // Unknown means it stays, and the caller hears about it.
+        Err(_) => {
+            return Ok(AtomicWriteResult::ReplacedBackupKept {
+                backup: friendly(backup),
+            });
+        }
+        Ok(Some(_)) => {
+            return Err(CodecError::TargetChanged {
+                path: friendly(target),
+                new_text: None,
+                other_version: Some(friendly(backup)),
+            });
+        }
+    }
+    Ok(match delete_ours(backup) {
+        None => AtomicWriteResult::Replaced,
+        Some(backup) => AtomicWriteResult::ReplacedBackupKept { backup },
+    })
+}
+enum Swap {
+    Done,
+    /// The target was not what this save started from, and no swap was tried.
+    TargetChanged,
+    Failed(u32),
+}
 fn retry_replace(
     target: &Path,
     temp: &Path,
     backup: &Path,
+    before: FileState,
     env: &mut impl SaveEnv,
-) -> Result<(), u32> {
+) -> Swap {
     let mut tries = 0;
+    let mut last_code = None;
     loop {
+        // Checked before every try: a retry waits long enough for another program to
+        // finish its own save. A failed try may itself have changed the target, and
+        // only `after_failed_replace` can tell, so after a try the code is what counts.
+        match file_state(target) {
+            Ok(Some(state)) if state == before => {}
+            Ok(_) => return last_code.map_or(Swap::TargetChanged, Swap::Failed),
+            Err(code) => return Swap::Failed(last_code.unwrap_or(code)),
+        }
         match env.replace(target, temp, backup) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Swap::Done,
             Err(code) if is_passing(code) && tries + 1 < TRIES => {
                 tries += 1;
+                last_code = Some(code);
                 env.sleep(TRY_DELAY);
             }
-            Err(code) => return Err(code),
+            Err(code) => return Swap::Failed(code),
         }
     }
 }
@@ -569,17 +791,23 @@ fn is_passing(code: u32) -> bool {
         || code == ERROR_UNABLE_TO_REMOVE_REPLACED.0
         || code == ERROR_ACCESS_DENIED.0
 }
-fn with_leftover(error: CodecError, found: Option<PathBuf>) -> CodecError {
+/// Adds a file that could not be deleted to an error. An error with no place for it
+/// is wrapped, so the file is never left unsaid.
+pub(crate) fn with_leftover(error: CodecError, found: Option<PathBuf>) -> CodecError {
+    let Some(found) = found else {
+        return error;
+    };
+    let found_slot = Some(found.clone());
     match error {
         CodecError::AccessDenied { path, code, .. } => CodecError::AccessDenied {
             path,
             code,
-            leftover: found,
+            leftover: found_slot,
         },
         CodecError::SharingViolation { path, code, .. } => CodecError::SharingViolation {
             path,
             code,
-            leftover: found,
+            leftover: found_slot,
         },
         CodecError::SaveFailed {
             path,
@@ -590,13 +818,25 @@ fn with_leftover(error: CodecError, found: Option<PathBuf>) -> CodecError {
             path,
             code,
             original_intact,
+            leftover: found_slot,
+        },
+        CodecError::SourceChanged { path, .. } => CodecError::SourceChanged {
+            path,
+            leftover: found_slot,
+        },
+        other => CodecError::CleanupFailed {
+            cause: Box::new(other),
             leftover: found,
         },
-        other => other,
     }
 }
 /// Looks at the disk to learn what the failed replace did, and says only what it
 /// found. The temp file goes only when the original is known to be safe.
+///
+/// The backup started as an empty reservation of ours, and nothing else writes to it,
+/// so bytes there always came from the target. File numbers are not enough to tell:
+/// on FAT and exFAT a number may come from a folder slot. So a backup is deleted only
+/// when it is empty and is still the reservation.
 fn after_failed_replace(
     target: &Path,
     temp: &Path,
@@ -608,22 +848,34 @@ fn after_failed_replace(
 ) -> CodecError {
     let now = file_state(target);
     let aside = file_state(backup);
-    let original_is_aside = matches!(aside, Ok(Some(state)) if state.same_file(&before));
+    let original_is_aside = matches!(
+        aside,
+        Ok(Some(state)) if state.size > 0 || state.same_content_stamp(&before)
+    );
+    // The backup's path, if it must stay or could not go.
     let drop_placeholder = |aside: &Result<Option<FileState>, u32>| -> Option<PathBuf> {
         match (aside, placeholder) {
-            (Ok(Some(state)), Some(reserved)) if state.same_file(&reserved) => delete_ours(backup),
-            _ => None,
+            (Ok(None), _) => None,
+            (Ok(Some(state)), Some(reserved)) if state.size == 0 && state.same_file(&reserved) => {
+                delete_ours(backup)
+            }
+            _ => Some(friendly(backup)),
         }
     };
     if matches!(now, Ok(Some(state)) if state == before) {
         let temp_left = delete_ours(temp);
-        let leftover = temp_left.or(drop_placeholder(&aside));
-        return save_error(real_cause(code, target), target, true, leftover);
+        let backup_left = drop_placeholder(&aside);
+        return save_error(
+            real_cause(code, target),
+            target,
+            true,
+            backup_left.or(temp_left),
+        );
     }
     if original_is_aside && matches!(now, Ok(None)) {
         // The original was moved aside and the new file did not take its name.
         let restored = env.move_no_replace(backup, target).is_ok()
-            && matches!(file_state(target), Ok(Some(state)) if state == before);
+            && matches!(file_state(target), Ok(Some(state)) if state.same_content_stamp(&before));
         if restored {
             let leftover = delete_ours(temp);
             return save_error(code, target, true, leftover);
@@ -633,20 +885,18 @@ fn after_failed_replace(
         return CodecError::RecoveryRequired {
             original: friendly(target),
             backup: friendly(backup),
-            new_text: Some(friendly(temp)),
+            new_text: if_on_disk(temp),
             code,
         };
     }
     // The original is neither where it was nor aside, or another program changed it.
     // The temp file stays: it may be the only copy of this text on disk.
-    // An empty reservation that cannot go now is harmless: `find_leftovers` lists it
-    // and does not offer it.
-    let _ = drop_placeholder(&aside);
+    let backup_left = drop_placeholder(&aside);
     CodecError::SaveFailed {
         path: friendly(target),
         code,
         original_intact: false,
-        leftover: Some(friendly(temp)),
+        leftover: if_on_disk(temp).or(backup_left),
     }
 }
 /// Puts a finished temp file at a name where nothing was. It never replaces.
@@ -697,23 +947,62 @@ pub enum AtomicWriteResult {
 }
 /// Writes `bytes` to `path` so that the file holds either all the old bytes or all
 /// the new ones. A failed save is always an error.
+///
+/// The target's state is compared just before the swap. If another program changed it
+/// after this call began, the result is `TargetChanged`, and no version is lost.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<AtomicWriteResult, CodecError> {
     atomic_write_with(path, bytes, &mut RealEnv)
+}
+/// `atomic_write` that also refuses if the file is not what `expected` recorded, for
+/// a change at any time since then, such as since the document was opened. Nothing
+/// is written in that case, so `TargetChanged` names no file: the text is still with
+/// the caller. A file that was deleted since then also gives `TargetChanged`.
+pub fn atomic_write_if_unchanged(
+    path: &Path,
+    bytes: &[u8],
+    expected: FileStamp,
+) -> Result<AtomicWriteResult, CodecError> {
+    atomic_write_expecting(path, bytes, Some(expected), &mut RealEnv)
 }
 fn atomic_write_with(
     path: &Path,
     bytes: &[u8],
     env: &mut impl SaveEnv,
 ) -> Result<AtomicWriteResult, CodecError> {
+    atomic_write_expecting(path, bytes, None, env)
+}
+fn changed_since_stamp(target: &Path) -> CodecError {
+    CodecError::TargetChanged {
+        path: friendly(target),
+        new_text: None,
+        other_version: None,
+    }
+}
+fn atomic_write_expecting(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<FileStamp>,
+    env: &mut impl SaveEnv,
+) -> Result<AtomicWriteResult, CodecError> {
     let (target, before, rules) = match resolve_target(path)? {
         Resolved::Existing(target) => {
             let (state, rules) = preflight_existing(&target)?;
+            if expected.is_some_and(|stamp| stamp.0 != state) {
+                return Err(changed_since_stamp(&target));
+            }
             (target, Some(state), rules)
         }
-        Resolved::New(target) => (target, None, None),
+        Resolved::New(target) => {
+            if expected.is_some() {
+                return Err(changed_since_stamp(&target));
+            }
+            (target, None, None)
+        }
     };
     let (temp, mut file) = create_temp(&target, rules, env)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = env
+        .write_temp(&mut file, bytes)
+        .and_then(|()| env.flush_temp(&mut file));
     drop(file);
     if let Err(error) = written {
         return Err(after_failed_write(error, &target, &temp, before));
@@ -723,6 +1012,26 @@ fn atomic_write_with(
         Some(before) => commit_replace(&target, &temp, before, env),
         None => commit_new(&target, &temp, env).map(|()| AtomicWriteResult::Replaced),
     }
+}
+/// What a file was at one moment: which file, its size and its last write time. Keep
+/// the stamp from when a document was opened and from each save, and pass it to
+/// `atomic_write_if_unchanged`. Take a new one after every save, because a save
+/// changes all of these.
+///
+/// A program that keeps its handle open can write without moving the time until it
+/// closes the handle. A write of the same size inside one step of the file time can
+/// go unseen: about 16 ms on NTFS, 2 seconds on FAT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp(FileState);
+/// The stamp of the real file behind `path`, or `None` when no file is there. An error
+/// means that the path's folder is missing or the check itself failed.
+pub fn file_stamp(path: &Path) -> Result<Option<FileStamp>, CodecError> {
+    let target = match resolve_target(path)? {
+        Resolved::Existing(target) | Resolved::New(target) => target,
+    };
+    file_state(&target)
+        .map(|state| state.map(FileStamp))
+        .map_err(|code| save_error(code, &target, true, None))
 }
 
 /// A complete copy under a temp name in the target's folder. Nothing is at the
@@ -742,6 +1051,10 @@ impl PreparedCopy {
     /// Puts the copy at the final name, all at once. A target that existed at
     /// `prepare_large_copy` is replaced, with the same guarantees as `atomic_write`.
     /// A new name stays new: a file that appeared meanwhile gives `TargetExists`.
+    ///
+    /// A target that another program changed since `prepare_large_copy` gives
+    /// `TargetChanged`. The target keeps that program's bytes, and the copy stays at
+    /// `new_text`. The caller decides what to do with it.
     pub fn commit(mut self) -> Result<AtomicWriteResult, CodecError> {
         self.done = true;
         let env = &mut RealEnv;
@@ -750,11 +1063,44 @@ impl PreparedCopy {
             None => commit_new(&self.target, &self.temp, env).map(|()| AtomicWriteResult::Replaced),
         }
     }
+    /// `commit` that also refuses if the target is not what `expected` recorded, as
+    /// in `atomic_write_if_unchanged`. The copy stays at `new_text` in that case.
+    pub fn commit_if_unchanged(
+        mut self,
+        expected: FileStamp,
+    ) -> Result<AtomicWriteResult, CodecError> {
+        if self.before != Some(expected.0) {
+            self.done = true;
+            return Err(CodecError::TargetChanged {
+                path: friendly(&self.target),
+                new_text: if_on_disk(&self.temp),
+                other_version: None,
+            });
+        }
+        self.commit()
+    }
+    /// Throws the copy away and says if the temp file could not go. Dropping a
+    /// `PreparedCopy` does the same, but a drop cannot report a failure.
+    pub fn discard(mut self) -> Result<(), CodecError> {
+        self.done = true;
+        try_delete(&self.temp).map_err(|code| CodecError::SaveFailed {
+            path: friendly(&self.temp),
+            code,
+            original_intact: true,
+            leftover: Some(friendly(&self.temp)),
+        })
+    }
+    /// Removes the temp file after a failed copy, and adds it to `error` if it stayed.
+    fn fail_with(mut self, error: CodecError) -> CodecError {
+        self.done = true;
+        with_leftover(error, delete_ours(&self.temp))
+    }
 }
 impl Drop for PreparedCopy {
     fn drop(&mut self) {
         if !self.done {
-            // `find_leftovers` reports this file if it cannot go now.
+            // A drop cannot report. `find_leftovers` lists this file if it stayed, and
+            // `discard` is the call for a caller that wants to know now.
             let _ = delete_ours(&self.temp);
         }
     }
@@ -774,8 +1120,7 @@ fn prepare_copy(
     cancel: &mut dyn FnMut() -> bool,
     env: &mut impl SaveEnv,
 ) -> Result<PreparedCopy, CodecError> {
-    let mut source = File::open(input)?;
-    let total = source.metadata()?.len();
+    let mut source = WatchedSource::open(input)?;
     let (target, before, rules) = match resolve_target(dest)? {
         Resolved::Existing(target) => {
             if must_be_new {
@@ -796,9 +1141,21 @@ fn prepare_copy(
         before,
         done: false,
     };
-    // Declared after `prepared`, so on an early return the file closes before
-    // `prepared` deletes it.
-    let mut output = file;
+    // `file` is closed when this call returns, so the temp file can then be deleted.
+    match copy_into(&mut source, file, &prepared, progress, cancel, env) {
+        Ok(()) => Ok(prepared),
+        Err(error) => Err(prepared.fail_with(error)),
+    }
+}
+fn copy_into(
+    source: &mut WatchedSource,
+    mut output: File,
+    prepared: &PreparedCopy,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &mut dyn FnMut() -> bool,
+    env: &mut impl SaveEnv,
+) -> Result<(), CodecError> {
+    let total = source.size();
     let mut buffer = vec![0u8; COPY_CHUNK];
     let mut done = 0;
     loop {
@@ -809,18 +1166,29 @@ fn prepare_copy(
         if n == 0 {
             break;
         }
-        output
-            .write_all(&buffer[..n])
-            .map_err(|e| copy_failure(&e, &prepared))?;
+        env.write_temp(&mut output, &buffer[..n])
+            .map_err(|e| copy_failure(&e, prepared))?;
         done += n as u64;
         progress(done, total);
     }
-    output.sync_all().map_err(|e| copy_failure(&e, &prepared))?;
-    Ok(prepared)
+    if total == 0 {
+        progress(0, 0);
+    }
+    env.flush_temp(&mut output)
+        .map_err(|e| copy_failure(&e, prepared))?;
+    source.confirm_unchanged()
 }
 /// Copies `input` to a temp name beside `dest`, ready for `PreparedCopy::commit`.
 /// This is the safe way to Save As a file too large to hold in memory, over an
 /// existing file or to a new name. It writes nothing under the final name.
+///
+/// `progress` gets `(done, total)`. `total` is the size of `input` at the start, and
+/// `done` never passes it. An empty file reports `(0, 0)` once, as its finish, so a
+/// caller that shows a percentage must handle a total of zero.
+///
+/// If `input` changes during the copy, the result is `SourceChanged` and the partial
+/// copy is deleted: a longer or shorter file, a new write time, or another file under
+/// that name. A failure that could not delete the temp file names it in the error.
 pub fn prepare_large_copy(
     input: &Path,
     dest: &Path,
@@ -830,7 +1198,8 @@ pub fn prepare_large_copy(
     prepare_copy(input, dest, false, &mut progress, &mut cancel, &mut RealEnv)
 }
 /// Copies `input` to a new file at `dest`. A file already at `dest` gives
-/// `TargetExists`. A crash cannot leave a partial file under the final name.
+/// `TargetExists`. A crash cannot leave a partial file under the final name. Progress
+/// and a changed `input` work as in `prepare_large_copy`.
 pub fn copy_large_original(
     input: &Path,
     dest: &Path,
@@ -946,6 +1315,55 @@ pub fn find_leftovers(folder_or_path: &Path) -> Result<Vec<Leftover>, CodecError
     }
     leftovers.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(leftovers)
+}
+
+/// How far `delete_leftover` may go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeftoverDelete {
+    /// Refuses a file that holds text the user could still recover.
+    KeepRecoverable,
+    /// Deletes that text too. Use this only after the user has chosen it.
+    IncludeRecoverable,
+}
+/// Deletes one file that `find_leftovers` listed, when the user asks. A file already
+/// gone counts as done. It gives `LeftoverKept` and leaves the file alone if the name
+/// is not one of ours, if the file changed since it was listed, if another running
+/// process made it, or, under `KeepRecoverable`, if it may hold the user's text.
+///
+/// This process's own files are allowed, so do not call this during a save of the
+/// same document.
+pub fn delete_leftover(leftover: &Leftover, how: LeftoverDelete) -> Result<(), CodecError> {
+    let path = verbatim(&std::path::absolute(&leftover.path)?);
+    let kept = |reason| CodecError::LeftoverKept {
+        path: leftover.path.clone(),
+        reason,
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parsed = parse_leftover_name(&name).ok_or_else(|| kept("it is not a file of ours"))?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() || meta.len() != leftover.size || meta.modified()? != leftover.modified {
+        return Err(kept("it changed after it was listed"));
+    }
+    if parsed.pid != std::process::id() && process_is_running(parsed.pid) {
+        return Err(kept("the program that made it is still running"));
+    }
+    let recoverable = match parsed.kind {
+        LeftoverKind::Backup => meta.len() > 0,
+        LeftoverKind::Temp => meta.len() > 0 && leftover.target_missing,
+    };
+    if recoverable && how == LeftoverDelete::KeepRecoverable {
+        return Err(kept("it may hold text the user can still recover"));
+    }
+    try_delete(&path).map_err(|code| CodecError::SaveFailed {
+        path: leftover.path.clone(),
+        code,
+        original_intact: true,
+        leftover: Some(leftover.path.clone()),
+    })
 }
 
 #[cfg(test)]

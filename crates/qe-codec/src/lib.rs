@@ -9,7 +9,8 @@ use qe_api::TextEncoding;
 use std::path::PathBuf;
 
 pub use save::{
-    AtomicWriteResult, Leftover, LeftoverKind, PreparedCopy, atomic_write, copy_large_original,
+    AtomicWriteResult, FileStamp, Leftover, LeftoverDelete, LeftoverKind, PreparedCopy,
+    atomic_write, atomic_write_if_unchanged, copy_large_original, delete_leftover, file_stamp,
     find_leftovers, prepare_large_copy,
 };
 pub use text::{can_encode, decode, decode_file, encode, is_available, transcode_to_utf8_file};
@@ -25,7 +26,11 @@ pub enum LineEnding {
     CrLf,
     Cr,
 }
+/// How a file's text is stored. Code outside this crate gets one from `decode`,
+/// `Format::new_document`, `Format::changed_to` or `Format::new`; it cannot write
+/// one out as a struct literal. `encode` refuses a value whose fields disagree.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Format {
     pub encoding: TextEncoding,
     pub has_bom: bool,
@@ -42,6 +47,46 @@ impl Format {
             main_line_ending: LineEnding::Lf,
             lossy: false,
         }
+    }
+    /// A format from stored values, such as a session restored at launch. Values
+    /// that disagree give `InvalidFormat`: an `endian` on anything but UTF-16 or
+    /// UTF-32, an `endian` against a fixed-order encoding, or a BOM on a legacy page.
+    pub fn new(
+        encoding: TextEncoding,
+        has_bom: bool,
+        endian: Option<Endian>,
+        main_line_ending: LineEnding,
+        lossy: bool,
+    ) -> Result<Self, CodecError> {
+        let format = Self {
+            encoding,
+            has_bom,
+            endian,
+            main_line_ending,
+            lossy,
+        };
+        format.check()?;
+        Ok(format)
+    }
+    pub(crate) fn check(&self) -> Result<(), CodecError> {
+        let fixed = match self.encoding {
+            TextEncoding::Utf16Le | TextEncoding::Utf32Le => Some(Endian::Little),
+            TextEncoding::Utf16Be | TextEncoding::Utf32Be => Some(Endian::Big),
+            _ => None,
+        };
+        let what = if text::unicode_endian(self.encoding).is_none() && self.endian.is_some() {
+            "only UTF-16 and UTF-32 have a byte order"
+        } else if fixed.is_some() && self.endian.is_some() && fixed != self.endian {
+            "the byte order disagrees with the encoding"
+        } else if self.has_bom
+            && self.encoding != TextEncoding::Utf8
+            && text::unicode_endian(self.encoding).is_none()
+        {
+            "a legacy encoding has no BOM"
+        } else {
+            return Ok(());
+        };
+        Err(CodecError::InvalidFormat { what })
     }
     pub fn changed_to(&self, encoding: TextEncoding) -> Self {
         if encoding == self.encoding {
@@ -117,6 +162,45 @@ pub enum CodecError {
         original_intact: bool,
         leftover: Option<PathBuf>,
     },
+    /// The file being read changed while it was read: its size, its time, or which
+    /// file the name points to. Nothing from it was used. `leftover` is as above.
+    SourceChanged {
+        path: PathBuf,
+        leftover: Option<PathBuf>,
+    },
+    /// Another program changed the target during this save, or since the stamp the
+    /// caller passed. No version was lost. If `other_version` is `None`, the target
+    /// still holds the other program's bytes, and `new_text` holds this save's text
+    /// if it reached the disk. If `other_version` is set, the change came in the last
+    /// instant: the target holds this save's text and that file holds the other
+    /// program's bytes.
+    TargetChanged {
+        path: PathBuf,
+        new_text: Option<PathBuf>,
+        other_version: Option<PathBuf>,
+    },
+    /// This account may change the file but may not delete or rename it, so a safe
+    /// save cannot put a new file there. Nothing was written. The app should offer
+    /// Save As.
+    NotReplaceable {
+        path: PathBuf,
+        code: u32,
+    },
+    /// The fields of a `Format` disagree. Nothing was written.
+    InvalidFormat {
+        what: &'static str,
+    },
+    /// `cause` is what went wrong. Then a file of ours could not be deleted.
+    CleanupFailed {
+        cause: Box<CodecError>,
+        leftover: PathBuf,
+    },
+    /// `delete_leftover` refused: the file may still be in use, it changed since it
+    /// was listed, or it holds text the user could still recover.
+    LeftoverKept {
+        path: PathBuf,
+        reason: &'static str,
+    },
     Io(std::io::Error),
     Cancelled,
 }
@@ -180,6 +264,31 @@ impl std::fmt::Display for CodecError {
                     "the file on disk may have changed"
                 }
             ),
+            Self::SourceChanged { path, .. } => write!(
+                f,
+                "{} changed while it was being read; try again",
+                path.display()
+            ),
+            Self::TargetChanged { path, .. } => write!(
+                f,
+                "another program changed {} during the save; both versions were kept",
+                path.display()
+            ),
+            Self::NotReplaceable { path, code } => write!(
+                f,
+                "cannot safely save {} (Windows error {code}): this account may edit the file \
+                 but not replace it; the file on disk was not changed; use Save As",
+                path.display()
+            ),
+            Self::InvalidFormat { what } => write!(f, "invalid text format: {what}"),
+            Self::CleanupFailed { cause, leftover } => write!(
+                f,
+                "{cause}; also, {} could not be deleted",
+                leftover.display()
+            ),
+            Self::LeftoverKept { path, reason } => {
+                write!(f, "{} was not deleted: {reason}", path.display())
+            }
             Self::Io(e) => e.fmt(f),
             Self::Cancelled => write!(f, "operation cancelled"),
         }

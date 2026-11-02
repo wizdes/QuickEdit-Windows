@@ -418,6 +418,15 @@ fn automatic_opens_every_byte_value() {
     assert_eq!(format, d.format);
     assert_eq!(text, d.text);
     println!("system page read this as {:?}", d.format.encoding);
+    // Every ASCII byte reads as itself on every Windows system page, and a byte
+    // over 7F always gives some text. `src/text.rs` checks each byte by hand.
+    let ascii: String = (0u8..0x80).map(char::from).collect();
+    assert!(d.text.starts_with(&ascii), "{:?}", d.text);
+    assert!(d.text.len() > ascii.len());
+    if d.format.encoding == T::Utf8 {
+        assert!(d.format.lossy);
+        assert_eq!(d.text, String::from_utf8_lossy(&bytes));
+    }
 }
 
 /// Items 14 and 17: the same fault gives the same text from both paths.
@@ -551,6 +560,445 @@ fn euc_jp_refuses_what_code_page_20932_cannot_write_in_standard_form() {
         encode("\u{4e02}", &format),
         Err(CodecError::Unencodable(T::EucJp))
     ));
+}
+
+/// Item 4: standard JIS X 0212 reads as the right character, or not at all. Values
+/// are from the published JIS X 0212 table. Writing stays refused, so the file is
+/// marked lossy and a save in EUC-JP gives an error, not other bytes.
+#[test]
+fn euc_jp_reads_standard_jis_x_0212() {
+    for (bytes, text) in [
+        (&[0x8f, 0xb0, 0xa1][..], "\u{4e02}"),
+        (&[0x8f, 0xb0, 0xa2], "\u{4e04}"),
+        (
+            &[b'a', 0x8f, 0xb0, 0xa1, 0xb4, 0xc1, 0x8e, 0xb1],
+            "a\u{4e02}\u{6f22}\u{ff71}",
+        ),
+    ] {
+        let d = decode(bytes.to_vec(), specific(T::EucJp)).unwrap();
+        assert_eq!(d.text, text, "{bytes:02x?}");
+        assert!(d.format.lossy, "this crate cannot write it back");
+        assert!(matches!(
+            encode(&d.text, &d.format),
+            Err(CodecError::Unencodable(T::EucJp))
+        ));
+        let (stream, format) = through_stream(bytes, specific(T::EucJp)).unwrap();
+        assert_eq!(stream, text);
+        assert_eq!(format, d.format);
+    }
+    // These show the wrong letters, or none, if read by code page 20932 alone.
+    for bytes in [
+        &[0x8f, 0xb0][..],
+        &[0x8f, 0x21, 0x21],
+        &[0x8f, 0xa1, 0x21],
+        &[0x80],
+        &[0xb0, 0x21],
+        &[0xff],
+        &[0x8e, 0x21],
+    ] {
+        match decode(bytes.to_vec(), specific(T::EucJp)) {
+            Err(CodecError::InapplicableEncoding(T::EucJp)) => {}
+            other => panic!("{bytes:02x?}: {other:?}"),
+        }
+        assert_eq!(
+            through_stream(bytes, specific(T::EucJp)).unwrap_err(),
+            "could not be opened using text encoding EUC-JP",
+            "{bytes:02x?}"
+        );
+    }
+    // A three-byte character across a piece end.
+    let mut file = vec![b'a'; (1 << 20) - 1];
+    file.extend([0x8f, 0xb0, 0xa1]);
+    let (stream, _) = through_stream(&file, specific(T::EucJp)).unwrap();
+    assert!(stream.ends_with('\u{4e02}'));
+    assert_eq!(stream.len(), (1 << 20) - 1 + 3);
+}
+
+/// Item 8: an `endian` on a page that has no byte order must not change the bytes.
+#[test]
+fn encode_refuses_a_format_whose_fields_disagree() {
+    let check = |format: &Format| {
+        assert!(
+            matches!(encode("a", format), Err(CodecError::InvalidFormat { .. })),
+            "{format:?}"
+        );
+    };
+    let mut bad = Format::new_document().changed_to(T::Windows1252);
+    bad.endian = Some(Endian::Little);
+    check(&bad);
+    let mut bad = Format::new_document();
+    bad.endian = Some(Endian::Big);
+    check(&bad);
+    let mut bad = Format::new_document().changed_to(T::Windows1252);
+    bad.has_bom = true;
+    check(&bad);
+    let mut bad = Format::new_document().changed_to(T::Utf16Le);
+    bad.endian = Some(Endian::Big);
+    check(&bad);
+    let mut bad = Format::new_document().changed_to(T::Utf32Be);
+    bad.endian = Some(Endian::Little);
+    check(&bad);
+
+    let new = |e, bom, endian| Format::new(e, bom, endian, LineEnding::Lf, false);
+    assert!(matches!(
+        new(T::Windows1252, false, Some(Endian::Little)),
+        Err(CodecError::InvalidFormat { .. })
+    ));
+    assert!(matches!(
+        new(T::ShiftJis, true, None),
+        Err(CodecError::InvalidFormat { .. })
+    ));
+    assert!(matches!(
+        new(T::Utf16Be, false, Some(Endian::Little)),
+        Err(CodecError::InvalidFormat { .. })
+    ));
+    for good in [
+        new(T::Utf16, true, Some(Endian::Little)),
+        new(T::Utf16, false, Some(Endian::Big)),
+        new(T::Utf16Be, true, Some(Endian::Big)),
+        new(T::Utf8, true, None),
+        new(T::Windows1252, false, None),
+    ] {
+        encode("a", &good.unwrap()).unwrap();
+    }
+}
+
+/// Item 11: done never passes total, and an empty file reports (0, 0) as its finish.
+#[test]
+fn an_empty_file_reports_zero_of_zero_once_from_the_streaming_calls() {
+    let dir = scratch("empty");
+    let (input, output) = (dir.join("in"), dir.join("out"));
+    std::fs::write(&input, b"").unwrap();
+    for choice in [EncodingChoice::Automatic, specific(T::Windows1252)] {
+        let mut seen = Vec::new();
+        transcode_to_utf8_file(&input, &output, choice, |d, t| seen.push((d, t)), || false)
+            .unwrap();
+        assert_eq!(seen, [(0, 0)], "{choice:?}");
+        std::fs::remove_file(&output).unwrap();
+        let mut seen = Vec::new();
+        let d = decode_file(&input, choice, |d, t| seen.push((d, t)), || false).unwrap();
+        assert_eq!(d.text, "");
+        assert_eq!(seen, [(0, 0)], "{choice:?}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 5: one pass, one file size in `total`, for every route.
+#[test]
+fn decode_file_reports_one_file_size_and_rises_to_it() {
+    let dir = scratch("one-pass");
+    let input = dir.join("in");
+    const SIZE: usize = 3 << 20;
+    for (bytes, choice) in [
+        (vec![b'a'; SIZE], EncodingChoice::Automatic),
+        (vec![b'a'; SIZE], specific(T::Utf8)),
+        (vec![0xe9; SIZE], specific(T::Windows1252)),
+    ] {
+        std::fs::write(&input, &bytes).unwrap();
+        let mut seen = Vec::new();
+        decode_file(&input, choice, |d, t| seen.push((d, t)), || false).unwrap();
+        assert!(seen.is_sorted(), "{seen:?}");
+        assert!(
+            seen.iter().all(|(d, t)| *t == SIZE as u64 && d <= t),
+            "{seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&(SIZE as u64, SIZE as u64)));
+        assert!(seen.len() >= 3, "{seen:?}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 5: a file that is like its first 1 MiB is read once. `cancel` is asked once
+/// for every 1 MiB read, so more asks would mean another pass.
+#[test]
+fn decode_file_reads_a_uniform_file_once() {
+    let dir = scratch("once");
+    let input = dir.join("in");
+    const MIB: usize = 1 << 20;
+    for (bytes, choice) in [
+        (vec![b'a'; 8 * MIB], EncodingChoice::Automatic),
+        (vec![0xe9; 8 * MIB], specific(T::Windows1252)),
+        ([0x8a, 0xbf].repeat(4 * MIB), specific(T::ShiftJis)),
+        (b"ab".repeat(4 * MIB), specific(T::Utf16Le)),
+    ] {
+        std::fs::write(&input, &bytes).unwrap();
+        let mut asked = 0;
+        decode_file(
+            &input,
+            choice,
+            |_, _| {},
+            || {
+                asked += 1;
+                false
+            },
+        )
+        .unwrap();
+        assert!((8..=10).contains(&asked), "{choice:?}: {asked} asks");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 5: text that grows past the first estimate still comes out whole, with one
+/// allocation, for each shape of file. The result must match the in-memory route.
+#[test]
+fn decode_file_handles_text_that_outgrows_or_undershoots_the_first_estimate() {
+    let dir = scratch("uneven");
+    let input = dir.join("in");
+    let ascii = vec![b'a'; 3 << 20];
+    let kanji = [0x8au8, 0xbf].repeat(3 << 19);
+    for (name, first, second) in [
+        ("ASCII, then kanji", &ascii, &kanji),
+        ("kanji, then ASCII", &kanji, &ascii),
+    ] {
+        let mut file = first.clone();
+        file.extend_from_slice(second);
+        std::fs::write(&input, &file).unwrap();
+        let memory = decode(file, specific(T::ShiftJis)).unwrap();
+        let mut last = (0, 0);
+        let mut falls = 0;
+        let streamed = decode_file(
+            &input,
+            specific(T::ShiftJis),
+            |d, t| {
+                falls += u32::from(d < last.0);
+                last = (d, t);
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(streamed, memory, "{name}");
+        assert_eq!(falls, 0, "{name}");
+        assert_eq!(last.0, last.1, "{name}");
+        // The string must not hold on to a much larger block than it needs.
+        assert!(
+            streamed.text.capacity() <= streamed.text.len() + streamed.text.len() / 4 + (2 << 20),
+            "{name}: {} of {}",
+            streamed.text.len(),
+            streamed.text.capacity()
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Automatic, for a file whose bad byte comes after the first estimate.
+#[test]
+fn decode_file_falls_back_after_a_late_bad_byte() {
+    let dir = scratch("late");
+    let input = dir.join("in");
+    let mut file = vec![b'a'; 3 << 20];
+    file.push(0xff);
+    file.extend_from_slice(b"\r\n");
+    std::fs::write(&input, &file).unwrap();
+    let memory = decode(file, EncodingChoice::Automatic).unwrap();
+    let d = decode_file(&input, EncodingChoice::Automatic, |_, _| {}, || false).unwrap();
+    assert_eq!(d, memory);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Runs `decode_file` while `change` runs at the first progress report.
+fn decode_while_changing(
+    dir: &std::path::Path,
+    start: &[u8],
+    choice: EncodingChoice,
+    change: impl FnOnce(&std::path::Path),
+) -> Result<qe_codec::Decoded, CodecError> {
+    let input = dir.join("in");
+    std::fs::write(&input, start).unwrap();
+    let mut change = Some(change);
+    let mut over = false;
+    let result = decode_file(
+        &input,
+        choice,
+        |done, total| {
+            over |= done > total;
+            if let Some(change) = change.take() {
+                change(&input);
+            }
+        },
+        || false,
+    );
+    assert!(!over, "done passed total");
+    assert!(change.is_none(), "the file was never changed");
+    result
+}
+/// Waits out one step of the file time, which moves about every 16 ms. A write of the
+/// same size inside one step looks like no change at all. The README lists this limit.
+fn next_time_step() {
+    std::thread::sleep(std::time::Duration::from_millis(40));
+}
+fn append(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
+/// Item 7: every kind of change gives the one clear error.
+#[test]
+fn decode_file_refuses_a_file_that_changes_while_it_is_read() {
+    let dir = scratch("changing");
+    let mib = 1usize << 20;
+    let text = vec![b'a'; 3 * mib];
+    let expect = |result: Result<qe_codec::Decoded, CodecError>, what: &str| match result {
+        Err(CodecError::SourceChanged { path, leftover }) => {
+            assert!(path.ends_with("in"), "{what}: {path:?}");
+            assert_eq!(leftover, None, "{what}");
+        }
+        other => panic!("{what}: {:?}", other.map(|d| d.text.len())),
+    };
+    for choice in [
+        EncodingChoice::Automatic,
+        specific(T::Windows1252),
+        specific(T::Utf8),
+    ] {
+        expect(
+            decode_while_changing(&dir, &text, choice, |p| append(p, &vec![b'b'; 27 * mib])),
+            "grew",
+        );
+        expect(
+            decode_while_changing(&dir, &text, choice, |p| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(mib as u64 / 2)
+                    .unwrap();
+            }),
+            "shrank",
+        );
+        expect(
+            decode_while_changing(&dir, &text, choice, |p| {
+                next_time_step();
+                std::fs::write(p, vec![b'c'; 3 * mib]).unwrap();
+            }),
+            "same size, new bytes",
+        );
+        expect(
+            decode_while_changing(&dir, &text, choice, |p| {
+                std::fs::rename(p, p.with_extension("old")).unwrap();
+                std::fs::write(p, vec![b'c'; 3 * mib]).unwrap();
+            }),
+            "replaced",
+        );
+    }
+    // A bad byte written in place. Automatic must not fall back or fail with the
+    // encoding error: the file is not the one it started to read.
+    let bad_byte = |p: &std::path::Path| {
+        use std::io::{Seek, SeekFrom, Write};
+        next_time_step();
+        let mut file = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        file.seek(SeekFrom::Start(2 * mib as u64)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+    };
+    expect(
+        decode_while_changing(&dir, &text, EncodingChoice::Automatic, bad_byte),
+        "bad byte added",
+    );
+    expect(
+        decode_while_changing(&dir, &text, specific(T::Utf8), bad_byte),
+        "bad byte added, chosen encoding",
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 7: a file that grows stops the read at once, so it cannot use up memory.
+#[test]
+fn decode_file_stops_at_the_first_byte_past_the_size() {
+    let dir = scratch("stops");
+    let input = dir.join("in");
+    let mib = 1usize << 20;
+    for choice in [specific(T::Utf8), specific(T::Windows1252)] {
+        std::fs::write(&input, vec![b'a'; 3 * mib]).unwrap();
+        let mut asked = 0;
+        let mut grown = false;
+        let result = decode_file(
+            &input,
+            choice,
+            |_, _| {
+                if !grown {
+                    grown = true;
+                    append(&input, &vec![b'b'; 27 * mib]);
+                }
+            },
+            || {
+                asked += 1;
+                false
+            },
+        );
+        assert!(
+            matches!(result, Err(CodecError::SourceChanged { .. })),
+            "{choice:?}"
+        );
+        assert!(asked <= 5, "{choice:?}: read on for {asked} pieces");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 7 applies to the streaming file route too, because both read the same way.
+#[test]
+fn transcode_refuses_a_file_that_changes_and_removes_its_output() {
+    let dir = scratch("transcode-changing");
+    let (input, output) = (dir.join("in"), dir.join("out"));
+    let mib = 1usize << 20;
+    std::fs::write(&input, vec![b'a'; 3 * mib]).unwrap();
+    let mut grown = false;
+    let result = transcode_to_utf8_file(
+        &input,
+        &output,
+        specific(T::Windows1252),
+        |done, total| {
+            assert!(done <= total);
+            if !grown {
+                grown = true;
+                append(&input, &vec![b'b'; 5 * mib]);
+            }
+        },
+        || false,
+    );
+    assert!(
+        matches!(result, Err(CodecError::SourceChanged { .. })),
+        "{result:?}"
+    );
+    assert!(!output.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 10: the promise that output is gone after a failure must not be false.
+#[test]
+fn transcode_names_an_output_it_could_not_delete() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = scratch("stuck-output");
+    let (input, output) = (dir.join("in"), dir.join("out"));
+    std::fs::write(&input, vec![b'a'; 3 << 20]).unwrap();
+    let holder = std::cell::RefCell::new(None);
+    let result = transcode_to_utf8_file(
+        &input,
+        &output,
+        specific(T::Windows1252),
+        |_, _| {
+            *holder.borrow_mut() = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(3)
+                    .open(&output)
+                    .unwrap(),
+            );
+        },
+        || holder.borrow().is_some(),
+    );
+    match result {
+        Err(CodecError::CleanupFailed { cause, leftover }) => {
+            assert!(matches!(*cause, CodecError::Cancelled), "{cause:?}");
+            assert_eq!(leftover, output);
+            assert!(output.exists());
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(holder);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

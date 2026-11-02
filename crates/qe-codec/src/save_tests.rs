@@ -25,6 +25,8 @@ type PathHook = Option<Box<dyn FnMut(&Path)>>;
 struct FakeEnv {
     replace: Option<ReplaceStep>,
     move_fails_with: Option<u32>,
+    write_fails_with: Option<i32>,
+    flush_fails_with: Option<i32>,
     randoms: Vec<u64>,
     on_temp_created: PathHook,
     on_before_commit: PathHook,
@@ -43,6 +45,18 @@ impl SaveEnv for FakeEnv {
         match self.move_fails_with {
             Some(code) => Err(code),
             None => RealEnv.move_no_replace(from, to),
+        }
+    }
+    fn write_temp(&mut self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        match self.write_fails_with {
+            Some(code) => Err(std::io::Error::from_raw_os_error(code)),
+            None => RealEnv.write_temp(file, bytes),
+        }
+    }
+    fn flush_temp(&mut self, file: &mut File) -> std::io::Result<()> {
+        match self.flush_fails_with {
+            Some(code) => Err(std::io::Error::from_raw_os_error(code)),
+            None => RealEnv.flush_temp(file),
         }
     }
     fn random(&mut self) -> u64 {
@@ -167,7 +181,10 @@ fn temp_file_keeps_rules_that_are_not_protected() {
     set_rules(&dir, "D:(A;OICI;FA;;;WD)");
     set_rules(&path, "D:(A;;FA;;;OW)");
     let narrow = rules_of(&path);
-    let wanted = narrow.clone();
+    assert!(
+        narrow.contains(";OW)") && !narrow.contains(";WD)"),
+        "{narrow}"
+    );
     let mut env = FakeEnv {
         on_temp_created: Some(Box::new(move |temp| {
             let rules = rules_of(temp);
@@ -175,12 +192,22 @@ fn temp_file_keeps_rules_that_are_not_protected() {
                 !rules.contains(";WD)"),
                 "open rule on the temp file: {rules}"
             );
-            assert!(wanted.contains("OW"), "{wanted}");
             assert!(rules.contains(";OW)"), "{rules}");
         })),
         ..Default::default()
     };
     atomic_write_with(&path, b"after", &mut env).unwrap();
+    // The document itself must not have picked up the folder's open rule.
+    assert_eq!(fs::read(&path).unwrap(), b"after");
+    let after = rules_of(&path);
+    assert!(
+        !after.contains(";WD)"),
+        "the save widened the file: {after}"
+    );
+    assert!(
+        after.contains(";OW)"),
+        "the save lost the owner rule: {after}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -402,6 +429,440 @@ fn new_file_save_does_not_overwrite_a_file_made_during_the_save() {
     assert_eq!(fs::read(&path).unwrap(), b"made by another program");
     assert_eq!(names_in(&dir), ["doc.txt"]);
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// Holds a temp or backup file so that it cannot be deleted while the test runs.
+fn hold(path: &Path) -> File {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Share read and write, not delete: the save's own handle stays legal.
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .open(path)
+        .unwrap()
+}
+type Held = std::rc::Rc<RefCell<Vec<File>>>;
+fn holding_temp() -> (Held, PathHook) {
+    let held: Held = Default::default();
+    let keep = held.clone();
+    (
+        held,
+        Some(Box::new(move |temp: &Path| {
+            keep.borrow_mut().push(hold(temp));
+        })),
+    )
+}
+
+/// The old bytes are safe to delete, but something holds the backup.
+#[test]
+fn a_backup_that_cannot_go_is_reported_after_a_good_save() {
+    let dir = scratch("kept");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let held: Held = Default::default();
+    let keep = held.clone();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(move |target, temp, backup| {
+            RealEnv.replace(target, temp, backup)?;
+            keep.borrow_mut().push(hold(backup));
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap() {
+        AtomicWriteResult::ReplacedBackupKept { backup } => {
+            assert_eq!(fs::read(&backup).unwrap(), b"before");
+            assert_eq!(fs::read(&path).unwrap(), b"after");
+            held.borrow_mut().clear();
+            fs::remove_file(backup).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names_in(&dir), ["doc.txt"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A full disk during the temp write, and during the flush. Windows error 112.
+#[test]
+fn a_failed_write_keeps_the_original_and_removes_the_temp() {
+    let dir = scratch("full");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    for (write, flush) in [(Some(112), None), (None, Some(112))] {
+        let mut env = FakeEnv {
+            write_fails_with: write,
+            flush_fails_with: flush,
+            ..Default::default()
+        };
+        match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+            CodecError::SaveFailed {
+                code: 112,
+                original_intact: true,
+                leftover: None,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+        assert_eq!(names_in(&dir), ["doc.txt"]);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn copy_with(input: &Path, dest: &Path, env: &mut FakeEnv) -> Result<PreparedCopy, CodecError> {
+    prepare_copy(input, dest, false, &mut |_, _| {}, &mut || false, env)
+}
+
+/// `copy_failure` for a large copy, with the temp file going away.
+#[test]
+fn a_failed_copy_keeps_the_target_and_removes_the_temp() {
+    let dir = scratch("copyfail");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, vec![1u8; 1000]).unwrap();
+    fs::write(&dest, b"old").unwrap();
+    for (write, flush) in [(Some(112), None), (None, Some(112))] {
+        let mut env = FakeEnv {
+            write_fails_with: write,
+            flush_fails_with: flush,
+            ..Default::default()
+        };
+        match copy_with(&input, &dest, &mut env).unwrap_err() {
+            CodecError::SaveFailed {
+                code: 112,
+                original_intact: true,
+                leftover: None,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+        assert_eq!(names_in(&dir), ["dest", "input"]);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 10: a temp file that cannot be deleted is named, on every failing route.
+#[test]
+fn a_temp_file_that_cannot_be_deleted_is_named_in_the_error() {
+    let dir = scratch("stuck");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, vec![1u8; 1000]).unwrap();
+    fs::write(&dest, b"old").unwrap();
+    let expect_stuck = |error: CodecError, held: &Held| {
+        let CodecError::SaveFailed {
+            code: 112,
+            original_intact: true,
+            leftover: Some(stuck),
+            ..
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        assert!(stuck.exists(), "named a file that is gone: {stuck:?}");
+        held.borrow_mut().clear();
+        fs::remove_file(stuck).unwrap();
+    };
+
+    // The copy route.
+    let (held, hook) = holding_temp();
+    let mut env = FakeEnv {
+        write_fails_with: Some(112),
+        on_temp_created: hook,
+        ..Default::default()
+    };
+    expect_stuck(copy_with(&input, &dest, &mut env).unwrap_err(), &held);
+
+    // The atomic_write route.
+    let (held, hook) = holding_temp();
+    let mut env = FakeEnv {
+        write_fails_with: Some(112),
+        on_temp_created: hook,
+        ..Default::default()
+    };
+    expect_stuck(
+        atomic_write_with(&dest, b"new", &mut env).unwrap_err(),
+        &held,
+    );
+
+    // A cancel has no leftover field of its own.
+    let (held, hook) = holding_temp();
+    let mut env = FakeEnv {
+        on_temp_created: hook,
+        ..Default::default()
+    };
+    let error =
+        prepare_copy(&input, &dest, false, &mut |_, _| {}, &mut || true, &mut env).unwrap_err();
+    match error {
+        CodecError::CleanupFailed { cause, leftover } => {
+            assert!(matches!(*cause, CodecError::Cancelled), "{cause:?}");
+            assert!(leftover.exists());
+            held.borrow_mut().clear();
+            fs::remove_file(leftover).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names_in(&dir), ["dest", "input"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 10: `discard` reports what `Drop` cannot.
+#[test]
+fn discard_reports_a_copy_that_cannot_go() {
+    let dir = scratch("discard");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"new").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    let temp = prepared.temp_path().to_path_buf();
+    let holder = hold(&temp);
+    match prepared.discard().unwrap_err() {
+        CodecError::SaveFailed {
+            leftover: Some(stuck),
+            ..
+        } => assert_eq!(
+            fs::canonicalize(stuck).unwrap(),
+            fs::canonicalize(&temp).unwrap()
+        ),
+        other => panic!("{other:?}"),
+    }
+    drop(holder);
+    fs::remove_file(&temp).unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    prepared.discard().unwrap();
+    assert_eq!(names_in(&dir), ["input"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 2: another program writes after the temp is ready and before the swap.
+#[test]
+fn a_change_just_before_the_swap_is_an_error_and_keeps_both_versions() {
+    let dir = scratch("before-swap");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let other = path.clone();
+    let mut env = FakeEnv {
+        on_before_commit: Some(Box::new(move |_| {
+            fs::write(&other, b"other program").unwrap();
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"mine", &mut env).unwrap_err() {
+        CodecError::TargetChanged {
+            new_text: Some(new_text),
+            other_version: None,
+            ..
+        } => {
+            assert_eq!(fs::read(&new_text).unwrap(), b"mine");
+            fs::remove_file(new_text).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(env.replace_calls, 0, "the swap ran anyway");
+    assert_eq!(fs::read(&path).unwrap(), b"other program");
+    assert_eq!(names_in(&dir), ["doc.txt"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 2: the last instant, after the check. The swap has happened, so the other
+/// program's bytes are in the backup, and the backup must not be deleted.
+#[test]
+fn a_change_in_the_last_instant_keeps_the_other_programs_bytes_in_the_backup() {
+    let dir = scratch("in-swap");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|target, temp, backup| {
+            fs::write(target, b"other program").unwrap();
+            RealEnv.replace(target, temp, backup)
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"mine", &mut env).unwrap_err() {
+        CodecError::TargetChanged {
+            new_text: None,
+            other_version: Some(other),
+            ..
+        } => {
+            assert_eq!(fs::read(&other).unwrap(), b"other program");
+            assert_eq!(fs::read(&path).unwrap(), b"mine");
+            fs::remove_file(other).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names_in(&dir), ["doc.txt"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 2: the normal swap must not look like a change. `before` must match the
+/// original as ReplaceFileW leaves it under the backup name.
+#[test]
+fn a_real_swap_leaves_the_original_recognisable_under_the_backup_name() {
+    let dir = scratch("recognise");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let start = file_state(&path).unwrap().unwrap();
+    let seen = std::rc::Rc::new(RefCell::new(None));
+    let keep = seen.clone();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(move |target, temp, backup| {
+            RealEnv.replace(target, temp, backup)?;
+            *keep.borrow_mut() = file_state(backup).unwrap();
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        atomic_write_with(&path, b"after", &mut env).unwrap(),
+        AtomicWriteResult::Replaced
+    );
+    let aside = seen.borrow().unwrap();
+    assert_eq!((aside.size, aside.written), (start.size, start.written));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 9: a failure names only files that are there.
+#[test]
+fn errors_do_not_name_a_temp_file_that_is_gone() {
+    let dir = scratch("gone");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|target, temp, _| {
+            fs::write(target, b"damaged").unwrap();
+            fs::remove_file(temp).unwrap();
+            Err(87)
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::SaveFailed {
+            original_intact: false,
+            leftover: None,
+            ..
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|target, temp, backup| {
+            fs::rename(target, backup).unwrap();
+            fs::remove_file(temp).unwrap();
+            Err(1177)
+        })),
+        move_fails_with: Some(5),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::RecoveryRequired {
+            new_text: None,
+            backup,
+            ..
+        } => assert_eq!(fs::read(backup).unwrap(), b"before"),
+        other => panic!("{other:?}"),
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 13. On FAT a file's number may come from its folder slot, so a moved
+/// original can share the empty reservation's number. This forces that on NTFS by
+/// writing into the reservation itself. FAT itself was not tested.
+#[test]
+fn bytes_in_the_reservation_are_never_deleted_as_a_placeholder() {
+    let dir = scratch("fat-intact");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|_, _, backup| {
+            fs::write(backup, b"bytes").unwrap();
+            Err(87)
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::SaveFailed {
+            original_intact: true,
+            leftover: Some(kept),
+            ..
+        } => assert_eq!(fs::read(kept).unwrap(), b"bytes"),
+        other => panic!("{other:?}"),
+    }
+    fs::remove_dir_all(&dir).unwrap();
+
+    // The target is gone and the bytes sit in the reservation's slot.
+    let dir = scratch("fat-aside");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|target, _, backup| {
+            fs::write(backup, b"before").unwrap();
+            fs::remove_file(target).unwrap();
+            Err(1177)
+        })),
+        move_fails_with: Some(5),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::RecoveryRequired { backup, .. } => {
+            assert_eq!(fs::read(backup).unwrap(), b"before");
+        }
+        other => panic!("{other:?}"),
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Item 10: an empty reservation that cannot go is named when nothing else is.
+#[test]
+fn a_reservation_that_cannot_go_is_named() {
+    let dir = scratch("reservation");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let held: Held = Default::default();
+    let keep = held.clone();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(move |target, temp, backup| {
+            fs::write(target, b"damaged").unwrap();
+            fs::remove_file(temp).unwrap();
+            keep.borrow_mut().push(hold(backup));
+            Err(87)
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::SaveFailed {
+            original_intact: false,
+            leftover: Some(kept),
+            ..
+        } => {
+            assert_eq!(fs::read(&kept).unwrap(), b"");
+        }
+        other => panic!("{other:?}"),
+    }
+    drop(env);
+    held.borrow_mut().clear();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn process_is_running_tells_a_live_process_from_an_ended_one() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    assert!(process_is_running(std::process::id()));
+    // Not a real process number: real ones are multiples of 4.
+    assert!(!process_is_running(4_294_967_293));
+    // The System process exists but cannot be opened: denied still means running.
+    assert!(process_is_running(4));
+    let mut child = std::process::Command::new("cmd")
+        .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    assert!(process_is_running(pid), "live child not seen");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        !process_is_running(pid),
+        "ended child still seen as running"
+    );
 }
 
 #[test]

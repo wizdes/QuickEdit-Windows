@@ -45,12 +45,33 @@ fn peaks() -> (usize, usize) {
     (m.peak_pagefile, m.peak_working_set)
 }
 
+/// The file's shape. `decode_file` sets its memory from the first 1 MiB, so a file
+/// whose start is unlike the rest is its hardest case.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Uniform,
+    AsciiThenPattern,
+    PatternThenAscii,
+}
 struct Case {
     label: &'static str,
     encoding: TextEncoding,
     head: &'static [u8],
     pattern: &'static [u8],
+    shape: Shape,
+    /// Automatic in place of the chosen encoding, and `decode_file` only.
+    automatic: bool,
+    file_only: bool,
 }
+const UNIFORM: Case = Case {
+    label: "",
+    encoding: TextEncoding::Utf8,
+    head: &[],
+    pattern: &[],
+    shape: Shape::Uniform,
+    automatic: false,
+    file_only: false,
+};
 const CASES: &[Case] = &[
     // 漢字é CR LF
     Case {
@@ -58,6 +79,7 @@ const CASES: &[Case] = &[
         encoding: TextEncoding::Utf8,
         head: &[],
         pattern: &[0xE6, 0xBC, 0xA2, 0xE5, 0xAD, 0x97, 0xC3, 0xA9, 0x0D, 0x0A],
+        ..UNIFORM
     },
     // Same text, UTF-16 LE, with a BOM.
     Case {
@@ -65,6 +87,7 @@ const CASES: &[Case] = &[
         encoding: TextEncoding::Utf16,
         head: &[0xFF, 0xFE],
         pattern: &[0x22, 0x6F, 0x57, 0x5B, 0xE9, 0x00, 0x0D, 0x00, 0x0A, 0x00],
+        ..UNIFORM
     },
     // éàfox CR LF
     Case {
@@ -72,6 +95,7 @@ const CASES: &[Case] = &[
         encoding: TextEncoding::Windows1252,
         head: &[],
         pattern: &[0xE9, 0xE0, 0x66, 0x6F, 0x78, 0x0D, 0x0A],
+        ..UNIFORM
     },
     // 漢 only: text is 1.5 times the file, the worst common case.
     Case {
@@ -79,6 +103,7 @@ const CASES: &[Case] = &[
         encoding: TextEncoding::ShiftJis,
         head: &[],
         pattern: &[0x8A, 0xBF],
+        ..UNIFORM
     },
     // 漢あab CR LF: a more usual Japanese document.
     Case {
@@ -86,6 +111,39 @@ const CASES: &[Case] = &[
         encoding: TextEncoding::ShiftJis,
         head: &[],
         pattern: &[0x8A, 0xBF, 0x82, 0xA0, 0x61, 0x62, 0x0D, 0x0A],
+        ..UNIFORM
+    },
+    Case {
+        label: "UTF-8, Automatic",
+        encoding: TextEncoding::Utf8,
+        pattern: &[0xE6, 0xBC, 0xA2, 0xE5, 0xAD, 0x97, 0xC3, 0xA9, 0x0D, 0x0A],
+        automatic: true,
+        file_only: true,
+        ..UNIFORM
+    },
+    // Thai: 1 byte becomes 3, the largest growth of any code page here.
+    Case {
+        label: "Windows-874 (Thai)",
+        encoding: TextEncoding::Windows874,
+        pattern: &[0xA1, 0xA2, 0xA3, 0xA4, 0xA5],
+        file_only: true,
+        ..UNIFORM
+    },
+    Case {
+        label: "SJIS 8 MiB a, then 漢",
+        encoding: TextEncoding::ShiftJis,
+        pattern: &[0x8A, 0xBF],
+        shape: Shape::AsciiThenPattern,
+        file_only: true,
+        ..UNIFORM
+    },
+    Case {
+        label: "SJIS 8 MiB 漢, then a",
+        encoding: TextEncoding::ShiftJis,
+        pattern: &[0x8A, 0xBF],
+        shape: Shape::PatternThenAscii,
+        file_only: true,
+        ..UNIFORM
     },
 ];
 const MIB: usize = 1024 * 1024;
@@ -94,6 +152,17 @@ fn fixture(case: &Case, mib: usize) -> Vec<u8> {
     let size = case.head.len() + (mib * MIB / case.pattern.len()) * case.pattern.len();
     let mut bytes = Vec::with_capacity(size);
     bytes.extend_from_slice(case.head);
+    let first = 8 * MIB / case.pattern.len() * case.pattern.len();
+    match case.shape {
+        Shape::Uniform => {}
+        Shape::AsciiThenPattern => bytes.resize(first, b'a'),
+        Shape::PatternThenAscii => {
+            while bytes.len() < first {
+                bytes.extend_from_slice(case.pattern);
+            }
+            bytes.resize(size, b'a');
+        }
+    }
     while bytes.len() < size {
         bytes.extend_from_slice(case.pattern);
     }
@@ -103,18 +172,17 @@ fn fixture(case: &Case, mib: usize) -> Vec<u8> {
 fn child_file(case: &Case, path: &str) {
     let size = std::fs::metadata(path).expect("fixture file").len() as f64;
     let start = Instant::now();
-    let decoded = decode_file(
-        path.as_ref(),
-        EncodingChoice::Specific(case.encoding),
-        |_, _| {},
-        || false,
-    )
-    .expect("decode_file");
+    let choice = if case.automatic {
+        EncodingChoice::Automatic
+    } else {
+        EncodingChoice::Specific(case.encoding)
+    };
+    let decoded = decode_file(path.as_ref(), choice, |_, _| {}, || false).expect("decode_file");
     let seconds = start.elapsed().as_secs_f64();
     let (private, set) = peaks();
     assert!(!decoded.format.lossy, "{}: lossy", case.label);
     println!(
-        "{:<20} {:>5} MiB | decode_file {:>7.1} MB/s, peak {:>5.2} GiB private ({:.2} x file), {:>5.2} GiB working set",
+        "{:<22} {:>5} MiB | decode_file {:>7.1} MB/s, peak {:>5.2} GiB private ({:.2} x file), {:>5.2} GiB working set",
         case.label,
         size as usize / MIB,
         size / 1_000_000.0 / seconds,
@@ -147,7 +215,7 @@ fn child(case: &Case, mib: usize) {
     let mb = size as f64 / 1_000_000.0;
     let times = size as f64;
     println!(
-        "{:<20} {:>5} MiB | decode {:>7.1} MB/s, peak {:>5.2} GiB private ({:.2} x file), {:>5.2} GiB working set | encode {:>7.1} MB/s | peak after encode {:>5.2} GiB ({:.2} x file)",
+        "{:<22} {:>5} MiB | decode {:>7.1} MB/s, peak {:>5.2} GiB private ({:.2} x file), {:>5.2} GiB working set | encode {:>7.1} MB/s | peak after encode {:>5.2} GiB ({:.2} x file)",
         case.label,
         size / MIB,
         mb / decode_s,
@@ -194,7 +262,9 @@ fn main() {
             );
         };
         let number = index.to_string();
-        run(&["child", &number, &mib.to_string()]);
+        if !case.file_only {
+            run(&["child", &number, &mib.to_string()]);
+        }
         let path = std::env::temp_dir().join(format!("qe-bench-{}.bin", std::process::id()));
         std::fs::write(&path, fixture(case, mib)).expect("write fixture file");
         run(&["child-file", &number, path.to_str().expect("plain path")]);

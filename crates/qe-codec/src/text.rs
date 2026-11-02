@@ -1,8 +1,9 @@
 //! Bytes to text and text to bytes. Follows PlainTextIO.swift on the Mac.
+use crate::save::{WatchedSource, with_leftover};
 use crate::{CodecError, Decoded, Endian, Format, LineEnding};
 use qe_api::{EncodingChoice, TextEncoding};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use windows::Win32::Foundation::{ERROR_INVALID_FLAGS, GetLastError};
 use windows::Win32::Globalization::{
@@ -158,6 +159,39 @@ fn is_standard_euc_jp(bytes: &[u8]) -> bool {
         i += width;
     }
     true
+}
+/// Turns standard EUC-JP into the form code page 20932 reads. The page reads JIS X 0212
+/// as two bytes with the last one's high bit clear, and reads a bare 8F as a control
+/// character followed by the wrong letter. Any byte outside the standard form gives
+/// `None`, so the caller refuses the file and never shows a wrong character.
+fn euc_jp_for_code_page(bytes: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let high = |b: Option<&u8>| b.copied().filter(|b| (0xa1..=0xfe).contains(b));
+    out.clear();
+    out.reserve(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            a @ 0..=0x7f => {
+                out.push(a);
+                i += 1;
+            }
+            0x8e if bytes.get(i + 1).is_some_and(|b| (0xa1..=0xdf).contains(b)) => {
+                out.extend_from_slice(&bytes[i..i + 2]);
+                i += 2;
+            }
+            0x8f => {
+                let (a, b) = (high(bytes.get(i + 1))?, high(bytes.get(i + 2))?);
+                out.extend_from_slice(&[a, b & 0x7f]);
+                i += 3;
+            }
+            a @ 0xa1..=0xfe => {
+                out.extend_from_slice(&[a, high(bytes.get(i + 1))?]);
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(())
 }
 /// Encodes `text` in pieces and hands each piece to `sink`. No allocation grows
 /// with the text, and any output size works.
@@ -360,6 +394,7 @@ struct Converter {
     lead: [bool; 256],
     wide: Vec<u16>,
     scratch: Vec<u8>,
+    euc_jp: Vec<u8>,
 }
 impl Converter {
     fn new(plan: Plan) -> Result<Self, CodecError> {
@@ -382,6 +417,7 @@ impl Converter {
             lead,
             wide: Vec::new(),
             scratch: Vec::new(),
+            euc_jp: Vec::new(),
         })
     }
     /// The length of the longest start of `bytes` that does not cut a character.
@@ -462,6 +498,13 @@ impl Converter {
             Ok(())
         } else {
             let cp = self.code_page.ok_or(CodecError::UnavailableEncoding(e))?;
+            let bytes = if cp == CP_EUC_JP {
+                euc_jp_for_code_page(bytes, &mut self.euc_jp)
+                    .ok_or(CodecError::InapplicableEncoding(self.plan.fault))?;
+                &self.euc_jp[..]
+            } else {
+                bytes
+            };
             bytes_to_wide(cp, bytes, &mut self.wide).map_err(|code| {
                 if code == ERROR_INVALID_FLAGS.0 {
                     CodecError::UnavailableEncoding(e)
@@ -569,7 +612,8 @@ fn utf8_decoded(mut text: String, has_bom: bool) -> Decoded {
 }
 /// Decodes file bytes. A chosen encoding wins and refuses bytes that do not fit.
 /// Automatic reads a BOM, then strict UTF-8, then the Windows system code page,
-/// and at last lossy UTF-8, so that no file is unopenable.
+/// and at last lossy UTF-8. As on the Mac, a UTF-16 or UTF-32 BOM ends the search: a
+/// UTF-32 body with a value that is not a character gives `InapplicableEncoding`.
 pub fn decode(bytes: impl Into<Vec<u8>>, choice: EncodingChoice) -> Result<Decoded, CodecError> {
     // SAFETY: the call takes no arguments.
     decode_with_system_page(bytes.into(), choice, unsafe { GetACP() })
@@ -643,8 +687,9 @@ fn reserve_output(out: &mut Vec<u8>, size: usize) -> Result<(), CodecError> {
 }
 /// Writes `text` in `format`. Never converts line endings. Plain UTF-16 and UTF-32
 /// with a BOM write little-endian, as on the Mac; read without a BOM they write
-/// big-endian with no BOM.
+/// big-endian with no BOM. A format whose fields disagree gives `InvalidFormat`.
 pub fn encode(text: &str, format: &Format) -> Result<Vec<u8>, CodecError> {
+    format.check()?;
     let e = format.encoding;
     let mut out = Vec::new();
     if e == TextEncoding::Utf8 {
@@ -704,7 +749,8 @@ pub fn can_encode(text: &str, encoding: TextEncoding) -> Result<bool, CodecError
     }
 }
 
-/// Sends progress upward only. `base` moves the numbers past an earlier phase.
+/// Sends progress upward only, and never past `total`. `base` moves the numbers past
+/// an earlier phase. An empty file has a total of 0 and reports `(0, 0)` as its finish.
 struct Progress<F> {
     report: F,
     total: u64,
@@ -723,11 +769,11 @@ impl<F: FnMut(u64, u64)> Progress<F> {
 /// The UTF-8 step of Automatic, with progress and cancel on every piece. On a bad
 /// byte it stops at once, since the rest cannot change the answer.
 fn stream_is_utf8<F: FnMut(u64, u64)>(
-    file: &mut File,
+    source: &mut WatchedSource,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<bool, CodecError> {
-    file.seek(SeekFrom::Start(0))?;
+    source.seek_to(0)?;
     let mut chunk = vec![0u8; CHUNK];
     let mut scanner = Utf8Scanner::default();
     let mut done = 0;
@@ -735,7 +781,7 @@ fn stream_is_utf8<F: FnMut(u64, u64)>(
         if cancel() {
             return Err(CodecError::Cancelled);
         }
-        let n = file.read(&mut chunk)?;
+        let n = source.read(&mut chunk)?;
         if n == 0 {
             return Ok(scanner.finish());
         }
@@ -747,13 +793,13 @@ fn stream_is_utf8<F: FnMut(u64, u64)>(
     }
 }
 fn write_utf8_stream<F: FnMut(u64, u64)>(
-    source: &mut File,
-    out: &mut impl Write,
+    source: &mut WatchedSource,
+    out: &mut impl TextSink,
     plan: Plan,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<Format, CodecError> {
-    source.seek(SeekFrom::Start(plan.bom as u64))?;
+    source.seek_to(plan.bom as u64)?;
     let mut chunk = vec![0u8; CHUNK];
     let mut scanner = Utf8Scanner::default();
     let mut lines = LineCounts::default();
@@ -769,9 +815,9 @@ fn write_utf8_stream<F: FnMut(u64, u64)>(
         if !scanner.feed(&chunk[..n]) {
             return Err(CodecError::InapplicableEncoding(plan.fault));
         }
-        out.write_all(&chunk[..n])?;
-        lines.add(&chunk[..n]);
         done += n as u64;
+        out.put(&chunk[..n], done)?;
+        lines.add(&chunk[..n]);
         progress.at(done);
     }
     if !scanner.finish() {
@@ -783,15 +829,23 @@ fn write_utf8_stream<F: FnMut(u64, u64)>(
         ..Format::new_document()
     })
 }
+/// Whether a pass must find out if a save would change the bytes. That check is slow,
+/// and a second pass over a file already has the answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LossCheck {
+    Run,
+    Skip,
+}
 fn write_converted_stream<F: FnMut(u64, u64)>(
-    source: &mut File,
-    out: &mut impl Write,
+    source: &mut WatchedSource,
+    out: &mut impl TextSink,
     plan: Plan,
+    loss_check: LossCheck,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<Format, CodecError> {
     let mut converter = Converter::new(plan)?;
-    source.seek(SeekFrom::Start(plan.bom as u64))?;
+    source.seek_to(plan.bom as u64)?;
     let mut buffer = vec![0u8; CHUNK + 8];
     let mut text = String::new();
     let mut lines = LineCounts::default();
@@ -811,8 +865,10 @@ fn write_converted_stream<F: FnMut(u64, u64)>(
         };
         text.clear();
         converter.append_text(&buffer[..cut], &mut text)?;
-        lossy |= !converter.round_trips(&text, &buffer[..cut]);
-        out.write_all(text.as_bytes())?;
+        if loss_check == LossCheck::Run {
+            lossy |= !converter.round_trips(&text, &buffer[..cut]);
+        }
+        out.put(text.as_bytes(), done)?;
         lines.add(text.as_bytes());
         if last {
             break;
@@ -832,17 +888,17 @@ fn write_converted_stream<F: FnMut(u64, u64)>(
 /// The last step of Automatic, in pieces: bad bytes become U+FFFD exactly as
 /// `String::from_utf8_lossy` does it.
 fn write_lossy_stream<F: FnMut(u64, u64)>(
-    source: &mut File,
-    out: &mut impl Write,
+    source: &mut WatchedSource,
+    out: &mut impl TextSink,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<Format, CodecError> {
-    source.seek(SeekFrom::Start(0))?;
+    source.seek_to(0)?;
     let mut buffer = vec![0u8; CHUNK + 4];
     let mut lines = LineCounts::default();
     let (mut held, mut done) = (0, 0u64);
-    let mut emit = |bytes: &[u8]| -> Result<(), CodecError> {
-        out.write_all(bytes)?;
+    let mut emit = |bytes: &[u8], done: u64| -> Result<(), CodecError> {
+        out.put(bytes, done)?;
         lines.add(bytes);
         Ok(())
     };
@@ -858,20 +914,20 @@ fn write_lossy_stream<F: FnMut(u64, u64)>(
         while start < end {
             match std::str::from_utf8(&buffer[start..end]) {
                 Ok(_) => {
-                    emit(&buffer[start..end])?;
+                    emit(&buffer[start..end], done)?;
                     start = end;
                 }
                 Err(e) => {
                     let good = start + e.valid_up_to();
-                    emit(&buffer[start..good])?;
+                    emit(&buffer[start..good], done)?;
                     start = good;
                     match e.error_len() {
                         Some(bad) => {
-                            emit("\u{fffd}".as_bytes())?;
+                            emit("\u{fffd}".as_bytes(), done)?;
                             start += bad;
                         }
                         None if last => {
-                            emit("\u{fffd}".as_bytes())?;
+                            emit("\u{fffd}".as_bytes(), done)?;
                             start = end;
                         }
                         None => break,
@@ -888,49 +944,87 @@ fn write_lossy_stream<F: FnMut(u64, u64)>(
     }
     Ok(lossy_utf8_format(lines.main()))
 }
-/// Where streamed text goes. `restart` throws away what a failed try wrote.
-trait TextSink: Write {
-    fn restart(&mut self) -> Result<(), CodecError>;
+/// Where streamed text goes. `input_done` is how many file bytes have been read so far.
+trait TextSink {
+    fn put(&mut self, text: &[u8], input_done: u64) -> Result<(), CodecError>;
 }
 impl TextSink for File {
-    fn restart(&mut self) -> Result<(), CodecError> {
-        self.set_len(0)?;
-        self.seek(SeekFrom::Start(0))?;
-        Ok(())
+    fn put(&mut self, text: &[u8], _input_done: u64) -> Result<(), CodecError> {
+        Ok(self.write_all(text)?)
     }
 }
-/// Counts bytes, for the first pass of `decode_file`.
+/// Counts bytes, for a file whose text did not fit the first estimate.
 #[derive(Default)]
 struct SizeCounter(usize);
-impl Write for SizeCounter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 += bytes.len();
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 impl TextSink for SizeCounter {
-    fn restart(&mut self) -> Result<(), CodecError> {
-        self.0 = 0;
+    fn put(&mut self, text: &[u8], _input_done: u64) -> Result<(), CodecError> {
+        self.0 += text.len();
         Ok(())
     }
 }
-/// The text of the second pass of `decode_file`.
-struct FilledBytes(Vec<u8>);
-impl Write for FilledBytes {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
+/// Holds the text in one block that never moves. Growing a block would hold the old
+/// and new blocks at once, so text that does not fit sets `overflowed` and stops, and
+/// the caller measures the file and starts again. No write can end the process, since
+/// memory is only asked for through `try_reserve_exact`.
+struct FilledBytes {
+    bytes: Vec<u8>,
+    /// The file's size, until the first piece has set the size of the block.
+    estimating_from: Option<u64>,
+    overflowed: bool,
+}
+impl FilledBytes {
+    fn exact(size: usize) -> Result<Self, CodecError> {
+        let mut bytes = Vec::new();
+        reserve_output(&mut bytes, size)?;
+        Ok(Self {
+            bytes,
+            estimating_from: None,
+            overflowed: false,
+        })
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn estimating(file_size: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            estimating_from: Some(file_size),
+            overflowed: false,
+        }
+    }
+    /// The block for a whole file, from what the first piece turned into, plus about
+    /// 3%. A file that is not uniform either starts again or gets a block that is too
+    /// large, which `into_bytes` gives back.
+    fn estimate(piece_text: usize, input_done: u64, file_size: u64) -> u128 {
+        let whole = piece_text as u128 * u128::from(file_size) / u128::from(input_done.max(1));
+        whole + whole / 32 + 64
+    }
+    fn into_bytes(mut self) -> Vec<u8> {
+        let spare = self.bytes.capacity() - self.bytes.len();
+        if spare > self.bytes.len() / 8 + CHUNK {
+            self.bytes.shrink_to_fit();
+        }
+        self.bytes
     }
 }
 impl TextSink for FilledBytes {
-    fn restart(&mut self) -> Result<(), CodecError> {
-        self.0.clear();
+    fn put(&mut self, text: &[u8], input_done: u64) -> Result<(), CodecError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if let Some(file_size) = self.estimating_from.take() {
+            let wanted = Self::estimate(text.len(), input_done, file_size);
+            let reserved = usize::try_from(wanted)
+                .ok()
+                .is_some_and(|wanted| self.bytes.try_reserve_exact(wanted).is_ok());
+            // Too large for the estimate says nothing about the real size, which the
+            // measuring pass finds. Only that pass may give `TooLarge` to the caller.
+            self.overflowed = !reserved;
+        }
+        if self.overflowed || self.bytes.capacity() - self.bytes.len() < text.len() {
+            self.overflowed = true;
+            return Err(CodecError::TooLarge {
+                what: "its text is larger than the memory set aside for it",
+            });
+        }
+        self.bytes.extend_from_slice(text);
         Ok(())
     }
 }
@@ -941,29 +1035,36 @@ enum Route {
     Converted(Plan),
     LossyUtf8,
 }
+/// One pass over the file. A refusal is only trusted if the file is still the one that
+/// was opened; otherwise the bad byte may be the other program's, and it says so.
 fn run_route<F: FnMut(u64, u64)>(
     route: Route,
-    source: &mut File,
+    source: &mut WatchedSource,
     sink: &mut impl TextSink,
+    loss_check: LossCheck,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<Format, CodecError> {
-    match route {
+    let result = match route {
         Route::Utf8(plan) => write_utf8_stream(source, sink, plan, progress, cancel),
-        Route::Converted(plan) => write_converted_stream(source, sink, plan, progress, cancel),
+        Route::Converted(plan) => {
+            write_converted_stream(source, sink, plan, loss_check, progress, cancel)
+        }
         Route::LossyUtf8 => write_lossy_stream(source, sink, progress, cancel),
+    };
+    if matches!(result, Err(CodecError::InapplicableEncoding(_))) {
+        source.confirm_unchanged()?;
     }
+    result
 }
-/// The start of a streaming read: the file, its size, and its first bytes.
+/// The start of a streaming read: the file and its first bytes.
 struct Opened {
-    source: File,
-    size: u64,
+    source: WatchedSource,
     head: [u8; 4],
     head_len: usize,
 }
 fn open_for_stream(input: &Path) -> Result<Opened, CodecError> {
-    let mut source = File::open(input)?;
-    let size = source.metadata()?.len();
+    let mut source = WatchedSource::open(input)?;
     let mut head = [0u8; 4];
     let mut head_len = 0;
     while head_len < head.len() {
@@ -975,50 +1076,62 @@ fn open_for_stream(input: &Path) -> Result<Opened, CodecError> {
     }
     Ok(Opened {
         source,
-        size,
         head,
         head_len,
     })
 }
-/// Picks the route the same way `decode` does, and writes the text to `sink`.
+fn utf8_route(opened: &Opened) -> Route {
+    let has_bom = opened.head[..opened.head_len].starts_with(&UTF8_BOM);
+    Route::Utf8(Plan {
+        bom: usize::from(has_bom) * UTF8_BOM.len(),
+        ..legacy_plan(TextEncoding::Utf8)
+    })
+}
+fn planned_route(plan: Plan) -> Route {
+    if plan.encoding == TextEncoding::Utf8 {
+        Route::Utf8(plan)
+    } else {
+        Route::Converted(plan)
+    }
+}
+/// Picks the route the same way `decode` does, and writes the text to `out`. A scan
+/// comes first under Automatic, so that a wrong route rarely writes anything.
 fn stream_choosing_route<F: FnMut(u64, u64)>(
     opened: &mut Opened,
     plan: Option<Plan>,
     system_cp: u32,
-    sink: &mut impl TextSink,
+    out: &mut File,
     progress: &mut Progress<F>,
     cancel: &mut impl FnMut() -> bool,
-) -> Result<(Route, Format), CodecError> {
-    let source = &mut opened.source;
+) -> Result<Format, CodecError> {
+    let check = LossCheck::Run;
     if let Some(plan) = plan {
-        let route = if plan.encoding == TextEncoding::Utf8 {
-            Route::Utf8(plan)
-        } else {
-            Route::Converted(plan)
-        };
-        let format = run_route(route, source, sink, progress, cancel)?;
-        return Ok((route, format));
+        return run_route(
+            planned_route(plan),
+            &mut opened.source,
+            out,
+            check,
+            progress,
+            cancel,
+        );
     }
-    let is_utf8 = stream_is_utf8(source, progress, cancel)?;
-    progress.base += opened.size;
+    let is_utf8 = stream_is_utf8(&mut opened.source, progress, cancel)?;
+    progress.base += opened.source.size();
     if is_utf8 {
-        let has_bom = opened.head[..opened.head_len].starts_with(&UTF8_BOM);
-        let route = Route::Utf8(Plan {
-            bom: usize::from(has_bom) * UTF8_BOM.len(),
-            ..legacy_plan(TextEncoding::Utf8)
-        });
-        let format = run_route(route, source, sink, progress, cancel)?;
-        return Ok((route, format));
+        let route = utf8_route(opened);
+        return run_route(route, &mut opened.source, out, check, progress, cancel);
     }
+    let source = &mut opened.source;
     if let Some(plan) = system_plan(system_cp) {
-        let route = Route::Converted(plan);
-        match run_route(route, source, sink, progress, cancel) {
-            Err(CodecError::InapplicableEncoding(_)) => sink.restart()?,
-            finished => return finished.map(|format| (route, format)),
+        match run_route(Route::Converted(plan), source, out, check, progress, cancel) {
+            Err(CodecError::InapplicableEncoding(_)) => {
+                out.set_len(0)?;
+                out.seek(SeekFrom::Start(0))?;
+            }
+            finished => return finished,
         }
     }
-    let format = run_route(Route::LossyUtf8, source, sink, progress, cancel)?;
-    Ok((Route::LossyUtf8, format))
+    run_route(Route::LossyUtf8, source, out, check, progress, cancel)
 }
 fn choice_plan(choice: EncodingChoice, head: &[u8]) -> Result<Option<Plan>, CodecError> {
     let plan = match choice {
@@ -1036,9 +1149,14 @@ fn choice_plan(choice: EncodingChoice, head: &[u8]) -> Result<Option<Plan>, Code
 /// returns the same format `decode` would. Memory stays at a few MiB.
 ///
 /// `progress` gets `(done, total)` and only rises. `total` is the file size, or
-/// twice that when Automatic must scan the file before it converts. `cancel` is
-/// asked before every 1 MiB of work, scan included. After any failure `output` is
-/// gone.
+/// twice that when Automatic must scan the file before it converts. `done` never
+/// passes `total`. An empty file reports `(0, 0)` once, as its finish, so a caller
+/// that shows a percentage must handle a total of zero. `cancel` is asked before
+/// every 1 MiB of work, scan included.
+///
+/// After any failure `output` is gone. If it could not be deleted, the error is
+/// `CleanupFailed`, which names it, or `SourceChanged` with it in `leftover`. If
+/// `input` changes during the read, the error is `SourceChanged`.
 pub fn transcode_to_utf8_file(
     input: &Path,
     output: &Path,
@@ -1060,9 +1178,10 @@ fn transcode_with_system_page(
 ) -> Result<Format, CodecError> {
     let mut opened = open_for_stream(input)?;
     let plan = choice_plan(choice, &opened.head[..opened.head_len])?;
+    let size = opened.source.size();
     let mut progress = Progress {
         report: progress,
-        total: opened.size * if plan.is_none() { 2 } else { 1 },
+        total: size * if plan.is_none() { 2 } else { 1 },
         base: 0,
         best: 0,
     };
@@ -1078,23 +1197,92 @@ fn transcode_with_system_page(
         &mut progress,
         &mut cancel,
     )
-    .and_then(|(_, format)| {
+    .and_then(|format| {
         out.sync_all()?;
-        progress.at(opened.size);
+        progress.at(size);
         Ok(format)
     });
-    if result.is_err() {
-        drop(out);
-        // The first failure is what the caller needs. `output` is the caller's own
-        // scratch file, and a later create-new at this name would show if it stayed.
-        let _ = std::fs::remove_file(output);
+    match result {
+        Ok(format) => Ok(format),
+        Err(error) => {
+            drop(out);
+            // `output` is the caller's own scratch file. The first failure is what the
+            // caller needs most, and this one is added to it.
+            let stuck = match std::fs::remove_file(output) {
+                Ok(()) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => Some(output.to_path_buf()),
+            };
+            Err(with_leftover(error, stuck))
+        }
     }
-    result
 }
-/// `decode` for a file on disk. It never holds the file's bytes in memory, so its
-/// peak is the text plus a few MiB. The first pass checks the file and measures the
-/// text; the second fills one exact allocation. `progress` and `cancel` work as in
-/// `transcode_to_utf8_file`, with one more file size in `total` for the second pass.
+/// One route over a whole file: the text bytes and the format.
+///
+/// Most files take one pass. The first piece sets the size of one block, and the text
+/// fills it. If the text does not fit, the block is freed before anything else happens,
+/// the file is measured, and a second pass fills a block of the exact size. So peak
+/// memory stays at the larger of that first block and the text, plus a few MiB.
+fn read_route<F: FnMut(u64, u64)>(
+    route: Route,
+    source: &mut WatchedSource,
+    progress: &mut Progress<F>,
+    cancel: &mut impl FnMut() -> bool,
+) -> Result<(Vec<u8>, Format), CodecError> {
+    let too_large = || CodecError::TooLarge {
+        what: "there is not enough memory for its text",
+    };
+    let size = source.size();
+    let first = match route {
+        // UTF-8 text is the file itself, so the size is already known.
+        Route::Utf8(_) => Some(FilledBytes::exact(
+            usize::try_from(size).map_err(|_| too_large())?,
+        )?),
+        Route::Converted(_) => Some(FilledBytes::estimating(size)),
+        // Rare, and its first piece says little: it can end at the first bad byte.
+        Route::LossyUtf8 => None,
+    };
+    if let Some(mut sink) = first {
+        match run_route(route, source, &mut sink, LossCheck::Run, progress, cancel) {
+            Ok(format) => return Ok((sink.into_bytes(), format)),
+            Err(_) if sink.overflowed => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut counter = SizeCounter::default();
+    let format = run_route(
+        route,
+        source,
+        &mut counter,
+        LossCheck::Run,
+        progress,
+        cancel,
+    )?;
+    let mut sink = FilledBytes::exact(counter.0)?;
+    match run_route(route, source, &mut sink, LossCheck::Skip, progress, cancel) {
+        Ok(_) => Ok((sink.into_bytes(), format)),
+        // The measure was exact, so more text means that the file changed.
+        Err(_) if sink.overflowed => Err(CodecError::SourceChanged {
+            path: source.shown_path(),
+            leftover: None,
+        }),
+        Err(error) => Err(error),
+    }
+}
+/// `decode` for a file on disk. It never holds the file's bytes in memory. Its peak
+/// is the text plus about 3% and a few MiB for a file whose start is like the rest.
+/// A file whose first 1 MiB gives more text per byte than the rest, such as Japanese
+/// and then ASCII, peaks at that first rate instead; the extra memory is reserved
+/// but not touched. A file whose first 1 MiB gives less takes a second pass, at the
+/// same peak.
+///
+/// `progress` gets `(done, total)` and only rises. `total` is the file size, and `done`
+/// never passes it. An empty file reports `(0, 0)` once, as its finish, so a caller that
+/// shows a percentage must handle a total of zero. A second pass holds the number still
+/// until it catches up. `cancel` is asked before every 1 MiB of work.
+///
+/// If the file changes during the read, the error is `SourceChanged`: a longer or
+/// shorter file, a new write time, or another file under that name.
 pub fn decode_file(
     input: &Path,
     choice: EncodingChoice,
@@ -1114,43 +1302,95 @@ fn decode_file_with_system_page(
 ) -> Result<Decoded, CodecError> {
     let mut opened = open_for_stream(input)?;
     let plan = choice_plan(choice, &opened.head[..opened.head_len])?;
-    let passes = if plan.is_none() { 3 } else { 2 };
+    let size = opened.source.size();
     let mut progress = Progress {
         report: progress,
-        total: opened.size * passes,
+        total: size,
         base: 0,
         best: 0,
     };
-    let mut counter = SizeCounter::default();
-    let (route, _) = stream_choosing_route(
-        &mut opened,
-        plan,
-        system_cp,
-        &mut counter,
-        &mut progress,
-        &mut cancel,
-    )?;
-    let mut bytes = Vec::new();
-    reserve_output(&mut bytes, counter.0)?;
-    progress.base = opened.size * (passes - 1);
-    let mut sink = FilledBytes(bytes);
-    let format = run_route(
-        route,
-        &mut opened.source,
-        &mut sink,
-        &mut progress,
-        &mut cancel,
-    )?;
-    progress.at(opened.size);
-    // No copy is made. The check also covers a file that changed between the passes.
-    let text =
-        String::from_utf8(sink.0).map_err(|_| CodecError::InapplicableEncoding(format.encoding))?;
-    Ok(Decoded { text, format })
+    // Each route but the last may refuse the file, which moves on to the next. The first
+    // route needs no scan: a bad byte stops it at that byte.
+    let (tries, last) = match plan {
+        Some(plan) => (Vec::new(), planned_route(plan)),
+        None => {
+            let mut tries = vec![utf8_route(&opened)];
+            tries.extend(system_plan(system_cp).map(Route::Converted));
+            (tries, Route::LossyUtf8)
+        }
+    };
+    let finish = |(bytes, format): (Vec<u8>, Format)| {
+        // No copy is made. The bytes were checked or built as text piece by piece, so
+        // this cannot fail unless this crate has a bug. Then it is an error, not a panic.
+        String::from_utf8(bytes)
+            .map(|text| Decoded { text, format })
+            .map_err(|_| CodecError::InapplicableEncoding(TextEncoding::Utf8))
+    };
+    let source = &mut opened.source;
+    for route in tries {
+        match read_route(route, source, &mut progress, &mut cancel) {
+            Err(CodecError::InapplicableEncoding(_)) => {}
+            finished => {
+                let decoded = finish(finished?)?;
+                progress.at(size);
+                return Ok(decoded);
+            }
+        }
+    }
+    let decoded = finish(read_route(last, source, &mut progress, &mut cancel)?)?;
+    progress.at(size);
+    Ok(decoded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 7: nothing here can end the process by growing a block.
+    #[test]
+    fn filled_bytes_never_grows_its_block() {
+        let mut sink = FilledBytes::exact(4).unwrap();
+        sink.put(b"abc", 3).unwrap();
+        let block = sink.bytes.as_ptr();
+        let error = sink.put(b"de", 5).unwrap_err();
+        assert!(matches!(error, CodecError::TooLarge { .. }), "{error}");
+        assert!(sink.overflowed);
+        assert_eq!(sink.bytes, b"abc");
+        assert_eq!(sink.bytes.as_ptr(), block);
+        assert!(matches!(
+            FilledBytes::exact(usize::MAX / 2),
+            Err(CodecError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn filled_bytes_estimates_from_the_first_piece() {
+        // 1 MiB became 1.5 MiB, and the file is 100 MiB.
+        let wanted = FilledBytes::estimate(1_572_864, 1 << 20, 100 << 20);
+        assert_eq!(wanted, 157_286_400 + 157_286_400 / 32 + 64);
+        // An estimate too large for memory is not an error yet: the measuring pass decides.
+        let mut sink = FilledBytes::estimating(u64::MAX);
+        assert!(sink.put(b"text", 1).is_err());
+        assert!(sink.overflowed);
+        // Uniform text fits the estimate, whatever the first read's size.
+        let mut sink = FilledBytes::estimating(30);
+        for done in [10, 20, 30] {
+            sink.put(&[b'a'; 15], done).unwrap();
+        }
+        assert!(!sink.overflowed);
+        assert_eq!(sink.into_bytes().len(), 45);
+    }
+
+    #[test]
+    fn filled_bytes_gives_back_a_block_that_was_far_too_large() {
+        let mut sink = FilledBytes::exact(50 << 20).unwrap();
+        sink.put(b"small", 5).unwrap();
+        assert!(sink.into_bytes().capacity() < CHUNK);
+        // A small spare part is kept: giving it back can copy the whole block.
+        let mut sink = FilledBytes::exact(8 << 20).unwrap();
+        sink.put(&vec![b'a'; 7 << 20], 1).unwrap();
+        assert!(sink.into_bytes().capacity() == 8 << 20);
+    }
 
     #[test]
     fn conversion_count_refuses_zero_and_negative() {
@@ -1285,6 +1525,40 @@ mod tests {
             std::fs::remove_file(output).unwrap();
         }
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// The whole of Automatic on a chosen system page, against a hand-made answer.
+    #[test]
+    fn automatic_reads_every_byte_value_as_the_system_page_says() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let d = automatic(&bytes, 1252);
+        assert_eq!(d.format.encoding, TextEncoding::Windows1252);
+        assert!(!d.format.lossy);
+        let chars: Vec<char> = d.text.chars().collect();
+        assert_eq!(chars.len(), 256);
+        for (byte, c) in chars.iter().enumerate().take(0x80) {
+            assert_eq!(*c as usize, byte);
+        }
+        // From the published CP1252 table, including the bytes with no letter.
+        for (byte, wanted) in [
+            (0x80, '\u{20ac}'),
+            (0x81, '\u{81}'),
+            (0x8d, '\u{8d}'),
+            (0x8f, '\u{8f}'),
+            (0x90, '\u{90}'),
+            (0x99, '\u{2122}'),
+            (0x9d, '\u{9d}'),
+            (0x9f, '\u{178}'),
+            (0xa0, '\u{a0}'),
+            (0xe9, '\u{e9}'),
+            (0xff, '\u{ff}'),
+        ] {
+            assert_eq!(chars[byte], wanted, "{byte:#x}");
+        }
+        // A page with no entry goes straight to the last step.
+        let d = automatic(&bytes, 37);
+        assert_eq!(d.text, String::from_utf8_lossy(&bytes));
+        assert!(d.format.lossy);
     }
 
     #[test]

@@ -64,15 +64,15 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | Mac ID | Behavior | What Windows does | Builds | Status | Built |
 | --- | --- | --- | --- | --- | --- |
 | I01 | QuickEdit menu has About, Settings, Hide, Show All, Quit. | Put About, Settings, Quit in caret list; omit Mac hide actions. | M7, M8 | changed (Windows menu and no Mac hide actions) | no |
-| I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in caret list; omit Share. | M7, M13, M14 | changed (caret menu; Share omitted) | no |
-| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in caret list with Windows keys. | M7, M12, M14 | changed (caret menu and Windows keys) | no |
-| I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in caret list. | M7, M12 | changed (caret menu) | no |
+| I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in the menu bar; omit Share. | M7, M13, M14 | changed (menu bar; Share omitted) | no |
+| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in the menu bar with Windows keys. | M7, M12, M14 | changed (menu bar and Windows keys) | no |
+| I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in the menu bar. | M7, M12 | changed (menu bar) | no |
 | I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10 | changed (grammar omitted) | no |
 | I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | no |
-| I07 | Transformations menu has upper, lower, capitalize. | Keep all three in caret list. | M7, M12 | changed (caret menu) | no |
-| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in caret list. | M7, M13, M14 | changed (caret menu) | no |
+| I07 | Transformations menu has upper, lower, capitalize. | Keep all three in the menu bar. | M7, M12 | changed (menu bar) | no |
+| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in the menu bar. | M7, M13, M14 | changed (menu bar) | no |
 | I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and caret menu) | no |
-| I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in caret list. | M6, M7, M14 | changed (Windows controls and caret menu) | no |
+| I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in the menu bar. | M6, M7, M14 | changed (Windows controls and menu bar) | no |
 | I11 | Help menu is empty. | No Help group, because the Mac Help menu is empty. About stays in the caret list. | M7 | left out (nothing to show; choice to check) | no |
 | I12 | Settings is 440 wide, fixed size, with three tabs. | Keep three tabs and 440 device-independent pixels. | M8 | same | no |
 | I13 | Restore All Defaults sits at lower left. | Keep this button. | M8 | same | no |

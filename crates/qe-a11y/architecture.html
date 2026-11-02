@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickEdit UI Automation bridge</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; color: #172334; background: #f5f7fb; margin: 0; padding: 2rem; }
+  main { max-width: 920px; margin: auto; }
+  h1 { font-size: 1.7rem; margin-bottom: .25rem; }
+  p { max-width: 70ch; }
+  svg { display: block; max-width: 100%; height: auto; background: white; border: 1px solid #d7dfeb; border-radius: 12px; }
+  .box { fill: #edf3ff; stroke: #506ca3; stroke-width: 2; rx: 12; }
+  .host { fill: #e7f8ef; stroke: #418263; }
+  .text { font: 600 17px system-ui, sans-serif; fill: #172334; text-anchor: middle; }
+  .small { font: 14px system-ui, sans-serif; fill: #42546c; text-anchor: middle; }
+  .arrow { stroke: #50647f; stroke-width: 2.5; fill: none; marker-end: url(#head); }
+</style>
+<main>
+<h1>QuickEdit UI Automation bridge</h1>
+<p>A screen reader asks the root provider for widgets and a document. Text comes from a bounded snapshot. Geometry and actions go through shell hosts to the UI thread.</p>
+<svg viewBox="0 0 920 420" role="img" aria-label="UIA client asks the widget root. The root exposes widgets and a document. The document reads a text snapshot or asks an editor host for geometry and actions. Widget actions go through a widget host.">
+  <defs><marker id="head" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0L10 4L0 8Z" fill="#50647f"/></marker></defs>
+  <rect class="box" x="26" y="40" width="190" height="75"/><text class="text" x="121" y="73">UIA client</text><text class="small" x="121" y="96">Narrator or inspector</text>
+  <rect class="box" x="300" y="40" width="265" height="75"/><text class="text" x="432" y="73">WidgetProvider root</text><text class="small" x="432" y="96">created on WM_GETOBJECT</text>
+  <rect class="box" x="652" y="28" width="240" height="75"/><text class="text" x="772" y="61">Painted widgets</text><text class="small" x="772" y="84">name, role, value, action</text>
+  <rect class="box" x="652" y="143" width="240" height="75"/><text class="text" x="772" y="176">DocumentProvider</text><text class="small" x="772" y="199">text and selection</text>
+  <rect class="host" x="540" y="307" width="280" height="75"/><text class="text" x="680" y="340">EditorHost / WidgetHost</text><text class="small" x="680" y="363">marshal to UI thread</text>
+  <rect class="box" x="103" y="307" width="320" height="75"/><text class="text" x="263" y="340">TextSnapshot</text><text class="small" x="263" y="363">bounded, nonblocking reads</text>
+  <path class="arrow" d="M216 78H298"/><path class="arrow" d="M565 68H650"/><path class="arrow" d="M535 115V180H650"/>
+  <path class="arrow" d="M714 218V305"/><path class="arrow" d="M653 218L382 305"/><path class="arrow" d="M775 103V305"/>
+</svg>
+</main>
+</html>

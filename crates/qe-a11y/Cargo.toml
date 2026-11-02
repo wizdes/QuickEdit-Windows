@@ -12,4 +12,4 @@ workspace = true
 qe-api.workspace = true
 qe-ui.workspace = true
 qe-editor.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }

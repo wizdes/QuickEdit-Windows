@@ -13,7 +13,10 @@ use crate::{
     host::{UiaHost, WidgetAction},
     marshal::WindowThread,
     search::{FIND_PATIENCE, FindError, FindRequest, find_on_window, find_waiting},
-    text::{Answer, Mover, TextDoc, TextRange, Unit, byte_of, known_len, read_text, utf16_of},
+    text::{
+        Answer, Mover, TextDoc, TextRange, Unit, byte_of, known_len, read_text, read_text_waiting,
+        utf16_of,
+    },
     widgets::{CachedNodes, find_widget},
 };
 use qe_api::{
@@ -91,8 +94,6 @@ struct EditorDoc<'a> {
     view_id: u64,
     window: isize,
     scale: f64,
-    /// The document's box in the tree, in window coordinates.
-    element: Option<Rect>,
     text: Arc<dyn TextSnapshot>,
     rows: Option<Vec<qe_editor::VisibleRow>>,
 }
@@ -176,33 +177,55 @@ impl Doc for EditorDoc<'_> {
         );
         Ok(())
     }
-    /// The editor has no hook that scrolls to a byte and keeps the selection, so this uses
-    /// the same estimate the scroll bar does: lines with no layout count at their estimate.
+    /// Puts the range's start at the top of the view, or its end at the bottom. Text with a
+    /// layout lands exactly. The editor has no hook that gives the height of other text, so
+    /// that uses the same estimate as the scroll bar, and wrapped text can land off by the
+    /// rows the estimate does not know. The selection stays.
     fn scroll(&mut self, range: TextRange, top: bool) -> Result<()> {
-        let start = byte_of(self.text.as_ref(), range.start).map_err(read_error)?;
-        if let Ok(visible) = self.view.visible_range()
-            && (visible.start.0..visible.end.0).contains(&start)
-        {
-            return Ok(());
-        }
-        let line = self
-            .view
-            .line_of_byte(ByteOffset(start))
-            .map_err(|e| read_error(e.into()))?;
-        let lines = self.view.store_status().known_lines.max(1);
-        let along = self.view.total_height() * line.0 as f64 / lines as f64;
-        let height = f64::from(self.view.text_area().height.0);
-        let y = if top {
-            along
+        let text = self.text.clone();
+        // The last unit of the range, because its end may be on the next line.
+        let edge = if top || range.start == range.end {
+            range.start
         } else {
-            (along - height / 2.0).max(0.0)
+            range.end - 1
         };
-        self.view.run_host(HostCommand::ScrollTo(y), self.ctx);
+        let byte = byte_of(text.as_ref(), edge).map_err(read_error)?;
+        let area = self.view.text_area();
+        let height = f64::from(area.height.0);
+        let scroll = self.view.scroll_offset();
+        let exact = self
+            .view
+            .range_rects(ByteOffset(byte)..ByteOffset(byte))
+            .ok()
+            .and_then(|rects| rects.first().map(|part| part.rect));
+        let y = if let Some(rect) = exact {
+            let row_top = scroll + f64::from(rect.y.0 - area.y.0);
+            if top {
+                row_top
+            } else {
+                row_top + f64::from(rect.height.0) - height
+            }
+        } else {
+            let line = self
+                .view
+                .line_of_byte(ByteOffset(byte))
+                .map_err(|e| read_error(e.into()))?;
+            let lines = self.view.store_status().known_lines.max(1) as f64;
+            let row = self.view.total_height() / lines;
+            let row_top = row * line.0 as f64;
+            if top { row_top } else { row_top + row - height }
+        };
+        self.view
+            .run_host(HostCommand::ScrollTo(y.max(0.0)), self.ctx);
         Ok(())
     }
-    /// Only text on screen has rectangles. A range off screen, or on screen with no layout
-    /// yet, gives none, which is how UIA says "not visible".
+    /// Only text on screen has rectangles. An empty range has none, as UIA's contract says. A
+    /// range off screen, or on screen with no layout yet, has none either, which is how UIA
+    /// says "not visible".
     fn rects(&mut self, range: TextRange) -> Result<Vec<[f64; 4]>> {
+        if range.start == range.end {
+            return Ok(Vec::new());
+        }
         let text = self.text.clone();
         let start = byte_of(text.as_ref(), range.start).map_err(read_error)?;
         let end = byte_of(text.as_ref(), range.end).map_err(read_error)?;
@@ -240,15 +263,10 @@ impl Doc for EditorDoc<'_> {
             utf16_of(text, found.end.0).map_err(read_error)?,
         )))
     }
-    /// A point inside the document's box gets the nearest text. A point outside it is the
-    /// caller's mistake.
+    /// Any point gets the nearest text, as UIA's contract says.
     fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange> {
         let (x, y) = to_window(self.window, self.scale, x, y)?;
         let area = self.view.text_area();
-        let element = self.element.unwrap_or(area);
-        if !inside(element, x, y) {
-            return Err(invalid("This point is outside the document."));
-        }
         // Just inside the far edges, because those edges belong to whatever is next.
         let x = x
             .max(area.x.0)
@@ -269,10 +287,6 @@ impl Doc for EditorDoc<'_> {
         let at = utf16_of(self.text.as_ref(), hit.byte.0).map_err(read_error)?;
         Ok(TextRange::new(at, at))
     }
-}
-
-fn inside(rect: Rect, x: f32, y: f32) -> bool {
-    x >= rect.x.0 && y >= rect.y.0 && x < rect.x.0 + rect.width.0 && y < rect.y.0 + rect.height.0
 }
 
 fn clip(rect: Rect, area: Rect) -> Option<Rect> {
@@ -386,7 +400,10 @@ impl Doc for FieldDoc {
     }
     /// The field does not report where its characters are, so any text in it answers with
     /// the field's whole box.
-    fn rects(&mut self, _: TextRange) -> Result<Vec<[f64; 4]>> {
+    fn rects(&mut self, range: TextRange) -> Result<Vec<[f64; 4]>> {
+        if range.start == range.end {
+            return Ok(Vec::new());
+        }
         Ok(vec![to_screen(
             self.window,
             self.scale,
@@ -397,10 +414,19 @@ impl Doc for FieldDoc {
         let len = known_len(self.text.as_ref()).map_err(read_error)?.0;
         Ok(Some(TextRange::new(0, len)))
     }
-    fn at_point(&mut self, _: f64, _: f64) -> Result<TextRange> {
-        Err(not_supported(
-            "A field does not report where its characters are.",
-        ))
+    /// `Widget` does not say where a field's characters are, so this is an estimate: the same
+    /// share of the text as the point is of the box. The README lists this for M14.
+    fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange> {
+        let _ = y;
+        let (x, _) = to_window(self.window, self.scale, x, 0.0)?;
+        let text = self.text.as_ref();
+        let len = known_len(text).map_err(read_error)?.0;
+        let share =
+            ((x - self.widget.bounds.x.0) / self.widget.bounds.width.0.max(1.0)).clamp(0.0, 1.0);
+        let unit = (f64::from(share) * len as f64).round() as usize;
+        let byte = byte_of(text, unit.min(len)).map_err(read_error)?;
+        let at = utf16_of(text, byte).map_err(read_error)?;
+        Ok(TextRange::new(at, at))
     }
 }
 
@@ -416,7 +442,6 @@ pub(crate) fn with_doc<T: 'static>(
         match source {
             Source::Editor => {
                 let view_id = host.view_id().ok_or_else(gone)?;
-                let element = host.document_widget().map(|w| w.bounds);
                 let mut body = Some(body);
                 let mut out = None;
                 let reached = host.with_editor(&mut |view, ctx| {
@@ -427,7 +452,6 @@ pub(crate) fn with_doc<T: 'static>(
                         view_id,
                         window,
                         scale,
-                        element,
                         text,
                         rows: None,
                     };
@@ -466,7 +490,7 @@ pub(crate) fn make_range(
     enclosing: IRawElementProviderSimple,
 ) -> ITextRangeProvider {
     let (owner, revision) = stamp;
-    ComObject::new(TextRangeObject {
+    let made: ITextRangeProvider = ComObject::new(TextRangeObject {
         shared: shared.clone(),
         source,
         enclosing,
@@ -476,7 +500,9 @@ pub(crate) fn make_range(
             revision,
         }),
     })
-    .to_interface()
+    .to_interface();
+    crate::abi::range::protect(&made);
+    made
 }
 
 fn unit_of(unit: TextUnit) -> Result<Unit> {
@@ -578,7 +604,7 @@ impl TextRangeObject_Impl {
                 }
             }
             _ => {
-                self.shared.ui.check_open()?;
+                self.run(|_, _, _| Ok(()))?;
                 not_supported_value()
             }
         }
@@ -658,7 +684,7 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         }
         // Text with a lone surrogate cannot be in a document, which is all valid text.
         let Ok(query) = String::from_utf16(query) else {
-            self.shared.ui.check_open()?;
+            self.run(|_, _, _| Ok(()))?;
             return Err(none());
         };
         // The window's thread only hands over a snapshot. The search then runs on this thread.
@@ -698,18 +724,23 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         rectangle_array(&rectangles)
     }
     fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
-        // A closed provider has no element to give.
-        self.shared.ui.check_open()?;
+        // A closed provider or a stale range has no element to give.
+        self.run(|_, _, _| Ok(()))?;
         Ok(self.enclosing.clone())
     }
     fn GetText(&self, limit: i32) -> Result<BSTR> {
         if limit < -1 {
             return Err(invalid("The limit must be -1 or more."));
         }
-        self.run(move |_, doc, range| {
-            let text = read_text(doc.snapshot(), *range, limit).map_err(read_error)?;
-            bstr(&text)
-        })
+        // The window's thread only hands over a snapshot. A client's read then runs on this
+        // thread, where it can wait for disk and hold nothing up.
+        let (text, range) = self.run(|_, doc, range| Ok((doc.shared_snapshot(), *range)))?;
+        let read = if self.shared.ui.is_window_thread() {
+            read_text(text.as_ref(), range, limit)
+        } else {
+            read_text_waiting(text.as_ref(), range, limit)
+        };
+        bstr(&read.map_err(read_error)?)
     }
     fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
         let unit = unit_of(unit)?;
@@ -761,11 +792,11 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         self.run(|_, doc, range| doc.select(*range))
     }
     fn AddToSelection(&self) -> Result<()> {
-        self.shared.ui.check_open()?;
+        self.run(|_, _, _| Ok(()))?;
         Err(not_supported("This text has one selection only."))
     }
     fn RemoveFromSelection(&self) -> Result<()> {
-        self.shared.ui.check_open()?;
+        self.run(|_, _, _| Ok(()))?;
         Err(not_supported("This text has one selection only."))
     }
     fn ScrollIntoView(&self, align_top: BOOL) -> Result<()> {
@@ -773,7 +804,7 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         self.run(move |_, doc, range| doc.scroll(*range, top))
     }
     fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
-        self.shared.ui.check_open()?;
+        self.run(|_, _, _| Ok(()))?;
         interface_array::<IRawElementProviderSimple>(&[])
     }
 }

@@ -165,7 +165,12 @@ fn model_move(
     let stops = m.stops(unit);
     let len = m.len();
     let empty = range.0 == range.1;
-    let mut at = range.0;
+    // A range with text starts from the start of the unit it is in.
+    let mut at = if empty {
+        range.0
+    } else {
+        model_expand(m, range.0, unit).0
+    };
     let mut moved = 0;
     let whole = matches!(unit, TextUnit_Document | TextUnit_Page | TextUnit_Format);
     while moved != count {

@@ -241,6 +241,18 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let (first_read_units, first_read_calls) = get_text_settled(&word, 200);
+    // A whole-cap read from the middle, as UIA calls it: one call, on another thread.
+    let to_the_end = unsafe { middle.Clone() }.expect("Clone");
+    unsafe {
+        to_the_end.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            &doc,
+            TextPatternRangeEndpoint_End,
+        )
+    }
+    .expect("to the end");
+    let (long_units, long_ms, long_stall) = read_off_thread(&to_the_end);
+    assert_eq!(long_units, qe_a11y::GET_TEXT_CAP, "the whole cap");
 
     let mut rows = Vec::new();
     let runs = 200;
@@ -273,13 +285,6 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
             .map(drop)
             .or_else(not_yet_is_fine)
             .expect("a provider call");
-    });
-    time(&mut rows, "GetText(-1) on the whole document", 20, || {
-        let Ok(answer) = (unsafe { doc.GetText(-1) }) else {
-            NOT_YET_ANSWERS.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        assert!(answer.len() <= qe_a11y::GET_TEXT_CAP);
     });
     for (name, unit) in [
         ("character", TextUnit_Character),
@@ -354,6 +359,9 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
     println!("\n{label}: {bytes} bytes");
     println!(
         "  first GetText(200) in the middle: {first_read_units} units after {first_read_calls} calls"
+    );
+    println!(
+        "  GetText(-1) from the middle, one call: {long_units} units, answer after {long_ms:.1} ms, window held up {long_stall:.3} ms at most"
     );
     println!(
         "  'not yet' answers so far in this process: {}",
@@ -459,4 +467,29 @@ fn measure_1_gib_mapped_file() {
     window.lay_out(800.0, 600.0);
     measure("1 GiB, mapped, read-only", &window, bytes);
     window.close();
+}
+
+/// One GetText(-1), as UIA calls it. Gives its length, how long the answer took, and the longest
+/// the window's message loop was held up meanwhile.
+fn read_off_thread(range: &ITextRangeProvider) -> (usize, f64, f64) {
+    let moved = SendIt(range.clone());
+    let (say, heard) = std::sync::mpsc::channel();
+    let began = Instant::now();
+    std::thread::spawn(move || {
+        let moved = moved;
+        let answer = unsafe { moved.0.GetText(-1) }.map(|text| text.len());
+        say.send(answer.map_err(|error| error.to_string()))
+            .expect("report");
+    });
+    let mut stall = 0f64;
+    loop {
+        let turn = Instant::now();
+        pump();
+        stall = stall.max(turn.elapsed().as_secs_f64() * 1000.0);
+        if let Ok(answer) = heard.try_recv() {
+            let units = answer.expect("GetText failed");
+            return (units, began.elapsed().as_secs_f64() * 1000.0, stall);
+        }
+        std::thread::yield_now();
+    }
 }

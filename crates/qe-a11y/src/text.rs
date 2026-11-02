@@ -116,9 +116,8 @@ pub fn utf16_of(text: &dyn TextSnapshot, byte: usize) -> Answer<usize> {
 }
 
 /// Read at most `limit` UTF-16 units, and never more than `GET_TEXT_CAP`. A negative limit
-/// means the cap. A limit that ends inside a surrogate pair stops before the pair. If memory
-/// runs out part way, the answer is the part that was read. If nothing could be read, the
-/// answer is the error.
+/// means the cap. A limit that ends inside a surrogate pair stops before the pair. If any part
+/// cannot be read, the answer is the error, so a short answer always means the limit or the cap.
 pub fn read_text(text: &dyn TextSnapshot, range: TextRange, limit: i32) -> Answer<String> {
     let (len, _) = known_len(text)?;
     if range.start > range.end || range.end > len {
@@ -132,6 +131,35 @@ pub fn read_text(text: &dyn TextSnapshot, range: TextRange, limit: i32) -> Answe
     )
 }
 
+/// `read_text` for a thread that may wait for disk, which is any thread but the window's. So a
+/// read needs no pages to be in memory already, and it answers in one call. It must not run on
+/// the window's thread.
+pub fn read_text_waiting(text: &dyn TextSnapshot, range: TextRange, limit: i32) -> Answer<String> {
+    let (len, _) = known_len(text)?;
+    if range.start > range.end || range.end > len {
+        return Err(ReadError::OutOfRange);
+    }
+    let most = usize::try_from(limit).map_or(GET_TEXT_CAP, |n| n.min(GET_TEXT_CAP));
+    let stop = range.start.saturating_add(most).min(range.end);
+    // A position inside a surrogate pair has no byte, so it counts as the start of the pair.
+    let byte = |unit: usize| {
+        text.utf16_to_byte(Utf16Offset(unit))
+            .or_else(|| text.utf16_to_byte(Utf16Offset(unit.saturating_sub(1))))
+            .map(|found| found.0)
+            .ok_or(ReadError::OutOfRange)
+    };
+    let (from, to) = (byte(range.start)?, byte(stop)?);
+    let mut answer = String::with_capacity(to.saturating_sub(from));
+    if !text.visit_chunks(ByteOffset(from)..ByteOffset(to), &mut |part| {
+        answer.push_str(part);
+    }) {
+        return Err(ReadError::Failed(
+            "The text could not be read from its file.".into(),
+        ));
+    }
+    Ok(answer)
+}
+
 /// Reads the units in `start..stop`, with no cap, in slices a mapped store accepts.
 pub(crate) fn read_units(text: &dyn TextSnapshot, start: usize, stop: usize) -> Answer<String> {
     let mut answer = String::new();
@@ -143,12 +171,7 @@ pub(crate) fn read_units(text: &dyn TextSnapshot, start: usize, stop: usize) -> 
         let result = text.try_visit_chunks(ByteOffset(from)..ByteOffset(to), &mut |part| {
             answer.push_str(part)
         });
-        if let Err(error) = result {
-            if answer.is_empty() {
-                return Err(error.into());
-            }
-            break;
-        }
+        result?;
         at = next;
         from = to;
     }
@@ -497,7 +520,12 @@ impl Mover<'_> {
             && len > 0
             && self.last_line_is_empty(len)?;
         let began = Instant::now();
-        let mut at = range.start;
+        // UIA first normalizes a range with text to the start of the unit it is in.
+        let mut at = if empty {
+            range.start
+        } else {
+            self.unit_at(unit, range.start)?.start
+        };
         let mut moved = 0i32;
         while moved != count && (moved.abs() < SURE_STEPS || began.elapsed() <= MOVE_BUDGET) {
             let step = if count > 0 {

@@ -155,6 +155,58 @@ fn a_page_not_in_memory_says_ask_again_and_then_answers() {
     assert_eq!(retry(|| unsafe { found.GetText(-1) }).0, "line 599999");
 }
 
+#[test]
+fn a_client_read_of_text_not_in_memory_answers_in_one_call() {
+    let mut body = Vec::new();
+    let mut middle = 0;
+    for i in 0..600_000 {
+        if i == 300_000 {
+            middle = body.len();
+        }
+        body.extend_from_slice(format!("line {i}\n").as_bytes());
+    }
+    let (view, _temp) = mapped_view("cold", &body, Some(Duration::from_millis(5)));
+    settle(&view);
+    let window = TestWindow::new(view);
+    let ui = window.accessibility();
+    let document = ui.document().unwrap();
+    let doc = document_range(&document);
+    window.ui.view.borrow_mut().select(
+        ByteOffset(middle)..ByteOffset(middle),
+        &mut qe_api::ViewContext::default(),
+    );
+    let caret = retry(|| unsafe {
+        let mut active = windows::core::BOOL(0);
+        text_of(&document).GetCaretRange(&mut active)
+    })
+    .0;
+    unsafe {
+        caret.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            &doc,
+            TextPatternRangeEndpoint_End,
+        )
+    }
+    .unwrap();
+    let moved = SendIt(caret);
+    let (say, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let moved = moved;
+        let answer = unsafe { moved.0.GetText(-1) }.map(|text| text.to_string());
+        say.send(answer.map_err(|e| e.code().0)).expect("report");
+    });
+    let mut got = None;
+    window.pump_until("GetText", 60, || {
+        if let Ok(answer) = heard.try_recv() {
+            got = Some(answer);
+        }
+        got.is_some()
+    });
+    let text = got.expect("an answer").expect("one call is enough");
+    assert_eq!(text.len(), qe_a11y::GET_TEXT_CAP);
+    assert!(text.starts_with("line 300000\n"));
+}
+
 /// Knows only the first part of its text, as a mapped file does while its index grows.
 struct PartlyKnown {
     text: String,

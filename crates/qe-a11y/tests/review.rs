@@ -154,17 +154,6 @@ fn a_point_inside_the_document_but_outside_the_text_gets_the_nearest_position() 
     }
     .expect("a point below the text");
     assert_eq!(ends(&hit, &doc).0, 11);
-    // Outside the box is the caller's mistake.
-    assert_code(
-        unsafe {
-            text.RangeFromPoint(UiaPoint {
-                x: element.left + element.width + 50.0,
-                y: element.top,
-            })
-        },
-        -2147024809,
-        "a point outside the document",
-    );
 }
 
 #[test]

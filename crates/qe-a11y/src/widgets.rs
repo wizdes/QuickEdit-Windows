@@ -15,15 +15,22 @@ use crate::{
 use qe_api::{Rect, Widget, WidgetId, WidgetRole};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::c_void,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::{Com::SAFEARRAY, Variant::VARIANT},
-        UI::{Accessibility::*, WindowsAndMessaging::WM_GETOBJECT},
+        UI::{
+            Accessibility::*,
+            WindowsAndMessaging::{InSendMessage, ReplyMessage, WM_GETOBJECT},
+        },
     },
     core::{
         BOOL, BSTR, ComObject, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement,
@@ -131,11 +138,7 @@ fn make_node(shared: &Arc<Shared>, target: Target) -> Result<IRawElementProvider
     match target {
         Target::Root => root_simple(shared)?.cast(),
         Target::Document => document_simple(shared)?.cast(),
-        Target::Widget(_) => Ok(ComObject::new(Node {
-            shared: shared.clone(),
-            target,
-        })
-        .to_interface()),
+        Target::Widget(_) => Ok(new_node(shared, target).to_interface()),
     }
 }
 
@@ -155,13 +158,22 @@ fn document_simple(shared: &Arc<Shared>) -> Result<IRawElementProviderSimple> {
     if let Some(found) = &nodes.document {
         return Ok(found.clone());
     }
-    let made: IRawElementProviderSimple = ComObject::new(Node {
-        shared: shared.clone(),
-        target: Target::Document,
-    })
-    .to_interface();
+    let made = new_node(shared, Target::Document);
+    let made: IRawElementProviderSimple = made.to_interface();
     nodes.document = Some(made.clone());
     Ok(made)
+}
+
+/// A node whose "none" answers write null. See `abi.rs`.
+fn new_node(shared: &Arc<Shared>, target: Target) -> ComObject<Node> {
+    let made = ComObject::new(Node {
+        shared: shared.clone(),
+        target,
+    });
+    crate::abi::node_simple::protect(&made.to_interface());
+    crate::abi::node_fragment::protect(&made.to_interface());
+    crate::abi::node_selection_item::protect(&made.to_interface());
+    made
 }
 
 #[implement(
@@ -367,7 +379,13 @@ impl Node {
             return Ok(std::ptr::null_mut());
         }
         let id = self.widget()?.id.0;
-        int_array(&[UiaAppendRuntimeId as i32, id as i32, (id >> 32) as i32])
+        let (low, high) = (id as i32, (id >> 32) as i32);
+        // The document's number comes from the shell separately from the painted tree, so a
+        // fourth part keeps it apart from a widget with the same number.
+        if self.target == Target::Document {
+            return int_array(&[UiaAppendRuntimeId as i32, low, high, 1]);
+        }
+        int_array(&[UiaAppendRuntimeId as i32, low, high])
     }
     fn rect(&self) -> Result<UiaRect> {
         let (target, window) = (self.target, self.shared.window);
@@ -512,13 +530,19 @@ impl IValueProvider_Impl for Node_Impl {
     /// property with no limit.
     fn Value(&self) -> Result<BSTR> {
         if self.target == Target::Document {
-            return with_doc(&self.shared, Source::Editor, |doc| {
-                let text = doc.snapshot();
-                let (len, _) = known_len(text).map_err(read_error)?;
-                let read = crate::text::read_text(text, crate::text::TextRange::new(0, len), -1)
-                    .map_err(read_error)?;
-                bstr(&read)
-            });
+            let text = with_doc(
+                &self.shared,
+                Source::Editor,
+                |doc| Ok(doc.shared_snapshot()),
+            )?;
+            let (len, _) = known_len(text.as_ref()).map_err(read_error)?;
+            let whole = TextRange::new(0, len);
+            let read = if self.shared.ui.is_window_thread() {
+                crate::text::read_text(text.as_ref(), whole, -1)
+            } else {
+                crate::text::read_text_waiting(text.as_ref(), whole, -1)
+            };
+            return bstr(&read.map_err(read_error)?);
         }
         bstr(self.widget()?.value.as_deref().unwrap_or(""))
     }
@@ -672,6 +696,9 @@ impl ITextProvider_Impl for Node_Impl {
         let source = self.text_source()?;
         let (shared, enclosing) = (self.shared.clone(), self.enclosing());
         let (x, y) = (point.x, point.y);
+        if !x.is_finite() || !y.is_finite() {
+            return Err(invalid("This point is not a number."));
+        }
         with_doc(&self.shared, source, move |doc| {
             let range = doc.at_point(x, y)?;
             Ok(make_range(&shared, source, doc.stamp(), range, enclosing))
@@ -881,11 +908,12 @@ impl UiaSlot {
     /// second call does nothing.
     pub fn shutdown(&self) -> Result<()> {
         self.closed.set(true);
-        let current = self.current.borrow_mut().take();
-        match current {
-            Some(ui) => ui.shutdown(),
-            None => Ok(()),
+        // If this fails, the provider stays here, so a later call can try again.
+        if let Some(ui) = self.current() {
+            ui.shutdown()?;
+            self.current.borrow_mut().take();
         }
+        Ok(())
     }
 }
 
@@ -894,6 +922,162 @@ impl UiaSlot {
 pub struct WidgetEvents {
     pub structure: bool,
     pub focus: bool,
+    /// A field's text changed.
+    pub text_changed: u32,
+    /// A field's selection changed.
+    pub selection_changed: u32,
+    /// An item in a tab list or a list became selected.
+    pub element_selected: u32,
+    /// Property changes: name, value, on or off, turned on or off, expanded, and range value.
+    pub properties: u32,
+}
+
+/// What a client can read of a widget, to compare with the last report.
+#[derive(Clone, PartialEq)]
+struct SeenWidget {
+    role: WidgetRole,
+    name: String,
+    value: Option<String>,
+    selection: Option<std::ops::Range<usize>>,
+    enabled: bool,
+    selected: bool,
+    checked: bool,
+    expanded: bool,
+    range: Option<f64>,
+}
+
+fn remember(node: &Widget, into: &mut HashMap<WidgetId, SeenWidget>) {
+    for child in &node.children {
+        into.insert(
+            child.id,
+            SeenWidget {
+                role: child.role,
+                name: child.name.clone(),
+                value: child.value.clone(),
+                selection: child.selection.clone(),
+                enabled: child.states.enabled,
+                selected: child.states.selected,
+                checked: child.states.checked,
+                expanded: child.states.expanded,
+                range: child.range_value.map(|r| r.value),
+            },
+        );
+        remember(child, into);
+    }
+}
+
+fn raise_property(
+    node: &IRawElementProviderSimple,
+    id: UIA_PROPERTY_ID,
+    old: VARIANT,
+    new: VARIANT,
+    raised: &mut WidgetEvents,
+) -> Result<()> {
+    unsafe { UiaRaiseAutomationPropertyChangedEvent(node, id, &old, &new) }?;
+    raised.properties += 1;
+    Ok(())
+}
+
+fn toggle_of(on: bool) -> VARIANT {
+    VARIANT::from(if on {
+        ToggleState_On.0
+    } else {
+        ToggleState_Off.0
+    })
+}
+fn expand_of(open: bool) -> VARIANT {
+    VARIANT::from(if open {
+        ExpandCollapseState_Expanded.0
+    } else {
+        ExpandCollapseState_Collapsed.0
+    })
+}
+
+/// Raises what changed in one widget between two reports.
+fn raise_changes(
+    node: &IRawElementProviderSimple,
+    old: &SeenWidget,
+    new: &SeenWidget,
+    raised: &mut WidgetEvents,
+) -> Result<()> {
+    if old.name != new.name {
+        raise_property(
+            node,
+            UIA_NamePropertyId,
+            VARIANT::from(old.name.as_str()),
+            VARIANT::from(new.name.as_str()),
+            raised,
+        )?;
+    }
+    if old.enabled != new.enabled {
+        raise_property(
+            node,
+            UIA_IsEnabledPropertyId,
+            VARIANT::from(old.enabled),
+            VARIANT::from(new.enabled),
+            raised,
+        )?;
+    }
+    if old.value != new.value {
+        raise_property(
+            node,
+            UIA_ValueValuePropertyId,
+            VARIANT::from(old.value.as_deref().unwrap_or("")),
+            VARIANT::from(new.value.as_deref().unwrap_or("")),
+            raised,
+        )?;
+        if new.role == WidgetRole::TextField {
+            unsafe { UiaRaiseAutomationEvent(node, UIA_Text_TextChangedEventId) }?;
+            raised.text_changed += 1;
+        }
+    }
+    if old.selection != new.selection && new.role == WidgetRole::TextField {
+        unsafe { UiaRaiseAutomationEvent(node, UIA_Text_TextSelectionChangedEventId) }?;
+        raised.selection_changed += 1;
+    }
+    if old.selected != new.selected {
+        raise_property(
+            node,
+            UIA_SelectionItemIsSelectedPropertyId,
+            VARIANT::from(old.selected),
+            VARIANT::from(new.selected),
+            raised,
+        )?;
+        if new.selected {
+            unsafe { UiaRaiseAutomationEvent(node, UIA_SelectionItem_ElementSelectedEventId) }?;
+            raised.element_selected += 1;
+        }
+    }
+    if old.checked != new.checked {
+        raise_property(
+            node,
+            UIA_ToggleToggleStatePropertyId,
+            toggle_of(old.checked),
+            toggle_of(new.checked),
+            raised,
+        )?;
+    }
+    if old.expanded != new.expanded {
+        raise_property(
+            node,
+            UIA_ExpandCollapseExpandCollapseStatePropertyId,
+            expand_of(old.expanded),
+            expand_of(new.expanded),
+            raised,
+        )?;
+    }
+    if let (Some(before), Some(after)) = (old.range, new.range)
+        && before != after
+    {
+        raise_property(
+            node,
+            UIA_RangeValueValuePropertyId,
+            VARIANT::from(before),
+            VARIANT::from(after),
+            raised,
+        )?;
+    }
+    Ok(())
 }
 
 /// Where keyboard focus is, as a client should hear it.
@@ -911,6 +1095,8 @@ pub struct Accessibility {
     tracker: RefCell<EventTracker>,
     last_focus: Cell<Option<Focus>>,
     last_shape: Cell<Option<u64>>,
+    last_states: RefCell<Option<HashMap<WidgetId, SeenWidget>>>,
+    last_document_name: RefCell<Option<String>>,
     closed: Cell<bool>,
 }
 
@@ -932,13 +1118,16 @@ impl Accessibility {
             ui: Arc::new(WindowThread::new(window, host)),
             nodes: Mutex::new(None),
         });
-        let root: IRawElementProviderSimple = ComObject::new(Root {
+        let made = ComObject::new(Root {
             node: Node {
                 shared: shared.clone(),
                 target: Target::Root,
             },
-        })
-        .to_interface();
+        });
+        crate::abi::root_simple::protect(&made.to_interface());
+        crate::abi::root_fragment::protect(&made.to_interface());
+        crate::abi::root_face::protect(&made.to_interface());
+        let root: IRawElementProviderSimple = made.to_interface();
         if let Ok(mut nodes) = shared.nodes.lock() {
             *nodes = Some(CachedNodes {
                 root: root.clone(),
@@ -951,6 +1140,8 @@ impl Accessibility {
             tracker: RefCell::default(),
             last_focus: Cell::new(None),
             last_shape: Cell::new(None),
+            last_states: RefCell::new(None),
+            last_document_name: RefCell::new(None),
             closed: Cell::new(false),
         }
     }
@@ -1005,8 +1196,8 @@ impl Accessibility {
         }
         Ok(flags)
     }
-    /// It raises a focus event if focus moved, and a structure event if the tree's shape
-    /// changed.
+    /// It raises a focus event if focus moved, a structure event if the shape of the tree
+    /// changed, and an event for each change a client can read in a widget.
     pub fn widgets_changed(&self) -> Result<WidgetEvents> {
         let listening = unsafe { UiaClientsAreListening() }.as_bool();
         self.widgets_changed_when(listening)
@@ -1016,6 +1207,8 @@ impl Accessibility {
         if !listening {
             self.last_focus.set(None);
             self.last_shape.set(None);
+            self.last_states.replace(None);
+            self.last_document_name.replace(None);
             return Ok(WidgetEvents::default());
         }
         let host = self.shared.ui.host_here()?;
@@ -1058,16 +1251,50 @@ impl Accessibility {
                 Focus::Nowhere => {}
             }
         }
+        let mut states = HashMap::new();
+        remember(&root, &mut states);
+        let before = self.last_states.replace(Some(states.clone()));
+        if let Some(before) = before {
+            for (id, new) in &states {
+                if let Some(old) = before.get(id)
+                    && old != new
+                {
+                    let node: IRawElementProviderSimple =
+                        make_node(&self.shared, Target::Widget(*id))?.cast()?;
+                    raise_changes(&node, old, new, &mut raised)?;
+                }
+            }
+        }
+        let document_name = host.document_widget().map(|d| d.name);
+        let last_name = self.last_document_name.replace(document_name.clone());
+        if let (Some(old), Some(new)) = (last_name, document_name)
+            && old != new
+        {
+            raise_property(
+                &self.document()?,
+                UIA_NamePropertyId,
+                VARIANT::from(old.as_str()),
+                VARIANT::from(new.as_str()),
+                &mut raised,
+            )?;
+        }
         Ok(raised)
     }
     /// Call on the window's thread. After this, every object a client holds says
-    /// UIA_E_ELEMENTNOTAVAILABLE. A second call does nothing.
+    /// UIA_E_ELEMENTNOTAVAILABLE. A second call does nothing, unless the first one failed: it
+    /// then tries again, with what it needs still in place.
     pub fn shutdown(&self) -> Result<()> {
-        if self.closed.replace(true) {
+        if self.closed.get() {
             return Ok(());
         }
         // Calls from other threads now fail at once, so nothing here waits for them.
         self.shared.ui.begin_close();
+        // UIA refuses to disconnect while a sender is waiting for this thread. A window can be
+        // closed from inside a sent message, so this lets the sender go first. A call of ours
+        // that is waiting then hears "gone", and any other sender hears 0.
+        if !SKIP_REPLY_FOR_TESTS.load(Ordering::Relaxed) && unsafe { InSendMessage() }.as_bool() {
+            let _ = unsafe { ReplyMessage(LRESULT(0)) };
+        }
         let document = self
             .shared
             .nodes
@@ -1087,19 +1314,32 @@ impl Accessibility {
                 None::<&IRawElementProviderSimple>,
             )
         };
-        let document_gone = document.map_or(Ok(()), |document| unsafe {
-            UiaDisconnectProvider(&document)
-        });
-        self.shared.nodes.lock().map_err(|_| gone())?.take();
+        if let Some(document) = document {
+            unsafe { UiaDisconnectProvider(&document) }?;
+        }
+        self.closed.set(true);
+        self.finish();
+        Ok(())
+    }
+    /// Lets go of the host and the cached objects.
+    fn finish(&self) {
+        if let Ok(mut nodes) = self.shared.nodes.lock() {
+            nodes.take();
+        }
         self.shared.ui.finish_close();
-        document_gone
     }
 }
+
+/// Lets a test reach the failure that a shutdown inside a sent message would have.
+#[doc(hidden)]
+pub static SKIP_REPLY_FOR_TESTS: AtomicBool = AtomicBool::new(false);
 
 impl Drop for Accessibility {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
             eprintln!("UI Automation did not close cleanly: {error}");
+            self.closed.set(true);
+            self.finish();
         }
     }
 }

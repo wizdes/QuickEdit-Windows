@@ -3,6 +3,7 @@
 //!
 //! Nothing here exists until a client sends WM_GETOBJECT, and nothing here runs after that
 //! unless a client calls or the host reports input.
+pub(crate) mod abi;
 pub mod clusters;
 mod com;
 pub mod events;

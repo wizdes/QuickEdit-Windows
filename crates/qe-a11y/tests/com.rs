@@ -552,9 +552,9 @@ fn bounding_rectangles_cover_only_what_shows() {
     let rects = rectangles(&word);
     assert_eq!(rects.len(), 4, "one row is one rectangle");
     assert!(rects[2] > 0.0 && rects[3] > 0.0, "{rects:?}");
-    // A caret has a place too, with a width of one pixel or so.
+    // An empty range has no rectangles, as UIA's contract says.
     let caret = range_at(&document, 2, 2);
-    assert_eq!(rectangles(&caret).len(), 4);
+    assert!(rectangles(&caret).is_empty());
     // Text off screen has no rectangles, and this must not be an error.
     let far = unsafe { doc.Clone() }.unwrap();
     unsafe { far.MoveEndpointByRange(START, &doc, END) }.unwrap();
@@ -588,7 +588,7 @@ fn no_layout_gives_no_rectangles_and_no_visible_range() {
 }
 
 #[test]
-fn range_from_point_finds_text_and_refuses_points_outside() {
+fn range_from_point_finds_text_and_takes_the_nearest_for_points_outside() {
     let window = TestWindow::from_text("hello");
     window.lay_out(400.0, 200.0);
     let ui = window.accessibility();
@@ -603,16 +603,14 @@ fn range_from_point_finds_text_and_refuses_points_outside() {
     }
     .unwrap();
     assert_eq!(ends(&hit, &doc), (0, 0));
-    assert_code(
-        unsafe {
-            text_of(&document).RangeFromPoint(UiaPoint {
-                x: -5000.0,
-                y: -5000.0,
-            })
-        },
-        -2147024809,
-        "a point outside",
-    );
+    let hit = unsafe {
+        text_of(&document).RangeFromPoint(UiaPoint {
+            x: -5000.0,
+            y: -5000.0,
+        })
+    }
+    .unwrap();
+    assert_eq!(ends(&hit, &doc), (0, 0));
 }
 
 #[test]

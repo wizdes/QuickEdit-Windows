@@ -120,6 +120,31 @@ fn a_long_query_on_a_short_range() {
     }
 }
 
+/// The second review's input, through the COM call on the window's thread: an all-a document
+/// and a half-length run of a followed by b, ignoring case.
+#[test]
+#[ignore = "A timing. Run by name, in release."]
+fn a_repetitive_ignore_case_search_on_the_window_thread() {
+    println!();
+    for size in [4096usize, 8192, 16384, 65_536] {
+        let window = TestWindow::from_text(&"a".repeat(size));
+        let ui = window.accessibility();
+        let doc = document_range(&ui.document().unwrap());
+        let query = BSTR::from(format!("{}b", "a".repeat(size / 2)).as_str());
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let began = Instant::now();
+            let answer = unsafe { doc.FindText(&query, false, true) };
+            samples.push(began.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(answer.err().map(|e| e.code().0), Some(0), "no match");
+        }
+        let worst = samples.iter().copied().fold(0.0, f64::max);
+        let middle = median(&mut samples);
+        println!("  {size} units: median {middle:.3} ms, worst {worst:.3} ms");
+        assert!(middle < 16.0, "{middle} ms is over a frame");
+    }
+}
+
 /// Through UIA, with its thread hop and the move to the window's thread.
 #[test]
 #[ignore = "A timing. Run by name, in release."]

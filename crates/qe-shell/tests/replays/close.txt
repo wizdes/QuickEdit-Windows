@@ -1,16 +1,16 @@
 # Close tabs until one is left. The test answers each request, as an owner does.
 event	0	mouse_down	380	20	left	-
 event	0	mouse_up	380	20	left	-
-expect	events	CloseTabRequested(1)
+expect	events	CloseTabRequested(TabId(2))
 expect	active	Tab 0
 expect	count	2
 event	0	mouse_down	225	20	left	-
 event	0	mouse_up	225	20	left	-
-expect	events	CloseTabRequested(1)|CloseTabRequested(0)|SelectTab(0)
+expect	events	CloseTabRequested(TabId(2))|CloseTabRequested(TabId(1))|SelectTab(TabId(3))
 expect	active	Tab 2
 expect	count	1
 event	0	mouse_down	225	20	left	-
 event	0	mouse_up	225	20	left	-
-expect	events	CloseTabRequested(1)|CloseTabRequested(0)|SelectTab(0)|CloseTabRequested(0)
+expect	events	CloseTabRequested(TabId(2))|CloseTabRequested(TabId(1))|SelectTab(TabId(3))|CloseTabRequested(TabId(3))
 expect	active	Untitled
 expect	count	1

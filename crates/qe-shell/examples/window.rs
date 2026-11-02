@@ -21,8 +21,8 @@ fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     window.set_event_handler(|handle, event| {
         let result = match event {
-            ShellEvent::NewTab => handle.add_tab(Tab::new("Untitled")),
-            ShellEvent::CloseTabRequested(index) => handle.close_tab(index),
+            ShellEvent::NewTab => handle.add_tab(Tab::new("Untitled")).map(|_| ()),
+            ShellEvent::CloseTabRequested(id) => handle.close_tab(id),
             ShellEvent::CloseWindowRequested => handle.destroy(),
             ShellEvent::WindowDestroyed => {
                 quit_message_loop(0);

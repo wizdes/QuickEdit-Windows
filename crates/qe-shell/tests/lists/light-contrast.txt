@@ -3,13 +3,13 @@ fill 0.000,0.000,800.000,40.000 #010203ff
 push-clip 0.000,0.000,480.000,40.000
 round 0.000,8.000,240.000,40.000 8.000 #1aebffff
 text 16.000,28.000 "Segoe UI" 13.000 #040506ff "Tab 0"
-icon 220.500,28.000 "E8BB" 10.000 #040506ff
+icon 221.000,28.000 "E8BB" 10.000 #040506ff
 text 256.000,28.000 "Segoe UI" 13.000 #fafbfcff "Tab 1"
-icon 460.500,28.000 "E8BB" 10.000 #fafbfcff
+icon 461.000,28.000 "E8BB" 10.000 #fafbfcff
 pop-clip
 icon 492.000,28.000 "E710" 12.000 #fafbfcff
-icon 524.000,28.000 "E96E" 12.000 #fafbfcff
+icon 522.000,28.000 "E96E" 9.000 #fafbfcff
 fill 511.000,12.000,1.000,24.000 #fafbfcff
-icon 681.500,24.000 "E921" 10.000 #fafbfcff
-icon 727.500,24.000 "E922" 10.000 #fafbfcff
-icon 773.500,24.000 "E8BB" 10.000 #fafbfcff
+icon 682.000,24.000 "EF2D" 10.000 #fafbfcff
+icon 728.000,24.000 "EF2E" 10.000 #fafbfcff
+icon 774.000,24.000 "EF2C" 10.000 #fafbfcff

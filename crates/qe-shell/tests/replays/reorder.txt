@@ -2,10 +2,10 @@
 event	0	mouse_down	100	20	left	-
 event	0	mouse_move	500	20
 event	0	mouse_up	500	20	left	-
-expect	events	ReorderTab { from: 0, to: 2 }
+expect	events	ReorderTab { tab: TabId(1), to: 2 }
 expect	active	Tab 0
 event	0	mouse_down	580	20	left	-
 event	0	mouse_up	580	20	left	-
-expect	events	ReorderTab { from: 0, to: 2 }|CloseTabRequested(2)|SelectTab(1)
+expect	events	ReorderTab { tab: TabId(1), to: 2 }|CloseTabRequested(TabId(1))|SelectTab(TabId(3))
 expect	active	Tab 2
 expect	count	2

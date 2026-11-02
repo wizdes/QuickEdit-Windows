@@ -1,20 +1,26 @@
 //! Hidden windows only. Every test ends by checking that its window never showed.
 use qe_api::{
-    Bitmap, Dip, DisplayList, PixelRect, Rect, RenderError, Renderer, Theme, ThemeKind, View,
+    Bitmap, Color, CommandId, Dip, DisplayList, DrawCommand, InputKind, Modifiers, MouseButton,
+    MouseCursor, PixelRect, Rect, RenderError, Renderer, Theme, ThemeKind, View, ViewRequest,
 };
 use qe_render::BitmapRenderer;
 use qe_shell::{
-    AutoHideEdges, CaptionHit, FrameMode, ShellError, ShellEvent, ShellWindow, Tab, TabStrip,
-    WindowConfig, apply_autohide, theme_from_status,
+    AutoHideEdges, CaptionHit, ContrastColors, FrameMode, KeyBinding, KeyTable, ShellAction,
+    ShellError, ShellEvent, ShellWindow, Tab, TabStrip, TestFault, VIEW_TIMER, WindowConfig,
+    apply_autohide, color_from_colorref, theme_from_status, top_border_height,
 };
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::mem::size_of;
 use std::rc::Rc;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F11, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, SetKeyboardState, TME_LEAVE, TME_NONCLIENT, TME_QUERY, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_CONTROL, VK_F4, VK_F10, VK_F11, VK_MENU, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod support;
@@ -115,11 +121,14 @@ fn fixture_with(dpi: Option<u32>, renderer: Logged) -> Fixture {
             line_height: 17.0,
             fake_dpi: dpi,
             record_system_commands: true,
+            fault: None,
         },
         Box::new(renderer.clone()),
         Box::new(RealMeasurer),
     )
     .unwrap();
+    // A new window reports its first size. Tests start from an empty queue.
+    window.take_events().unwrap();
     Fixture {
         window,
         renderer,
@@ -128,6 +137,27 @@ fn fixture_with(dpi: Option<u32>, renderer: Logged) -> Fixture {
 }
 fn fixture(dpi: Option<u32>) -> Fixture {
     fixture_with(dpi, Logged::new())
+}
+/// Small enough at every test DPI to fit a 1024 x 768 desktop, which limits window size.
+fn small_fixture(dpi: u32, renderer: Logged) -> Fixture {
+    let window = ShellWindow::create_with(
+        WindowConfig {
+            cell_width: 2.0,
+            line_height: 5.0,
+            fake_dpi: Some(dpi),
+            record_system_commands: true,
+            fault: None,
+        },
+        Box::new(renderer.clone()),
+        Box::new(RealMeasurer),
+    )
+    .unwrap();
+    window.take_events().unwrap();
+    Fixture {
+        window,
+        renderer,
+        scale: dpi as f32 / 96.0,
+    }
 }
 impl Fixture {
     fn hwnd(&self) -> HWND {
@@ -167,8 +197,19 @@ impl Fixture {
     fn screen_at(&self, x: f32, y: f32) -> isize {
         self.screen((x * self.scale) as i32, (y * self.scale) as i32)
     }
+    /// The events a test is about. A desktop can add others: a DWM problem with no
+    /// composition, and focus that moves when `SetFocus` runs.
     fn events(&self) -> Vec<ShellEvent> {
-        self.window.take_events().unwrap()
+        self.window
+            .take_events()
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                !matches!(e, ShellEvent::Problem(_))
+                    && !matches!(e, ShellEvent::ContentInput(input)
+                        if matches!(input.kind, InputKind::Focus | InputKind::Blur))
+            })
+            .collect()
     }
     fn commands(&self) -> Vec<u32> {
         self.window.system_commands().unwrap()
@@ -226,14 +267,14 @@ fn create_removes_the_standard_title_bar_at_once() {
 
 #[test]
 fn window_size_comes_from_the_dpi_before_the_first_draw() {
-    let f = fixture(Some(144));
+    let f = small_fixture(144, Logged::new());
     let log = f.renderer.took();
     assert_eq!(log[0], "dpi 144", "{log:?}");
     assert!(!log.iter().any(|l| l == "draw"), "no draw yet: {log:?}");
     assert_eq!(f.window.dpi().unwrap(), 144);
     let (columns, rows, row): (f32, f32, f32) = (90.0, 30.0, 40.0);
-    let width = (columns * 8.0 + 138.0) * 1.5;
-    let height = (rows * 17.0 + row) * 1.5;
+    let width = (columns * 2.0 + 138.0).max(500.0) * 1.5;
+    let height = (rows * 5.0 + row) * 1.5;
     assert_eq!(f.client().right, width.ceil() as i32);
     assert_eq!(f.client().bottom, height.ceil() as i32);
     assert!(log.contains(&format!(
@@ -247,9 +288,10 @@ fn window_size_comes_from_the_dpi_before_the_first_draw() {
     let image = f.renderer.bitmap();
     assert_eq!(image.width, f.client().right as u32);
     // The 40-dip row ends at 60 pixels, not at 40.
-    let x = (500.0 * 1.5) as u32;
+    // Dips 320 is the empty part of the row in this 500-wide window.
+    let x = (320.0 * 1.5) as u32;
     assert_ne!(pixel(&image, x, 50), pixel(&image, x, 70));
-    assert_eq!(pixel(&image, x, 62), pixel(&image, x, 300));
+    assert_eq!(pixel(&image, x, 62), pixel(&image, x, 200));
 }
 
 #[test]
@@ -281,7 +323,12 @@ fn renderer_failure_is_named_and_the_frame_still_ends_and_presents() {
         message: "broken on purpose".into(),
     };
     assert_eq!(f.renderer_problems(), vec![expected.clone()]);
-    assert!(f.events().contains(&ShellEvent::Problem(expected)));
+    assert!(
+        f.window
+            .take_events()
+            .unwrap()
+            .contains(&ShellEvent::Problem(expected))
+    );
 }
 
 #[test]
@@ -331,11 +378,12 @@ fn nchittest_gives_the_right_code_at_each_dpi() {
 fn dpi_change_uses_the_suggested_rectangle_and_invalidates() {
     let f = fixture(Some(96));
     f.renderer.took();
+    // It fits a 1024 x 768 desktop, and is over the minimum size at 144 DPI.
     let suggested = RECT {
         left: 40,
         top: 50,
-        right: 1240,
-        bottom: 950,
+        right: 840,
+        bottom: 550,
     };
     let dpi = 144usize;
     f.send(
@@ -346,7 +394,7 @@ fn dpi_change_uses_the_suggested_rectangle_and_invalidates() {
     let outer = f.outer();
     assert_eq!(
         (outer.left, outer.top, outer.right, outer.bottom),
-        (40, 50, 1240, 950)
+        (40, 50, 840, 550)
     );
     assert_eq!(f.window.dpi().unwrap(), 144);
     let log = f.renderer.took();
@@ -443,14 +491,23 @@ fn close_is_a_request_and_the_owner_decides() {
 
     f.window.add_tab(Tab::new("Second")).unwrap();
     f.events();
-    let b = f.window.with_strip(|s| s.tab_rects()[0]).unwrap();
+    let (b, first) = f
+        .window
+        .with_strip(|s| (s.tab_rects()[0], s.tab_id(0).unwrap()))
+        .unwrap();
     let x = b.x.0 + b.width.0 - 5.0;
     f.send(WM_LBUTTONDOWN, 0, f.at(x, 20.0));
     f.send(WM_LBUTTONUP, 0, f.at(x, 20.0));
-    assert!(f.events().contains(&ShellEvent::CloseTabRequested(0)));
+    assert!(f.events().contains(&ShellEvent::CloseTabRequested(first)));
     assert_eq!(f.window.with_strip(|s| s.tabs().len()).unwrap(), 2);
-    f.window.close_tab(0).unwrap();
+    f.window.close_tab(first).unwrap();
     assert_eq!(f.window.with_strip(|s| s.tabs().len()).unwrap(), 1);
+    f.window.close_tab(first).unwrap();
+    assert_eq!(
+        f.window.with_strip(|s| s.tabs()[0].title.clone()).unwrap(),
+        "Second",
+        "a late answer changes nothing"
+    );
 }
 
 #[test]
@@ -459,7 +516,6 @@ fn many_windows_share_one_thread_and_nothing_quits_on_its_own() {
     let b = fixture(None);
     let hwnd_b = b.hwnd();
     a.window.destroy().unwrap();
-    assert!(a.events_after_destroy());
     assert_eq!(a.window.hwnd().unwrap_err(), ShellError::WindowGone);
     assert!(unsafe { IsWindow(Some(hwnd_b)) }.as_bool());
     let mut msg = MSG::default();
@@ -471,13 +527,6 @@ fn many_windows_share_one_thread_and_nothing_quits_on_its_own() {
     assert_eq!(qe_shell::run_message_loop().unwrap(), 7);
     b.send(WM_NCHITTEST, 0, 0);
 }
-impl Fixture {
-    /// The window has gone, so its queue can only be seen from a handler set earlier.
-    fn events_after_destroy(&self) -> bool {
-        self.window.take_events() == Err(ShellError::WindowGone)
-    }
-}
-
 #[test]
 fn owner_hears_about_destruction() {
     let f = fixture(None);
@@ -683,9 +732,13 @@ fn keys_and_wheel_go_to_the_content_unless_the_strip_takes_them() {
     ));
     f.window.focus_strip().unwrap();
     f.send(WM_KEYDOWN, 0x27, 0);
-    assert!(f.events().is_empty(), "the strip has focus and takes it");
+    let keys = content_events(&f);
+    assert!(
+        !keys.iter().any(|k| matches!(k, InputKind::KeyDown { .. })),
+        "the strip has focus and takes it: {keys:?}"
+    );
     f.send(WM_KEYDOWN, 0x1b, 0);
-    assert_eq!(f.events(), vec![ShellEvent::FocusContent]);
+    assert!(f.events().contains(&ShellEvent::FocusContent));
 
     let w = f.window.with_strip(|s| s.tab_rects()[0].x.0).unwrap();
     let notch_down = (-120i16 as u16 as usize) << 16;
@@ -696,7 +749,9 @@ fn keys_and_wheel_go_to_the_content_unless_the_strip_takes_them() {
     ));
     assert_eq!(f.window.with_strip(|s| s.tab_rects()[0].x.0).unwrap(), w);
     if f.window.with_strip(|s| s.overflow()).unwrap() {
-        f.window.with_strip(|s| s.select(0)).unwrap();
+        f.window
+            .with_strip(|s| s.select(s.tab_id(0).unwrap()))
+            .unwrap();
         f.events();
         let start = f.window.with_strip(|s| s.tab_rects()[0].x.0).unwrap();
         f.send(WM_MOUSEWHEEL, notch_down, f.screen_at(200.0, 20.0));
@@ -824,4 +879,798 @@ fn trait_present_and_scroll_reach_the_real_renderer() {
     renderer
         .present_rect(std::ptr::null_mut(), PixelRect::default())
         .unwrap();
+}
+
+fn content_events(f: &Fixture) -> Vec<InputKind> {
+    f.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            ShellEvent::ContentInput(input) => Some(input.kind),
+            _ => None,
+        })
+        .collect()
+}
+fn capture(f: &Fixture) -> bool {
+    let holder = unsafe { GetCapture() };
+    holder == f.hwnd()
+}
+/// Sets this thread's view of the modifier keys. No key is really pressed.
+fn hold_keys(keys: &[u16]) {
+    let mut state = [0u8; 256];
+    for key in keys {
+        state[*key as usize] = 0x80;
+    }
+    unsafe { SetKeyboardState(&state) }.unwrap();
+}
+
+#[test]
+fn a_caption_press_holds_the_mouse_until_release() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    assert!(!capture(&f));
+    f.send(
+        WM_NCLBUTTONDOWN,
+        HTMAXBUTTON as usize,
+        f.screen_at(w - 69.0, 20.0),
+    );
+    assert!(capture(&f), "held");
+    f.send(WM_LBUTTONUP, 0, f.at(w - 69.0, 20.0));
+    assert!(!capture(&f), "released");
+}
+
+#[test]
+fn hover_asks_windows_for_a_repaint() {
+    let f = fixture(None);
+    f.send(WM_PAINT, 0, 0);
+    let plus = f.window.with_strip(|s| s.split_rect().x.0 + 5.0).unwrap();
+    f.window.invalidated_rects().unwrap();
+    f.send(WM_MOUSEMOVE, 0, f.at(plus, 20.0));
+    // A hidden window keeps no update region, so `GetUpdateRect` cannot see this. The
+    // list holds only rectangles for which `InvalidateRect` itself returned success.
+    let rects = f.window.invalidated_rects().unwrap();
+    assert_eq!(rects.len(), 1, "{rects:?}");
+    let rect = rects[0];
+    assert!(rect.right - rect.left <= 40, "only the button: {rect:?}");
+    assert!(rect.bottom <= 40, "{rect:?}");
+    f.send(WM_MOUSEMOVE, 0, f.at(plus + 1.0, 20.0));
+    assert_eq!(f.window.invalidated_rects().unwrap(), vec![], "no change");
+}
+
+#[test]
+fn window_buttons_send_the_right_system_command() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    let click = |code: u32, x: f32| {
+        f.send(WM_NCLBUTTONDOWN, code as usize, f.screen_at(x, 20.0));
+        f.send(WM_LBUTTONUP, 0, f.at(x, 20.0));
+    };
+    click(HTMINBUTTON, w - 115.0);
+    assert_eq!(f.commands(), vec![SC_MINIMIZE]);
+    click(HTMAXBUTTON, w - 69.0);
+    assert_eq!(f.commands(), vec![SC_MINIMIZE, SC_MAXIMIZE]);
+    set_maximized_style(&f);
+    f.send(WM_SIZE, 0, 0);
+    let w = f.width_dips();
+    f.send(
+        WM_NCLBUTTONDOWN,
+        HTMAXBUTTON as usize,
+        f.screen_at(w - 69.0, 20.0),
+    );
+    f.send(WM_LBUTTONUP, 0, f.at(w - 69.0, 20.0));
+    assert_eq!(f.commands(), vec![SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE]);
+}
+
+/// With no test double at all: the real `SendMessageW` and `DefWindowProcW` turn the
+/// Close button into `WM_CLOSE`, and the window stays hidden and alive.
+#[test]
+fn the_close_button_reaches_wm_close_through_the_real_system_command() {
+    let window = ShellWindow::create_with(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            ..Default::default()
+        },
+        Box::new(Logged::new()),
+        Box::new(RealMeasurer),
+    )
+    .unwrap();
+    let hwnd = HWND(window.hwnd().unwrap());
+    window.take_events().unwrap();
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) }.unwrap();
+    let (x, y) = (client.right - 10, 20);
+    let mut at = POINT { x, y };
+    let _ = unsafe { ClientToScreen(hwnd, &mut at) };
+    let send = |msg: u32, w: usize, l: isize| unsafe {
+        SendMessageW(hwnd, msg, Some(WPARAM(w)), Some(LPARAM(l)));
+    };
+    send(WM_NCLBUTTONDOWN, HTCLOSE as usize, pack(at.x, at.y));
+    send(WM_LBUTTONUP, 0, pack(x, y));
+    assert!(
+        window
+            .take_events()
+            .unwrap()
+            .contains(&ShellEvent::CloseWindowRequested)
+    );
+    assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+}
+
+#[test]
+fn alt_f4_and_alt_space_reach_the_default_handler() {
+    let f = fixture(None);
+    let alt_down = 1isize << 29;
+    f.send(WM_SYSKEYDOWN, usize::from(VK_F4.0), alt_down);
+    // On an inactive window the default handler sends no command, so that this checks
+    // that the key reached it. Root's visible run checks that Alt+F4 closes the window.
+    assert!(
+        f.window
+            .default_messages()
+            .unwrap()
+            .contains(&WM_SYSKEYDOWN)
+    );
+    f.send(WM_SYSCHAR, usize::from(b' '), alt_down);
+    assert_eq!(f.commands(), vec![SC_KEYMENU], "Alt+Space");
+}
+
+#[test]
+fn alt_chords_reach_the_owner_and_alt_letters_do_not_ask_for_a_menu() {
+    let f = fixture(None);
+    let alt_down = 1isize << 29;
+    let x = 0x58usize;
+    f.send(WM_SYSKEYDOWN, x, alt_down);
+    assert!(matches!(
+        content_events(&f).as_slice(),
+        [InputKind::KeyDown {
+            virtual_key: 0x58,
+            ..
+        }]
+    ));
+    // The default handler looks for a menu here, and beeps. It must never run. The test
+    // double stops any `WM_SYSCOMMAND`, so that this test cannot make a sound either.
+    assert_eq!(f.send(WM_SYSCHAR, x, alt_down), 0);
+    assert!(!f.window.default_messages().unwrap().contains(&WM_SYSCHAR));
+    assert_eq!(f.commands(), Vec::<u32>::new());
+    f.send(WM_SYSKEYUP, x, alt_down);
+    assert!(matches!(
+        content_events(&f).as_slice(),
+        [InputKind::KeyUp {
+            virtual_key: 0x58,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn f10_and_alt_never_start_the_invisible_menu_loop() {
+    let f = fixture(None);
+    for key in [usize::from(VK_F10.0), usize::from(VK_MENU.0)] {
+        f.send(WM_SYSKEYDOWN, key, 0);
+        f.send(WM_SYSKEYUP, key, 0);
+        assert_eq!(f.commands(), Vec::<u32>::new(), "{key:#x}");
+        let log = f.window.default_messages().unwrap();
+        assert!(!log.contains(&WM_SYSKEYDOWN), "{key:#x}: {log:?}");
+        assert!(!log.contains(&WM_SYSKEYUP), "{key:#x}: {log:?}");
+    }
+    let f10 = content_events(&f);
+    assert!(
+        f10.iter().any(
+            |k| matches!(k, InputKind::KeyDown { virtual_key, .. } if *virtual_key == VK_F10.0)
+        )
+    );
+}
+
+#[test]
+fn track_mouse_event_watches_for_the_pointer_leaving() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    // The pointer is not over a hidden window, so Windows may post the leave at once.
+    let tracked = |flags: u32| {
+        let mut query = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_QUERY,
+            ..Default::default()
+        };
+        unsafe { TrackMouseEvent(&mut query) }.unwrap();
+        let live = query.hwndTrack == f.hwnd() && query.dwFlags.0 & flags == flags;
+        let mut msg = MSG::default();
+        let mut posted = false;
+        while unsafe { PeekMessageW(&mut msg, Some(f.hwnd()), 0, 0, PM_REMOVE) }.as_bool() {
+            posted |= msg.message == WM_NCMOUSELEAVE || msg.message == WM_MOUSELEAVE;
+        }
+        live || posted
+    };
+    f.send(
+        WM_NCMOUSEMOVE,
+        HTCLOSE as usize,
+        f.screen_at(w - 23.0, 20.0),
+    );
+    assert!(tracked(TME_LEAVE.0 | TME_NONCLIENT.0), "non-client");
+    f.send(WM_NCMOUSELEAVE, 0, 0);
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 300.0));
+    assert!(tracked(TME_LEAVE.0), "client");
+}
+
+/// Terminal lets these reach `DefWindowProc`, and the Snap flyout may depend on it. The
+/// test before this one asserted the opposite. Astra's review reversed it.
+#[test]
+fn ncmousemove_on_a_window_button_reaches_the_default_handler() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    let count = |f: &Fixture, msg: u32| {
+        f.window
+            .default_messages()
+            .unwrap()
+            .iter()
+            .filter(|m| **m == msg)
+            .count()
+    };
+    for (i, (code, x)) in [
+        (HTMINBUTTON, w - 115.0),
+        (HTMAXBUTTON, w - 69.0),
+        (HTCLOSE, w - 23.0),
+        (HTCAPTION, w - 200.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.send(WM_NCMOUSEMOVE, code as usize, f.screen_at(x, 20.0));
+        assert_eq!(count(&f, WM_NCMOUSEMOVE), i + 1, "{code}");
+    }
+    f.send(WM_NCMOUSELEAVE, 0, 0);
+    assert_eq!(count(&f, WM_NCMOUSELEAVE), 1);
+}
+
+#[test]
+fn both_forms_of_wm_nccalcsize_give_the_same_client_area() {
+    let f = fixture(None);
+    let start = RECT {
+        left: 100,
+        top: 100,
+        right: 900,
+        bottom: 700,
+    };
+    let mut plain = start;
+    f.send(WM_NCCALCSIZE, 0, &mut plain as *mut RECT as isize);
+    let mut position = WINDOWPOS::default();
+    let mut params = NCCALCSIZE_PARAMS {
+        rgrc: [start, start, start],
+        lppos: &mut position,
+    };
+    f.send(
+        WM_NCCALCSIZE,
+        1,
+        &mut params as *mut NCCALCSIZE_PARAMS as isize,
+    );
+    let wide = params.rgrc[0];
+    assert_eq!(
+        (plain.left, plain.top, plain.right, plain.bottom),
+        (wide.left, wide.top, wide.right, wide.bottom)
+    );
+    assert!(
+        plain.left > start.left && plain.right < start.right,
+        "side frame"
+    );
+    assert_eq!(plain.top, start.top, "no top frame");
+    assert!(plain.bottom < start.bottom, "bottom frame");
+    println!(
+        "measured: ({}, {}, {}, {}) from (100, 100, 900, 700)",
+        plain.left, plain.top, plain.right, plain.bottom
+    );
+}
+
+#[test]
+fn a_failed_wm_create_releases_the_window_state_once() {
+    let renderer = Logged::new();
+    let result = ShellWindow::create_with(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            record_system_commands: true,
+            fault: Some(TestFault::FailWmCreate),
+            ..Default::default()
+        },
+        Box::new(renderer.clone()),
+        Box::new(RealMeasurer),
+    );
+    assert!(matches!(
+        result,
+        Err(ShellError::Win32 {
+            call: "CreateWindowExW",
+            ..
+        })
+    ));
+    assert_eq!(Rc::strong_count(&renderer.log), 1, "released");
+    // A second release would free memory that is still in use, and this would crash.
+    for _ in 0..200 {
+        let _ = std::hint::black_box(vec![0u8; 512]);
+    }
+}
+
+#[test]
+fn a_colorref_is_blue_green_red() {
+    assert_eq!(
+        color_from_colorref(0x00112233),
+        Color::rgb(0x33, 0x22, 0x11)
+    );
+}
+
+#[test]
+fn minimum_size_is_for_the_client_area_at_each_dpi() {
+    for dpi in [96u32, 144] {
+        let f = fixture(Some(dpi));
+        let mut info = MINMAXINFO::default();
+        f.send(WM_GETMINMAXINFO, 0, &mut info as *mut MINMAXINFO as isize);
+        let (outer, client) = (f.outer(), f.client());
+        let frame_w = outer.right - outer.left - client.right;
+        let frame_h = outer.bottom - outer.top - client.bottom;
+        let scale = dpi as f32 / 96.0;
+        assert_eq!(
+            info.ptMinTrackSize.x - frame_w,
+            (500.0 * scale).ceil() as i32
+        );
+        assert_eq!(
+            info.ptMinTrackSize.y - frame_h,
+            (160.0 * scale).ceil() as i32
+        );
+    }
+}
+
+#[test]
+fn the_top_frame_margin_follows_terminal() {
+    let f = fixture(None);
+    assert!(
+        f.window.frame_top_margin().unwrap() > 1,
+        "the whole top frame"
+    );
+    assert_eq!(top_border_height(FrameMode::Restored), 1);
+    assert_eq!(top_border_height(FrameMode::Maximized), 0);
+    assert_eq!(top_border_height(FrameMode::FullScreen), 0);
+    set_maximized_style(&f);
+    f.send(WM_SIZE, 0, 0);
+    assert_eq!(f.window.frame_top_margin().unwrap(), 0, "maximized");
+    let g = fixture(None);
+    full_screen_key(&g, false);
+    assert_eq!(g.window.frame_top_margin().unwrap(), 0, "full screen");
+    full_screen_key(&g, false);
+    assert!(g.window.frame_top_margin().unwrap() > 1, "restored again");
+}
+
+#[test]
+fn typed_characters_reach_the_owner_and_surrogates_join() {
+    let f = fixture(None);
+    f.send(WM_CHAR, usize::from(b'a'), 0);
+    f.send(WM_CHAR, 0xd83d, 0);
+    f.send(WM_CHAR, 0xde00, 0);
+    assert_eq!(
+        content_events(&f),
+        vec![InputKind::Char('a'), InputKind::Char('\u{1f600}')]
+    );
+    f.send(WM_CHAR, 0xde00, 0);
+    assert_eq!(content_events(&f), vec![]);
+    assert!(
+        f.window
+            .problems()
+            .unwrap()
+            .contains(&ShellError::LoneSurrogate { unit: 0xde00 })
+    );
+}
+
+#[test]
+fn a_key_the_strip_takes_does_not_type_its_character() {
+    let f = fixture(None);
+    f.window.focus_strip().unwrap();
+    f.send(WM_KEYDOWN, 0x20, 0);
+    f.send(WM_CHAR, 0x20, 0);
+    f.send(WM_KEYUP, 0x20, 0);
+    let events = content_events(&f);
+    assert!(!events.contains(&InputKind::Char(' ')), "{events:?}");
+    f.send(WM_KEYDOWN, 0x41, 0);
+    f.send(WM_CHAR, usize::from(b'a'), 0);
+    assert!(content_events(&f).contains(&InputKind::Char('a')));
+}
+
+#[test]
+fn other_mouse_buttons_focus_resize_and_dpi_reach_the_owner() {
+    let f = fixture(None);
+    for (down, up, button) in [
+        (WM_RBUTTONDOWN, WM_RBUTTONUP, MouseButton::Right),
+        (WM_MBUTTONDOWN, WM_MBUTTONUP, MouseButton::Middle),
+    ] {
+        f.send(down, 0, f.at(100.0, 300.0));
+        assert!(capture(&f), "{button:?} holds the mouse");
+        f.send(up, 0, f.at(100.0, 300.0));
+        assert!(!capture(&f));
+        let events = content_events(&f);
+        assert!(matches!(&events[0], InputKind::MouseDown { button: b, .. } if *b == button));
+        assert!(matches!(&events[1], InputKind::MouseUp { button: b, .. } if *b == button));
+        // Over the row, it stays out of the text area.
+        f.send(down, 0, f.at(100.0, 20.0));
+        f.send(up, 0, f.at(100.0, 20.0));
+        assert_eq!(content_events(&f), vec![]);
+    }
+    f.send(WM_XBUTTONDOWN, 2 << 16, f.at(100.0, 300.0));
+    f.send(WM_XBUTTONUP, 2 << 16, f.at(100.0, 300.0));
+    assert!(matches!(
+        content_events(&f)[0],
+        InputKind::MouseDown {
+            button: MouseButton::X2,
+            ..
+        }
+    ));
+    f.window.take_events().unwrap();
+    f.send(WM_SETFOCUS, 0, 0);
+    f.send(WM_KILLFOCUS, 0, 0);
+    let kinds: Vec<InputKind> = f
+        .window
+        .take_events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e {
+            ShellEvent::ContentInput(input) => Some(input.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, vec![InputKind::Focus, InputKind::Blur]);
+
+    let outer = f.outer();
+    unsafe {
+        SetWindowPos(
+            f.hwnd(),
+            None,
+            0,
+            0,
+            outer.right - outer.left + 30,
+            outer.bottom - outer.top + 20,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    }
+    .unwrap();
+    let content = f.window.content_rect().unwrap();
+    assert!(content_events(&f).contains(&InputKind::Resize {
+        width: content.width,
+        height: content.height,
+    }));
+    let suggested = f.outer();
+    f.send(
+        WM_DPICHANGED,
+        144 | (144 << 16),
+        &suggested as *const RECT as isize,
+    );
+    assert!(content_events(&f).contains(&InputKind::DpiChange { dpi: 144 }));
+}
+
+#[test]
+fn ime_start_and_end_reach_the_owner() {
+    let f = fixture(None);
+    f.send(WM_IME_STARTCOMPOSITION, 0, 0);
+    f.send(WM_IME_ENDCOMPOSITION, 0, 0);
+    assert_eq!(
+        content_events(&f),
+        vec![
+            InputKind::ImeStart,
+            InputKind::ImeEnd {
+                text: String::new()
+            }
+        ]
+    );
+}
+
+#[test]
+fn the_owner_paints_the_text_area_through_the_hook() {
+    let f = fixture(None);
+    let seen = Rc::new(RefCell::new(None));
+    let log = seen.clone();
+    let hwnd = f.hwnd();
+    f.window.set_content_painter(move |list, frame| {
+        *log.borrow_mut() = Some(frame.rect);
+        // A painter holds no borrow, so that it can send messages.
+        unsafe { SendMessageW(hwnd, WM_NCHITTEST, None, Some(LPARAM(pack(200, 200)))) };
+        list.push(DrawCommand::FillRect {
+            rect: rect(0.0, 0.0, 100.0, 100.0),
+            color: Color::rgb(10, 200, 30),
+        });
+    });
+    f.window.invalidate_content().unwrap();
+    f.send(WM_PAINT, 0, 0);
+    let content = f.window.content_rect().unwrap();
+    assert_eq!(*seen.borrow(), Some(content));
+    assert_eq!(content.y.0, 40.0);
+    assert_eq!(content.height.0, f.client().bottom as f32 - 40.0);
+    let image = f.renderer.bitmap();
+    assert_eq!(pixel(&image, 50, 60), [10, 200, 30], "under the row");
+    assert_ne!(pixel(&image, 50, 30), [10, 200, 30], "clipped off the row");
+    assert_eq!(f.renderer_problems(), vec![]);
+
+    // Only the text area repaints when the owner asks.
+    f.renderer.took();
+    f.window.invalidate_content().unwrap();
+    assert_eq!(f.renderer.took(), ["invalidate"]);
+    let rects = f.window.invalidated_rects().unwrap();
+    assert!(rects.iter().all(|r| r.top >= 40), "{rects:?}");
+    f.window
+        .invalidate_rect(rect(0.0, 50.0, 10.0, 10.0))
+        .unwrap();
+    assert_eq!(f.renderer.took(), ["invalidate"]);
+}
+
+#[test]
+fn the_text_area_cursor_is_routed_and_the_row_keeps_the_arrow() {
+    let f = fixture(None);
+    let code = (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16);
+    let cursor = |id| unsafe { LoadCursorW(None, id) }.unwrap();
+    f.window.set_content_cursor(MouseCursor::IBeam).unwrap();
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 300.0));
+    assert_eq!(f.send(WM_SETCURSOR, 0, code), 1);
+    assert_eq!(unsafe { GetCursor() }, cursor(IDC_IBEAM));
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 20.0));
+    f.send(WM_SETCURSOR, 0, code);
+    assert_eq!(unsafe { GetCursor() }, cursor(IDC_ARROW));
+    f.window
+        .apply_requests(vec![ViewRequest::SetCursor(MouseCursor::Hand)])
+        .unwrap();
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 300.0));
+    f.send(WM_SETCURSOR, 0, code);
+    assert_eq!(unsafe { GetCursor() }, cursor(IDC_HAND));
+    // On the frame, the default handler picks the resize cursor.
+    f.send(WM_SETCURSOR, 0, HTLEFT as isize);
+    assert!(f.window.default_messages().unwrap().contains(&WM_SETCURSOR));
+}
+
+#[test]
+fn timers_and_run_requests_reach_the_owner() {
+    let f = fixture(None);
+    f.window.set_timer(5, 60_000).unwrap();
+    f.send(WM_TIMER, 5, 0);
+    assert_eq!(f.events(), vec![ShellEvent::Timer(5)]);
+    f.window.kill_timer(5).unwrap();
+    f.window
+        .apply_requests(vec![
+            ViewRequest::RequestTimer(60_000),
+            ViewRequest::Run(CommandId::Find),
+        ])
+        .unwrap();
+    assert_eq!(f.events(), vec![ShellEvent::RunCommand(CommandId::Find)]);
+    f.send(WM_TIMER, VIEW_TIMER as usize, 0);
+    assert_eq!(f.events(), vec![ShellEvent::Timer(VIEW_TIMER)]);
+    assert!(
+        f.window.kill_timer(VIEW_TIMER).is_err(),
+        "a view timer fires once"
+    );
+}
+
+#[test]
+fn a_selection_drag_keeps_the_mouse_over_the_row() {
+    let f = fixture(None);
+    let rest = f.row_list();
+    f.send(WM_LBUTTONDOWN, 0, f.at(100.0, 300.0));
+    assert!(capture(&f), "the text area holds the mouse");
+    f.events();
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 20.0));
+    let events = content_events(&f);
+    assert!(
+        matches!(events.as_slice(), [InputKind::MouseMove { .. }]),
+        "{events:?}"
+    );
+    assert_eq!(f.row_list(), rest, "the row does not hover meanwhile");
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 20.0));
+    assert!(matches!(
+        content_events(&f).as_slice(),
+        [InputKind::MouseUp { .. }]
+    ));
+    assert!(!capture(&f), "released");
+    // Over the row with no drag, the strip has it again.
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 20.0));
+    assert_eq!(content_events(&f), vec![]);
+
+    f.send(WM_LBUTTONDOWN, 0, f.at(100.0, 300.0));
+    f.events();
+    f.send(WM_CAPTURECHANGED, 0, 0);
+    assert_eq!(f.events(), vec![ShellEvent::ContentCaptureLost]);
+    f.send(WM_MOUSEMOVE, 0, f.at(100.0, 20.0));
+    assert_eq!(content_events(&f), vec![], "the drag is over");
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() }.unwrap();
+}
+
+#[test]
+fn changing_tabs_during_a_press_releases_the_mouse() {
+    let f = fixture(None);
+    f.send(WM_LBUTTONDOWN, 0, f.at(100.0, 20.0));
+    assert!(capture(&f));
+    f.window.add_tab(Tab::new("New")).unwrap();
+    assert!(!capture(&f), "add");
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 20.0));
+    f.send(WM_LBUTTONDOWN, 0, f.at(100.0, 20.0));
+    assert!(capture(&f));
+    let id = f.window.with_strip(|s| s.tab_id(1).unwrap()).unwrap();
+    f.window.close_tab(id).unwrap();
+    assert!(!capture(&f), "close");
+}
+
+#[test]
+fn clicking_the_text_area_takes_focus_from_the_strip() {
+    let f = fixture(None);
+    f.window.add_tab(Tab::new("Second")).unwrap();
+    f.window.focus_strip().unwrap();
+    f.events();
+    f.send(WM_LBUTTONDOWN, 0, f.at(100.0, 300.0));
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 300.0));
+    f.events();
+    f.send(WM_KEYDOWN, 0x20, 0);
+    let events = f.events();
+    assert!(
+        !events.iter().any(|e| matches!(e, ShellEvent::SelectTab(_))),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_full_screen_click_on_the_row_stays_out_of_the_text_area() {
+    let f = fixture(None);
+    full_screen_key(&f, false);
+    f.events();
+    let w = f.width_dips();
+    assert_eq!(f.hit(w - 200.0, 20.0), HTCLIENT);
+    f.send(WM_LBUTTONDOWN, 0, f.at(w - 200.0, 20.0));
+    f.send(WM_LBUTTONUP, 0, f.at(w - 200.0, 20.0));
+    assert_eq!(content_events(&f), vec![]);
+    assert!(!capture(&f));
+}
+
+#[test]
+fn f11_and_ctrl_t_come_from_a_table_the_owner_can_replace() {
+    let f = fixture(None);
+    let f11 = usize::from(VK_F11.0);
+    let plain_f11_up = |f: &Fixture| {
+        f.send(WM_KEYUP, f11, 0);
+        assert!(
+            !content_events(f)
+                .iter()
+                .any(|k| matches!(k, InputKind::KeyUp { .. })),
+            "its key-up stays with the table"
+        );
+    };
+    f.send(WM_KEYDOWN, f11, 0);
+    assert_eq!(f.window.frame_mode().unwrap(), FrameMode::FullScreen);
+    plain_f11_up(&f);
+    f.send(WM_KEYDOWN, f11, 0);
+    assert_eq!(f.window.frame_mode().unwrap(), FrameMode::Restored);
+    plain_f11_up(&f);
+    f.events();
+
+    // F11 with a modifier is another key.
+    hold_keys(&[VK_SHIFT.0]);
+    f.send(WM_KEYDOWN, f11, 0);
+    assert_eq!(f.window.frame_mode().unwrap(), FrameMode::Restored);
+    assert_eq!(content_events(&f).len(), 1, "it reaches the owner");
+
+    hold_keys(&[VK_CONTROL.0]);
+    f.send(WM_KEYDOWN, 0x54, 0);
+    f.send(WM_CHAR, 0x14, 0);
+    assert_eq!(f.events(), vec![ShellEvent::NewTab]);
+    f.send(WM_KEYUP, 0x54, 0);
+    assert_eq!(f.events(), vec![]);
+
+    // A held key does not make more tabs.
+    f.send(WM_KEYDOWN, 0x54, 1 << 30);
+    assert_eq!(f.events(), vec![]);
+
+    // The owner moves New Tab, and F11 becomes an ordinary key.
+    hold_keys(&[]);
+    f.window
+        .set_key_table(KeyTable {
+            bindings: vec![KeyBinding {
+                virtual_key: 0x71,
+                modifiers: Modifiers::default(),
+                action: ShellAction::NewTab,
+            }],
+        })
+        .unwrap();
+    f.send(WM_KEYDOWN, 0x71, 0);
+    assert_eq!(f.events(), vec![ShellEvent::NewTab]);
+    f.send(WM_KEYDOWN, f11, 0);
+    assert_eq!(f.window.frame_mode().unwrap(), FrameMode::Restored);
+    assert_eq!(content_events(&f).len(), 1);
+    hold_keys(&[VK_CONTROL.0]);
+    f.send(WM_KEYDOWN, 0x54, 0);
+    assert_eq!(content_events(&f).len(), 1, "Ctrl+T is an ordinary key now");
+    hold_keys(&[]);
+}
+
+fn contrast_colors() -> ContrastColors {
+    ContrastColors {
+        window: Color::rgb(0, 0, 0),
+        window_text: Color::rgb(255, 255, 255),
+        highlight: Color::rgb(26, 235, 255),
+        highlight_text: Color::rgb(0, 0, 0),
+        gray_text: Color::rgb(63, 242, 63),
+    }
+}
+#[test]
+fn a_change_of_only_highlight_text_or_gray_text_repaints() {
+    let f = fixture(None);
+    let colors = contrast_colors();
+    f.window.apply_theme(true, Some(colors)).unwrap();
+    f.send(WM_PAINT, 0, 0);
+    f.renderer.took();
+    f.window.apply_theme(true, Some(colors)).unwrap();
+    assert!(
+        !f.renderer.took().contains(&"invalidate_all".to_string()),
+        "nothing changed"
+    );
+    for changed in [
+        ContrastColors {
+            highlight_text: Color::rgb(9, 9, 9),
+            ..colors
+        },
+        ContrastColors {
+            gray_text: Color::rgb(9, 9, 9),
+            ..colors
+        },
+    ] {
+        f.window.apply_theme(true, Some(changed)).unwrap();
+        assert!(f.renderer.took().contains(&"invalidate_all".to_string()));
+    }
+}
+
+#[test]
+fn a_polling_owner_hears_that_the_window_is_gone() {
+    let f = fixture(None);
+    f.window.destroy().unwrap();
+    assert!(f.events().contains(&ShellEvent::WindowDestroyed));
+}
+
+#[test]
+fn a_late_failure_in_create_destroys_the_hidden_window() {
+    let renderer = Logged::new();
+    let result = ShellWindow::create_with(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            record_system_commands: true,
+            fault: Some(TestFault::AfterCreate),
+            ..Default::default()
+        },
+        Box::new(renderer.clone()),
+        Box::new(RealMeasurer),
+    );
+    assert!(result.is_err());
+    // The window owned one copy of the renderer. Only destroying it lets that copy go.
+    assert_eq!(Rc::strong_count(&renderer.log), 1, "the window is gone");
+}
+
+#[test]
+fn a_failed_move_into_full_screen_changes_nothing() {
+    let renderer = Logged::new();
+    let window = ShellWindow::create_with(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            record_system_commands: true,
+            fault: Some(TestFault::FullScreenMove),
+            ..Default::default()
+        },
+        Box::new(renderer.clone()),
+        Box::new(RealMeasurer),
+    )
+    .unwrap();
+    let hwnd = HWND(window.hwnd().unwrap());
+    let before = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_KEYDOWN,
+            Some(WPARAM(usize::from(VK_F11.0))),
+            Some(LPARAM(0)),
+        );
+    }
+    assert_eq!(window.frame_mode().unwrap(), FrameMode::Restored);
+    assert_eq!(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) }, before);
+    assert!(window.problems().unwrap().iter().any(|p| matches!(
+        p,
+        ShellError::Win32 {
+            call: "SetWindowPos",
+            ..
+        }
+    )));
 }

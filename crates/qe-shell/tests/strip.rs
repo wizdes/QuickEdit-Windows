@@ -5,8 +5,8 @@ use qe_api::{
     WidgetRole, parse_replay, run_replay,
 };
 use qe_shell::{
-    CONTENT_WIDGET, CaptionHit, ContrastColors, FrameMode, ShellEvent, ShellTokens, Tab, TabStrip,
-    caption_hit, maximized_insets,
+    CONTENT_WIDGET, CaptionHit, ContrastColors, FrameMode, ShellEvent, ShellTokens, Tab, TabId,
+    TabStrip, caption_hit, maximized_insets,
 };
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -178,14 +178,14 @@ fn maximized_has_no_top_band() {
 fn reorder_close_and_last_tab() {
     let mut s = strip(3, 800.0);
     assert_eq!(s.active(), 0);
-    s.reorder(0, 2);
+    s.reorder(s.tab_id(0).unwrap(), 2);
     assert_eq!(s.tabs()[2].title, "Tab 0");
     assert_eq!(s.active(), 2, "the active document moved with its tab");
-    s.close(2);
+    s.close(s.tab_id(2).unwrap());
     assert_eq!(s.active(), 1);
-    s.close(1);
+    s.close(s.tab_id(1).unwrap());
     assert_eq!(s.active(), 0);
-    s.close(0);
+    s.close(s.tab_id(0).unwrap());
     assert_eq!(s.tabs().len(), 1);
     assert_eq!(s.active(), 0);
 }
@@ -193,18 +193,21 @@ fn reorder_close_and_last_tab() {
 #[test]
 fn closing_left_of_active_keeps_the_document() {
     let mut s = strip(4, 800.0);
-    s.select(1);
+    s.select(s.tab_id(1).unwrap());
     s.take_events();
-    s.close(0);
+    s.close(s.tab_id(0).unwrap());
     assert_eq!(s.tabs()[s.active()].title, "Tab 1");
     assert_eq!(s.active(), 0);
     assert_eq!(s.take_events(), vec![]);
-    s.close(2);
+    s.close(s.tab_id(2).unwrap());
     assert_eq!(s.tabs()[s.active()].title, "Tab 1");
     assert_eq!(s.take_events(), vec![]);
-    s.close(0);
+    s.close(s.tab_id(0).unwrap());
     assert_eq!(s.tabs()[s.active()].title, "Tab 2");
-    assert_eq!(s.take_events(), vec![ShellEvent::SelectTab(0)]);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::SelectTab(s.tab_id(0).unwrap())]
+    );
 }
 
 #[test]
@@ -277,8 +280,8 @@ fn replay_drag_and_close() {
                 while !pending.is_empty() {
                     for e in pending {
                         log.borrow_mut().push(format!("{e:?}"));
-                        if let ShellEvent::CloseTabRequested(i) = e {
-                            s.close(i);
+                        if let ShellEvent::CloseTabRequested(id) = e {
+                            s.close(id);
                         }
                     }
                     pending = s.take_events();
@@ -336,7 +339,10 @@ fn right_arrow_and_enter_select_the_next_tab() {
     s.focus_strip();
     assert_eq!(key(&mut s, VK_RIGHT, Modifiers::default()), Handled::Yes);
     assert_eq!(key(&mut s, VK_RETURN, Modifiers::default()), Handled::Yes);
-    assert_eq!(s.take_events(), vec![ShellEvent::SelectTab(1)]);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::SelectTab(s.tab_id(1).unwrap())]
+    );
     assert_eq!(s.focused(), Some(CaptionHit::Tab(1)));
 }
 
@@ -423,7 +429,10 @@ fn overflow_tab_stops_include_scroll_buttons_and_enter_on_close_asks() {
     key(&mut s, VK_TAB, Modifiers::default());
     assert_eq!(s.focused(), Some(CaptionHit::TabClose(0)));
     key(&mut s, VK_RETURN, Modifiers::default());
-    assert_eq!(s.take_events(), vec![ShellEvent::CloseTabRequested(0)]);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(0).unwrap())]
+    );
     s.set_focused(Some(CaptionHit::Tab(39)));
     key(&mut s, VK_TAB, Modifiers::default());
     key(&mut s, VK_TAB, Modifiers::default());
@@ -450,14 +459,14 @@ fn every_focused_part_reports_focus_in_the_widget_tree() {
 fn focus_stays_right_after_close_and_reorder() {
     let mut s = strip(4, 800.0);
     s.set_focused(Some(CaptionHit::Tab(3)));
-    s.close(0);
+    s.close(s.tab_id(0).unwrap());
     assert_eq!(s.focused(), Some(CaptionHit::Tab(2)));
-    s.close(2);
+    s.close(s.tab_id(2).unwrap());
     assert_eq!(s.focused(), Some(CaptionHit::Tab(1)));
     s.set_focused(Some(CaptionHit::TabClose(0)));
-    s.reorder(0, 1);
+    s.reorder(s.tab_id(0).unwrap(), 1);
     assert_eq!(s.focused(), Some(CaptionHit::TabClose(1)));
-    s.close(1);
+    s.close(s.tab_id(1).unwrap());
     assert_eq!(s.focused(), Some(CaptionHit::Tab(0)));
     let mut wide = strip(40, 500.0);
     wide.set_focused(Some(CaptionHit::ScrollRight));
@@ -532,9 +541,9 @@ fn widening_or_closing_brings_scrolled_tabs_back() {
     assert_eq!(s.tab_rects()[0].x.0, 0.0, "widening");
 
     let mut s = strip(10, 500.0);
-    s.select(9);
+    s.select(s.tab_id(9).unwrap());
     while s.tabs().len() > 3 {
-        s.close(0);
+        s.close(s.tab_id(0).unwrap());
     }
     assert_eq!(s.tab_rects()[0].x.0, 0.0, "closing");
     assert!(!s.overflow());
@@ -549,9 +558,9 @@ fn new_selected_and_focused_tabs_scroll_into_view() {
     let mut s = strip(20, 500.0);
     s.add_tab(Tab::new("New"));
     assert!(shows(&s, 20), "new");
-    s.select(0);
+    s.select(s.tab_id(0).unwrap());
     assert!(shows(&s, 0), "selected left");
-    s.select(15);
+    s.select(s.tab_id(15).unwrap());
     assert!(shows(&s, 15), "selected right");
     s.set_focused(Some(CaptionHit::Tab(2)));
     assert!(shows(&s, 2), "focused");
@@ -564,7 +573,7 @@ fn new_selected_and_focused_tabs_scroll_into_view() {
 #[test]
 fn hidden_tabs_clip_at_the_left_scroll_button() {
     let mut s = strip(40, 500.0);
-    s.select(20);
+    s.select(s.tab_id(20).unwrap());
     let list = draw(&s, ThemeKind::Light);
     let clip = list
         .commands
@@ -589,10 +598,10 @@ fn draw_and_widgets_work_before_any_layout() {
     assert_eq!(s.tab_rects().len(), 3);
     draw(&s, ThemeKind::Dark);
     assert!(s.widgets().is_some());
-    s.close(0);
+    s.close(s.tab_id(0).unwrap());
     assert_eq!(s.tab_rects().len(), 2);
     draw(&s, ThemeKind::Light);
-    s.reorder(0, 1);
+    s.reorder(s.tab_id(0).unwrap(), 1);
     draw(&s, ThemeKind::Light);
     // A window width that arrives later still reveals the active tab.
     let mut many = TabStrip::new((0..30).map(|i| Tab::new(format!("{i}"))).collect());
@@ -613,9 +622,12 @@ fn press_tab_and_release_on_its_close_zone_does_nothing() {
     assert_eq!(s.tabs().len(), 3);
     down(&mut s, close_x, 20.0);
     up(&mut s, close_x, 20.0);
-    assert_eq!(s.take_events(), vec![ShellEvent::CloseTabRequested(1)]);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(1).unwrap())]
+    );
     assert_eq!(s.tabs().len(), 3, "the tab stays until the owner answers");
-    s.close(1);
+    s.close(s.tab_id(1).unwrap());
     assert_eq!(s.tabs().len(), 2);
 }
 
@@ -660,7 +672,7 @@ fn tear_off_clears_press_and_uses_the_row_height() {
     assert_eq!(
         s.take_events(),
         vec![ShellEvent::TearOffTab {
-            index: 0,
+            tab: s.tab_id(0).unwrap(),
             at: point(100.0, 53.0)
         }]
     );
@@ -1069,7 +1081,7 @@ fn caption_icons_request_ten_pixel_font() {
         ("E922", 10.0),
         ("E8BB", 10.0),
         ("E710", 12.0),
-        ("E96E", 12.0),
+        ("E96E", 9.0),
     ] {
         assert!(sizes.contains(&(id.to_string(), size)), "{id} at {size}");
     }
@@ -1095,4 +1107,351 @@ fn tokens_match_the_design_spec_and_the_theme() {
     assert_eq!(t.row, theme.tab_background);
     assert_eq!(t.active, theme.text_background);
     assert_eq!(t.split_width(), 63.0);
+}
+
+#[test]
+fn a_click_outside_the_strip_takes_keyboard_focus_away() {
+    let mut s = strip(2, 800.0);
+    s.focus_strip();
+    assert_eq!(down(&mut s, 400.0, 300.0).0, Handled::No);
+    assert_eq!(s.focused(), None);
+    assert_eq!(s.take_events(), vec![ShellEvent::FocusContent]);
+    up(&mut s, 400.0, 300.0);
+    assert_eq!(
+        key(&mut s, 0x20, Modifiers::default()),
+        Handled::No,
+        "Space"
+    );
+    assert_eq!(s.take_events(), vec![], "Space selected nothing");
+}
+
+#[test]
+fn a_late_answer_cannot_close_or_move_the_wrong_tab() {
+    let mut s = strip(3, 800.0);
+    let (first, second) = (s.tab_id(0).unwrap(), s.tab_id(1).unwrap());
+    let x = s.tab_rects()[1].x.0 + s.tab_width() - 5.0;
+    down(&mut s, x, 20.0);
+    up(&mut s, x, 20.0);
+    assert_eq!(s.take_events(), vec![ShellEvent::CloseTabRequested(second)]);
+    // While the owner asks "save changes?", another tab closes, and positions shift.
+    s.close(first);
+    assert_eq!(s.index_of(second), Some(0));
+    s.close(second);
+    assert_eq!(s.index_of(second), None);
+    assert_eq!(s.tabs().len(), 1);
+    assert_eq!(s.tabs()[0].title, "Tab 2", "the right tab went");
+    // A second answer finds nothing to do.
+    s.close(second);
+    s.select(second);
+    s.reorder(second, 0);
+    assert_eq!(s.tabs()[0].title, "Tab 2");
+    let id = s.add_tab(Tab::new("New"));
+    assert_eq!(s.tab_id(1), Some(id));
+    assert_ne!(id, TabId(0));
+    let last = s.tab_id(0).unwrap();
+    s.close(id);
+    s.close(last);
+    assert_ne!(
+        s.tab_id(0),
+        Some(last),
+        "the blank tab that replaces the last is new"
+    );
+}
+
+#[test]
+fn changing_tabs_during_a_press_asks_to_release_the_mouse() {
+    let mut s = strip(3, 800.0);
+    assert!(!s.take_capture_release());
+    down(&mut s, 100.0, 20.0);
+    s.add_tab(Tab::new("New"));
+    assert!(s.take_capture_release(), "add");
+    assert!(!s.take_capture_release(), "once");
+    down(&mut s, 100.0, 20.0);
+    s.close(s.tab_id(2).unwrap());
+    assert!(s.take_capture_release(), "close");
+    // With no press, nothing is asked.
+    s.add_tab(Tab::new("Other"));
+    assert!(!s.take_capture_release());
+}
+
+#[test]
+fn a_dragged_tab_reaches_a_tab_that_is_scrolled_off() {
+    let mut s = strip(20, 500.0);
+    let id = s.tab_id(0).unwrap();
+    let x = s.tab_rects()[0].x.0 + 10.0;
+    down(&mut s, x, 20.0);
+    let past = s.split_rect().x.0 - 5.0;
+    for _ in 0..19 {
+        mv(&mut s, past, 20.0);
+    }
+    assert_eq!(s.index_of(id), Some(19));
+    up(&mut s, past, 20.0);
+    let b = s.tab_rects()[19];
+    assert!(
+        b.x.0 + b.width.0 <= s.split_rect().x.0 - 20.0,
+        "it stays in view"
+    );
+    // And back to the start, over the left scroll button.
+    let x = s.tab_rects()[19].x.0 + 10.0;
+    down(&mut s, x, 20.0);
+    for _ in 0..19 {
+        mv(&mut s, 5.0, 20.0);
+    }
+    assert_eq!(s.index_of(id), Some(0));
+}
+
+#[test]
+fn hover_follows_the_tab_under_the_pointer_after_a_wheel_scroll() {
+    let mut s = strip(40, 500.0);
+    let (x, y) = (s.tab_rects()[1].x.0 + 10.0, 20.0);
+    mv(&mut s, x, y);
+    let wheel = InputKind::Wheel {
+        at: point(x, y),
+        delta_x: 0.0,
+        delta_y: -1.0,
+        modifiers: Modifiers::default(),
+    };
+    send(&mut s, wheel);
+    assert_eq!(s.hit_test(point(x, y)), CaptionHit::Tab(2));
+    let after = draw(&s, ThemeKind::Light);
+    let mut fresh = strip(40, 500.0);
+    send(
+        &mut fresh,
+        InputKind::Wheel {
+            at: point(x, y),
+            delta_x: 0.0,
+            delta_y: -1.0,
+            modifiers: Modifiers::default(),
+        },
+    );
+    mv(&mut fresh, x, y);
+    assert_eq!(
+        after,
+        draw(&fresh, ThemeKind::Light),
+        "the same as moving there"
+    );
+}
+
+#[test]
+fn an_ellipsis_never_splits_what_shows_as_one_character() {
+    // Each character is 7 wide, so that the cut lands inside each cluster in turn.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let flag = "\u{1f1fa}\u{1f1f8}";
+    let tone = "\u{1f44d}\u{1f3fd}";
+    let accent = "e\u{301}";
+    for (name, whole) in [
+        ("family", family),
+        ("flag", flag),
+        ("tone", tone),
+        ("accent", accent),
+    ] {
+        let title = whole.repeat(40);
+        for width in [
+            300.0, 320.0, 340.0, 360.0, 380.0, 400.0, 420.0, 440.0, 460.0, 480.0,
+        ] {
+            let mut s = TabStrip::new(vec![Tab::new(title.clone())]);
+            s.layout(bounds(width + 201.0), &measure());
+            let list = draw(&s, ThemeKind::Light);
+            let shown = list
+                .commands
+                .iter()
+                .find_map(|c| match c {
+                    DrawCommand::TextRun { text, .. } if text.ends_with('…') => {
+                        Some(text.trim_end_matches('…').to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name}: no ellipsis at {width}"));
+            assert_eq!(shown.len() % whole.len(), 0, "{name} at {width}: {shown:?}");
+        }
+    }
+}
+
+#[test]
+fn full_screen_row_never_gives_clicks_to_the_text_area() {
+    let mut s = strip(1, 800.0);
+    s.set_frame_mode(FrameMode::FullScreen);
+    assert_eq!(s.hit_test(point(500.0, 20.0)), CaptionHit::Drag);
+    assert_eq!(down(&mut s, 500.0, 20.0).0, Handled::Yes);
+    assert_eq!(up(&mut s, 500.0, 20.0).0, Handled::Yes);
+    assert_eq!(down(&mut s, 500.0, 40.0).0, Handled::No, "under the row");
+    assert_eq!(up(&mut s, 500.0, 40.0).0, Handled::No);
+}
+
+#[test]
+fn other_buttons_on_the_row_stay_out_of_the_text_area() {
+    let mut s = strip(1, 800.0);
+    for button in [MouseButton::Right, MouseButton::Middle] {
+        for (y, expected) in [(20.0, Handled::Yes), (300.0, Handled::No)] {
+            let at = point(100.0, y);
+            let modifiers = Modifiers::default();
+            assert_eq!(
+                send(
+                    &mut s,
+                    InputKind::MouseDown {
+                        at,
+                        button,
+                        modifiers
+                    }
+                )
+                .0,
+                expected
+            );
+            assert_eq!(
+                send(
+                    &mut s,
+                    InputKind::MouseUp {
+                        at,
+                        button,
+                        modifiers
+                    }
+                )
+                .0,
+                expected
+            );
+        }
+    }
+    assert_eq!(s.take_events(), vec![]);
+}
+
+#[test]
+fn the_quick_tab_lookup_agrees_with_a_full_scan() {
+    for (count, width) in [(1, 800.0), (3, 800.0), (40, 500.0), (10_000, 900.0)] {
+        for scrolled in [None, Some(count / 2), Some(count - 1)] {
+            let mut s = strip(count, width);
+            if let Some(i) = scrolled {
+                s.select(s.tab_id(i).unwrap());
+            }
+            let rects = s.tab_rects().to_vec();
+            let split = s.split_rect().x.0;
+            let left = if s.overflow() { 20.0 } else { 0.0 };
+            let right = if s.overflow() { split - 20.0 } else { split };
+            let mut x = left;
+            while x < right {
+                let expected = rects
+                    .iter()
+                    .position(|b| x >= b.x.0 && x < b.x.0 + b.width.0)
+                    .map_or(CaptionHit::Drag, |i| {
+                        if x >= rects[i].x.0 + rects[i].width.0 - 32.0 {
+                            CaptionHit::TabClose(i)
+                        } else {
+                            CaptionHit::Tab(i)
+                        }
+                    });
+                assert_eq!(s.hit_test(point(x, 38.0)), expected, "{count} at {x}");
+                x += 0.37;
+            }
+        }
+    }
+}
+
+#[test]
+fn the_strip_has_no_built_in_shortcut() {
+    let mut s = strip(1, 800.0);
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    assert_eq!(key(&mut s, 0x54, ctrl), Handled::No);
+    assert_eq!(
+        s.take_events(),
+        vec![],
+        "Ctrl+T lives in the window's key table"
+    );
+}
+
+fn icons(list: &DisplayList) -> Vec<String> {
+    list.commands
+        .iter()
+        .filter_map(|c| match c {
+            DrawCommand::Icon { icon_id, .. } => Some(icon_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+#[test]
+fn high_contrast_uses_terminals_own_window_button_glyphs() {
+    let mut s = strip(1, 800.0);
+    s.set_high_contrast(Some(contrast()));
+    let found = icons(&draw(&s, ThemeKind::Dark));
+    for id in ["EF2D", "EF2E", "EF2C"] {
+        assert!(found.contains(&id.to_string()), "{id}: {found:?}");
+    }
+    s.set_maximized(true);
+    assert!(icons(&draw(&s, ThemeKind::Dark)).contains(&"EF2F".to_string()));
+    s.set_high_contrast(None);
+    let normal = icons(&draw(&s, ThemeKind::Dark));
+    assert!(normal.contains(&"E923".to_string()));
+    assert!(!normal.contains(&"EF2F".to_string()));
+}
+
+#[test]
+fn the_split_button_values_come_from_winui_and_terminal() {
+    for (kind, secondary, tertiary, divider) in [
+        (ThemeKind::Light, 0x9e, 0x72, 0x0f),
+        (ThemeKind::Dark, 0xc5, 0x87, 0x12),
+    ] {
+        let t = ShellTokens::from_theme(&Theme::new(kind));
+        assert_eq!(t.caret_text.a, secondary, "TextFillColorSecondary");
+        assert_eq!(t.caret_text_pressed.a, tertiary, "TextFillColorTertiary");
+        assert_eq!(t.separator.a, divider, "ControlStrokeColorDefault");
+    }
+    // The caret's center is at x = 13 of the 31-wide part, and + stays at the center.
+    let s = strip(1, 800.0);
+    let list = draw(&s, ThemeKind::Light);
+    let at = |id: &str| {
+        list.commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::Icon { icon_id, at, .. } if icon_id == id => Some(at.x.0),
+                _ => None,
+            })
+            .unwrap()
+    };
+    // The fixed measurer gives one character 7 wide, and starts round to whole pixels.
+    let split = s.split_rect().x.0;
+    assert_eq!(at("E96E"), (split + 32.0 + 13.0 - 3.5).round());
+    assert_eq!(at("E710"), (split + 15.5 - 3.5).round());
+}
+
+#[test]
+fn split_hover_is_one_plain_fill_and_plus_covers_the_divider_column() {
+    let fills = |s: &TabStrip| -> Vec<(Rect, Rect)> {
+        let list = draw(s, ThemeKind::Light);
+        let mut out = Vec::new();
+        for pair in list.commands.windows(2) {
+            if let [
+                DrawCommand::PushClip(clip),
+                DrawCommand::RoundedRect { rect, .. },
+            ] = pair
+            {
+                out.push((*clip, *rect));
+            }
+        }
+        out.retain(|(clip, _)| clip.width.0 < 100.0);
+        out
+    };
+    let mut s = strip(1, 800.0);
+    let split = s.split_rect();
+    assert!(fills(&s).is_empty());
+    mv(&mut s, split.x.0 + 5.0, 20.0);
+    let plus = fills(&s);
+    assert_eq!(plus.len(), 1);
+    assert_eq!(plus[0].0.x.0, split.x.0);
+    assert_eq!(plus[0].0.width.0, 32.0, "over the divider column");
+    assert!(
+        plus[0].1.width.0 > 32.0,
+        "the inner corners fall outside the clip"
+    );
+    mv(&mut s, split.x.0 + 40.0, 20.0);
+    let caret = fills(&s);
+    assert_eq!(caret.len(), 1);
+    assert_eq!(caret[0].0.x.0, split.x.0 + 32.0);
+    assert_eq!(caret[0].0.width.0, 31.0);
+    assert!(caret[0].1.x.0 < split.x.0 + 32.0, "its inner corners too");
+    // The divider's column belongs to +.
+    assert_eq!(
+        s.hit_test(point(split.x.0 + 31.5, 20.0)),
+        CaptionHit::NewTab
+    );
 }

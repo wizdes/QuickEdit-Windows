@@ -79,6 +79,7 @@ pub fn render_strip(
         rect: rect(0.0, 0.0, width_dips, height_dips),
         color: theme.text_background,
     });
+    strip.set_scale(scale);
     strip.draw(&mut list, theme, &RealMeasurer);
     let mut renderer = BitmapRenderer::new(w, h).unwrap();
     renderer.set_dpi(dpi).unwrap();

@@ -2,18 +2,30 @@
 //! no window handle, so that every rule here can run in a test with no desktop.
 use crate::ShellError;
 use qe_api::*;
+use std::cell::Cell;
+
+/// Names one tab for as long as it lives. A position can change while an owner shows a
+/// "save changes?" question, and an id cannot, so a late answer cannot close another tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TabId(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tab {
     pub title: String,
     pub dirty: bool,
+    id: TabId,
 }
 impl Tab {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
             dirty: false,
+            id: TabId(0),
         }
+    }
+    /// Set when the tab joins a strip.
+    pub fn id(&self) -> TabId {
+        self.id
     }
 }
 
@@ -21,17 +33,17 @@ impl Tab {
 pub enum ShellEvent {
     NewTab,
     /// The user asked to close this tab. The tab stays until the owner calls `close`.
-    CloseTabRequested(usize),
+    CloseTabRequested(TabId),
     /// The user asked to close the window. It stays until the owner destroys it.
     CloseWindowRequested,
-    SelectTab(usize),
+    SelectTab(TabId),
     ReorderTab {
-        from: usize,
+        tab: TabId,
         to: usize,
     },
     OpenCaretList(Rect),
     TearOffTab {
-        index: usize,
+        tab: TabId,
         at: Point,
     },
     /// A window button was clicked. `ShellWindow` acts on this itself, so that an owner
@@ -41,6 +53,12 @@ pub enum ShellEvent {
     FocusContent,
     /// Input that the top row did not take, for the text area.
     ContentInput(InputEvent),
+    /// The text area held the mouse, and another window took it. A selection drag ends.
+    ContentCaptureLost,
+    /// A timer from `ShellHandle::set_timer` or `ViewRequest::RequestTimer` fired.
+    Timer(u32),
+    /// A view asked to run a command, with `ViewRequest::Run`.
+    RunCommand(CommandId),
     /// The window was destroyed. The owner quits the message loop after the last one.
     WindowDestroyed,
     Problem(ShellError),
@@ -104,6 +122,10 @@ pub struct ShellTokens {
     pub top_band: f32,
     pub icon: f32,
     pub caption_icon: f32,
+    /// The font size that gives the caret WinUI's ink of about 7.7 x 4.2.
+    pub caret_icon: f32,
+    pub caret_box: f32,
+    pub caret_right_padding: f32,
     pub focus_width: f32,
     pub drag_threshold: f32,
     pub text_inset: f32,
@@ -111,6 +133,7 @@ pub struct ShellTokens {
     pub close_box: f32,
     pub text_font_size: f32,
     pub min_window_width: f32,
+    pub min_window_height: f32,
     pub new_window_columns: f32,
     pub new_window_rows: f32,
     pub row: Color,
@@ -119,6 +142,8 @@ pub struct ShellTokens {
     pub dim: Color,
     pub button_text: Color,
     pub button_text_pressed: Color,
+    pub caret_text: Color,
+    pub caret_text_pressed: Color,
     pub caption_dim: Color,
     pub hover: Color,
     pub pressed: Color,
@@ -135,6 +160,8 @@ pub struct ShellTokens {
     pub icon_token: &'static str,
     /// Measures a 10-dip icon. 10 dips is 7.5 points.
     pub caption_icon_token: &'static str,
+    /// Measures the caret. 9 dips is 6.75 points.
+    pub caret_token: &'static str,
 }
 const fn alpha(c: Color, a: u8) -> Color {
     Color { a, ..c }
@@ -159,6 +186,9 @@ impl ShellTokens {
             top_band: 8.0,
             icon: 12.0,
             caption_icon: 10.0,
+            caret_icon: 9.0,
+            caret_box: 12.0,
+            caret_right_padding: 12.0,
             focus_width: 2.0,
             drag_threshold: 12.0,
             text_inset: 16.0,
@@ -166,6 +196,7 @@ impl ShellTokens {
             close_box: 24.0,
             text_font_size: 13.0,
             min_window_width: 500.0,
+            min_window_height: 160.0,
             new_window_columns: 90.0,
             new_window_rows: 30.0,
             row: theme.tab_background,
@@ -182,6 +213,17 @@ impl ShellTokens {
             } else {
                 alpha(theme.text, 0x9e)
             },
+            // `SplitButtonForegroundSecondary`: Terminal does not override it.
+            caret_text: if dark {
+                alpha(theme.text, 0xc5)
+            } else {
+                alpha(theme.text, 0x9e)
+            },
+            caret_text_pressed: if dark {
+                alpha(theme.text, 0x87)
+            } else {
+                alpha(theme.text, 0x72)
+            },
             caption_dim: if dark {
                 alpha(theme.text, 0x5d)
             } else {
@@ -197,7 +239,12 @@ impl ShellTokens {
             } else {
                 alpha(theme.text, 0x06)
             },
-            separator: theme.border,
+            // `ControlStrokeColorDefault`, through `SplitButtonBorderBrushDivider`.
+            separator: if dark {
+                alpha(theme.text, 0x12)
+            } else {
+                alpha(theme.text, 0x0f)
+            },
             close_hover: Color::rgb(0xc4, 0x2b, 0x1c),
             close_pressed: alpha(Color::rgb(0xc4, 0x2b, 0x1c), 230),
             close_text: Color::rgb(255, 255, 255),
@@ -211,6 +258,7 @@ impl ShellTokens {
             text_token: "Segoe UI 9.75",
             icon_token: "Segoe Fluent Icons 9",
             caption_icon_token: "Segoe Fluent Icons 7.5",
+            caret_token: "Segoe Fluent Icons 6.75",
         }
     }
     /// Replaces each color with a system color. There is no hardcoded red or white.
@@ -221,6 +269,8 @@ impl ShellTokens {
         self.dim = c.window_text;
         self.button_text = c.window_text;
         self.button_text_pressed = c.highlight_text;
+        self.caret_text = c.window_text;
+        self.caret_text_pressed = c.highlight_text;
         self.caption_dim = c.gray_text;
         self.hover = c.highlight;
         self.pressed = c.highlight;
@@ -249,7 +299,6 @@ const VK_ESCAPE: u16 = 0x1b;
 const VK_SPACE: u16 = 0x20;
 const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
-const VK_T: u16 = 0x54;
 const VK_LMENU: u16 = 0xa4;
 const VK_RMENU: u16 = 0xa5;
 
@@ -284,33 +333,72 @@ struct IconStyle {
     size: f32,
     token: &'static str,
     color: Color,
+    scale: f32,
 }
 fn icon(list: &mut DisplayList, b: Rect, code: u32, style: IconStyle, m: &dyn TextMeasurer) {
     let Some(ch) = char::from_u32(code) else {
         return;
     };
     let metrics = m.measure(ch.encode_utf8(&mut [0; 4]), style.token);
+    // WinUI's layout rounding starts a glyph on a whole pixel. A half pixel here widens
+    // the ClearType ink by one more column.
+    let at = centered(b, metrics);
+    let at = p((at.x.0 * style.scale).round() / style.scale, at.y.0);
     list.push(DrawCommand::Icon {
-        at: centered(b, metrics),
+        at,
         icon_id: format!("{code:04X}"),
         font_size: Dip(style.size),
         color: style.color,
     });
 }
+/// True when a cut before `c` would split what the eye sees as one character. This is a
+/// short form of Unicode's grapheme rules, because this crate's lock entry has no
+/// `unicode-segmentation`. It covers combining marks, variation selectors, skin tones,
+/// joined emoji, flags, keycaps and tag sequences. It does not cover Indic conjuncts or
+/// Hangul jamo, where a cut still gives valid text.
+fn joins_previous(previous: char, c: char, regional_run: usize) -> bool {
+    let code = c as u32;
+    let extends = matches!(code,
+        0x0300..=0x036f
+        | 0x0483..=0x0489
+        | 0x0591..=0x05bd
+        | 0x0610..=0x061a
+        | 0x064b..=0x065f
+        | 0x1ab0..=0x1aff
+        | 0x1dc0..=0x1dff
+        | 0x200c..=0x200d
+        | 0x20d0..=0x20ff
+        | 0xfe00..=0xfe0f
+        | 0xfe20..=0xfe2f
+        | 0x1f3fb..=0x1f3ff
+        | 0xe0020..=0xe007f
+        | 0xe0100..=0xe01ef);
+    let flag = matches!(code, 0x1f1e6..=0x1f1ff) && regional_run % 2 == 1;
+    extends || flag || previous == '\u{200d}'
+}
+/// The longest start of `title` that fits with an ellipsis, cut between whole characters.
 fn ellipsis(title: &str, max: f32, measure: &dyn TextMeasurer, font: &str) -> String {
     if measure.measure(title, font).width.0 <= max {
         return title.into();
     }
-    let mut out = String::new();
-    for ch in title.chars() {
-        let candidate = format!("{out}{ch}…");
-        if measure.measure(&candidate, font).width.0 > max {
-            break;
+    let mut best = 0;
+    let mut previous = '\0';
+    let mut regional_run = 0;
+    for (at, c) in title.char_indices() {
+        if at > 0 && !joins_previous(previous, c, regional_run) {
+            if measure.measure(&format!("{}…", &title[..at]), font).width.0 > max {
+                break;
+            }
+            best = at;
         }
-        out.push(ch);
+        regional_run = if matches!(c as u32, 0x1f1e6..=0x1f1ff) {
+            regional_run + 1
+        } else {
+            0
+        };
+        previous = c;
     }
-    out.push('…');
-    out
+    format!("{}…", &title[..best])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +436,9 @@ pub struct TabStrip {
     capturing: bool,
     alt_armed: bool,
     reveal_on_layout: bool,
+    release_capture: bool,
+    next_id: u64,
+    scale: Cell<f32>,
     events: Vec<ShellEvent>,
 }
 impl TabStrip {
@@ -376,8 +467,14 @@ impl TabStrip {
             capturing: false,
             alt_armed: false,
             reveal_on_layout: true,
+            release_capture: false,
+            next_id: 0,
+            scale: Cell::new(1.0),
             events: Vec::new(),
         };
+        for i in 0..out.tabs.len() {
+            out.tabs[i].id = out.new_id();
+        }
         out.arrange();
         out
     }
@@ -387,11 +484,38 @@ impl TabStrip {
     pub fn tabs_mut(&mut self) -> &mut [Tab] {
         &mut self.tabs
     }
-    pub fn add_tab(&mut self, tab: Tab) {
+    fn new_id(&mut self) -> TabId {
+        self.next_id += 1;
+        TabId(self.next_id)
+    }
+    pub fn add_tab(&mut self, mut tab: Tab) -> TabId {
+        tab.id = self.new_id();
+        let id = tab.id;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.clear_pointer();
         self.reveal(self.active);
+        id
+    }
+    /// The position of a tab now, or nothing if it has closed.
+    pub fn index_of(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+    pub fn tab_id(&self, index: usize) -> Option<TabId> {
+        self.tabs.get(index).map(Tab::id)
+    }
+    /// Device pixels per dip, so that icons can start on a whole pixel.
+    pub fn set_scale(&self, scale: f32) {
+        self.scale.set(scale);
+    }
+    /// True once if a change to the tabs ended a press that held the mouse. The window
+    /// then releases capture, because no button-up will reach the press.
+    pub fn take_capture_release(&mut self) -> bool {
+        std::mem::take(&mut self.release_capture)
+    }
+    /// A key table used this key, so that Alt was not alone.
+    pub fn disarm_alt(&mut self) {
+        self.alt_armed = false;
     }
     pub fn active(&self) -> usize {
         self.active
@@ -466,18 +590,30 @@ impl TabStrip {
     pub fn take_events(&mut self) -> Vec<ShellEvent> {
         std::mem::take(&mut self.events)
     }
-    pub fn select(&mut self, index: usize) {
+    pub fn select(&mut self, id: TabId) {
+        if let Some(index) = self.index_of(id) {
+            self.select_index(index);
+        }
+    }
+    fn select_index(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active = index;
             self.reveal(index);
-            self.events.push(ShellEvent::SelectTab(index));
+            self.events.push(ShellEvent::SelectTab(self.tabs[index].id));
         }
     }
-    pub fn reorder(&mut self, from: usize, to: usize) {
+    /// Moves a tab to this position. A tab that has closed does nothing.
+    pub fn reorder(&mut self, id: TabId, to: usize) {
+        if let Some(from) = self.index_of(id) {
+            self.reorder_index(from, to);
+        }
+    }
+    fn reorder_index(&mut self, from: usize, to: usize) {
         if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
         let tab = self.tabs.remove(from);
+        let id = tab.id;
         self.tabs.insert(to, tab);
         let moved = |i: usize| {
             if i == from {
@@ -498,18 +634,20 @@ impl TabStrip {
         };
         self.hover = CaptionHit::None;
         self.reveal(to);
-        self.events.push(ShellEvent::ReorderTab { from, to });
+        self.events.push(ShellEvent::ReorderTab { tab: id, to });
     }
-    /// Removes a tab. The owner calls this after it answers `CloseTabRequested`. The
-    /// same document stays active unless the active tab itself goes, and then
-    /// `SelectTab` names the new one. The last tab turns into a new blank tab.
-    pub fn close(&mut self, index: usize) {
-        if index >= self.tabs.len() {
+    /// Removes a tab. The owner calls this after it answers `CloseTabRequested`. An id
+    /// that has already closed does nothing. The same document stays active unless the
+    /// active tab itself goes, and then `SelectTab` names the new one. The last tab
+    /// turns into a new blank tab.
+    pub fn close(&mut self, id: TabId) {
+        let Some(index) = self.index_of(id) else {
             return;
-        }
+        };
         self.clear_pointer();
         if self.tabs.len() == 1 {
             self.tabs[0] = Tab::new("Untitled");
+            self.tabs[0].id = self.new_id();
             self.active = 0;
             self.arrange();
             return;
@@ -520,7 +658,8 @@ impl TabStrip {
             self.active -= 1;
         } else if index == self.active {
             self.active = self.active.min(last);
-            self.events.push(ShellEvent::SelectTab(self.active));
+            self.events
+                .push(ShellEvent::SelectTab(self.tabs[self.active].id));
         }
         let after = |i: usize| {
             if i > index {
@@ -572,13 +711,20 @@ impl TabStrip {
                 return hit;
             }
         }
-        // The 1-dip separator between the two parts belongs to the split button too.
-        if inside(at, self.split) {
-            return CaptionHit::Caret;
-        }
-        if x >= self.clip_start() && x < self.clip_end() {
-            for (i, b) in self.tab_rects.iter().enumerate() {
-                if inside(at, *b) {
+        if x >= self.clip_start()
+            && x < self.clip_end()
+            && let Some(first) = self.tab_rects.first()
+        {
+            // All tabs have one width, so the position gives the tab with no scan. A move
+            // costs the same with 3 tabs or 10,000. Rounding can land one tab off.
+            let guess = ((x - first.x.0) / self.tab_width).floor() as isize;
+            for i in [guess, guess - 1, guess + 1] {
+                let Ok(i) = usize::try_from(i) else {
+                    continue;
+                };
+                if let Some(b) = self.tab_rects.get(i)
+                    && inside(at, *b)
+                {
                     return if x >= b.x.0 + b.width.0 - t.close_width {
                         CaptionHit::TabClose(i)
                     } else {
@@ -594,6 +740,7 @@ impl TabStrip {
     pub fn cancel_pointer(&mut self, ctx: &mut ViewContext) {
         if self.capturing {
             ctx.capture_mouse(false);
+            self.capturing = false;
         }
         if self.pressed != CaptionHit::None {
             ctx.invalidate(self.part_rect(self.pressed));
@@ -616,6 +763,9 @@ impl TabStrip {
         self.cancel_pointer(ctx);
     }
     fn clear_pointer(&mut self) {
+        if self.capturing {
+            self.release_capture = true;
+        }
         self.hover = CaptionHit::None;
         self.pressed = CaptionHit::None;
         self.drag = None;
@@ -648,7 +798,13 @@ impl TabStrip {
             CaptionHit::Tab(i) | CaptionHit::TabClose(i) => {
                 self.tab_rects.get(i).copied().unwrap_or_default()
             }
-            CaptionHit::NewTab => r(self.split.x.0, self.split.y.0, t.split_part, t.split_height),
+            // WinUI's `PrimaryBackgroundGrid` spans the divider's column too.
+            CaptionHit::NewTab => r(
+                self.split.x.0,
+                self.split.y.0,
+                t.split_part + t.separator_width,
+                t.split_height,
+            ),
             CaptionHit::Caret => r(
                 self.split.x.0 + t.split_part + t.separator_width,
                 self.split.y.0,
@@ -870,8 +1026,12 @@ impl TabStrip {
         match hit {
             CaptionHit::NewTab => self.events.push(ShellEvent::NewTab),
             CaptionHit::Caret => self.events.push(ShellEvent::OpenCaretList(self.split)),
-            CaptionHit::Tab(i) => self.select(i),
-            CaptionHit::TabClose(i) => self.events.push(ShellEvent::CloseTabRequested(i)),
+            CaptionHit::Tab(i) => self.select_index(i),
+            CaptionHit::TabClose(i) => {
+                if let Some(id) = self.tab_id(i) {
+                    self.events.push(ShellEvent::CloseTabRequested(id));
+                }
+            }
             CaptionHit::ScrollLeft => self.scroll_by(-1),
             CaptionHit::ScrollRight => self.scroll_by(1),
             CaptionHit::Minimize | CaptionHit::Maximize | CaptionHit::Close => {
@@ -893,18 +1053,33 @@ impl TabStrip {
         self.set_hover(hit, ctx);
         if let Some(drag) = self.drag {
             if (at.y.0 - drag.start.y.0).abs() > self.row_height() {
-                self.events.push(ShellEvent::TearOffTab {
-                    index: drag.index,
-                    at,
-                });
+                if let Some(tab) = self.tab_id(drag.index) {
+                    self.events.push(ShellEvent::TearOffTab { tab, at });
+                }
                 self.cancel_pointer(ctx);
                 return Handled::Yes;
             }
-            if (at.x.0 - drag.start.x.0).abs() > t.drag_threshold
-                && let CaptionHit::Tab(to) | CaptionHit::TabClose(to) = hit
-                && to != drag.index
-            {
-                self.reorder(drag.index, to);
+            // Past the visible tabs, each move steps one place and scrolls with it, so
+            // that a dragged tab can reach a tab that is scrolled off.
+            let at_edge = if !self.overflow {
+                None
+            } else if at.x.0 < self.clip_start() {
+                drag.index.checked_sub(1)
+            } else if at.x.0 >= self.clip_end() {
+                Some(drag.index + 1).filter(|next| *next < self.tabs.len())
+            } else {
+                None
+            };
+            let target = at_edge.or(match hit {
+                CaptionHit::Tab(to) | CaptionHit::TabClose(to)
+                    if to != drag.index && (at.x.0 - drag.start.x.0).abs() > t.drag_threshold =>
+                {
+                    Some(to)
+                }
+                _ => None,
+            });
+            if let Some(to) = target {
+                self.reorder_index(drag.index, to);
                 self.drag = Some(TabDrag {
                     index: to,
                     start: at,
@@ -921,13 +1096,20 @@ impl TabStrip {
             Handled::No
         }
     }
-    fn mouse_down(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
+    fn mouse_down(&mut self, at: Point, left: bool, ctx: &mut ViewContext) -> Handled {
         let hit = self.hit_test(at);
-        if matches!(
-            hit,
-            CaptionHit::None | CaptionHit::Drag | CaptionHit::ResizeTop
-        ) {
+        if hit == CaptionHit::None {
+            // A click in the text area takes keyboard focus away from the strip.
+            if self.focused.take().is_some() {
+                self.events.push(ShellEvent::FocusContent);
+                ctx.invalidate(self.row_rect());
+            }
             return Handled::No;
+        }
+        // The rest of the row never reaches the text area, even in full screen, where
+        // its empty part is client area because a full-screen window does not move.
+        if !left || matches!(hit, CaptionHit::Drag | CaptionHit::ResizeTop) {
+            return Handled::Yes;
         }
         self.pressed = hit;
         self.hover = hit;
@@ -945,10 +1127,14 @@ impl TabStrip {
     }
     fn mouse_up(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
         let pressed = self.pressed;
-        if pressed == CaptionHit::None {
-            return Handled::No;
-        }
         let hit = self.hit_test(at);
+        if pressed == CaptionHit::None {
+            return if hit == CaptionHit::None {
+                Handled::No
+            } else {
+                Handled::Yes
+            };
+        }
         let moved = self.drag.is_some_and(|drag| drag.moved);
         ctx.invalidate(self.part_rect(pressed));
         self.drag = None;
@@ -1014,12 +1200,6 @@ impl View for TabStrip {
                 repeat,
             } => {
                 self.alt_armed = false;
-                if virtual_key == VK_T && modifiers.ctrl && !modifiers.alt && !modifiers.shift {
-                    if !repeat {
-                        self.events.push(ShellEvent::NewTab);
-                    }
-                    return Handled::Yes;
-                }
                 // Chords belong to the system and the command table.
                 if modifiers.alt || modifiers.ctrl || modifiers.win {
                     return Handled::No;
@@ -1029,17 +1209,20 @@ impl View for TabStrip {
             InputKind::MouseMove { at } => self.mouse_move(at, ctx),
             InputKind::MouseDown { at, button, .. } => {
                 self.alt_armed = false;
-                if button == MouseButton::Left {
-                    self.mouse_down(at, ctx)
-                } else {
-                    Handled::No
-                }
+                self.mouse_down(at, button == MouseButton::Left, ctx)
             }
             InputKind::MouseUp {
                 at,
                 button: MouseButton::Left,
                 ..
             } => self.mouse_up(at, ctx),
+            InputKind::MouseUp { at, .. } => {
+                if inside(at, self.row_rect()) {
+                    Handled::Yes
+                } else {
+                    Handled::No
+                }
+            }
             InputKind::Wheel {
                 at,
                 delta_x,
@@ -1055,6 +1238,8 @@ impl View for TabStrip {
                 self.wheel -= steps;
                 if self.overflow && steps != 0.0 {
                     self.scroll_by(steps as isize);
+                    // A different tab is under the pointer now.
+                    self.hover = self.hit_test(at);
                     ctx.invalidate(self.row_rect());
                 }
                 Handled::Yes
@@ -1092,9 +1277,7 @@ impl View for TabStrip {
                 self.draw_button(list, hit, code, t, measure);
             }
         }
-        for (hit, code) in [(CaptionHit::NewTab, 0xe710), (CaptionHit::Caret, 0xe96e)] {
-            self.draw_button(list, hit, code, t, measure);
-        }
+        self.draw_split(list, t, measure);
         // A fill snaps to whole pixels. A line 1 wide on a whole x would blur across two.
         list.push(DrawCommand::FillRect {
             rect: r(
@@ -1206,9 +1389,12 @@ impl TabStrip {
             row.height.0,
         )));
         let contrast = self.contrast.is_some();
-        for (i, tab) in self.tabs.iter().enumerate() {
+        for (i, tab) in self.tabs.iter().enumerate().skip(self.scroll) {
             let b = self.tab_rects[i];
-            if b.x.0 + b.width.0 <= start || b.x.0 >= end {
+            if b.x.0 >= end {
+                break;
+            }
+            if b.x.0 + b.width.0 <= start {
                 continue;
             }
             let active = i == self.active;
@@ -1321,6 +1507,7 @@ impl TabStrip {
                         size: t.caption_icon,
                         token: t.caption_icon_token,
                         color: button_ink,
+                        scale: self.scale.get(),
                     },
                     measure,
                 );
@@ -1388,6 +1575,7 @@ impl TabStrip {
                 size: t.icon,
                 token: t.icon_token,
                 color,
+                scale: self.scale.get(),
             },
             measure,
         );
@@ -1400,13 +1588,117 @@ impl TabStrip {
             });
         }
     }
+    /// WinUI's `SplitButton.xaml` and Terminal's `TabRowControl.xaml`. The fills are plain
+    /// rectangles: only the outer corners round, from the 4-radius root grid's clip. The
+    /// `+` fill spans the divider's column. The caret's 12 x 12 box is right aligned with
+    /// padding 0,0,12,0, so that its center is at x = 13 of the 31-wide part.
+    fn draw_split(&self, list: &mut DisplayList, t: ShellTokens, measure: &dyn TextMeasurer) {
+        let contrast = self.contrast.is_some();
+        let s = self.split;
+        let r_btn = t.button_radius;
+        let caret_x = s.x.0 + t.split_part + t.separator_width;
+        for (hit, clip, shape) in [
+            (
+                CaptionHit::NewTab,
+                self.part_rect(CaptionHit::NewTab),
+                r(
+                    s.x.0,
+                    s.y.0,
+                    t.split_part + t.separator_width + r_btn,
+                    t.split_height,
+                ),
+            ),
+            (
+                CaptionHit::Caret,
+                self.part_rect(CaptionHit::Caret),
+                r(caret_x - r_btn, s.y.0, t.split_part + r_btn, t.split_height),
+            ),
+        ] {
+            let look = self.look(hit);
+            if look != Look::Rest {
+                list.push(DrawCommand::PushClip(clip));
+                list.push(DrawCommand::RoundedRect {
+                    rect: shape,
+                    radius: Dip(r_btn),
+                    color: if look == Look::Pressed {
+                        t.pressed
+                    } else {
+                        t.hover
+                    },
+                });
+                list.push(DrawCommand::PopClip);
+            }
+        }
+        let plus_look = self.look(CaptionHit::NewTab);
+        icon(
+            list,
+            r(s.x.0, s.y.0, t.split_part, t.split_height),
+            0xe710,
+            IconStyle {
+                size: t.icon,
+                token: t.icon_token,
+                color: if plus_look == Look::Pressed || (contrast && plus_look == Look::Hover) {
+                    t.button_text_pressed
+                } else if self.window_active {
+                    t.button_text
+                } else {
+                    t.dim
+                },
+                scale: self.scale.get(),
+            },
+            measure,
+        );
+        let caret_look = self.look(CaptionHit::Caret);
+        icon(
+            list,
+            r(
+                caret_x + t.split_part - t.caret_right_padding - t.caret_box,
+                s.y.0 + (t.split_height - t.caret_box) / 2.0,
+                t.caret_box,
+                t.caret_box,
+            ),
+            0xe96e,
+            IconStyle {
+                size: t.caret_icon,
+                token: t.caret_token,
+                color: match caret_look {
+                    Look::Pressed => t.caret_text_pressed,
+                    Look::Hover if contrast => t.caret_text_pressed,
+                    Look::Hover => t.button_text,
+                    Look::Rest if self.window_active => t.caret_text,
+                    Look::Rest => t.dim,
+                },
+                scale: self.scale.get(),
+            },
+            measure,
+        );
+        for hit in [CaptionHit::NewTab, CaptionHit::Caret] {
+            if self.focused == Some(hit) {
+                list.push(DrawCommand::StrokeRect {
+                    rect: self.part_rect(hit),
+                    radius: Dip(r_btn),
+                    width: Dip(t.focus_width),
+                    color: t.focus,
+                });
+            }
+        }
+    }
     fn draw_caption(&self, list: &mut DisplayList, t: ShellTokens, measure: &dyn TextMeasurer) {
         let restore = self.mode != FrameMode::Restored;
         let contrast = self.contrast.is_some();
+        // `MinMaxCloseControl.xaml`: high contrast has its own heavier glyphs.
+        let (minimize, maximize, restore_glyph, close) = if contrast {
+            (0xef2d, 0xef2e, 0xef2f, 0xef2c)
+        } else {
+            (0xe921, 0xe922, 0xe923, 0xe8bb)
+        };
         for (hit, code) in [
-            (CaptionHit::Minimize, 0xe921),
-            (CaptionHit::Maximize, if restore { 0xe923 } else { 0xe922 }),
-            (CaptionHit::Close, 0xe8bb),
+            (CaptionHit::Minimize, minimize),
+            (
+                CaptionHit::Maximize,
+                if restore { restore_glyph } else { maximize },
+            ),
+            (CaptionHit::Close, close),
         ] {
             let b = self.part_rect(hit);
             let look = self.look(hit);
@@ -1436,6 +1728,7 @@ impl TabStrip {
                     size: t.caption_icon,
                     token: t.caption_icon_token,
                     color,
+                    scale: self.scale.get(),
                 },
                 measure,
             );

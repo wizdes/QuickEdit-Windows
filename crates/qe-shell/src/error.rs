@@ -18,6 +18,8 @@ pub enum ShellError {
     /// A message arrived while the window's state was in use, so it took the default
     /// path. An owner's `with_strip` closure must not run a dialog or a message loop.
     Reentered { message: u32 },
+    /// `WM_CHAR` gave half of a surrogate pair, with no other half. It was dropped.
+    LoneSurrogate { unit: u16 },
     /// The window no longer exists.
     WindowGone,
 }
@@ -36,6 +38,9 @@ impl fmt::Display for ShellError {
             }
             Self::Reentered { message } => {
                 write!(f, "message {message:#x} arrived while the state was in use")
+            }
+            Self::LoneSurrogate { unit } => {
+                write!(f, "WM_CHAR gave a lone surrogate {unit:#x}; it was dropped")
             }
             Self::WindowGone => f.write_str("the window no longer exists"),
         }

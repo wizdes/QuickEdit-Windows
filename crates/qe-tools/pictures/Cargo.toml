@@ -1,0 +1,25 @@
+# Pictures of the tools through the real renderer. This is its own workspace with its own
+# lock file because the root Cargo.lock lists no qe-render for qe-tools, and only root edits
+# that file. Run: cargo test --manifest-path crates/qe-tools/pictures/Cargo.toml --locked
+# with CARGO_TARGET_DIR set to the repo's target folder.
+[package]
+name = "qe-tools-pictures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dev-dependencies]
+qe-api = { path = "../../qe-api" }
+qe-editor = { path = "../../qe-editor" }
+qe-layout = { path = "../../qe-layout" }
+qe-render = { path = "../../qe-render" }
+qe-tools = { path = ".." }
+qe-ui = { path = "../../qe-ui" }
+
+[profile.dev]
+debug = 0

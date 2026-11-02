@@ -13,3 +13,6 @@ qe-api.workspace = true
 qe-ui.workspace = true
 qe-editor.workspace = true
 windows.workspace = true
+
+[dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }

@@ -14,6 +14,7 @@ license = "MIT"
 [workspace.dependencies]
 windows = { version = "=0.62.2", default-features = false }
 windows-core = "0.62"
+unicode-segmentation = "=1.12.0"
 qe-api = { path = "crates/qe-api" }
 qe-buffer = { path = "crates/qe-buffer" }
 qe-codec = { path = "crates/qe-codec" }

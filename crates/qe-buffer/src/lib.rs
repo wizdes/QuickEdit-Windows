@@ -8,12 +8,14 @@
 //!   truncating the file.
 use qe_api::{
     ByteOffset, EditError, LineIndex, TextChange, TextPosition, TextSnapshot, TextStore,
-    Utf16Offset,
+    TrackedChange, Utf16Change, Utf16Offset,
 };
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(windows)]
+mod hash;
 #[cfg(windows)]
 mod mapped;
 mod measure;
@@ -143,17 +145,32 @@ impl PieceStore {
             revision: self.revision,
         }
     }
+    /// The UTF-16 offset of a byte on a character edge.
+    pub(crate) fn utf16_at(&self, at: usize) -> Utf16Offset {
+        if at == 0 {
+            return Utf16Offset(0);
+        }
+        Utf16Offset(prefix(&self.root, at).map_or(0, |s| s.units))
+    }
     /// Makes the edit and gives back the removed text as a tree. The range must
     /// have passed `check_range`.
     pub(crate) fn splice_text(
         &mut self,
         range: Range<ByteOffset>,
         text: &str,
-    ) -> (TextChange, Tree) {
+    ) -> (TrackedChange, Tree) {
         let before = self.line_count();
+        let start16 = self.utf16_at(range.start.0).0;
         let (left, rest) = split(self.root.clone(), range.start.0);
         let (removed, right) = split(rest, range.end.0 - range.start.0);
-        self.root = splice(left, from_text(text), right);
+        let middle = from_text(text);
+        let new_units = units_of(&middle);
+        let utf16 = Utf16Change {
+            start: Utf16Offset(start16),
+            old_end: Utf16Offset(start16 + units_of(&removed)),
+            new_end: Utf16Offset(start16 + new_units),
+        };
+        self.root = splice(left, middle, right);
         self.revision += 1;
         self.stamp = fresh_stamp();
         let change = TextChange {
@@ -162,7 +179,7 @@ impl PieceStore {
             line_count_delta: self.line_count() as isize - before as isize,
             revision: self.revision,
         };
-        (change, removed)
+        (TrackedChange { change, utf16 }, removed)
     }
     /// Swaps each edit with the text in the document, on a copy of the root. The
     /// store changes only when every edit worked.
@@ -170,7 +187,7 @@ impl PieceStore {
         &mut self,
         edits: &[Edit],
         backwards: bool,
-    ) -> Result<(Vec<Edit>, Vec<TextChange>), EditError> {
+    ) -> Result<(Vec<Edit>, Vec<TrackedChange>), EditError> {
         let mut root = self.root.clone();
         let mut revision = self.revision;
         let mut swapped = Vec::with_capacity(edits.len());
@@ -182,16 +199,29 @@ impl PieceStore {
                 return Err(EditError::InvalidRange);
             }
             let before = lines(&root);
+            let start16 = if e.start == 0 {
+                0
+            } else {
+                prefix(&root, e.start).map_or(0, |s| s.units)
+            };
             let (left, rest) = split(root.clone(), e.start);
             let (taken, right) = split(rest, e.len_in_doc);
+            let utf16 = Utf16Change {
+                start: Utf16Offset(start16),
+                old_end: Utf16Offset(start16 + units_of(&taken)),
+                new_end: Utf16Offset(start16 + units_of(&e.other)),
+            };
             root = splice(left, e.other.clone(), right);
             let new_len = e.other.as_ref().map_or(0, |n| n.sum.bytes);
             revision += 1;
-            changes.push(TextChange {
-                replaced: ByteOffset(e.start)..ByteOffset(end),
-                new_len,
-                line_count_delta: lines(&root) - before,
-                revision,
+            changes.push(TrackedChange {
+                change: TextChange {
+                    replaced: ByteOffset(e.start)..ByteOffset(end),
+                    new_len,
+                    line_count_delta: lines(&root) - before,
+                    revision,
+                },
+                utf16,
             });
             swapped.push(Edit {
                 start: e.start,
@@ -211,6 +241,10 @@ impl PieceStore {
         self.stamp = fresh_stamp();
         Ok((swapped, changes))
     }
+}
+
+fn units_of(tree: &Tree) -> usize {
+    tree.as_ref().map_or(0, |n| n.sum.units)
 }
 
 impl TextSnapshot for PieceStore {
@@ -299,6 +333,22 @@ impl TextSnapshot for PieceStore {
             return false;
         }
         if let Some(n) = &self.root {
+            visit(n, range.start.0, range.end.0, &mut |s| {
+                f(s);
+                true
+            });
+        }
+        true
+    }
+    fn visit_chunks_while(
+        &self,
+        range: Range<ByteOffset>,
+        f: &mut dyn FnMut(&str) -> bool,
+    ) -> bool {
+        if self.check_range(&range).is_err() {
+            return false;
+        }
+        if let Some(n) = &self.root {
             visit(n, range.start.0, range.end.0, f);
         }
         true
@@ -320,6 +370,6 @@ impl TextStore for PieceStore {
         if range.start == range.end && text.is_empty() {
             return Ok(self.no_change(range));
         }
-        Ok(self.splice_text(range, text).0)
+        Ok(self.splice_text(range, text).0.change)
     }
 }

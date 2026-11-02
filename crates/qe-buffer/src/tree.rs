@@ -253,19 +253,21 @@ pub(crate) fn is_boundary(tree: &Tree, mut at: usize) -> bool {
     }
 }
 
-pub(crate) fn visit(n: &Node, start: usize, end: usize, f: &mut dyn FnMut(&str)) {
+/// Gives each chunk to `f` in order. Returns false as soon as `f` does.
+pub(crate) fn visit(n: &Node, start: usize, end: usize, f: &mut dyn FnMut(&str) -> bool) -> bool {
     if start >= end {
-        return;
+        return true;
     }
     match &n.kind {
         Kind::Leaf(text) => f(&text[start..end]),
         Kind::Branch(l, r) => {
-            if start < l.sum.bytes {
-                visit(l, start, end.min(l.sum.bytes), f);
+            if start < l.sum.bytes && !visit(l, start, end.min(l.sum.bytes), f) {
+                return false;
             }
             if end > l.sum.bytes {
-                visit(r, start.saturating_sub(l.sum.bytes), end - l.sum.bytes, f);
+                return visit(r, start.saturating_sub(l.sum.bytes), end - l.sum.bytes, f);
             }
+            true
         }
     }
 }

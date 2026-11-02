@@ -66,9 +66,10 @@ fn run(folder: &Path, name: &str, line: &str) {
         let t = store.index_timing();
         println!(
             "round {round}: open {open:?}, open + 50 lines + {chars} bytes read {first_screen:?}, \
-             utf16_to_byte(5) {small:?}, index {index:?} (read {:.3} s, validate {:.3} s, \
+             utf16_to_byte(5) {small:?}, index {index:?} (read {:.3} s, hash {:.3} s, validate {:.3} s, \
              measure {:.3} s, check {:.3} s), index memory {} bytes",
             t.read as f64 / 1e9,
+            t.hash as f64 / 1e9,
             t.validate as f64 / 1e9,
             t.measure as f64 / 1e9,
             t.check as f64 / 1e9,
@@ -121,6 +122,56 @@ fn run(folder: &Path, name: &str, line: &str) {
             store.file_checks() - checks_before,
             all.elapsed(),
             count * 3
+        );
+        // One painted frame of 60 lines, from memory, somewhere in the file.
+        let mut frames = Vec::with_capacity(200);
+        let mut misses = 0;
+        for _ in 0..200 {
+            let first = next() % (lines - 70);
+            let run = |store: &MappedStore| -> bool {
+                let mut all = true;
+                for n in first..first + 60 {
+                    match store.try_line_range(LineIndex(n)) {
+                        Ok(range) => {
+                            let mut bytes = 0;
+                            all &= store
+                                .try_visit_chunks(range, &mut |s| bytes += s.len())
+                                .is_ok();
+                            std::hint::black_box(bytes);
+                        }
+                        Err(_) => all = false,
+                    }
+                }
+                all
+            };
+            if !run(&store) {
+                misses += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let t = Instant::now();
+            let whole = run(&store);
+            let took = t.elapsed();
+            if whole {
+                frames.push(took);
+            }
+        }
+        if !frames.is_empty() {
+            println!(
+                "  frame of 60 try_line_range + 60 try_visit_chunks from memory: {} ({} frames, {misses} first passes missed)",
+                sample(frames.clone()),
+                frames.len()
+            );
+        }
+        let mut try_misses = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let n = next() % lines;
+            let t = Instant::now();
+            std::hint::black_box(store.try_line_range(LineIndex(n)).is_ok());
+            try_misses.push(t.elapsed());
+        }
+        println!(
+            "  random try_line_range, hit or miss: {}",
+            sample(try_misses)
         );
         let drop_start = Instant::now();
         drop(store);

@@ -1,6 +1,6 @@
 //! Undo, redo, saved state, groups and the tree's balance rule.
 use qe_api::testing::StringStore;
-use qe_api::{ByteOffset, EditError, LineIndex, TextSnapshot, TextStore};
+use qe_api::{ByteOffset, EditError, LineIndex, TextSnapshot, TextStore, Utf16Offset};
 use qe_buffer::{PieceStore, UndoHistory};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,7 @@ fn undo_and_redo_report_what_changed() {
 #[test]
 fn the_saved_state_follows_undo_and_redo() {
     let mut store = PieceStore::new("base");
-    let mut history = UndoHistory::new();
+    let mut history = UndoHistory::for_store(&store);
     assert!(history.is_at_save_point(&store));
     history.replace(&mut store, at(4, 4), "1", true).unwrap();
     assert!(!history.is_at_save_point(&store));
@@ -297,6 +297,9 @@ fn a_key_press_after_undoing_many_steps_is_fast() {
     assert!(!history.has_memory_to_release());
 }
 
+/// Random edits with typing runs, Backspace runs, groups, undo and redo, against a
+/// plain string. The model takes its undo steps from the history's own group count,
+/// so it checks that each step restores exactly the text from before that step.
 fn random_run(seed: u64, steps: usize, keep: usize) {
     let mut rng = seed;
     let mut next = move || {
@@ -317,67 +320,128 @@ fn random_run(seed: u64, steps: usize, keep: usize) {
         "\u{85}",
         "語語語",
     ];
+    let big = "paste 語 line\r\n".repeat(400);
     let mut store = PieceStore::new("");
     let mut reference = StringStore::new("");
     let mut history = UndoHistory::new();
     let mut undone: Vec<String> = Vec::new();
-    let mut done: Vec<String> = vec![String::new()];
-    for step in 0..steps {
-        let text = reference.as_str().to_owned();
-        match next() % 12 {
-            0 if done.len() > 1 => {
-                history.undo(&mut store).unwrap();
-                undone.push(done.pop().unwrap());
-                reference = StringStore::new(done.last().unwrap().clone());
-            }
-            1 if !undone.is_empty() => {
-                history.redo(&mut store).unwrap();
-                let back = undone.pop().unwrap();
-                reference = StringStore::new(back.clone());
-                done.push(back);
-            }
-            _ => {
-                let edges: Vec<usize> = text
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .chain(std::iter::once(text.len()))
-                    .collect();
-                let a = next() % edges.len();
-                let b = if next() % 3 == 0 && text.len() > keep {
-                    (a + next() % 20).min(edges.len() - 1)
-                } else {
-                    a
-                };
-                let range = at(edges[a], edges[b]);
-                let insert = if text.len() > keep {
-                    ""
-                } else {
-                    choices[next() % choices.len()]
-                };
-                if range.start == range.end && insert.is_empty() {
-                    continue;
-                }
-                history.break_group();
-                let left = history.replace(&mut store, range.clone(), insert, false);
-                let right = reference.replace(range, insert);
-                assert_eq!(
-                    left.unwrap().line_count_delta,
-                    right.unwrap().line_count_delta
-                );
-                done.push(reference.as_str().to_owned());
-                undone.clear();
-            }
-        }
+    let mut before_steps: Vec<String> = Vec::new();
+    let mut depth = 0;
+    let mut caret = 0;
+    let check = |store: &PieceStore, reference: &StringStore, step: usize| {
         store
             .check_tree()
             .unwrap_or_else(|e| panic!("seed {seed:x}, step {step}: {e}"));
-        assert_eq!(
-            text_of(&store),
-            reference.as_str(),
-            "seed {seed:x}, step {step}"
+        assert!(
+            text_of(store) == reference.as_str(),
+            "seed {seed:x}, step {step}: the text differs"
         );
         assert_eq!(store.line_count(), reference.line_count());
         assert_eq!(store.len_utf16(), reference.len_utf16());
+    };
+    for step in 0..steps {
+        let text = reference.as_str().to_owned();
+        let roll = next() % 40;
+        if roll == 0 && depth == 0 && !before_steps.is_empty() {
+            let changes = history.undo(&mut store).unwrap();
+            assert!(!changes.is_empty());
+            undone.push(text);
+            reference = StringStore::new(before_steps.pop().unwrap());
+            caret = next() % (reference.len_bytes().0 + 1);
+            history.cursor_moved();
+        } else if roll == 1 && depth == 0 && !undone.is_empty() {
+            history.redo(&mut store).unwrap();
+            before_steps.push(text);
+            reference = StringStore::new(undone.pop().unwrap());
+            caret = next() % (reference.len_bytes().0 + 1);
+            history.cursor_moved();
+        } else if roll == 2 {
+            history.begin_group();
+            depth += 1;
+        } else if roll == 3 && depth > 0 {
+            history.end_group();
+            depth -= 1;
+        } else {
+            while !text.is_char_boundary(caret.min(text.len())) {
+                caret -= 1;
+            }
+            caret = caret.min(text.len());
+            let edge_after = |mut at: usize, n: usize| {
+                for _ in 0..n {
+                    at = (at + 1..=text.len())
+                        .find(|i| text.is_char_boundary(*i))
+                        .unwrap_or(text.len());
+                }
+                at
+            };
+            let edge_before = |mut at: usize, n: usize| {
+                for _ in 0..n {
+                    at = (0..at)
+                        .rev()
+                        .find(|i| text.is_char_boundary(*i))
+                        .unwrap_or(0);
+                }
+                at
+            };
+            let (range, insert, typing) = match next() % 8 {
+                // A typed character at the caret.
+                0..=3 => (at(caret, caret), choices[next() % choices.len()], true),
+                // Backspace.
+                4 => (at(edge_before(caret, 1 + next() % 3), caret), "", true),
+                // Typing over a selection.
+                5 => (
+                    at(caret, edge_after(caret, next() % 40)),
+                    choices[next() % choices.len()],
+                    true,
+                ),
+                // A paste or a delete away from the caret.
+                _ => {
+                    let from = edge_before(text.len(), next() % 200);
+                    let to = edge_after(from, next() % 200);
+                    let insert = if text.len() > keep || next() % 2 == 0 {
+                        ""
+                    } else {
+                        big.as_str()
+                    };
+                    (at(from, to), insert, false)
+                }
+            };
+            if range.start == range.end && insert.is_empty() {
+                continue;
+            }
+            if next() % 6 == 0 {
+                history.cursor_moved();
+            }
+            let groups = history.undo_groups();
+            let start16 = reference.byte_to_utf16(range.start).unwrap();
+            let old_end16 = reference.byte_to_utf16(range.end).unwrap();
+            let tracked = history
+                .replace_tracked(&mut store, range.clone(), insert, typing)
+                .unwrap();
+            let right = reference.replace(range.clone(), insert).unwrap();
+            assert_eq!(tracked.change.line_count_delta, right.line_count_delta);
+            assert_eq!(tracked.utf16.start, start16);
+            assert_eq!(tracked.utf16.old_end, old_end16);
+            let new_end = reference
+                .byte_to_utf16(ByteOffset(range.start.0 + insert.len()))
+                .unwrap();
+            assert_eq!(tracked.utf16.new_end, new_end);
+            if history.undo_groups() > groups {
+                before_steps.push(text);
+            }
+            undone.clear();
+            caret = range.start.0 + insert.len();
+        }
+        check(&store, &reference, step);
+    }
+    while depth > 0 {
+        history.end_group();
+        depth -= 1;
+    }
+    while let Some(before) = before_steps.pop() {
+        history.undo(&mut store).unwrap();
+        reference = StringStore::new(before);
+        check(&store, &reference, steps);
     }
 }
 
@@ -388,7 +452,7 @@ fn undo_and_redo_match_a_plain_string_and_the_tree_stays_balanced() {
         0xdead_beef_cafe_f00d,
         0x0f0f_0f0f_1357_9bdf,
     ] {
-        random_run(seed, 4_000, 1_500);
+        random_run(seed, 2_000, 60_000);
     }
 }
 
@@ -477,4 +541,161 @@ fn undo_text_stays_exact_across_a_leaf_edge() {
     history.undo(&mut store).unwrap();
     assert_eq!(text_of(&store), text);
     store.check_tree().unwrap();
+}
+
+#[test]
+fn a_full_redo_side_loses_its_furthest_step_first() {
+    let block = "abcdefghij".repeat(300);
+    let mut store = PieceStore::new("start");
+    // Each undone insert keeps about 3 KB on the redo side, and 5 KB holds fewer than 3.
+    let mut history = UndoHistory::with_limit(5_000);
+    let mut states = vec![text_of(&store)];
+    for _ in 0..3 {
+        let end = store.len_bytes().0;
+        history
+            .replace(&mut store, at(end, end), &block, false)
+            .unwrap();
+        states.push(text_of(&store));
+    }
+    assert_eq!(history.undo_groups(), 3);
+    for _ in 0..3 {
+        history.undo(&mut store).unwrap();
+    }
+    assert_eq!(text_of(&store), states[0]);
+    assert!(
+        history.redo_groups() < 3,
+        "{} steps should not fit",
+        history.redo_groups()
+    );
+    // Whichever steps stayed, redo goes on from the current text, in order.
+    let mut place = 0;
+    while !history.redo(&mut store).unwrap().is_empty() {
+        place += 1;
+        assert_eq!(text_of(&store), states[place], "the next redo was dropped");
+    }
+    assert!(place >= 1);
+}
+
+#[test]
+fn a_typed_run_stops_when_the_caret_jumps() {
+    let mut store = PieceStore::new("0123456789");
+    let mut history = UndoHistory::new();
+    history.replace(&mut store, at(0, 0), "a", true).unwrap();
+    history.replace(&mut store, at(1, 1), "b", true).unwrap();
+    assert_eq!(history.undo_groups(), 1);
+    // The next key lands away from the caret, with no `cursor_moved` call.
+    history.replace(&mut store, at(9, 9), "c", true).unwrap();
+    assert_eq!(history.undo_groups(), 2, "a jump must start a new step");
+    assert_eq!(text_of(&store), "ab0123456c789");
+    history.undo(&mut store).unwrap();
+    assert_eq!(text_of(&store), "ab0123456789");
+}
+
+#[test]
+fn undo_and_redo_end_the_typed_run() {
+    let mut store = PieceStore::new("");
+    let mut history = UndoHistory::new();
+    history.replace(&mut store, at(0, 0), "a", true).unwrap();
+    history.undo(&mut store).unwrap();
+    history.redo(&mut store).unwrap();
+    // The caret is where the run left it, and the next key must still start a step.
+    history.replace(&mut store, at(1, 1), "b", true).unwrap();
+    assert_eq!(history.undo_groups(), 2, "redo left the typed run open");
+    history.undo(&mut store).unwrap();
+    assert_eq!(text_of(&store), "a");
+    // After an undo, a key at the place the old run would continue is a new step too.
+    history.replace(&mut store, at(1, 1), "c", true).unwrap();
+    history.undo(&mut store).unwrap();
+    assert_eq!(text_of(&store), "a");
+    assert_eq!(history.undo_groups(), 1);
+}
+
+#[test]
+fn undo_inside_an_open_group_is_refused_and_keeps_the_group() {
+    let mut store = PieceStore::new("abc");
+    let mut history = UndoHistory::new();
+    history.begin_group();
+    history.replace(&mut store, at(0, 0), "x", false).unwrap();
+    assert_eq!(history.undo(&mut store), Err(EditError::GroupOpen));
+    assert_eq!(history.redo(&mut store), Err(EditError::GroupOpen));
+    assert_eq!(text_of(&store), "xabc");
+    history.replace(&mut store, at(4, 4), "y", false).unwrap();
+    history.end_group();
+    assert_eq!(history.undo_groups(), 1, "the group stayed open and whole");
+    assert_eq!(history.undo(&mut store).unwrap().len(), 2);
+    assert_eq!(text_of(&store), "abc");
+}
+
+#[test]
+fn a_backspace_run_crosses_from_typed_text_into_older_text() {
+    let mut store = PieceStore::new("hello");
+    let mut history = UndoHistory::new();
+    history.replace(&mut store, at(5, 5), "XY", true).unwrap();
+    for end in [7, 6, 5, 4] {
+        history
+            .replace(&mut store, at(end - 1, end), "", true)
+            .unwrap();
+    }
+    assert_eq!(text_of(&store), "hel");
+    assert_eq!(history.undo_groups(), 1);
+    history.replace(&mut store, at(3, 3), "p", true).unwrap();
+    assert_eq!(text_of(&store), "help");
+    assert_eq!(history.undo_groups(), 1);
+    history.undo(&mut store).unwrap();
+    assert_eq!(text_of(&store), "hello");
+    history.redo(&mut store).unwrap();
+    assert_eq!(text_of(&store), "help");
+}
+
+#[test]
+fn a_forward_delete_is_not_part_of_a_backspace_run() {
+    let mut store = PieceStore::new("abcdef");
+    let mut history = UndoHistory::new();
+    history.replace(&mut store, at(3, 4), "", true).unwrap();
+    // The caret is at 3, and this delete starts there and ends after it.
+    history.replace(&mut store, at(3, 4), "", true).unwrap();
+    assert_eq!(history.undo_groups(), 2);
+}
+
+#[test]
+fn tracked_changes_give_the_utf16_place_of_undo_and_redo() {
+    let mut store = PieceStore::new("a💡b");
+    let mut history = UndoHistory::new();
+    let done = history
+        .replace_tracked(&mut store, at(1, 5), "語語", false)
+        .unwrap();
+    assert_eq!(done.utf16.start, Utf16Offset(1));
+    assert_eq!(done.utf16.old_end, Utf16Offset(3));
+    assert_eq!(done.utf16.new_end, Utf16Offset(3));
+    let undone = history.undo_tracked(&mut store).unwrap();
+    assert_eq!(undone.len(), 1);
+    assert_eq!(undone[0].utf16.start, Utf16Offset(1));
+    assert_eq!(undone[0].utf16.old_end, Utf16Offset(3));
+    assert_eq!(undone[0].utf16.new_end, Utf16Offset(3));
+    assert_eq!(undone[0].change.replaced, at(1, 7));
+    let redone = history.redo_tracked(&mut store).unwrap();
+    assert_eq!(redone[0].change.replaced, at(1, 5));
+    let none = history
+        .replace_tracked(&mut store, at(7, 7), "", false)
+        .unwrap();
+    assert_eq!(none.utf16.start, none.utf16.new_end);
+}
+
+#[test]
+fn line_ending_length_and_an_early_stop_work_on_the_store() {
+    let store = PieceStore::new("a\r\nb\nc\u{85}d\u{2028}e\u{2029}f\rg");
+    let lens: Vec<usize> = (0..7)
+        .map(|n| store.try_line_ending_len(LineIndex(n)).unwrap())
+        .collect();
+    assert_eq!(lens, [2, 1, 2, 3, 3, 1, 0]);
+    assert!(store.try_line_ending_len(LineIndex(9)).is_err());
+
+    let long = PieceStore::new(&"x".repeat(100_000));
+    let mut calls = 0;
+    assert!(long.visit_chunks_while(at(0, 100_000), &mut |_| {
+        calls += 1;
+        calls < 3
+    }));
+    assert_eq!(calls, 3, "the visit must stop when asked");
+    assert!(!long.visit_chunks_while(at(5, 200_000), &mut |_| true));
 }

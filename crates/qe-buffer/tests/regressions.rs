@@ -208,6 +208,13 @@ mod mapped {
         one.repeat(size / one.len())
     }
 
+    /// File times move in steps. A same-size rewrite in the step of the last write can
+    /// leave every time alone, which the README states as a limit. These tests are about
+    /// what follows a rewrite that can be seen, so the rewrite waits for a later step.
+    fn past_time_step() {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
     /// Stays above the store's file check interval, so the check has to run.
     fn after_check_interval() {
         std::thread::sleep(Duration::from_millis(60));
@@ -256,6 +263,7 @@ mod mapped {
         let path = temp("item1-small.txt");
         fs::write(&path, "hello\nworld!").unwrap();
         let store = MappedStore::open(&path).unwrap();
+        past_time_step();
         fs::write(&path, "saved\nover!!").unwrap();
         after_check_interval();
         assert_eq!(store.line_range(LineIndex(1)), None);
@@ -304,6 +312,7 @@ mod mapped {
         let path = temp("item5.txt");
         fs::write(&path, "hello\nworld!").unwrap();
         let store = MappedStore::open(&path).unwrap();
+        past_time_step();
         fs::write(&path, "saved\nover!!").unwrap();
         after_check_interval();
         assert_eq!(store.line_range(LineIndex(1)), None);

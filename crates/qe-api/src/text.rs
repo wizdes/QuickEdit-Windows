@@ -28,6 +28,33 @@ pub enum EditError {
     InvalidRange,
     /// The store has edits that this undo history did not record.
     HistoryOutOfStep,
+    /// Undo or redo was asked for while an edit group is open.
+    GroupOpen,
+}
+
+/// A change in UTF-16 units, which an input method needs. All three offsets are in
+/// the text as it stood just before this change, except `new_end`, which is in the
+/// text just after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Utf16Change {
+    pub start: Utf16Offset,
+    pub old_end: Utf16Offset,
+    pub new_end: Utf16Offset,
+}
+
+/// A change in bytes and in UTF-16 units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackedChange {
+    pub change: TextChange,
+    pub utf16: Utf16Change,
+}
+
+/// The known part of a line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownLine {
+    pub range: Range<ByteOffset>,
+    /// False when the index has not found this line's end yet.
+    pub complete: bool,
 }
 
 /// A store failure that stays until the store is opened again.
@@ -48,6 +75,8 @@ pub enum LookupError {
     OutOfRange,
     /// The store failed, so this answer will never come.
     Failed(StoreFailure),
+    /// A `try_visit_chunks` range is longer than a store can give without a wait.
+    TooLong { max_bytes: usize },
 }
 
 /// What a store knows at this moment. Answers from the plain queries that return
@@ -64,6 +93,10 @@ pub struct StoreStatus {
 
 /// Immutable read side. Implementations are `Send + Sync`, so a snapshot may be
 /// shared across worker threads. Production lookups should be O(log n) or better.
+///
+/// The plain queries that return `Option` or `bool` may wait for disk on a store
+/// where `is_read_only` is true, so they must not run on the UI thread for that
+/// store. The `try_` queries and `status` never touch the disk on the calling thread.
 pub trait TextSnapshot: Send + Sync {
     fn revision(&self) -> u64;
     fn len_bytes(&self) -> ByteOffset;
@@ -92,6 +125,56 @@ pub trait TextSnapshot: Send + Sync {
     }
     // The `try_` queries never block and always say why there is no answer.
     // The UI thread uses these when a store can be `is_read_only`.
+    /// The known part of a line. It answers on a line whose end is still unknown,
+    /// so a very long line can paint before the index finishes.
+    fn try_known_line(&self, line: LineIndex) -> Result<KnownLine, LookupError> {
+        self.try_line_range(line).map(|range| KnownLine {
+            range,
+            complete: true,
+        })
+    }
+    /// Bytes of the line ending at the end of this line: 0 on a last line with no
+    /// ending, 2 for CRLF and for U+0085, 3 for U+2028 and U+2029, otherwise 1.
+    fn try_line_ending_len(&self, line: LineIndex) -> Result<usize, LookupError> {
+        let range = self.try_line_range(line)?;
+        let longest = (range.end.0 - range.start.0).min(3);
+        for back in (1..=longest).rev() {
+            let mut tail = String::new();
+            let start = ByteOffset(range.end.0 - back);
+            match self.try_visit_chunks(start..range.end, &mut |s| tail.push_str(s)) {
+                Ok(()) => {
+                    return Ok(if tail.ends_with("\r\n") {
+                        2
+                    } else if tail.ends_with(['\r', '\n']) {
+                        1
+                    } else if tail.ends_with('\u{85}') {
+                        2
+                    } else if tail.ends_with(['\u{2028}', '\u{2029}']) {
+                        3
+                    } else {
+                        0
+                    });
+                }
+                Err(LookupError::OutOfRange) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(0)
+    }
+    /// Like `visit_chunks`, and stops as soon as `visitor` returns false. The result
+    /// says whether the range was good, as in `visit_chunks`, not whether it stopped.
+    fn visit_chunks_while(
+        &self,
+        range: Range<ByteOffset>,
+        visitor: &mut dyn FnMut(&str) -> bool,
+    ) -> bool {
+        let mut going = true;
+        self.visit_chunks(range, &mut |s| {
+            if going {
+                going = visitor(s);
+            }
+        })
+    }
     fn try_len_bytes(&self) -> Result<ByteOffset, LookupError> {
         Ok(self.len_bytes())
     }

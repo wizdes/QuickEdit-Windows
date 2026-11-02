@@ -1,4 +1,4 @@
-//! Speed of warm frames. Run with `cargo run -p qe-render --release --locked --example bench`.
+//! Speed of warm frames. Run with `cargo run -p qe-render --release --locked --example render_bench`.
 //! Each number is the median of 15 frames after warm-up frames.
 use qe_api::{Color, Dip, DisplayList, DrawCommand, Point, Rect, Renderer};
 use qe_render::BitmapRenderer;

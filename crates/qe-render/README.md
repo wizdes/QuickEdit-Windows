@@ -103,4 +103,4 @@ Update saved images with `QE_RENDER_UPDATE_IMAGES=1 cargo test -p qe-render --lo
 
 ## Speed
 
-`cargo run -p qe-render --release --locked --example bench` measures warm frames of `GlyphRun` and `TextRun` text in both themes, emoji screens cold and warm, very large text, shapes, and the BitBlt copy. The copy goes to a bitmap, so that no window opens; it does not measure desktop composition.
+`cargo run -p qe-render --release --locked --example render_bench` measures warm frames of `GlyphRun` and `TextRun` text in both themes, emoji screens cold and warm, very large text, shapes, and the BitBlt copy. The copy goes to a bitmap, so that no window opens; it does not measure desktop composition.

@@ -1,6 +1,6 @@
 //! Release bench: speed and peak memory of `decode` and `encode` on non-ASCII text.
 //!
-//! Run with `cargo run --release -p qe-codec --locked --example bench`, or add a
+//! Run with `cargo run --release -p qe-codec --locked --example codec_bench`, or add a
 //! size in MiB (default 512). A process's peak memory never falls, so each case
 //! runs in its own child process. The fixtures are hand-written byte patterns;
 //! they do not come from the crate's own `encode`.

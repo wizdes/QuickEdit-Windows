@@ -1,4 +1,4 @@
-//! Layout timing. Run it with `cargo run -p qe-layout --release --example bench --locked`.
+//! Layout timing. Run it with `cargo run -p qe-layout --release --example layout_bench --locked`.
 //! Each number is a median over several runs, after the font has loaded.
 use qe_api::{
     ByteOffset, Dip, Layout, LineIndex, Point, TextPosition, TextSnapshot, Utf16Offset,

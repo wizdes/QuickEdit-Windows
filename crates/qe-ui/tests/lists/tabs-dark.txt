@@ -1,0 +1,4 @@
+display-list-v3
+round 0.000,0.000,120.000,32.000 4.000 #334c66ff
+text 8.000,8.000 "Segoe UI" #ffffffff "New"
+text 128.000,8.000 "Segoe UI" #ffffffff "Keyboard"

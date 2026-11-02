@@ -1,0 +1,9 @@
+display-list-v3
+push-clip 0.000,0.000,240.000,100.000
+text 8.000,8.000 "Segoe UI" #ffffffff "Command"
+fill 0.000,28.000,240.000,28.000 #334c66ff
+text 8.000,36.000 "Segoe UI" #ffffffd9 "File"
+text 144.000,36.000 "Segoe UI" #ffffff9e ""
+text 16.000,64.000 "Segoe UI" #ffffffff "Save"
+text 144.000,64.000 "Segoe UI" #ffffff9e "Ctrl+S"
+pop-clip

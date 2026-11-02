@@ -1,0 +1,11 @@
+down 380 20
+up 380 20
+layout
+down 225 20
+up 225 20
+layout
+down 225 20
+up 225 20
+expect CloseTab(1)
+expect CloseTab(0)
+expect CloseTab(0)

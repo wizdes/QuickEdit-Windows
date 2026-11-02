@@ -1,1 +1,7 @@
-//! qe-shell: filled in by its milestone. See docs/design-spec.md.
+//! QuickEdit's tab row and native frame.
+mod strip;
+pub use strip::*;
+#[cfg(windows)]
+mod window;
+#[cfg(windows)]
+pub use window::*;

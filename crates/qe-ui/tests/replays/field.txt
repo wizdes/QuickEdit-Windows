@@ -1,0 +1,9 @@
+# Keyboard-only text entry and undo.
+event	0	focus
+event	1	char	1
+event	2	char	2
+expect	text	12
+event	3	key_down	8	-	false
+expect	text	1
+event	4	key_down	90	C	false
+expect	text	12

@@ -1,0 +1,6 @@
+display-list-v3
+round 0.000,8.000,16.000,16.000 4.000 #82beffff
+stroke-rect 0.000,8.000,16.000,16.000 4.000 1.000 #ffffff38
+text 2.000,8.000 "Segoe UI" #1e1e1eff "✓"
+text 22.000,8.000 "Segoe UI" #ffffffff "Check spelling"
+stroke-rect 1.000,9.000,14.000,14.000 4.000 2.000 #99cdffff

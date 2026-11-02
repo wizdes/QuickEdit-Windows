@@ -1,0 +1,7 @@
+down 100 20
+move 500 20
+up 500 20
+down 580 20
+up 580 20
+expect ReorderTab { from: 0, to: 2 }
+expect CloseTab(2)

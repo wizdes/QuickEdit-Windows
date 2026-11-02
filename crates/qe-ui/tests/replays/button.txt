@@ -1,0 +1,5 @@
+# Keyboard-only button activation.
+event	0	focus
+event	1	key_down	32	-	false
+event	2	key_up	32	-
+expect	clicks	1

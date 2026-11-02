@@ -9,7 +9,7 @@ pub(crate) use windows::core::*;
 mod support;
 
 use qe_api::{ByteOffset, InputEvent, InputKind, Modifiers, View, ViewContext, ViewRequest};
-use qe_editor::{EditorCommand, EditorView};
+use qe_editor::{CompositionClause, EditorCommand, EditorView};
 use qe_ime::{TsfDocument, TsfThread};
 use std::{
     cell::{Cell, RefCell},
@@ -17,21 +17,29 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
-use support::{Fixture, laid_out, settle, units};
+use support::{Fixture, GateHost, laid_out, settle, units};
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, POINT, RECT},
+        Foundation::{E_FAIL, LPARAM, POINT, RECT, WPARAM},
+        System::{
+            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoGetApartmentType, CoUninitialize},
+            Variant::VARIANT,
+        },
         UI::TextServices::{
+            CLSID_TF_CategoryMgr, GUID_PROP_ATTRIBUTE, GXFPF_NEAREST, ITfCategoryMgr,
             ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
-            ITfContextComposition, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
-            ITfRange, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION,
-            TF_E_COMPOSITION_REJECTED, TF_E_LOCKED, TF_E_NOLAYOUT, TF_E_NOLOCK, TF_E_READONLY,
-            TF_E_SYNCHRONOUS, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-            TF_IAS_QUERYONLY, TF_S_ASYNC, TF_SELECTION, TF_SELECTIONSTYLE, TS_AE_END,
+            ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl,
+            ITfInsertAtSelection, ITfRange, ITfRangeACP, TF_ANCHOR_END, TF_ANCHOR_START,
+            TF_DEFAULT_SELECTION, TF_E_COMPOSITION_REJECTED, TF_E_LOCKED, TF_E_NOLAYOUT,
+            TF_E_NOLOCK, TF_E_READONLY, TF_E_SYNCHRONOUS, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE,
+            TF_ES_SYNC, TF_IAS_QUERYONLY, TF_S_ASYNC, TF_SELECTION, TF_SELECTIONSTYLE, TS_AE_END,
             TS_SD_READONLY,
         },
+        UI::WindowsAndMessaging::{
+            MSG, PostMessageW, PostQuitMessage, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_USER,
+        },
     },
-    core::{BOOL, HRESULT, Interface, Ref, Result, implement},
+    core::{BOOL, GUID, HRESULT, Interface, Ref, Result, implement},
 };
 
 type Body = Box<dyn FnOnce(u32) -> Result<()>>;
@@ -71,7 +79,7 @@ impl Tsf {
     fn new(view: EditorView) -> Self {
         let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let fixture = Fixture::new(view);
-        let thread = TsfThread::start().unwrap();
+        let thread = support::start_tsf();
         let doc = thread.open_document(fixture.host.clone()).unwrap();
         doc.focus().unwrap();
         Self {
@@ -82,20 +90,47 @@ impl Tsf {
             _one_at_a_time: one_at_a_time,
         }
     }
+    /// A store whose view the test can make busy, with the flag that does it.
+    fn gated(view: EditorView) -> (Self, Rc<Cell<bool>>) {
+        let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let fixture = Fixture::new(view);
+        let shut: Rc<Cell<bool>> = Rc::default();
+        let host = Rc::new(GateHost {
+            inner: fixture.host.clone(),
+            shut: shut.clone(),
+        });
+        let thread = support::start_tsf();
+        let doc = thread.open_document(host).unwrap();
+        doc.focus().unwrap();
+        (
+            Self {
+                fixture,
+                doc,
+                thread,
+                terminated: Rc::default(),
+                _one_at_a_time: one_at_a_time,
+            },
+            shut,
+        )
+    }
     fn context(&self) -> ITfContext {
         self.doc.context().clone()
     }
     /// A sync edit session. Returns the session's own result, as TSF hands it back.
     fn session(&self, flags: u32, body: impl FnOnce(u32) -> Result<()> + 'static) -> HRESULT {
         let session: ITfEditSession = Session(RefCell::new(Some(Box::new(body)))).into();
-        unsafe {
+        // The host syncs after its edits, and when the store asks after a lock.
+        self.doc.sync();
+        let answer = unsafe {
             self.context().RequestEditSession(
                 self.thread.client_id(),
                 &session,
                 windows::Win32::UI::TextServices::TF_CONTEXT_EDIT_CONTEXT_FLAGS(flags),
             )
         }
-        .unwrap()
+        .unwrap();
+        self.doc.sync();
+        answer
     }
     fn read_session(&self, body: impl FnOnce(u32) -> Result<()> + 'static) {
         let answer = self.session(TF_ES_SYNC.0 | TF_ES_READ.0, body);
@@ -466,10 +501,14 @@ fn an_editor_edit_during_a_composition_ends_it_in_tsf_at_the_next_sync() {
     tsf.doc.sync();
     assert_eq!(tsf.terminated.get(), 1);
     assert!(!tsf.doc.store().is_composing());
-    assert_eq!(tsf.fixture.text(), "abc");
+    assert_eq!(
+        tsf.fixture.text(),
+        "xabc",
+        "the composing text went in first"
+    );
     assert_eq!(
         tsf.read_text(),
-        "abc",
+        "xabc",
         "TSF's copy matches the editor again"
     );
     tsf.fixture.no_problems();
@@ -643,28 +682,14 @@ fn a_composition_with_no_layout_yet_says_so_and_tsf_hears_when_it_comes() {
 
 #[test]
 fn line_breaks_and_combining_marks_in_a_commit_stay_as_they_came() {
+    let text = "x\r\ne\u{301}";
     let tsf = Tsf::new(laid_out("ab"));
     let held = tsf.start_composition();
-    tsf.set_composition_text(
-        &held, "x
-e{301}",
-    );
-    assert_eq!(
-        tsf.read_text(),
-        "x
-e{301}ab"
-    );
+    tsf.set_composition_text(&held, text);
+    assert_eq!(tsf.read_text(), format!("{text}ab"));
     tsf.end_composition(&held);
-    assert_eq!(
-        tsf.fixture.text(),
-        "x
-e{301}ab"
-    );
-    assert_eq!(
-        tsf.read_text(),
-        "x
-e{301}ab"
-    );
+    assert_eq!(tsf.fixture.text(), format!("{text}ab"));
+    assert_eq!(tsf.read_text(), format!("{text}ab"));
     tsf.fixture.no_problems();
 }
 
@@ -849,4 +874,624 @@ fn selection_read_through_tsf_in_a_composition_is_at_its_cursor() {
         "the cursor stays where the service put it"
     );
     tsf.fixture.no_problems();
+}
+
+// ---- Composing text is never dropped unless the user cancels ----
+
+#[test]
+fn a_caret_move_commits_the_composition_and_the_host_call_keeps_the_text() {
+    let tsf = Tsf::new(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let mut ctx = ViewContext::default();
+    tsf.fixture
+        .view
+        .borrow_mut()
+        .select(ByteOffset(2)..ByteOffset(2), &mut ctx);
+    assert!(ctx.requests.contains(&ViewRequest::CancelComposition));
+    let sent = tsf.doc.store().counts().text_changes_sent;
+    tsf.doc.cancel_composition();
+    assert_eq!(tsf.terminated.get(), 1);
+    assert_eq!(tsf.fixture.text(), "xabc");
+    assert_eq!(tsf.read_text(), "xabc");
+    assert_eq!(
+        tsf.doc.store().counts().text_changes_sent,
+        sent,
+        "TSF wrote this text, so it must not hear of it as an edit"
+    );
+    assert!(!tsf.doc.store().is_composing());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_click_commits_the_composition_even_when_only_a_sync_follows() {
+    let tsf = Tsf::new(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let sent = tsf.doc.store().counts().text_changes_sent;
+    let mut ctx = ViewContext::default();
+    tsf.fixture.view.borrow_mut().handle(
+        &InputEvent {
+            time_us: 0,
+            kind: InputKind::MouseDown {
+                at: qe_api::Point {
+                    x: qe_api::Dip(300.0),
+                    y: qe_api::Dip(5.0),
+                },
+                button: qe_api::MouseButton::Left,
+                modifiers: Modifiers::default(),
+            },
+        },
+        &mut ctx,
+    );
+    tsf.doc.sync();
+    assert_eq!(tsf.terminated.get(), 1);
+    assert_eq!(tsf.fixture.text(), "xabc");
+    assert_eq!(
+        tsf.doc.store().counts().text_changes_sent,
+        sent,
+        "TSF wrote this text, so it must not hear that the text went or came"
+    );
+    assert_eq!(tsf.read_text(), "xabc");
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn undo_during_a_composition_commits_it_first_and_then_undoes_it() {
+    let tsf = Tsf::new(laid_out("abc"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let mut ctx = ViewContext::default();
+    tsf.fixture
+        .view
+        .borrow_mut()
+        .run(EditorCommand::Undo, &mut ctx);
+    tsf.doc.sync();
+    assert_eq!(tsf.terminated.get(), 1);
+    assert_eq!(tsf.fixture.text(), "abc");
+    assert_eq!(tsf.read_text(), "abc", "TSF hears of the undo");
+    tsf.fixture.no_problems();
+}
+
+// ---- A view in use costs no text and leaves no ghost ----
+
+#[test]
+fn tsf_ending_a_composition_while_the_view_is_busy_still_adds_the_text_later() {
+    let (tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let composition = held.borrow().as_ref().unwrap().0.clone();
+    let shut_now = shut.clone();
+    tsf.write(move |ec| unsafe {
+        shut_now.set(true);
+        composition.EndComposition(ec)
+    });
+    assert_eq!(tsf.fixture.text(), "ab", "the view is busy");
+    assert!(
+        tsf.fixture.busy.get() > 0,
+        "the host was asked to come back"
+    );
+    assert!(tsf.doc.store().is_composing(), "the text is still held");
+    tsf.doc.sync();
+    assert_eq!(tsf.fixture.text(), "ab", "still busy");
+
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(tsf.fixture.text(), "xab");
+    assert_eq!(tsf.read_text(), "xab");
+    assert!(
+        tsf.fixture.view.borrow().composition().is_none(),
+        "no ghost"
+    );
+    assert!(!tsf.doc.store().is_composing());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn complete_while_the_view_is_busy_finishes_at_the_next_sync() {
+    let (tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    shut.set(true);
+    tsf.doc.complete_composition();
+    assert_eq!(
+        tsf.terminated.get(),
+        0,
+        "TSF keeps it until the text can go in"
+    );
+    assert!(tsf.fixture.busy.get() > 0);
+    assert!(tsf.doc.store().is_composing());
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(tsf.terminated.get(), 1);
+    assert_eq!(tsf.fixture.text(), "xab");
+    assert_eq!(tsf.read_text(), "xab");
+    assert!(
+        tsf.fixture.view.borrow().composition().is_none(),
+        "no ghost"
+    );
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn cancel_while_the_view_is_busy_finishes_at_the_next_sync() {
+    let (tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    shut.set(true);
+    tsf.doc.cancel_composition();
+    assert_eq!(tsf.terminated.get(), 0);
+    assert!(tsf.fixture.busy.get() > 0);
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(tsf.terminated.get(), 1);
+    assert_eq!(tsf.fixture.text(), "ab");
+    assert_eq!(tsf.read_text(), "ab");
+    assert!(
+        tsf.fixture.view.borrow().composition().is_none(),
+        "no ghost"
+    );
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn closing_while_the_view_is_busy_shows_the_text_and_does_not_lose_it_unseen() {
+    let (mut tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "lost?");
+    shut.set(true);
+    tsf.doc.close();
+    let problems = tsf.fixture.problems.borrow().join(" | ");
+    assert!(
+        problems.contains("lost?"),
+        "the user sees the text: {problems}"
+    );
+    shut.set(false);
+}
+
+#[test]
+fn a_composition_update_while_the_view_is_busy_reaches_the_view_later() {
+    let (tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let range = held.borrow().as_ref().unwrap().1.clone();
+    let shut_now = shut.clone();
+    tsf.write(move |ec| unsafe {
+        range.SetText(ec, 0, &units("xy"))?;
+        shut_now.set(true);
+        Ok(())
+    });
+    assert_eq!(
+        tsf.fixture
+            .view
+            .borrow()
+            .composition()
+            .map(|c| c.text.clone()),
+        Some("x".to_owned()),
+        "the view was busy"
+    );
+    shut.set(false);
+    tsf.doc.sync();
+    assert_eq!(
+        tsf.fixture
+            .view
+            .borrow()
+            .composition()
+            .map(|c| c.text.clone()),
+        Some("xy".to_owned())
+    );
+    tsf.end_composition(&held);
+    assert_eq!(tsf.fixture.text(), "xyab");
+    tsf.fixture.no_problems();
+}
+
+// ---- Which composition ended ----
+
+#[test]
+fn a_second_composition_keeps_going_when_the_first_one_ends() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let first = tsf.start_composition();
+    tsf.set_composition_text(&first, "x");
+    let second = tsf.start_composition();
+    assert_eq!(tsf.fixture.text(), "xab", "the first one's text went in");
+    tsf.set_composition_text(&second, "y");
+    assert!(tsf.doc.store().is_composing());
+
+    tsf.end_composition(&first);
+    assert!(
+        tsf.doc.store().is_composing(),
+        "the first one's end must not end the second"
+    );
+    assert_eq!(tsf.fixture.text(), "xab", "the second is still composing");
+
+    tsf.end_composition(&second);
+    assert!(!tsf.doc.store().is_composing());
+    assert_eq!(tsf.fixture.text(), "xyab");
+    assert_eq!(tsf.read_text(), "xyab");
+    tsf.fixture.no_problems();
+}
+
+// ---- Closing tabs and threads ----
+
+fn linked_document(tsf: &Tsf) -> Option<ITfDocumentMgr> {
+    let doc = tsf.doc.document_manager();
+    // The wrapper turns "nothing was linked" into an error, with code 0.
+    unsafe {
+        tsf.thread
+            .thread_manager()
+            .AssociateFocus(tsf.fixture.window.0, doc)
+    }
+    .ok()
+}
+
+#[test]
+fn closing_a_background_tab_leaves_the_front_tab_linked() {
+    let tsf = Tsf::new(laid_out("front"));
+    let mut behind = tsf.thread.open_document(tsf.fixture.host.clone()).unwrap();
+    behind.focus().unwrap();
+    tsf.doc.focus().unwrap();
+    behind.close();
+    let linked = linked_document(&tsf);
+    assert_eq!(
+        linked.as_ref(),
+        Some(tsf.doc.document_manager()),
+        "the front tab must stay linked to the window"
+    );
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn closing_the_front_tab_takes_its_link_away() {
+    let mut tsf = Tsf::new(laid_out("front"));
+    tsf.doc.close();
+    assert!(linked_document(&tsf).is_none());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_document_outlives_its_thread_handle_and_com_goes_last() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    // A fresh thread, so that nothing else holds this thread's apartment open.
+    std::thread::spawn(|| unsafe {
+        assert!(CoGetApartmentType(&mut Default::default(), &mut Default::default()).is_err());
+        let fixture = Fixture::new(laid_out("ab"));
+        let thread = support::start_tsf();
+        let doc = thread.open_document(fixture.host.clone()).unwrap();
+        // `Fixture::new` joined the apartment too. Only TSF's hold on it is left after this.
+        CoUninitialize();
+        drop(thread);
+        doc.focus().unwrap();
+        doc.sync();
+        assert!(
+            CoGetApartmentType(&mut Default::default(), &mut Default::default()).is_ok(),
+            "the document holds COM open"
+        );
+        drop(doc);
+        assert!(
+            CoGetApartmentType(&mut Default::default(), &mut Default::default()).is_err(),
+            "COM goes when the last holder has gone"
+        );
+        fixture.no_problems();
+    })
+    .join()
+    .unwrap();
+}
+
+// ---- Writes and geometry through a running composition ----
+
+#[test]
+fn a_commit_is_not_told_back_to_tsf() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let sent = tsf.doc.store().counts().text_changes_sent;
+    tsf.end_composition(&held);
+    tsf.doc.sync();
+    assert_eq!(tsf.doc.store().counts().text_changes_sent, sent);
+    assert_eq!(tsf.fixture.text(), "xab");
+}
+
+#[test]
+fn a_composition_that_grows_over_the_text_after_it_takes_that_text_in() {
+    let tsf = Tsf::new(laid_out("abcd"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let (composition, range) = held.borrow().as_ref().unwrap().clone();
+    tsf.write(move |ec| unsafe {
+        let longer = range.Clone()?;
+        let mut moved = 0;
+        longer.ShiftEnd(ec, 2, &mut moved, std::ptr::null())?;
+        composition.ShiftEnd(ec, &longer)
+    });
+    assert_eq!(tsf.read_text(), "xabcd", "nothing changes for TSF");
+    assert_eq!(tsf.fixture.text(), "abcd", "the store is not edited yet");
+    assert_eq!(
+        tsf.fixture
+            .view
+            .borrow()
+            .composition()
+            .map(|c| c.text.clone()),
+        Some("xab".to_owned()),
+        "the view shows the text taken in once"
+    );
+    tsf.end_composition(&held);
+    assert_eq!(tsf.fixture.text(), "xabcd");
+    assert_eq!(tsf.read_text(), "xabcd");
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_write_that_reaches_past_the_composition_grows_it_with_no_commit() {
+    let tsf = Tsf::new(laid_out("abcd"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    // TSF would turn this write into a composition of its own and refuse it, so the test
+    // makes the call that a text service's write comes down to, with TSF's lock held.
+    let store = tsf.doc.store().text_store();
+    let seen = Rc::new(RefCell::new(String::new()));
+    let out = seen.clone();
+    tsf.write(move |_| unsafe {
+        store.SetText(0, 0, 2, &units("Q"))?;
+        *out.borrow_mut() = support::read(&store, 0, -1);
+        Ok(())
+    });
+    assert_eq!(seen.borrow().as_str(), "Qbcd");
+    assert_eq!(tsf.fixture.text(), "abcd", "no commit yet");
+    assert_eq!(
+        tsf.fixture
+            .view
+            .borrow()
+            .composition()
+            .map(|c| c.text.clone()),
+        Some("Q".to_owned()),
+        "the view shows the new text once"
+    );
+    tsf.end_composition(&held);
+    assert_eq!(tsf.fixture.text(), "Qbcd");
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn half_a_surrogate_pair_is_refused_inside_a_composition_too() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    let range = held.borrow().as_ref().unwrap().1.clone();
+    let answer = tsf.session(TF_ES_SYNC.0 | TF_ES_READWRITE.0, move |ec| unsafe {
+        range.SetText(ec, 0, &[0xd83d])
+    });
+    assert_ne!(answer, HRESULT(0), "the write must fail");
+    assert_eq!(tsf.read_text(), "xab");
+    tsf.end_composition(&held);
+    assert_eq!(tsf.fixture.text(), "xab");
+}
+
+/// The screen place of positions `start..end` as TSF asks for them, and for TSF's start.
+fn text_rect(tsf: &Tsf, start: i32, end: i32) -> RECT {
+    let out: Rc<Cell<RECT>> = Rc::default();
+    let (slot, context) = (out.clone(), tsf.context());
+    tsf.read_session(move |ec| unsafe {
+        let view = context.GetActiveView()?;
+        let range = context.GetStart(ec)?;
+        range.cast::<ITfRangeACP>()?.SetExtent(start, end - start)?;
+        let (mut rect, mut clipped) = (RECT::default(), BOOL(0));
+        view.GetTextExt(ec, &range, &mut rect, &mut clipped)?;
+        slot.set(rect);
+        Ok(())
+    });
+    out.get()
+}
+
+#[test]
+fn a_place_on_a_later_line_answers_through_a_composition() {
+    let tsf = Tsf::new(laid_out("ab\ncdef"));
+    let before = text_rect(&tsf, 3, 5);
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "xyz");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    // Three more units in front of it for TSF, and the same place on the screen.
+    let after = text_rect(&tsf, 6, 8);
+    assert_eq!(after, before);
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn the_candidate_place_for_a_clause_is_that_clause_and_not_the_whole_composition() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "wwwwwwww");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    let whole = text_rect(&tsf, 0, 8);
+    let head = text_rect(&tsf, 0, 4);
+    let tail = text_rect(&tsf, 4, 8);
+    assert_eq!(head.left, whole.left);
+    assert_eq!(tail.right, whole.right);
+    assert!(head.right <= tail.left + 1, "{head:?} then {tail:?}");
+    assert!(head.right < whole.right);
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_point_answers_through_a_composition_on_its_line_and_on_later_lines() {
+    let tsf = Tsf::new(laid_out("ab\ncdef"));
+    let on_e = text_rect(&tsf, 4, 5);
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "wwww");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    let third = text_rect(&tsf, 2, 3);
+    let answers: Rc<Cell<(i32, i32)>> = Rc::default();
+    let (slot, context) = (answers.clone(), tsf.context());
+    tsf.read_session(move |ec| unsafe {
+        let view = context.GetActiveView()?;
+        let inside = view.GetRangeFromPoint(
+            ec,
+            &POINT {
+                x: third.left + 1,
+                y: third.top + 2,
+            },
+            GXFPF_NEAREST,
+        )?;
+        let below = view.GetRangeFromPoint(
+            ec,
+            &POINT {
+                x: on_e.left + 1,
+                y: on_e.top + 2,
+            },
+            GXFPF_NEAREST,
+        )?;
+        let (mut a, mut b, mut count) = (0, 0, 0);
+        inside
+            .cast::<ITfRangeACP>()?
+            .GetExtent(&mut a, &mut count)?;
+        below.cast::<ITfRangeACP>()?.GetExtent(&mut b, &mut count)?;
+        slot.set((a, b));
+        Ok(())
+    });
+    let (inside, below) = answers.get();
+    assert_eq!(inside, 2, "the third character of the composition");
+    assert_eq!(below, 8, "e, after four more units in front of it");
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+// ---- Clauses ----
+
+#[test]
+fn clause_marks_from_a_service_reach_the_view() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "abcdef");
+    let (context, range) = (tsf.context(), held.borrow().as_ref().unwrap().1.clone());
+    tsf.write(move |ec| unsafe {
+        let manager: ITfCategoryMgr =
+            CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
+        let property = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+        let mut marks = [
+            GUID::from_u128(0x8f3a_0c11_6a2b_4c9e_9d55_0000_0000_0001),
+            GUID::from_u128(0x8f3a_0c11_6a2b_4c9e_9d55_0000_0000_0002),
+        ]
+        .into_iter();
+        let (first, second) = (range.Clone()?, range.Clone()?);
+        let mut moved = 0;
+        first.ShiftEnd(ec, -4, &mut moved, std::ptr::null())?;
+        second.ShiftStart(ec, 2, &mut moved, std::ptr::null())?;
+        for part in [first, second] {
+            let mark = marks.next().unwrap_or_default();
+            let atom = manager.RegisterGUID(&mark)?;
+            property.SetValue(ec, &part, &VARIANT::from(atom as i32))?;
+        }
+        Ok(())
+    });
+    let clauses = tsf.fixture.view.borrow().composition_clauses();
+    assert_eq!(
+        clauses,
+        vec![
+            CompositionClause {
+                range_utf16: 0..2,
+                target: false
+            },
+            CompositionClause {
+                range_utf16: 2..6,
+                target: false
+            },
+        ]
+    );
+    tsf.doc.complete_composition();
+    assert_eq!(tsf.fixture.text(), "abcdefab");
+    tsf.fixture.no_problems();
+}
+
+// ---- Keys ----
+
+fn key(message: u32) -> MSG {
+    MSG {
+        message,
+        wParam: WPARAM(0x41),
+        lParam: LPARAM(0x001e_0001),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn with_no_service_listening_a_key_is_not_taken_and_other_messages_never_are() {
+    let tsf = Tsf::new(laid_out("ab"));
+    assert!(!tsf.thread.key_was_taken(&key(WM_KEYDOWN)));
+    assert!(!tsf.thread.key_was_taken(&key(WM_KEYUP)));
+    assert!(!tsf.thread.key_was_taken(&key(WM_CHAR)));
+}
+
+#[test]
+fn the_pump_hands_out_messages_and_says_when_the_loop_should_stop() {
+    let tsf = Tsf::new(laid_out("ab"));
+    unsafe {
+        PostMessageW(
+            Some(tsf.fixture.window.0),
+            WM_USER + 7,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    }
+    .unwrap();
+    let mut message = MSG::default();
+    // Windows has its own messages for a new window, so this looks past them.
+    while message.message != WM_USER + 7 {
+        assert!(tsf.thread.get_message(&mut message).unwrap());
+    }
+    unsafe { PostQuitMessage(0) };
+    while tsf.thread.get_message(&mut message).unwrap() {
+        assert_ne!(message.message, WM_USER + 7, "the message came only once");
+    }
+    assert_eq!(message.message, WM_QUIT);
+}
+
+// ---- Second review ----
+
+#[test]
+fn a_hidden_or_minimized_window_gives_all_zero_rectangles_and_says_clipped() {
+    let tsf = Tsf::new(laid_out("abc"));
+    assert_ne!(text_rect(&tsf, 0, 1), RECT::default());
+    tsf.fixture.shown.set(false);
+    assert_eq!(text_rect(&tsf, 0, 1), RECT::default());
+    tsf.fixture.shown.set(true);
+    assert_ne!(text_rect(&tsf, 0, 1), RECT::default());
+}
+
+#[test]
+fn window_is_shown_is_false_for_a_window_that_was_never_shown() {
+    let tsf = Tsf::new(laid_out("abc"));
+    assert!(!qe_ime::window_is_shown(tsf.fixture.window.0));
+}
+
+#[test]
+fn a_range_across_a_composition_and_the_text_after_it_covers_both() {
+    let tsf = Tsf::new(laid_out("abcdef"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "xy");
+    settle(&mut tsf.fixture.view.borrow_mut());
+    let composition = text_rect(&tsf, 0, 2);
+    let after = text_rect(&tsf, 2, 6);
+    let both = text_rect(&tsf, 0, 6);
+    assert_eq!(both.left, composition.left);
+    assert_eq!(both.right, after.right);
+    assert!(both.right > composition.right);
+    tsf.doc.cancel_composition();
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn a_closed_document_refuses_focus_and_keeps_nothing_owed() {
+    let (mut tsf, shut) = Tsf::gated(laid_out("ab"));
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    shut.set(true);
+    tsf.doc.cancel_composition();
+    tsf.doc.close();
+    shut.set(false);
+    tsf.doc.sync();
+    assert!(!tsf.doc.store().is_composing());
+    assert!(!tsf.doc.store().lock_is_waiting());
+    assert_eq!(tsf.fixture.text(), "ab");
+    assert!(tsf.doc.focus().is_err());
 }

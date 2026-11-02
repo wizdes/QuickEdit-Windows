@@ -9,15 +9,20 @@ mod support;
 
 use qe_api::{ByteOffset, ViewContext};
 use qe_editor::EditorView;
-use qe_ime::{TextStoreHandle, TsfThread};
+use qe_ime::TextStoreHandle;
 use std::{process::Command, time::Instant};
 use support::Fixture;
-use windows::Win32::{
-    Foundation::HMODULE,
-    System::{
-        ProcessStatus::{EnumProcessModules, GetModuleBaseNameW},
-        Threading::GetCurrentProcess,
+use windows::{
+    Win32::{
+        Foundation::HMODULE,
+        System::{
+            LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            ProcessStatus::{EnumProcessModules, GetModuleBaseNameW},
+            Threading::GetCurrentProcess,
+        },
+        UI::TextServices::ITfThreadMgr,
     },
+    core::{HRESULT, Interface, s, w},
 };
 
 const CHILD: &str = "QE_IME_FIRST_FOCUS_CHILD";
@@ -46,6 +51,29 @@ fn loaded_modules() -> Vec<String> {
     }
 }
 
+/// True when TSF has a thread manager on this thread. A DLL in memory does not show this:
+/// Windows can load msctf.dll for any window. `TF_GetThreadMgr` answers only for a thread
+/// where TSF was started.
+fn tsf_runs_on_this_thread() -> bool {
+    unsafe {
+        let Ok(module) = GetModuleHandleW(w!("msctf.dll")) else {
+            return false;
+        };
+        let Some(get) = GetProcAddress(module, s!("TF_GetThreadMgr")) else {
+            panic!("msctf.dll has no TF_GetThreadMgr");
+        };
+        let get: unsafe extern "system" fn(*mut *mut std::ffi::c_void) -> HRESULT =
+            std::mem::transmute(get);
+        let mut manager = std::ptr::null_mut();
+        // With no thread manager it says `E_FAIL`, on this machine.
+        if get(&mut manager).is_err() || manager.is_null() {
+            return false;
+        }
+        drop(ITfThreadMgr::from_raw(manager));
+        true
+    }
+}
+
 /// The child's work. Runs as a test, in a process of its own, when the parent asks.
 #[test]
 fn child_process_body() {
@@ -60,9 +88,10 @@ fn child_process_body() {
     let fixture = Fixture::new(EditorView::from_text("hello").unwrap());
     let before = loaded_modules();
     println!("BEFORE {}", before.contains(&"msctf.dll".to_owned()));
+    println!("TSF_RUNNING_BEFORE {}", tsf_runs_on_this_thread());
     if mode == "focus" {
         let started = Instant::now();
-        let thread = TsfThread::start().unwrap();
+        let thread = support::start_tsf();
         let after_start = started.elapsed();
         let doc = thread.open_document(fixture.host.clone()).unwrap();
         let after_open = started.elapsed();
@@ -115,10 +144,12 @@ fn child_process_body() {
         println!("SENT {:?}", doc.store().counts());
         let after = loaded_modules();
         println!("AFTER {}", after.contains(&"msctf.dll".to_owned()));
+        println!("TSF_RUNNING {}", tsf_runs_on_this_thread());
     } else if mode == "store-only" {
         // A store with no thread manager is plain Rust, and must not pull TSF in either.
         let handle = TextStoreHandle::new(fixture.host.clone());
         handle.sync();
+        println!("TSF_RUNNING {}", tsf_runs_on_this_thread());
         drop(handle);
         let after = loaded_modules();
         println!("AFTER {}", after.contains(&"msctf.dll".to_owned()));
@@ -149,13 +180,20 @@ fn child(mode: &str) -> String {
 #[test]
 fn tsf_starts_only_on_the_call_and_the_cost_of_the_first_focus_is_measured() {
     let text = child("focus");
-    // The check can see the DLL once TSF runs. It may already be there, because Windows
-    // can load msctf.dll for any window. The report says what it saw on this machine.
-    assert!(text.contains("AFTER true"), "{text}");
+    assert!(
+        text.contains("TSF_RUNNING_BEFORE false"),
+        "a view alone must not start TSF: {text}"
+    );
+    assert!(
+        text.contains("TSF_RUNNING true"),
+        "TSF runs after the call: {text}"
+    );
     assert!(text.contains("MICROS start="), "{text}");
-    // A store with no thread manager is plain Rust.
     let idle = child("store-only");
-    assert!(idle.contains("BEFORE") && idle.contains("AFTER"), "{idle}");
+    assert!(
+        idle.contains("TSF_RUNNING_BEFORE false") && idle.contains("TSF_RUNNING false"),
+        "a store with no thread manager is plain Rust: {idle}"
+    );
     for line in text
         .lines()
         .filter(|l| l.contains("MICROS") || l.contains("NANOS") || l.contains("BEFORE"))

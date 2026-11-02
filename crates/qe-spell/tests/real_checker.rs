@@ -252,7 +252,7 @@ fn ignore_on_the_real_checker_lasts_and_touches_no_dictionary_file() {
     let menu = service.menu_at(&view, ByteOffset(0)).unwrap();
     service.ignore(&mut view, &menu, &mut ctx).unwrap();
     assert_eq!(marks(&view), vec![]);
-    // A recheck of the word asks Windows again, and Windows now agrees.
+    // A recheck of the word asks Windows again, and this document's ignore list holds.
     view.replace_range(ByteOffset(9)..ByteOffset(9), " ", &mut ctx);
     service.refresh(&mut view, &mut ctx);
     finish(&mut service, &mut view, &mut ctx);
@@ -309,8 +309,8 @@ fn a_language_with_no_dictionary_says_so_in_plain_words() {
 }
 
 #[test]
-fn real_marks_from_a_big_document_cost_the_key_nothing() {
-    if !have_english("real_marks_from_a_big_document_cost_the_key_nothing") {
+fn real_marks_from_a_big_document_stay_under_the_key_budget_in_release() {
+    if !have_english("real_marks_from_a_big_document_stay_under_the_key_budget_in_release") {
         return;
     }
     let text = "plain words and a speling here\n".repeat(200_000);
@@ -348,6 +348,15 @@ fn real_marks_from_a_big_document_cost_the_key_nothing() {
         worst,
         service.counts().bytes_asked,
     );
+    // The plan's budget for a key's spelling work is under 2 ms. A debug build is many times
+    // slower, and says nothing about the budget, so only a release build is held to it.
+    if !cfg!(debug_assertions) {
+        assert!(
+            total / (KEYS as u32) < Duration::from_millis(2),
+            "the mean key cost {:?}",
+            total / KEYS as u32
+        );
+    }
     // Each key may ask only for its own word. A whole-document check would be 6 MB.
     assert!(
         service.counts().bytes_asked < 200_000,
@@ -527,4 +536,25 @@ fn red_underlines_show_in_a_saved_picture_through_qe_render() {
         clean.y.0 + clean.height.0 + 2.0,
     );
     assert_eq!(under_clean, 0, "red under a word that is spelled right");
+}
+
+#[test]
+fn the_real_checker_refuses_text_with_no_end_mark() {
+    if !have_english("the_real_checker_refuses_text_with_no_end_mark") {
+        return;
+    }
+    let answer = std::thread::spawn(|| {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let answer = {
+            let mut checker = WindowsChecker::new(Some("en-US")).unwrap();
+            qe_spell::Checker::check(&mut checker, &[0x61, 0x62])
+        };
+        unsafe { CoUninitialize() };
+        answer
+    })
+    .join()
+    .unwrap();
+    assert!(answer.is_err());
 }

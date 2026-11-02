@@ -1,13 +1,15 @@
 //! The worker thread: reads text from a snapshot, asks the checker, and answers.
-use crate::{Action, Checker, MAX_SUGGESTIONS, MakeChecker, Misspelling, Wake, token_is_skipped};
+use crate::{
+    Action, Checker, Latest, MAX_SUGGESTIONS, MakeChecker, Misspelling, Wake, token_is_skipped,
+};
 use qe_api::{ByteOffset, TextSnapshot};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, Sender},
+        mpsc::{Receiver, Sender, TryRecvError},
     },
 };
 use windows::Win32::System::Com::{
@@ -30,12 +32,15 @@ pub(crate) struct Job {
 pub(crate) enum Command {
     Check(Job),
     Add(String),
+    /// Ignore belongs to one document, so it stays here and never reaches Windows, whose
+    /// `Ignore` lasts as long as the checker does.
     Ignore(String),
+    /// A new document came, with no words ignored yet.
+    ForgetIgnored,
     FindNext {
         snapshot: Arc<dyn TextSnapshot>,
         from: usize,
-        revision: u64,
-        document: u64,
+        generation: u64,
     },
 }
 pub(crate) enum Answer {
@@ -48,8 +53,7 @@ pub(crate) enum Answer {
     /// The job was for text that no one wants any more.
     Skipped,
     Found {
-        revision: u64,
-        document: u64,
+        generation: u64,
         found: Option<Misspelling>,
     },
     Failed(String),
@@ -60,7 +64,7 @@ pub(crate) fn run(
     jobs: Receiver<Command>,
     answers: Sender<Answer>,
     wake: Wake,
-    latest: Arc<AtomicU64>,
+    latest: Arc<Latest>,
 ) {
     // COM shuts the apartment down when its last thread leaves, and a checker that starts
     // during that shutdown fails with 0x80080008. Tabs come and go, so the apartment stays up
@@ -97,12 +101,22 @@ pub(crate) fn run(
     unsafe { CoUninitialize() };
 }
 
+/// A search through the document, one piece at a time, so that the worker can hear other
+/// commands between pieces.
+struct Scan {
+    snapshot: Arc<dyn TextSnapshot>,
+    generation: u64,
+    /// The rest of the search: what is left of this part, then the part after it.
+    now: Range<usize>,
+    then: Option<Range<usize>>,
+}
+
 fn serve(
     make: MakeChecker,
     jobs: &Receiver<Command>,
     answers: &Sender<Answer>,
     wake: &Wake,
-    latest: &AtomicU64,
+    latest: &Latest,
 ) {
     let say = |answer: Answer| {
         // No one to hear means that the service has gone, so this thread ends soon too.
@@ -117,15 +131,53 @@ fn serve(
             return;
         }
     };
-    let mut cache = HashMap::new();
-    for command in jobs {
+    let mut memory = Memory::default();
+    let mut scan: Option<Scan> = None;
+    loop {
+        // With a search running, a command must not wait for the search to end.
+        let command = if scan.is_some() {
+            match jobs.try_recv() {
+                Ok(command) => Some(command),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match jobs.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            }
+        };
+        let Some(command) = command else {
+            let Some(running) = scan.as_mut() else {
+                continue;
+            };
+            if running.generation < latest.find.load(Ordering::Relaxed) {
+                scan = None;
+                continue;
+            }
+            match scan_step(checker.as_mut(), &mut memory, running) {
+                Ok(None) => {}
+                Ok(Some(found)) => {
+                    say(Answer::Found {
+                        generation: running.generation,
+                        found,
+                    });
+                    scan = None;
+                }
+                Err(message) => {
+                    say(Answer::Failed(message));
+                    return;
+                }
+            }
+            continue;
+        };
         match command {
             Command::Check(job) => {
-                if job.generation < latest.load(Ordering::Relaxed) {
+                if job.generation < latest.check.load(Ordering::Relaxed) {
                     say(Answer::Skipped);
                     continue;
                 }
-                match check_job(checker.as_mut(), &mut cache, &job, latest) {
+                match check_job(checker.as_mut(), &mut memory, &job, &latest.check) {
                     Ok(Some((checked, errors))) => say(Answer::Checked {
                         revision: job.revision,
                         document: job.document,
@@ -144,42 +196,44 @@ fn serve(
                     say(Answer::Failed(message));
                     return;
                 }
-                cache.remove(&word);
+                memory.cache.remove(&word);
             }
             Command::Ignore(word) => {
-                if let Err(message) = checker.ignore(&word) {
-                    say(Answer::Failed(message));
-                    return;
-                }
-                cache.remove(&word);
+                memory.ignored.insert(word);
             }
+            Command::ForgetIgnored => memory.ignored.clear(),
             Command::FindNext {
                 snapshot,
                 from,
-                revision,
-                document,
-            } => match find_next(checker.as_mut(), &mut cache, snapshot.as_ref(), from) {
-                Ok(found) => say(Answer::Found {
-                    revision,
-                    document,
-                    found,
-                }),
-                Err(message) => {
-                    say(Answer::Failed(message));
-                    return;
-                }
-            },
+                generation,
+            } => {
+                let len = snapshot.len_bytes().0;
+                let from = floor_edge(snapshot.as_ref(), from.min(len));
+                scan = Some(Scan {
+                    snapshot,
+                    generation,
+                    now: from..len,
+                    then: Some(0..from),
+                });
+            }
         }
     }
 }
 
-type Cache = HashMap<String, Vec<String>>;
+/// What the worker keeps between commands.
+#[derive(Default)]
+struct Memory {
+    /// Suggestions by word.
+    cache: HashMap<String, Vec<String>>,
+    /// Words ignored in this document.
+    ignored: HashSet<String>,
+}
 /// What a job covered, and the errors in it.
 type Covered = (Vec<Range<usize>>, Vec<Misspelling>);
 
 fn check_job(
     checker: &mut dyn Checker,
-    cache: &mut Cache,
+    memory: &mut Memory,
     job: &Job,
     latest: &AtomicU64,
 ) -> Result<Option<Covered>, String> {
@@ -192,7 +246,7 @@ fn check_job(
                 return Ok(None);
             }
             let piece = at..range.end.min(at + CHUNK_BYTES);
-            let (done, found) = check_range(checker, cache, job.snapshot.as_ref(), &piece)?;
+            let (done, found) = check_range(checker, memory, job.snapshot.as_ref(), &piece)?;
             at = done.end.max(piece.end);
             checked.push(done);
             errors.extend(found);
@@ -210,9 +264,11 @@ fn floor_edge(snapshot: &dyn TextSnapshot, at: usize) -> usize {
 }
 
 /// Checks a range, grown out to whole words. Returns what it covered, and the errors in it.
+/// What it covered always holds all of `range`, so a gap asked about can never stay open,
+/// even when an end of `range` is inside a character of more than one byte.
 fn check_range(
     checker: &mut dyn Checker,
-    cache: &mut Cache,
+    memory: &mut Memory,
     snapshot: &dyn TextSnapshot,
     range: &Range<usize>,
 ) -> Result<(Range<usize>, Vec<Misspelling>), String> {
@@ -244,19 +300,19 @@ fn check_range(
     };
     let body = text.get(start..end).unwrap_or("");
     let base = read_start + start;
-    let covered = base..base + body.len();
-    let mut errors = errors_in(checker, cache, body, base)?;
+    let body_end = base + body.len();
+    let mut errors = errors_in(checker, memory, body, base)?;
     // A word cut by the margin is not a whole word, so its answer means nothing.
     errors.retain(|e| {
-        !(cut_left && e.range.start.0 == base) && !(cut_right && e.range.end.0 == covered.end)
+        !(cut_left && e.range.start.0 == base) && !(cut_right && e.range.end.0 == body_end)
     });
-    Ok((covered, errors))
+    Ok((base.min(range.start)..body_end.max(range.end), errors))
 }
 
 /// Asks the checker about `body`, which starts at byte `base`.
 fn errors_in(
     checker: &mut dyn Checker,
-    cache: &mut Cache,
+    memory: &mut Memory,
     body: &str,
     base: usize,
 ) -> Result<Vec<Misspelling>, String> {
@@ -286,19 +342,22 @@ fn errors_in(
             continue;
         };
         let Some(word) = body.get(a..b) else { continue };
-        if !word.chars().any(char::is_alphabetic) || token_is_skipped(token_around(body, a, b)) {
+        if !word.chars().any(char::is_alphabetic)
+            || token_is_skipped(token_around(body, a, b))
+            || memory.ignored.contains(word)
+        {
             continue;
         }
         let suggestions = match suggestions {
             Some(list) => list,
-            None => match cache.get(word) {
+            None => match memory.cache.get(word) {
                 Some(list) => list.clone(),
                 None => {
                     let list = checker.suggest(word, MAX_SUGGESTIONS)?;
-                    if cache.len() >= SUGGESTION_CACHE {
-                        cache.clear();
+                    if memory.cache.len() >= SUGGESTION_CACHE {
+                        memory.cache.clear();
                     }
-                    cache.insert(word.to_owned(), list.clone());
+                    memory.cache.insert(word.to_owned(), list.clone());
                     list
                 }
             },
@@ -360,26 +419,30 @@ impl<'a> Walker<'a> {
     }
 }
 
-/// The first misspelling after `from`, going around to the start of the document.
-fn find_next(
+/// One piece of a search. `Some(answer)` ends it, and `None` means there is more to do.
+fn scan_step(
     checker: &mut dyn Checker,
-    cache: &mut Cache,
-    snapshot: &dyn TextSnapshot,
-    from: usize,
-) -> Result<Option<Misspelling>, String> {
-    let len = snapshot.len_bytes().0;
-    let from = floor_edge(snapshot, from.min(len));
-    for part in [from..len, 0..from] {
-        let mut at = part.start;
-        while at < part.end {
-            let piece = at..part.end.min(at + CHUNK_BYTES);
-            let (done, errors) = check_range(checker, cache, snapshot, &piece)?;
-            if let Some(first) = errors.into_iter().find(|e| e.range.start.0 >= part.start) {
-                return Ok(Some(first));
+    memory: &mut Memory,
+    scan: &mut Scan,
+) -> Result<Option<Option<Misspelling>>, String> {
+    if scan.now.is_empty() {
+        return Ok(match scan.then.take() {
+            Some(next) => {
+                scan.now = next;
+                None
             }
-            at = done.end.max(piece.end);
-        }
+            None => Some(None),
+        });
     }
+    let piece = scan.now.start..scan.now.end.min(scan.now.start + CHUNK_BYTES);
+    let (done, errors) = check_range(checker, memory, scan.snapshot.as_ref(), &piece)?;
+    if let Some(first) = errors
+        .into_iter()
+        .find(|e| e.range.start.0 >= scan.now.start)
+    {
+        return Ok(Some(Some(first)));
+    }
+    scan.now.start = done.end.max(piece.end).min(scan.now.end);
     Ok(None)
 }
 

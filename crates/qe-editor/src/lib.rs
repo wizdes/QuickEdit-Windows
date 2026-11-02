@@ -25,8 +25,9 @@ mod load;
 mod stops;
 
 pub use hooks::{
-    ChangesSince, CompositionState, DecorationKind, GeometryError, HostCommand, PageWrap,
-    PreparedEdits, RangeRect, TextEdit, VisibleRow, VisibleRows, prepare_edits,
+    ChangesSince, CompositionClause, CompositionEnd, CompositionState, DecorationKind,
+    GeometryError, HostCommand, PageWrap, PreparedEdits, RangeRect, TextEdit, VisibleRow,
+    VisibleRows, prepare_edits,
 };
 pub use load::{EDITABLE_FILE_LIMIT, FileLoad, LoadOptions, LoadResult, LoadedFile};
 pub use stops::preferred_line_ending_bytes;
@@ -1252,6 +1253,10 @@ impl EditorView {
         self.copy_limit = bytes;
     }
     pub fn set_prevent_editing(&mut self, enabled: bool) {
+        // Text on its way goes in first. `run_host` has done this already, with its context.
+        if enabled {
+            self.commit_composition_first(&mut ViewContext::default());
+        }
         self.prevent_editing = enabled;
     }
     /// The one check every text change passes.
@@ -2550,12 +2555,18 @@ impl EditorView {
         reveal: bool,
         ctx: &mut ViewContext,
     ) {
+        // A move commits a composition first. The place asked for is in the text as it stood.
+        let (anchor, caret) =
+            if self.hooks.composition.is_some() && (anchor != self.anchor || caret != self.caret) {
+                match self.commit_composition_first(ctx) {
+                    Some(commit) => (commit.moved(anchor), commit.moved(caret)),
+                    None => (anchor, caret),
+                }
+            } else {
+                (anchor, caret)
+            };
         if caret != self.caret {
             self.history.cursor_moved();
-        }
-        if self.hooks.composition.is_some() && (anchor != self.anchor || caret != self.caret) {
-            self.end_composition(ctx);
-            ctx.cancel_composition();
         }
         let old = self.selection();
         let (old_caret, old_affinity) = (self.caret, self.affinity);
@@ -2628,6 +2639,11 @@ impl EditorView {
         if range.is_empty() && value.is_empty() {
             return;
         }
+        // An edit commits a composition first. The range is in the text as it stood.
+        let range = match self.commit_composition_first(ctx) {
+            Some(commit) => commit.moved(range.start)..commit.moved(range.end),
+            None => range,
+        };
         let old = self.store.snapshot();
         match self
             .history
@@ -2653,11 +2669,6 @@ impl EditorView {
         self.pending_anchor = None;
         self.keep_caret_visible = false;
         self.note_change(old.as_ref(), &change);
-        // The composition's place is gone. Its own commit ends it before the edit.
-        if self.hooks.composition.is_some() {
-            self.end_composition(ctx);
-            ctx.cancel_composition();
-        }
         let first_of = old.try_byte_to_position(change.replaced.start);
         let last_of = old.try_byte_to_position(change.replaced.end);
         let (mut first, old_last) = match (first_of, last_of) {
@@ -3176,6 +3187,7 @@ impl EditorView {
         }
     }
     fn undo_or_redo(&mut self, undo: bool, ctx: &mut ViewContext) {
+        self.commit_composition_first(ctx);
         let old = self.store.snapshot();
         let answer = if undo {
             self.history.undo_tracked(&mut self.store)
@@ -3834,6 +3846,7 @@ impl EditorView {
         }
         // Esc ends a composition first. The host then tells the input method.
         if vk == 0x1b && self.hooks.composition.is_some() {
+            self.hooks.composition_end = Some(CompositionEnd::Cancelled);
             self.end_composition(ctx);
             ctx.cancel_composition();
             return Handled::Yes;
@@ -4132,6 +4145,8 @@ impl EditorView {
                 modifiers,
             } => {
                 self.mouse_down(*at, modifiers.shift, event.time_us, ctx);
+                // A click at the caret moves nothing, and it still ends the composition.
+                self.commit_composition_first(ctx);
                 Handled::Yes
             }
             InputKind::MouseMove { at } if self.dragging => {
@@ -4269,7 +4284,7 @@ impl EditorView {
             wrap: self.wrap,
         };
         paint_line_layout(list, layout, &frame);
-        hooks::paint_composition_underline(list, layout, &composition.shown.text, x, y, theme);
+        hooks::paint_composition_underline(list, layout, composition, x, y, theme);
         true
     }
     /// The line as it was before an edit, with no selection, until its layout arrives.

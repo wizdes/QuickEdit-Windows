@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use qe_api::{Dip, Rect, View, ViewRequest};
 use qe_editor::EditorView;
-use qe_ime::{SharedViewHost, TextStoreHandle};
+use qe_ime::{ImeHost, SharedViewHost, TextStoreHandle, TsfThread};
 use qe_layout::DirectWriteLayout;
 use std::{
     cell::{Cell, RefCell},
@@ -11,7 +11,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HMODULE, HWND},
+        Foundation::{HMODULE, HWND, POINT, RECT},
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
             LibraryLoader::GetModuleHandleW,
@@ -117,6 +117,10 @@ pub struct Fixture {
     pub window: HiddenWindow,
     pub requests: Rc<RefCell<Vec<ViewRequest>>>,
     pub problems: Rc<RefCell<Vec<String>>>,
+    /// How many times the store asked for a `sync` because the view was busy.
+    pub busy: Rc<Cell<u32>>,
+    /// What the host says about the window, which these tests never really show.
+    pub shown: Rc<Cell<bool>>,
     pub host: Rc<SharedViewHost>,
 }
 impl Fixture {
@@ -126,6 +130,8 @@ impl Fixture {
         let window = HiddenWindow::new();
         let requests: Rc<RefCell<Vec<ViewRequest>>> = Rc::default();
         let problems: Rc<RefCell<Vec<String>>> = Rc::default();
+        let busy: Rc<Cell<u32>> = Rc::default();
+        let shown = Rc::new(Cell::new(true));
         let host = Rc::new(SharedViewHost {
             view: view.clone(),
             hwnd: window.0,
@@ -138,12 +144,22 @@ impl Fixture {
                 let problems = problems.clone();
                 Box::new(move |new| problems.borrow_mut().push(new))
             },
+            on_sync_needed: {
+                let busy = busy.clone();
+                Box::new(move || busy.set(busy.get() + 1))
+            },
+            shown: {
+                let shown = shown.clone();
+                Box::new(move || shown.get())
+            },
         });
         Self {
             view,
             window,
             requests,
             problems,
+            busy,
+            shown,
             host,
         }
     }
@@ -153,6 +169,46 @@ impl Fixture {
     pub fn no_problems(&self) {
         assert_eq!(self.problems.borrow().as_slice(), &[] as &[String]);
     }
+}
+
+/// A host whose view the test can make busy, as a view in use further up the stack is.
+pub struct GateHost {
+    pub inner: Rc<SharedViewHost>,
+    pub shut: Rc<Cell<bool>>,
+}
+impl ImeHost for GateHost {
+    fn with_view(&self, f: &mut dyn FnMut(&mut EditorView, &mut qe_api::ViewContext)) -> bool {
+        !self.shut.get() && self.inner.with_view(f)
+    }
+    fn to_screen(&self, rect: Rect) -> Option<RECT> {
+        self.inner.to_screen(rect)
+    }
+    fn to_window(&self, point: POINT) -> Option<qe_api::Point> {
+        self.inner.to_window(point)
+    }
+    fn hwnd(&self) -> HWND {
+        self.inner.hwnd()
+    }
+    fn problem(&self, message: String) {
+        self.inner.problem(message);
+    }
+    fn sync_needed(&self) {
+        self.inner.sync_needed();
+    }
+    fn is_shown(&self) -> bool {
+        self.inner.is_shown()
+    }
+}
+
+/// Starts TSF. If this account cannot, these tests cannot say anything, so they stop and
+/// say why. A review saw `0x80004005` in an account with no signed-in desktop session.
+pub fn start_tsf() -> TsfThread {
+    TsfThread::start().unwrap_or_else(|e| {
+        panic!(
+            "TSF did not start, so this test proves nothing here: {e}. This test needs an \
+             account with a signed-in desktop session."
+        )
+    })
 }
 
 pub fn sta() {
@@ -270,9 +326,13 @@ impl Direct {
             *slot.borrow_mut() = Some(f(&store));
             Ok(())
         }));
+        // The host syncs after its edits, and when the store asks after a lock.
+        self.handle.sync();
         let session = unsafe { self.store.RequestLock(kind | SYNC) }.unwrap();
         assert!(session.is_ok(), "the lock was refused: {session:?}");
-        out.borrow_mut().take().expect("the lock never ran")
+        let answer = out.borrow_mut().take().expect("the lock never ran");
+        self.handle.sync();
+        answer
     }
     pub fn read_all(&self) -> String {
         self.locked(READ, |store| read(store, 0, -1))

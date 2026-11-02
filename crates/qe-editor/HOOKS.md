@@ -145,11 +145,16 @@ Send the `InputKind` events through `handle`, or call the methods. Both keep the
 **The store and the selection do not change until a commit**, so a cancel has nothing to restore. On screen, a selection inside the line gives way to the composition. A selection that goes past the line stays highlighted.
 
 - **`composition()`** gives the text, the cursor, the place, and `showing`, which is false until the first layout arrives. **`composition_rects()`** gives the rectangles for a candidate list, and `caret_rect()` gives its cursor.
-- **Esc** ends the composition and asks the host with `ViewRequest::CancelComposition`. Any other edit or caret move does the same. The shell passes this request on as `ShellEvent::CancelComposition`, and the host then tells TSF.
+- **Esc or `ime_cancel`** throws the text away. These are the only calls that do.
+- **Any other edit, a caret move, a click, an undo or Prevent Editing commits the text first**, as its own undo step. A range or a place passed to that call is in the text as it stood, and it moves with the commit. `apply_edits` then refuses edits that were prepared before the commit.
+- **Both ask the host to tell the input method** with `ViewRequest::CancelComposition`, which the shell passes on as `ShellEvent::CancelComposition`. `take_composition_end()` says once which it was: `Committed { revision }` or `Cancelled`.
+- **Clauses:** `ime_set_clauses(clauses, ctx)` sets the parts to underline, in UTF-16 units. The target clause gets a heavier line. `composition_clauses()` reads them.
+- **Places:** `composition_range_rects(utf16_range)` gives the rectangles of part of the text, for a candidate list. It says `NotLaidOut` while newer text waits for its layout, which `composition().current` also says. `composition_place_at_point(point)` gives the UTF-16 place under a point. `byte_at_point` answers from what shows on a composition's line, and a point on the composition's own text gives the byte where it would go.
+- **`select_directed(anchor, caret, ctx)`** sets a selection with its caret at either end.
 - **A change of width, wrap, font or margins** lays the composition out again. Until the worker answers, the plain line shows.
 - **If a layout fails**, a warning says so, and the last good layout stays.
 - **`flush_input` does not end a composition.** Its text is not in the store. A Save decides whether to ask TSF to commit or cancel it first.
-- **A late `ImeEnd`** has no composition number. After `CancelComposition`, the host must not pass on text from a composition it cancelled, because the view would put it at the caret.
+- **A late `ImeEnd`** has no composition number. After `CancelComposition`, the host must not pass on text from that composition, because the view would put it at the caret a second time.
 - **A read-only view** counts the attempt in `refused_edits` and shows nothing.
 - **Line breaks** in the text show as spaces while composing. A commit keeps them.
 - **A cursor** inside a surrogate pair steps back to its start. Past the end, it stops at the end.

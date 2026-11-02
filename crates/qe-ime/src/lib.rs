@@ -16,7 +16,8 @@
 //! # Threads and locks
 //! Everything here runs on the UI thread, in a single-threaded COM apartment. A store call
 //! from TSF can arrive whenever the host runs its message loop. The host must not hold the
-//! view borrowed across the message loop. If it does, the store refuses and tries later.
+//! view borrowed across the message loop. If it does, nothing is lost: the store asks
+//! for a `sync` through `ImeHost::sync_needed` and finishes the work then.
 #![allow(hidden_glob_reexports)]
 
 // `#[implement]` writes paths that start at `windows_core`. This crate stands in
@@ -32,7 +33,7 @@ pub use store::{StoreCounts, TextStoreHandle};
 
 use qe_api::{Dip, Point, Rect, ViewContext, ViewRequest};
 use qe_editor::EditorView;
-use std::{cell::RefCell, fmt, rc::Rc, result::Result};
+use std::{cell::RefCell, fmt, mem::ManuallyDrop, rc::Rc, result::Result};
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT, RPC_E_CHANGED_MODE},
     Graphics::Gdi::{ClientToScreen, ScreenToClient},
@@ -40,9 +41,15 @@ use windows::Win32::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
     },
-    UI::TextServices::{CLSID_TF_ThreadMgr, ITfContext, ITfDocumentMgr, ITfThreadMgr, TF_POPF_ALL},
+    UI::{
+        TextServices::{
+            CLSID_TF_ThreadMgr, ITfContext, ITfDocumentMgr, ITfKeystrokeMgr, ITfMessagePump,
+            ITfSource, ITfTextEditSink, ITfThreadMgr, TF_POPF_ALL,
+        },
+        WindowsAndMessaging::{IsIconic, IsWindowVisible, MSG, WM_KEYDOWN, WM_KEYUP},
+    },
 };
-use windows::core::Interface;
+use windows::core::{BOOL, Interface};
 
 /// A failure with its reason in plain words.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +79,14 @@ pub trait ImeHost {
     fn hwnd(&self) -> HWND;
     /// Shows a problem to the user. It comes at once, and the text stays safe.
     fn problem(&self, message: String);
+    /// Something has to wait for a clean stack: the view was in use, or TSF has to hear of a
+    /// change, which must not happen inside `RequestLock`. Ask for a `sync` once the stack has
+    /// unwound, for example with the shell's wake. No timer is needed.
+    fn sync_needed(&self) {}
+    /// False when the window is hidden or minimized, so that no text shows.
+    fn is_shown(&self) -> bool {
+        true
+    }
 }
 
 /// A window rectangle in device-independent pixels, in screen pixels.
@@ -98,6 +113,12 @@ pub fn window_rect_to_screen(hwnd: HWND, rect: Rect, dpi: u32) -> Option<RECT> {
     })
 }
 
+/// True when the window is visible and not minimized.
+pub fn window_is_shown(hwnd: HWND) -> bool {
+    // SAFETY: both take a handle by value, and a bad window returns false.
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+}
+
 /// A screen point, in the window's device-independent pixels.
 pub fn screen_to_window(hwnd: HWND, point: POINT, dpi: u32) -> Option<Point> {
     let mut at = point;
@@ -118,6 +139,10 @@ pub struct SharedViewHost {
     /// Gets each batch of requests from a store call, after the view's borrow has ended.
     pub on_requests: Box<dyn Fn(Vec<ViewRequest>)>,
     pub on_problem: Box<dyn Fn(String)>,
+    /// Asks for a `sync` once the view is free.
+    pub on_sync_needed: Box<dyn Fn()>,
+    /// Whether the window shows now. The shell passes [`window_is_shown`] for its window.
+    pub shown: Box<dyn Fn() -> bool>,
 }
 impl ImeHost for SharedViewHost {
     fn with_view(&self, f: &mut dyn FnMut(&mut EditorView, &mut ViewContext)) -> bool {
@@ -144,12 +169,42 @@ impl ImeHost for SharedViewHost {
     fn problem(&self, message: String) {
         (self.on_problem)(message);
     }
+    fn sync_needed(&self) {
+        (self.on_sync_needed)();
+    }
+    fn is_shown(&self) -> bool {
+        (self.shown)()
+    }
+}
+
+/// TSF's part for a whole UI thread. The thread handle and every document share it, so TSF
+/// stops, and COM is uninitialized, only after the last of them has gone. The order cannot
+/// go wrong, whichever the host drops first.
+struct ThreadCore {
+    thread: ManuallyDrop<ITfThreadMgr>,
+    keys: ManuallyDrop<ITfKeystrokeMgr>,
+    pump: ManuallyDrop<ITfMessagePump>,
+    client: u32,
+}
+impl Drop for ThreadCore {
+    fn drop(&mut self) {
+        // SAFETY: pairs with `Activate` and `CoInitializeEx` in `start`. Each field is
+        // dropped once, here, so all of the COM objects go before COM does.
+        unsafe {
+            if let Err(e) = self.thread.Deactivate() {
+                eprintln!("TSF would not stop for this thread: {e}");
+            }
+            ManuallyDrop::drop(&mut self.pump);
+            ManuallyDrop::drop(&mut self.keys);
+            ManuallyDrop::drop(&mut self.thread);
+            CoUninitialize();
+        }
+    }
 }
 
 /// TSF on one UI thread. Start it on the first focus. Keep it for the thread's life.
 pub struct TsfThread {
-    thread: ITfThreadMgr,
-    client: u32,
+    core: Rc<ThreadCore>,
 }
 impl TsfThread {
     /// Loads TSF and activates it for this thread.
@@ -169,11 +224,24 @@ impl TsfThread {
             let thread: ITfThreadMgr =
                 unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) }
                     .map_err(|e| failed("creating the TSF thread manager", e))?;
+            let keys: ITfKeystrokeMgr = thread
+                .cast()
+                .map_err(|e| failed("asking for the keystroke manager", e))?;
+            let pump: ITfMessagePump = thread
+                .cast()
+                .map_err(|e| failed("asking for the message pump", e))?;
             let client = unsafe { thread.Activate() }.map_err(|e| failed("activating TSF", e))?;
-            Ok((thread, client))
+            Ok((thread, keys, pump, client))
         })();
         match started {
-            Ok((thread, client)) => Ok(Self { thread, client }),
+            Ok((thread, keys, pump, client)) => Ok(Self {
+                core: Rc::new(ThreadCore {
+                    thread: ManuallyDrop::new(thread),
+                    keys: ManuallyDrop::new(keys),
+                    pump: ManuallyDrop::new(pump),
+                    client,
+                }),
+            }),
             Err(e) => {
                 // SAFETY: pairs with the successful `CoInitializeEx` above.
                 unsafe { CoUninitialize() };
@@ -183,10 +251,44 @@ impl TsfThread {
     }
     /// The client id TSF gave this thread.
     pub fn client_id(&self) -> u32 {
-        self.client
+        self.core.client
     }
     pub fn thread_manager(&self) -> &ITfThreadMgr {
-        &self.thread
+        &self.core.thread
+    }
+    /// The message loop's wait, once TSF has started: Microsoft's `ITfMessagePump`, which
+    /// lets TSF work before and after each message. `Ok(false)` means `WM_QUIT`.
+    pub fn get_message(&self, message: &mut MSG) -> Result<bool, ImeError> {
+        let mut more = BOOL(0);
+        // SAFETY: both out values live for the call.
+        unsafe {
+            self.core
+                .pump
+                .GetMessageW(message, HWND::default(), 0, 0, &mut more)
+        }
+        .map_err(|e| failed("ITfMessagePump::GetMessageW", e))?;
+        Ok(more.as_bool())
+    }
+    /// Offers a key to the input method, before the loop translates it. When this says true,
+    /// the input method took the key, and the loop must skip `TranslateMessage` and
+    /// `DispatchMessageW` for it. A failure counts as "not taken", so a key is never lost.
+    pub fn key_was_taken(&self, message: &MSG) -> bool {
+        let keys = &self.core.keys;
+        let (w, l) = (message.wParam, message.lParam);
+        // SAFETY: a live interface on its own thread, with values from the message itself.
+        unsafe {
+            match message.message {
+                WM_KEYDOWN => {
+                    keys.TestKeyDown(w, l).is_ok_and(|taken| taken.as_bool())
+                        && keys.KeyDown(w, l).is_ok_and(|taken| taken.as_bool())
+                }
+                WM_KEYUP => {
+                    keys.TestKeyUp(w, l).is_ok_and(|taken| taken.as_bool())
+                        && keys.KeyUp(w, l).is_ok_and(|taken| taken.as_bool())
+                }
+                _ => false,
+            }
+        }
     }
     /// Makes a document for one view: document manager, context and text store. TSF
     /// advises its sink on the store during this call.
@@ -194,6 +296,7 @@ impl TsfThread {
         // SAFETY: plain COM calls on this apartment's thread, with live interfaces.
         unsafe {
             let doc = self
+                .core
                 .thread
                 .CreateDocumentMgr()
                 .map_err(|e| failed("CreateDocumentMgr", e))?;
@@ -201,7 +304,7 @@ impl TsfThread {
             let mut context = None;
             let mut cookie = 0;
             doc.CreateContext(
-                self.client,
+                self.core.client,
                 0,
                 &store.text_store(),
                 &mut context,
@@ -213,39 +316,36 @@ impl TsfThread {
             doc.Push(&context)
                 .map_err(|e| failed("pushing the context", e))?;
             store.set_context(&context);
+            let source: ITfSource = context
+                .cast()
+                .map_err(|e| failed("asking for the context's source", e))?;
+            let edit_sink = source
+                .AdviseSink(&ITfTextEditSink::IID, &store.text_edit_sink())
+                .map_err(|e| failed("listening for the end of edits", e))?;
             Ok(TsfDocument {
-                thread: self.thread.clone(),
                 doc,
                 context,
                 store,
+                edit_sink,
                 closed: false,
+                core: self.core.clone(),
             })
         }
     }
 }
-impl Drop for TsfThread {
-    fn drop(&mut self) {
-        // SAFETY: pairs with `Activate` and `CoInitializeEx` in `start`.
-        unsafe {
-            if let Err(e) = self.thread.Deactivate() {
-                eprintln!("TSF would not stop for this thread: {e}");
-            }
-            CoUninitialize();
-        }
-    }
-}
 
-/// Links a document to the window. The `windows` crate's wrapper treats the normal answer
-/// "no document was linked before" as an error, so this calls the interface directly.
+/// Links a document to the window, and hands back the one that was linked. The `windows`
+/// crate's wrapper treats the normal answer "no document was linked before" as an error, so
+/// this calls the interface directly.
 fn associate_focus(
     thread: &ITfThreadMgr,
     hwnd: HWND,
     doc: Option<&ITfDocumentMgr>,
-) -> windows::core::Result<()> {
+) -> windows::core::Result<Option<ITfDocumentMgr>> {
     let mut previous: *mut std::ffi::c_void = std::ptr::null_mut();
     let new = doc.map_or(std::ptr::null_mut(), Interface::as_raw);
     // SAFETY: a live interface on its own thread, with a matching vtable call. A previous
-    // document comes with a reference, which `from_raw` takes over and releases.
+    // document comes with a reference, which `from_raw` takes over.
     unsafe {
         (Interface::vtable(thread).AssociateFocus)(
             Interface::as_raw(thread),
@@ -254,30 +354,34 @@ fn associate_focus(
             &mut previous,
         )
         .ok()?;
-        if !previous.is_null() {
-            drop(ITfDocumentMgr::from_raw(previous));
-        }
+        Ok((!previous.is_null()).then(|| ITfDocumentMgr::from_raw(previous)))
     }
-    Ok(())
 }
 
-/// One view's document in TSF.
+/// One view's document in TSF. It keeps TSF's thread part alive, so it can outlive the
+/// `TsfThread` it came from with no harm.
 pub struct TsfDocument {
-    thread: ITfThreadMgr,
     doc: ITfDocumentMgr,
     context: ITfContext,
     store: TextStoreHandle,
+    edit_sink: u32,
     closed: bool,
+    // Last, so that this document's COM objects go before TSF and COM can stop.
+    core: Rc<ThreadCore>,
 }
 impl TsfDocument {
     /// Call when this view gets the keyboard focus or its tab comes to the front.
     pub fn focus(&self) -> Result<(), ImeError> {
+        if self.closed {
+            return Err(ImeError("This tab's input document has closed.".into()));
+        }
         let hwnd = self.store.hwnd();
         // SAFETY: plain COM calls on this apartment's thread, with live interfaces.
         unsafe {
-            associate_focus(&self.thread, hwnd, Some(&self.doc))
+            associate_focus(&self.core.thread, hwnd, Some(&self.doc))
                 .map_err(|e| failed("AssociateFocus", e))?;
-            self.thread
+            self.core
+                .thread
                 .SetFocus(&self.doc)
                 .map_err(|e| failed("setting TSF's focus", e))
         }
@@ -286,7 +390,8 @@ impl TsfDocument {
         &self.store
     }
     /// Call after any editor call that may have changed the text, the selection or the
-    /// editable state. See [`TextStoreHandle::sync`].
+    /// editable state, and on the wake that `ImeHost::sync_needed` asks for. See
+    /// [`TextStoreHandle::sync`].
     pub fn sync(&self) {
         self.store.sync();
     }
@@ -294,7 +399,8 @@ impl TsfDocument {
     pub fn layout_changed(&self) {
         self.store.layout_changed();
     }
-    /// The answer to `ViewRequest::CancelComposition`. Ends it in TSF and drops its text.
+    /// The answer to `ViewRequest::CancelComposition`. See
+    /// [`TextStoreHandle::cancel_composition`].
     pub fn cancel_composition(&self) {
         self.store.cancel_composition();
     }
@@ -308,16 +414,41 @@ impl TsfDocument {
     pub fn document_manager(&self) -> &ITfDocumentMgr {
         &self.doc
     }
-    /// Ends any composition, keeping its text, and takes the document out of TSF.
+    /// Ends any composition, keeping its text, and takes the document out of TSF. Call this
+    /// with the view free. If the view is in use even so, the text cannot go in, so the host
+    /// gets it in a problem message, and it is not dropped unseen.
     pub fn close(&mut self) {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
         self.store.complete_composition();
+        self.store.sync();
+        if let Some(text) = self.store.stranded_text() {
+            self.store.report(format!(
+                "This tab closed while its window was busy, so this input was not added: {text}"
+            ));
+        }
+        let hwnd = self.store.hwnd();
         // SAFETY: plain COM calls on this apartment's thread, with live interfaces.
         unsafe {
-            if let Err(e) = associate_focus(&self.thread, self.store.hwnd(), None) {
-                self.store.report(format!("TSF kept this tab's focus: {e}"));
+            if let Err(e) = self
+                .context
+                .cast::<ITfSource>()
+                .and_then(|source| source.UnadviseSink(self.edit_sink))
+            {
+                self.store
+                    .report(format!("TSF kept listening to this tab: {e}"));
+            }
+            // A tab behind the front one must not take the front tab's link with it.
+            match associate_focus(&self.core.thread, hwnd, None) {
+                Ok(Some(front)) if front != self.doc => {
+                    if let Err(e) = associate_focus(&self.core.thread, hwnd, Some(&front)) {
+                        self.store
+                            .report(format!("TSF lost the front tab's link: {e}"));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => self.store.report(format!("TSF kept this tab's focus: {e}")),
             }
             if let Err(e) = self.doc.Pop(TF_POPF_ALL) {
                 self.store

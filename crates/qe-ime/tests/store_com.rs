@@ -10,19 +10,26 @@ mod support;
 use qe_api::{ByteOffset, InputEvent, InputKind, Modifiers, View, ViewContext};
 use qe_buffer::{MappedStore, PieceStore};
 use qe_editor::{EditorView, LoadedFile};
-use std::time::Duration;
+use qe_ime::TextStoreHandle;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 use support::{Direct, Heard, READ, SYNC, WRITE, area, laid_out, read, units};
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, E_INVALIDARG, POINT, RECT},
+        Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, POINT, RECT},
         UI::TextServices::{
-            GXFPF_NEAREST, ITextStoreACPSink, ITfCompositionView, TS_AE_END, TS_AE_START,
-            TS_E_INVALIDPOINT, TS_E_INVALIDPOS, TS_E_NOLAYOUT, TS_E_NOLOCK, TS_E_READONLY,
-            TS_E_SYNCHRONOUS, TS_IAS_NOQUERY, TS_IAS_QUERYONLY, TS_S_ASYNC, TS_SD_LOADING,
-            TS_SD_READONLY, TS_SELECTION_ACP, TS_SELECTIONSTYLE, TS_SS_NOHIDDENTEXT, TS_TEXTCHANGE,
+            GXFPF_NEAREST, ITextStoreACP, ITextStoreACPSink, ITextStoreACPSink_Impl,
+            ITfCompositionView, TEXT_STORE_LOCK_FLAGS, TEXT_STORE_TEXT_CHANGE_FLAGS, TS_AE_END,
+            TS_AE_START, TS_ATTRVAL, TS_E_INVALIDPOINT, TS_E_INVALIDPOS, TS_E_NOLAYOUT,
+            TS_E_NOLOCK, TS_E_READONLY, TS_E_SYNCHRONOUS, TS_IAS_NOQUERY, TS_IAS_QUERYONLY,
+            TS_RT_PLAIN, TS_RUNINFO, TS_S_ASYNC, TS_SD_LOADING, TS_SD_READONLY, TS_SELECTION_ACP,
+            TS_SELECTIONSTYLE, TS_SS_NOHIDDENTEXT, TS_TEXTCHANGE, TsLayoutCode,
         },
     },
-    core::{BOOL, ComObject, GUID, HRESULT, Interface},
+    core::{BOOL, ComObject, GUID, HRESULT, Interface, implement},
 };
 
 fn view(text: &str) -> EditorView {
@@ -519,9 +526,15 @@ fn query_insert_moves_out_of_a_pair_and_refuses_bad_ranges() {
     let (mut start, mut end) = (0, 0);
     unsafe {
         d.store.QueryInsert(1, 1, 3, &mut start, &mut end).unwrap();
-        assert_eq!((start, end), (1, 4));
+        assert_eq!((start, end), (1, 1));
         d.store.QueryInsert(2, 3, 1, &mut start, &mut end).unwrap();
-        assert_eq!(start, 1);
+        assert_eq!((start, end), (1, 3));
+        d.store.QueryInsert(0, 2, 1, &mut start, &mut end).unwrap();
+        assert_eq!((start, end), (0, 3), "the end moves out of the pair too");
+        d.store
+            .QueryInsert(4, 4, 100, &mut start, &mut end)
+            .unwrap();
+        assert_eq!((start, end), (4, 4), "never outside the document");
         assert_eq!(
             code(d.store.QueryInsert(0, 9, 1, &mut start, &mut end)),
             E_INVALIDARG
@@ -795,26 +808,262 @@ fn an_edit_during_a_lock_waits_for_the_lock_to_end() {
         "no sink call during a lock"
     );
     assert_eq!(
+        doc.take_heard(),
+        vec![],
+        "and none on the stack of RequestLock"
+    );
+    doc.handle.sync();
+    assert_eq!(
         doc.take_heard()[0],
         Heard::Text(0, 0, 1),
-        "it came at the lock's end"
+        "it came at the host's next sync"
     );
 }
 
 #[test]
-fn a_lock_tells_tsf_about_editor_edits_before_it_can_read() {
+fn with_changes_to_tell_a_lock_waits_and_tsf_hears_first_and_never_inside_request_lock() {
     let d = Direct::new(view("abc"));
     let mut ctx = ViewContext::default();
     d.fixture
         .view
         .borrow_mut()
         .replace_range(b(0)..b(0), "x", &mut ctx);
+    d.take_heard();
     // No sync call from the host this time.
-    let heard_before = {
-        let sink = d.sink.clone();
-        d.locked(READ, move |_| sink.heard.borrow().clone())
-    };
-    assert_eq!(heard_before[0], Heard::Text(0, 0, 1));
+    let refused = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+    assert_eq!(
+        refused, TS_E_SYNCHRONOUS,
+        "the only answer Microsoft allows"
+    );
+    let asked = d.fixture.busy.get();
+    let sink = d.sink.clone();
+    let heard_in_lock: Rc<RefCell<Vec<Heard>>> = Rc::default();
+    let out = heard_in_lock.clone();
+    *d.sink.on_lock.borrow_mut() = Some(Box::new(move |_| {
+        *out.borrow_mut() = sink.heard.borrow().clone();
+        Ok(())
+    }));
+    let queued = unsafe { d.store.RequestLock(READ) }.unwrap();
+    assert_eq!(queued, TS_S_ASYNC);
+    assert_eq!(
+        d.take_heard(),
+        vec![],
+        "nothing on the stack of RequestLock"
+    );
+    assert!(d.fixture.busy.get() > asked, "the host is asked for a sync");
+    d.handle.sync();
+    assert_eq!(heard_in_lock.borrow()[0], Heard::Text(0, 0, 1));
+    assert!(!d.handle.lock_is_waiting());
+}
+
+#[test]
+fn edits_tsf_made_itself_do_not_hold_back_the_next_sync_lock() {
+    let d = Direct::new(laid_out("abc"));
+    let store = d.store.clone();
+    *d.sink.on_lock.borrow_mut() = Some(Box::new(move |_| {
+        unsafe { store.SetText(0, 0, 0, &units("x")) }?;
+        Ok(())
+    }));
+    let wrote = unsafe { d.store.RequestLock(WRITE | SYNC) }.unwrap();
+    assert!(wrote.is_ok(), "{wrote:?}");
+    assert_eq!(d.fixture.text(), "xabc");
+    // No sync from the host in between: there is nothing to tell TSF.
+    let ran: Rc<Cell<bool>> = Rc::default();
+    let seen = ran.clone();
+    *d.sink.on_lock.borrow_mut() = Some(Box::new(move |_| {
+        seen.set(true);
+        Ok(())
+    }));
+    let answer = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+    assert!(answer.is_ok(), "{answer:?}");
+    assert!(ran.get());
+}
+
+#[test]
+fn a_hidden_window_has_an_all_zero_screen_area() {
+    let d = Direct::new(laid_out("abc"));
+    assert_ne!(unsafe { d.store.GetScreenExt(0) }.unwrap(), RECT::default());
+    d.fixture.shown.set(false);
+    assert_eq!(unsafe { d.store.GetScreenExt(0) }.unwrap(), RECT::default());
+}
+
+#[test]
+fn text_scrolled_out_of_the_view_has_an_all_zero_rectangle_and_says_clipped() {
+    let d = Direct::new(laid_out(&"some line\n".repeat(2_000)));
+    let near = d.locked(READ, |store| unsafe {
+        let (mut rect, mut clipped) = (RECT::default(), BOOL(0));
+        let answer = code(store.GetTextExt(0, 0, 4, &mut rect, &mut clipped));
+        (answer, rect, clipped.as_bool())
+    });
+    assert_eq!(near.0, HRESULT(0));
+    assert_ne!(near.1, RECT::default());
+    assert!(!near.2);
+    let far = d.locked(READ, |store| unsafe {
+        let (mut rect, mut clipped) = (RECT::default(), BOOL(0));
+        let answer = code(store.GetTextExt(0, 15_000, 15_004, &mut rect, &mut clipped));
+        (answer, rect, clipped.as_bool())
+    });
+    assert_eq!(
+        far.0,
+        HRESULT(0),
+        "Microsoft: S_OK when the text is not visible"
+    );
+    assert_eq!(far.1, RECT::default());
+    assert!(far.2);
+}
+
+#[test]
+fn a_lock_on_the_stack_of_request_lock_sends_no_sink_change_at_its_end() {
+    let d = Direct::new(laid_out("abc"));
+    let view = d.fixture.view.clone();
+    // An edit from the host while TSF holds the lock, which is the worst case.
+    *d.sink.on_lock.borrow_mut() = Some(Box::new(move |_| {
+        view.borrow_mut()
+            .replace_range(b(0)..b(0), "x", &mut ViewContext::default());
+        Ok(())
+    }));
+    d.take_heard();
+    let asked = d.fixture.busy.get();
+    let answer = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+    assert!(answer.is_ok(), "{answer:?}");
+    assert_eq!(d.take_heard(), vec![], "not on this stack");
+    assert!(d.fixture.busy.get() > asked, "the host is asked for a sync");
+    d.handle.sync();
+    assert_eq!(d.take_heard()[0], Heard::Text(0, 0, 1));
+}
+
+#[test]
+fn a_sync_lock_that_works_replaces_a_waiting_async_one_and_a_refused_one_does_not() {
+    let d = Direct::new(laid_out("abc"));
+    {
+        let _in_use = d.fixture.view.borrow_mut();
+        assert_eq!(unsafe { d.store.RequestLock(READ) }.unwrap(), TS_S_ASYNC);
+        let refused = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+        assert_eq!(refused, TS_E_SYNCHRONOUS);
+    }
+    assert!(d.handle.lock_is_waiting(), "a refused one replaces nothing");
+    let answer = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+    assert!(answer.is_ok(), "{answer:?}");
+    assert!(!d.handle.lock_is_waiting());
+    d.handle.sync();
+    assert_eq!(d.sink.lock_flags.borrow().len(), 1, "one grant, not two");
+}
+
+#[test]
+fn a_sync_read_does_not_replace_a_waiting_write() {
+    let d = Direct::new(laid_out("abc"));
+    {
+        let _in_use = d.fixture.view.borrow_mut();
+        assert_eq!(unsafe { d.store.RequestLock(WRITE) }.unwrap(), TS_S_ASYNC);
+    }
+    let answer = unsafe { d.store.RequestLock(READ | SYNC) }.unwrap();
+    assert!(answer.is_ok(), "{answer:?}");
+    d.handle.sync();
+    assert_eq!(d.sink.lock_flags.borrow().as_slice(), &[READ, WRITE]);
+}
+
+#[test]
+fn looking_for_an_attribute_change_past_the_end_is_refused() {
+    let d = Direct::new(laid_out("abc"));
+    let answer = d.locked(READ, |store| {
+        let (mut next, mut found, mut offset) = (0, BOOL(0), 0);
+        code(unsafe {
+            store.FindNextAttrTransition(0, 99, &[], 0, &mut next, &mut found, &mut offset)
+        })
+    });
+    assert_eq!(answer, TS_E_INVALIDPOS);
+}
+
+#[test]
+fn a_store_that_is_closed_ignores_a_sync_and_refuses_a_lock() {
+    let d = Direct::new(laid_out("abc"));
+    let mut ctx = ViewContext::default();
+    d.fixture
+        .view
+        .borrow_mut()
+        .replace_range(b(0)..b(0), "x", &mut ctx);
+    d.take_heard();
+    assert_eq!(unsafe { d.store.RequestLock(READ) }.unwrap(), TS_S_ASYNC);
+    assert!(d.handle.lock_is_waiting());
+    d.handle.close();
+    assert!(!d.handle.lock_is_waiting(), "no lock runs after the close");
+    d.handle.sync();
+    assert_eq!(d.take_heard(), vec![]);
+    assert!(unsafe { d.store.RequestLock(READ | SYNC) }.is_err());
+    assert!(!d.handle.is_composing());
+}
+
+/// A COM object whose `QueryInterface` calls the store back, as any sink's may. It stands in
+/// front of a plain sink, and hands that sink out.
+#[repr(C)]
+struct CallbackInQuery {
+    vtable: *const windows::core::IUnknown_Vtbl,
+    refs: Cell<u32>,
+    store: ITextStoreACP,
+    inner: IUnknown,
+    calls: Rc<Cell<u32>>,
+}
+unsafe extern "system" fn query_with_callback(
+    this: *mut std::ffi::c_void,
+    iid: *const GUID,
+    out: *mut *mut std::ffi::c_void,
+) -> HRESULT {
+    let me = unsafe { &*(this as *const CallbackInQuery) };
+    me.calls.set(me.calls.get() + 1);
+    // A store still holding its state would panic here, and that stops the whole process.
+    let answer = unsafe { me.store.RequestLock(READ | SYNC) };
+    assert!(answer.is_err(), "no sink yet, so no lock");
+    unsafe { me.inner.query(iid, out) }
+}
+unsafe extern "system" fn add_ref_callback(this: *mut std::ffi::c_void) -> u32 {
+    let me = unsafe { &*(this as *const CallbackInQuery) };
+    me.refs.set(me.refs.get() + 1);
+    me.refs.get()
+}
+unsafe extern "system" fn release_callback(this: *mut std::ffi::c_void) -> u32 {
+    let me = unsafe { &*(this as *const CallbackInQuery) };
+    me.refs.set(me.refs.get() - 1);
+    let left = me.refs.get();
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut CallbackInQuery) });
+    }
+    left
+}
+static CALLBACK_VTABLE: windows::core::IUnknown_Vtbl = windows::core::IUnknown_Vtbl {
+    QueryInterface: query_with_callback,
+    AddRef: add_ref_callback,
+    Release: release_callback,
+};
+
+#[test]
+fn a_sink_that_calls_the_store_from_query_interface_during_advise_finds_it_free() {
+    let fixture = support::Fixture::new(laid_out("ab"));
+    let handle = TextStoreHandle::new(fixture.host.clone());
+    let plain = ComObject::new(support::FakeSink {
+        heard: RefCell::default(),
+        on_lock: RefCell::default(),
+        lock_flags: RefCell::default(),
+        fail_text: Cell::new(0),
+    });
+    let inner: ITextStoreACPSink = plain.to_interface();
+    let calls: Rc<Cell<u32>> = Rc::default();
+    let raw = Box::into_raw(Box::new(CallbackInQuery {
+        vtable: &CALLBACK_VTABLE,
+        refs: Cell::new(1),
+        store: handle.text_store(),
+        inner: inner.cast().unwrap(),
+        calls: calls.clone(),
+    }));
+    let punk = unsafe { IUnknown::from_raw(raw.cast()) };
+    unsafe {
+        handle
+            .text_store()
+            .AdviseSink(&ITextStoreACPSink::IID, &punk, 0x1f)
+    }
+    .unwrap();
+    assert!(calls.get() >= 2, "both looks went through the callback");
+    drop(punk);
+    handle.close();
 }
 
 #[test]
@@ -970,4 +1219,308 @@ fn a_point_maps_to_a_position_and_outside_points_follow_the_flags() {
     assert_eq!(out.1, TS_E_INVALIDPOINT);
     assert_eq!(out.2, HRESULT(0));
     assert_eq!(out.3, E_INVALIDARG);
+}
+
+// ---- Review fixes ----
+
+#[test]
+fn before_the_first_layout_the_screen_area_is_no_layout_and_tsf_hears_when_it_comes() {
+    let d = Direct::new(view("hello"));
+    assert_eq!(code(unsafe { d.store.GetScreenExt(0) }), TS_E_NOLAYOUT);
+    d.take_heard();
+    support::lay_out(&mut d.fixture.view.borrow_mut(), 600.0, 300.0);
+    d.handle.layout_changed();
+    assert_eq!(d.take_heard(), vec![Heard::Layout]);
+    assert_eq!(code(unsafe { d.store.GetScreenExt(0) }), HRESULT(0));
+}
+
+#[test]
+fn catching_up_on_four_thousand_edits_reads_the_log_a_few_times_only() {
+    let d = Direct::new(laid_out(""));
+    let mut ctx = ViewContext::default();
+    for at in 0..4000 {
+        d.fixture
+            .view
+            .borrow_mut()
+            .replace_range(b(at)..b(at), "x", &mut ctx);
+    }
+    d.take_heard();
+    let before = d.handle.counts();
+    d.handle.sync();
+    let after = d.handle.counts();
+    assert_eq!(after.text_changes_sent - before.text_changes_sent, 4000);
+    assert!(
+        after.change_log_reads - before.change_log_reads <= 3,
+        "{} looks at the log",
+        after.change_log_reads - before.change_log_reads
+    );
+    let heard = d.take_heard();
+    assert_eq!(heard[0], Heard::Text(0, 0, 1));
+    assert_eq!(heard[3999], Heard::Text(3999, 3999, 4000));
+    assert_eq!(
+        d.locked(READ, |store| unsafe { store.GetEndACP() }.unwrap()),
+        4000
+    );
+}
+
+#[test]
+fn edits_that_tsf_makes_while_hearing_a_change_are_not_lost_or_told_back() {
+    let d = Direct::new(laid_out("ab"));
+    let mut ctx = ViewContext::default();
+    d.fixture
+        .view
+        .borrow_mut()
+        .replace_range(b(0)..b(0), "x", &mut ctx);
+    d.fixture
+        .view
+        .borrow_mut()
+        .replace_range(b(0)..b(0), "y", &mut ctx);
+    d.handle.sync();
+    assert_eq!(
+        d.take_heard()
+            .into_iter()
+            .filter(|h| matches!(h, Heard::Text(..)))
+            .count(),
+        2
+    );
+    assert_eq!(d.read_all(), "yxab");
+    d.handle.sync();
+    assert_eq!(d.take_heard(), vec![]);
+}
+
+/// A sink that calls back into the store while it is being released, as a real one may.
+#[implement(ITextStoreACPSink)]
+struct NosySink {
+    store: RefCell<Option<ITextStoreACP>>,
+    ran: Rc<Cell<bool>>,
+}
+impl Drop for NosySink {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.borrow_mut().take() {
+            // A store that still held its state here would panic, and that stops the app.
+            let answer = unsafe { store.RequestLock(READ | SYNC) };
+            assert!(answer.is_err(), "no sink, so no lock");
+            self.ran.set(true);
+        }
+    }
+}
+impl ITextStoreACPSink_Impl for NosySink_Impl {
+    fn OnTextChange(
+        &self,
+        _: TEXT_STORE_TEXT_CHANGE_FLAGS,
+        _: *const TS_TEXTCHANGE,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnSelectionChange(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnLayoutChange(&self, _: TsLayoutCode, _: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnStatusChange(&self, _: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnAttrsChange(&self, _: i32, _: i32, _: u32, _: *const GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnLockGranted(&self, _: TEXT_STORE_LOCK_FLAGS) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnStartEditTransaction(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnEndEditTransaction(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+fn nosy_store(fixture: &support::Fixture) -> (TextStoreHandle, ITextStoreACPSink, Rc<Cell<bool>>) {
+    let handle = TextStoreHandle::new(fixture.host.clone());
+    let ran: Rc<Cell<bool>> = Rc::default();
+    let sink: ITextStoreACPSink = NosySink {
+        store: RefCell::new(Some(handle.text_store())),
+        ran: ran.clone(),
+    }
+    .into();
+    unsafe {
+        handle
+            .text_store()
+            .AdviseSink(&ITextStoreACPSink::IID, &sink, 0x1f)
+    }
+    .unwrap();
+    (handle, sink, ran)
+}
+
+#[test]
+fn a_sink_that_calls_the_store_while_it_is_released_finds_it_free() {
+    let fixture = support::Fixture::new(laid_out("ab"));
+    let (handle, sink, ran) = nosy_store(&fixture);
+    unsafe { handle.text_store().UnadviseSink(&sink) }.unwrap();
+    drop(sink);
+    assert!(ran.get(), "the sink's release ran");
+}
+
+#[test]
+fn a_sink_that_calls_the_store_while_it_is_closed_finds_it_free() {
+    let fixture = support::Fixture::new(laid_out("ab"));
+    let (handle, sink, ran) = nosy_store(&fixture);
+    drop(sink);
+    assert!(!ran.get());
+    handle.close();
+    assert!(ran.get(), "the sink's release ran");
+}
+
+#[test]
+fn get_text_can_be_asked_for_runs_alone() {
+    let d = Direct::new(laid_out("abcd"));
+    let (got, run_count, run, next) = d.locked(READ, |store| {
+        let mut runs = [TS_RUNINFO::default(); 1];
+        let (mut got, mut run_count, mut next) = (9, 9, 9);
+        unsafe {
+            store
+                .GetText(
+                    1,
+                    -1,
+                    &mut [],
+                    &mut got,
+                    &mut runs,
+                    &mut run_count,
+                    &mut next,
+                )
+                .unwrap();
+        }
+        (got, run_count, runs[0], next)
+    });
+    assert_eq!(got, 0);
+    assert_eq!(run_count, 1);
+    assert_eq!((run.uCount, run.r#type), (3, TS_RT_PLAIN));
+    assert_eq!(next, 4);
+}
+
+#[test]
+fn get_text_with_no_room_and_no_runs_says_nothing_was_read() {
+    let d = Direct::new(laid_out("abcd"));
+    let (got, run_count, next) = d.locked(READ, |store| {
+        let (mut got, mut run_count, mut next) = (9, 9, 9);
+        unsafe {
+            store
+                .GetText(1, -1, &mut [], &mut got, &mut [], &mut run_count, &mut next)
+                .unwrap();
+        }
+        (got, run_count, next)
+    });
+    assert_eq!((got, run_count, next), (0, 0, 1));
+}
+
+#[test]
+fn a_selection_set_with_its_active_end_first_keeps_the_caret_there() {
+    let d = Direct::new(laid_out("abcd"));
+    let out = d.locked(WRITE, |store| unsafe {
+        store.SetSelection(&[selection(1, 3, true)]).unwrap();
+        get_selection(store)
+    });
+    assert_eq!((out.acpStart, out.acpEnd), (1, 3));
+    assert_eq!(out.style.ase, TS_AE_START);
+    let view = d.fixture.view.borrow();
+    assert_eq!(view.caret(), b(1));
+    assert_eq!(view.selection(), b(1)..b(3));
+}
+
+#[test]
+fn a_mapped_file_past_what_its_index_knows_is_outside_the_text_for_now() {
+    // TSF sees the part that is known, with `TS_SD_LOADING`, and hears when more is known.
+    // Microsoft lists S_OK, TF_E_INVALIDPOS and TF_E_NOLOCK for `GetText`.
+    let (mapped, _remove) = mapped_view("qe-ime-review-pending");
+    let d = Direct::new(mapped);
+    let answer = d.locked(READ, |store| {
+        let mut buffer = [0_u16; 8];
+        let (mut got, mut run_count, mut next) = (0, 0, 0);
+        code(unsafe {
+            store.GetText(
+                1 << 29,
+                (1 << 29) + 8,
+                &mut buffer,
+                &mut got,
+                &mut [],
+                &mut run_count,
+                &mut next,
+            )
+        })
+    });
+    assert_eq!(answer, TS_E_INVALIDPOS);
+}
+
+// ---- The store methods that have nothing to offer say so properly ----
+
+#[test]
+fn embedded_objects_are_not_supported_and_each_call_says_so() {
+    let d = Direct::new(laid_out("ab"));
+    let (get, query, formatted) = d.locked(READ, |store| unsafe {
+        let guid = GUID::zeroed();
+        (
+            code(store.GetEmbedded(0, &guid, &guid)),
+            store.QueryInsertEmbedded(&guid, std::ptr::null()).unwrap(),
+            code(store.GetFormattedText(0, 2)),
+        )
+    });
+    assert_eq!(get, E_NOTIMPL);
+    assert!(!query.as_bool(), "nothing embedded can go in");
+    assert_eq!(formatted, E_NOTIMPL);
+}
+
+#[test]
+fn the_store_has_no_attributes_and_each_attribute_call_says_so() {
+    let d = Direct::new(laid_out("abc"));
+    let (supported, at_position, next, found, offset, fetched) = d.locked(READ, |store| unsafe {
+        let ids = [GUID::zeroed()];
+        let supported = code(store.RequestSupportedAttrs(0, &ids));
+        let at_position = code(store.RequestAttrsAtPosition(1, &ids, 0));
+        let (mut next, mut found, mut offset) = (9, BOOL(1), 9);
+        store
+            .FindNextAttrTransition(0, 2, &ids, 0, &mut next, &mut found, &mut offset)
+            .unwrap();
+        let mut values = [TS_ATTRVAL::default(); 1];
+        let mut fetched = 9;
+        store
+            .RetrieveRequestedAttrs(&mut values, &mut fetched)
+            .unwrap();
+        (supported, at_position, next, found, offset, fetched)
+    });
+    assert_eq!(supported, HRESULT(0));
+    assert_eq!(at_position, HRESULT(0));
+    assert_eq!(next, 2, "the walk stops at the place it was told to");
+    assert!(!found.as_bool());
+    assert_eq!(offset, 0);
+    assert_eq!(fetched, 0);
+}
+
+#[test]
+fn looking_for_an_attribute_change_needs_a_lock() {
+    let d = Direct::new(laid_out("abc"));
+    let (mut next, mut found, mut offset) = (0, BOOL(0), 0);
+    let answer = unsafe {
+        d.store
+            .FindNextAttrTransition(0, 2, &[], 0, &mut next, &mut found, &mut offset)
+    };
+    assert_eq!(code(answer), TS_E_NOLOCK);
+}
+
+#[test]
+fn text_past_the_right_side_of_the_view_has_an_all_zero_rectangle() {
+    let mut long = laid_out(&"w".repeat(600));
+    long.run_host(
+        qe_editor::HostCommand::Wrap(false),
+        &mut ViewContext::default(),
+    );
+    support::settle(&mut long);
+    let d = Direct::new(long);
+    let far = d.locked(READ, |store| unsafe {
+        let (mut rect, mut clipped) = (RECT::default(), BOOL(0));
+        let answer = code(store.GetTextExt(0, 590, 594, &mut rect, &mut clipped));
+        (answer, rect, clipped.as_bool())
+    });
+    assert_eq!(far.0, HRESULT(0));
+    assert_eq!(far.1, RECT::default());
+    assert!(far.2);
 }

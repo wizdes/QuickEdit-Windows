@@ -7,7 +7,8 @@ use windows::{
     Win32::{
         Globalization::{
             CORRECTIVE_ACTION_DELETE, CORRECTIVE_ACTION_GET_SUGGESTIONS, CORRECTIVE_ACTION_REPLACE,
-            GetUserDefaultLocaleName, ISpellChecker, ISpellCheckerFactory, SpellCheckerFactory,
+            GetUserDefaultLocaleName, GetUserPreferredUILanguages, ISpellChecker,
+            ISpellCheckerFactory, MUI_LANGUAGE_NAME, SpellCheckerFactory,
         },
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IEnumString},
     },
@@ -39,7 +40,6 @@ pub trait Checker {
     fn check(&mut self, text: &[u16]) -> Result<Vec<RawError>, String>;
     fn suggest(&mut self, word: &str, most: usize) -> Result<Vec<String>, String>;
     fn add(&mut self, word: &str) -> Result<(), String>;
-    fn ignore(&mut self, word: &str) -> Result<(), String>;
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -52,7 +52,59 @@ pub fn default_language() -> Option<String> {
     // SAFETY: the buffer outlives the call, and its length goes with it.
     let length = unsafe { GetUserDefaultLocaleName(&mut name) };
     let length = usize::try_from(length).ok()?.checked_sub(1)?;
-    Some(String::from_utf16_lossy(name.get(..length)?))
+    Some(without_sort_order(&String::from_utf16_lossy(
+        name.get(..length)?,
+    )))
+}
+
+/// `de-DE_phoneb` names a sort order as well as a language. A dictionary's tag never does.
+pub fn without_sort_order(tag: &str) -> String {
+    tag.split('_').next().unwrap_or(tag).to_owned()
+}
+
+/// The languages the user chose for Windows' own display, best first.
+fn display_languages() -> Vec<String> {
+    let (mut count, mut size) = (0, 0);
+    // SAFETY: both out values live for the call, and asking for the size takes no buffer.
+    let asked =
+        unsafe { GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, None, &mut size) };
+    if asked.is_err() || size == 0 {
+        return Vec::new();
+    }
+    let mut names = vec![0_u16; size as usize];
+    // SAFETY: the buffer has the size that the call above asked for.
+    let read = unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            Some(PWSTR(names.as_mut_ptr())),
+            &mut size,
+        )
+    };
+    if read.is_err() {
+        return Vec::new();
+    }
+    names
+        .split(|unit| *unit == 0)
+        .filter(|name| !name.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+/// The dictionary to use from the ones Windows has: the tag itself, then the first with the
+/// same language (`en-CA` finds `en-US`), then the same for each of Windows' display languages.
+pub fn choose_language(wanted: &str, display: &[String], supported: &[String]) -> Option<String> {
+    let same_language = |one: &str, tag: &str| one.split('-').next() == tag.split('-').next();
+    let wanted = without_sort_order(wanted);
+    std::iter::once(wanted.as_str())
+        .chain(display.iter().map(String::as_str))
+        .find_map(|tag| {
+            supported
+                .iter()
+                .find(|one| one.eq_ignore_ascii_case(tag))
+                .or_else(|| supported.iter().find(|one| same_language(one, tag)))
+                .cloned()
+        })
 }
 
 /// Windows' `ISpellChecker`.
@@ -73,7 +125,14 @@ impl WindowsChecker {
                 .map(str::to_owned)
                 .or_else(default_language)
                 .unwrap_or_else(|| "en-US".to_owned());
-            let tag = pick_language(&factory, &wanted)
+            // A language the caller named is that language. Only the user's default may fall
+            // back to Windows' display languages.
+            let display = if language.is_some() {
+                Vec::new()
+            } else {
+                display_languages()
+            };
+            let tag = pick_language(&factory, &wanted, &display)
                 .map_err(unavailable)?
                 .ok_or_else(|| {
                     format!(
@@ -104,25 +163,16 @@ impl WindowsChecker {
     }
 }
 
-/// The tag itself, or the first dictionary for the same language: `en-CA` finds `en-US`.
+/// The dictionary for this tag, with what `choose_language` allows.
 unsafe fn pick_language(
     factory: &ISpellCheckerFactory,
     wanted: &str,
+    display: &[String],
 ) -> windows::core::Result<Option<String>> {
-    let tag = wide(wanted);
-    // SAFETY: the caller is on a COM thread, and `tag` outlives the call.
-    if unsafe { factory.IsSupported(PCWSTR(tag.as_ptr())) }?.as_bool() {
-        return Ok(Some(wanted.to_owned()));
-    }
-    let primary = wanted.split('-').next().unwrap_or(wanted);
-    // SAFETY: as above.
+    // SAFETY: the caller is on a COM thread.
     let languages = unsafe { factory.SupportedLanguages() }?;
-    for language in strings(&languages, usize::MAX)? {
-        if language.split('-').next() == Some(primary) {
-            return Ok(Some(language));
-        }
-    }
-    Ok(None)
+    let supported = strings(&languages, usize::MAX)?;
+    Ok(choose_language(wanted, display, &supported))
 }
 
 fn strings(values: &IEnumString, most: usize) -> windows::core::Result<Vec<String>> {
@@ -152,6 +202,10 @@ fn strings(values: &IEnumString, most: usize) -> windows::core::Result<Vec<Strin
 
 impl Checker for WindowsChecker {
     fn check(&mut self, text: &[u16]) -> Result<Vec<RawError>, String> {
+        // Windows reads to the 0, so text with none would have it read past the end.
+        if text.last() != Some(&0) {
+            return Err("The spell check needs text that ends with a 0.".into());
+        }
         let failed = |e: windows::core::Error| format!("The spell check failed: {e}");
         // SAFETY: `text` ends with 0 and outlives the call, as `Checker::check` requires.
         let errors = unsafe { self.checker.Check(PCWSTR(text.as_ptr())) }.map_err(failed)?;
@@ -199,11 +253,5 @@ impl Checker for WindowsChecker {
         // SAFETY: `text` ends with 0 and outlives the call.
         unsafe { self.checker.Add(PCWSTR(text.as_ptr())) }
             .map_err(|e| format!("Could not add \"{word}\" to the dictionary: {e}"))
-    }
-    fn ignore(&mut self, word: &str) -> Result<(), String> {
-        let text = wide(word);
-        // SAFETY: `text` ends with 0 and outlives the call.
-        unsafe { self.checker.Ignore(PCWSTR(text.as_ptr())) }
-            .map_err(|e| format!("Could not ignore \"{word}\": {e}"))
     }
 }

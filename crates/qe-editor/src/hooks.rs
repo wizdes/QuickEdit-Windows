@@ -279,6 +279,44 @@ pub(crate) struct Composition {
     pub(crate) task: Option<u64>,
     /// The line's height before the composition, to put back at its end.
     pub(crate) old_height: Option<Dip>,
+    /// The parts that the input method marks. Empty means one underline for all of it.
+    pub(crate) clauses: Vec<CompositionClause>,
+}
+
+/// A part of a composition that the input method treats as one piece. In UTF-16 units of
+/// the composition's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositionClause {
+    pub range_utf16: Range<usize>,
+    /// The part that is being converted now, which gets the heavier line.
+    pub target: bool,
+}
+
+/// How the last composition ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositionEnd {
+    /// Its text went into the store, at this revision.
+    Committed { revision: u64 },
+    /// Esc or an explicit cancel threw it away.
+    Cancelled,
+}
+
+/// What a commit did to the text, to move a place asked for in the text before it.
+pub(crate) struct CompositionCommit {
+    start: usize,
+    old_end: usize,
+    new_len: usize,
+}
+impl CompositionCommit {
+    pub(crate) fn moved(&self, at: ByteOffset) -> ByteOffset {
+        ByteOffset(if at.0 <= self.start {
+            at.0
+        } else if at.0 >= self.old_end {
+            at.0 + self.new_len - (self.old_end - self.start)
+        } else {
+            self.start + self.new_len
+        })
+    }
 }
 
 /// What a host can read about a composition.
@@ -290,6 +328,8 @@ pub struct CompositionState {
     pub at: ByteOffset,
     /// False until a worker has laid the text out and it shows.
     pub showing: bool,
+    /// False while a newer text waits for its layout, so the rectangles are of older text.
+    pub current: bool,
 }
 
 /// A fixed text width, for Wrap to Page.
@@ -535,6 +575,7 @@ pub(crate) struct HookState {
     pub(crate) save_point_gone: bool,
     /// A layout, a width or a font changed, so the composition lays out again.
     pub(crate) composition_stale: bool,
+    pub(crate) composition_end: Option<CompositionEnd>,
 }
 impl Default for HookState {
     fn default() -> Self {
@@ -553,6 +594,7 @@ impl Default for HookState {
             test_refuse_edit: false,
             save_point_gone: false,
             composition_stale: false,
+            composition_end: None,
         }
     }
 }
@@ -676,6 +718,9 @@ impl EditorView {
         self.hooks.document = new_document();
         self.hooks.save_point_gone = false;
         self.hooks.composition_stale = false;
+        if self.hooks.composition.is_some() {
+            self.hooks.composition_end = Some(CompositionEnd::Cancelled);
+        }
         self.hooks.log.clear();
         self.hooks.log_base = None;
         self.hooks.decorations = Default::default();
@@ -1202,7 +1247,145 @@ impl EditorView {
                 cursor_utf16: composition.cursor_utf16,
                 at: composition.at,
                 showing: composition.layout.is_some(),
+                current: composition.layout.is_some() && composition.task.is_none(),
             })
+    }
+    /// Says once how the last composition ended, so that a host can tell an input method
+    /// whether its text went in. `ViewRequest::CancelComposition` asks the host to look.
+    pub fn take_composition_end(&mut self) -> Option<CompositionEnd> {
+        self.hooks.composition_end.take()
+    }
+    /// The parts of the composition that the input method marks.
+    pub fn composition_clauses(&self) -> Vec<CompositionClause> {
+        self.hooks
+            .composition
+            .as_ref()
+            .map_or_else(Vec::new, |composition| composition.clauses.clone())
+    }
+    /// Sets the parts to underline. One clause of a composition's text gets one line, and
+    /// the target clause gets a heavier one. It costs one repaint of the line.
+    pub fn ime_set_clauses(&mut self, clauses: Vec<CompositionClause>, ctx: &mut ViewContext) {
+        let Some(composition) = self.hooks.composition.as_mut() else {
+            return;
+        };
+        if composition.clauses == clauses {
+            return;
+        }
+        composition.clauses = clauses;
+        let line = composition.line;
+        self.repaint_line(line, ctx);
+        self.finish(Instant::now(), ctx);
+    }
+    /// The rectangles of part of the composition, in UTF-16 units of its text, in window
+    /// coordinates. An empty range gives the place between two characters. It says
+    /// `NotLaidOut` while the text waits for a layout, because the old one has other text.
+    pub fn composition_range_rects(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Vec<RangeRect>, GeometryError> {
+        let composition = self
+            .hooks
+            .composition
+            .as_ref()
+            .ok_or(GeometryError::NotLaidOut)?;
+        let layout = composition
+            .layout
+            .as_ref()
+            .ok_or(GeometryError::NotLaidOut)?;
+        if composition.task.is_some() {
+            return Err(GeometryError::NotLaidOut);
+        }
+        let bytes = composed_bytes(composition, &range);
+        let (x, y) = self.composition_origin(composition);
+        let mut rects = Vec::new();
+        for row in &layout.rows {
+            for (start, end, right_to_left, part) in row_spans(row, &bytes) {
+                rects.push(RangeRect {
+                    rect: Rect {
+                        x: Dip(x + start),
+                        y: Dip(y + row.y.0),
+                        width: Dip((end - start).max(1.0)),
+                        height: row.height,
+                    },
+                    right_to_left,
+                    range: part,
+                });
+            }
+        }
+        Ok(rects)
+    }
+    /// The UTF-16 place in the composition's text under a point, if the point is on the text.
+    pub fn composition_place_at_point(&self, at: Point) -> Option<usize> {
+        let composition = self.hooks.composition.as_ref()?;
+        let layout = composition.layout.as_ref()?;
+        let (x, y) = self.composition_origin(composition);
+        let hit = layout.hit_test_point(Point {
+            x: Dip(at.x.0 - x),
+            y: Dip(at.y.0 - y),
+        });
+        let inside = at.y.0 >= y
+            && at.y.0 < y + layout.height.0
+            && composition.shown.text.start <= hit.byte
+            && hit.byte <= composition.shown.text.end
+            && !composition.shown.text.is_empty();
+        if !inside {
+            return None;
+        }
+        let bytes = hit.byte.0 - composition.shown.text.start.0;
+        Some(utf16_of_shown(&composition.text, bytes))
+    }
+    /// Puts the composition's text in the store, as its own edit, before something else
+    /// changes the text or the caret. Nothing an input method typed is dropped on its own.
+    pub(crate) fn commit_composition_first(
+        &mut self,
+        ctx: &mut ViewContext,
+    ) -> Option<CompositionCommit> {
+        let text = self.hooks.composition.as_ref()?.text.clone();
+        self.end_composition(ctx);
+        ctx.cancel_composition();
+        if text.is_empty() {
+            self.hooks.composition_end = Some(CompositionEnd::Cancelled);
+            return None;
+        }
+        if !self.can_edit() {
+            self.hooks.composition_end = Some(CompositionEnd::Cancelled);
+            self.refused_edits += 1;
+            self.set_warning(
+                format!("This view cannot be edited, so this text was not added: {text}"),
+                false,
+            );
+            return None;
+        }
+        let range = self.selection();
+        self.touch();
+        self.history.break_group();
+        self.apply_edit(range.clone(), &text, false, ctx);
+        self.history.break_group();
+        self.hooks.composition_end = Some(CompositionEnd::Committed {
+            revision: self.revision(),
+        });
+        Some(CompositionCommit {
+            start: range.start.0,
+            old_end: range.end.0,
+            new_len: text.len(),
+        })
+    }
+    /// Sets the selection with its caret at either end, with no move of the view.
+    pub fn select_directed(
+        &mut self,
+        anchor: ByteOffset,
+        caret: ByteOffset,
+        ctx: &mut ViewContext,
+    ) {
+        let known = self.source().status().known_bytes.0;
+        let edge = |view: &mut Self, at: ByteOffset| {
+            let at = at.0.min(known);
+            view.with_stops(|s| s.edge_backward(at, 0))
+                .map_or(ByteOffset(at), ByteOffset)
+        };
+        let (anchor, caret) = (edge(self, anchor), edge(self, caret));
+        self.set_selection(anchor, caret, Affinity::After, false, ctx);
+        self.finish(Instant::now(), ctx);
     }
     /// The composition's rectangles in window coordinates, for a candidate list.
     pub fn composition_rects(&self) -> Result<Vec<RangeRect>, GeometryError> {
@@ -1277,6 +1460,7 @@ impl EditorView {
             wanted: ComposedBytes::default(),
             task: None,
             old_height: None,
+            clauses: Vec::new(),
         });
     }
     /// Shows `text` at the composition's place. A worker lays it out, and until then the
@@ -1329,16 +1513,7 @@ impl EditorView {
             at
         };
         // A composition is one line of text, whatever it holds.
-        let shown: String = text
-            .chars()
-            .map(|c| {
-                if matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}') {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
+        let shown = shown_composition_text(text);
         let mut full = String::new();
         let visited = self
             .source()
@@ -1495,22 +1670,31 @@ impl EditorView {
     }
     /// Puts the text in the store as one edit, in place of the selection.
     pub fn ime_commit(&mut self, text: &str, ctx: &mut ViewContext) {
+        let ended = self.hooks.composition.is_some();
         self.end_composition(ctx);
-        if text.is_empty() {
-            return;
-        }
-        if !self.can_edit() {
-            self.refused_edits += 1;
+        if text.is_empty() || !self.can_edit() {
+            if ended {
+                self.hooks.composition_end = Some(CompositionEnd::Cancelled);
+            }
+            if !text.is_empty() {
+                self.refused_edits += 1;
+            }
             return;
         }
         self.touch();
         let range = self.selection();
         self.history.break_group();
         self.apply_edit(range, text, false, ctx);
+        self.hooks.composition_end = Some(CompositionEnd::Committed {
+            revision: self.revision(),
+        });
         self.finish(Instant::now(), ctx);
     }
     /// Ends the composition. The store and the selection are as they were.
     pub fn ime_cancel(&mut self, ctx: &mut ViewContext) {
+        if self.hooks.composition.is_some() {
+            self.hooks.composition_end = Some(CompositionEnd::Cancelled);
+        }
         self.end_composition(ctx);
         self.finish(Instant::now(), ctx);
     }
@@ -1644,6 +1828,8 @@ impl EditorView {
             self.refused_edits += 1;
             return Err("This view cannot be edited.".to_string());
         }
+        // The commit changes the text, so edits prepared before it are refused below.
+        self.commit_composition_first(ctx);
         if edits.base_revision != self.revision() {
             return Err("The text changed after these edits were prepared.".to_string());
         }
@@ -1684,6 +1870,9 @@ impl EditorView {
     pub(crate) fn run_host_now(&mut self, command: HostCommand, ctx: &mut ViewContext) {
         let result = match command {
             HostCommand::PreventEditing(enabled) => {
+                if enabled {
+                    self.commit_composition_first(ctx);
+                }
                 self.set_prevent_editing(enabled);
                 Ok(())
             }
@@ -1833,16 +2022,62 @@ fn push_straight_underline(
 pub(crate) fn paint_composition_underline(
     list: &mut DisplayList,
     layout: &LineLayout,
-    range: &Range<ByteOffset>,
+    composition: &Composition,
     x: f32,
     y: f32,
     theme: &Theme,
 ) {
-    for row in &layout.rows {
-        for (start, end, _, _) in row_spans(row, range) {
-            push_straight_underline(list, row, x + start, x + end, y, theme);
+    if composition.clauses.is_empty() {
+        for row in &layout.rows {
+            for (start, end, _, _) in row_spans(row, &composition.shown.text) {
+                push_straight_underline(list, row, x + start, x + end, y, theme);
+            }
+        }
+        return;
+    }
+    // A small gap keeps two clauses apart, and the target's line is drawn twice as heavy.
+    const GAP: f32 = 1.0;
+    for clause in &composition.clauses {
+        let bytes = composed_bytes(composition, &clause.range_utf16);
+        for row in &layout.rows {
+            for (start, end, _, _) in row_spans(row, &bytes) {
+                let to = (x + end - GAP).max(x + start + GAP);
+                push_straight_underline(list, row, x + start, to, y, theme);
+                if clause.target {
+                    push_straight_underline(list, row, x + start, to, y - 1.0, theme);
+                }
+            }
         }
     }
+}
+
+/// What a composition's text looks like on screen: a line break shows as a space.
+fn shown_composition_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+/// UTF-16 units of a composition's text as bytes of its layout, inside its text.
+fn composed_bytes(composition: &Composition, range: &Range<usize>) -> Range<ByteOffset> {
+    let shown = shown_composition_text(&composition.text);
+    let text = &composition.shown.text;
+    let place =
+        |units: usize| ByteOffset((text.start.0 + byte_of_utf16(&shown, units)).min(text.end.0));
+    place(range.start)..place(range.end.max(range.start))
+}
+/// Bytes of a composition's layout as UTF-16 units of its text.
+fn utf16_of_shown(text: &str, bytes: usize) -> usize {
+    let shown = shown_composition_text(text);
+    shown.get(..bytes.min(shown.len())).map_or_else(
+        || shown.encode_utf16().count(),
+        |part| part.encode_utf16().count(),
+    )
 }
 
 /// The byte of a UTF-16 offset in `text`. Past the end, or inside a pair, it steps back.

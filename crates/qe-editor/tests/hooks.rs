@@ -7,8 +7,8 @@ use qe_api::{
 };
 use qe_buffer::{MappedStore, PieceStore};
 use qe_editor::{
-    ChangesSince, Clipboard, DecorationKind, EditorCommand, EditorView, GeometryError, HostCommand,
-    LoadedFile, PageWrap, TextEdit, prepare_edits,
+    ChangesSince, Clipboard, CompositionClause, CompositionEnd, DecorationKind, EditorCommand,
+    EditorView, GeometryError, HostCommand, LoadedFile, PageWrap, TextEdit, prepare_edits,
 };
 use qe_layout::DirectWriteLayout;
 use qe_render::{BitmapRenderer, TextSettings};
@@ -835,18 +835,20 @@ fn esc_asks_the_host_to_cancel_and_ends_it_here() {
 }
 
 #[test]
-fn an_edit_or_a_moved_selection_ends_a_composition() {
+fn an_edit_or_a_moved_selection_commits_a_composition_and_tells_the_host() {
     let mut e = open("abc", 600.0, 200.0);
     ime(&mut e, "\u{4e2d}", 1);
     let mut context = ctx();
     e.replace_range(b(0)..b(0), "x", &mut context);
     assert!(context.requests.contains(&ViewRequest::CancelComposition));
     assert!(e.composition().is_none());
+    assert_eq!(e.text().unwrap(), "x\u{4e2d}abc", "its text went in");
 
-    ime(&mut e, "\u{4e2d}", 1);
+    ime(&mut e, "\u{6587}", 1);
     let requests = press(&mut e, 0x27, false);
     assert!(requests.contains(&ViewRequest::CancelComposition));
     assert!(e.composition().is_none());
+    assert!(e.text().unwrap().contains('\u{6587}'), "its text went in");
 }
 
 #[test]
@@ -2118,4 +2120,319 @@ fn saved_images_of_marks_and_composition() {
             }
         }
     }
+}
+
+// ---- A composition's text is never dropped on its own ----
+
+#[test]
+fn a_caret_move_commits_the_composition_and_lands_on_the_same_text() {
+    let mut e = open("abcd", 600.0, 200.0);
+    ime(&mut e, "xyz", 3);
+    settle(&mut e);
+    // Selects "cd" as the text stood: the commit moves it along by three bytes.
+    let mut context = ctx();
+    e.select(b(2)..b(4), &mut context);
+    assert_eq!(e.text().unwrap(), "xyzabcd");
+    assert!(e.composition().is_none());
+    assert_eq!(e.selection(), b(5)..b(7), "still on cd");
+    assert!(context.requests.contains(&ViewRequest::CancelComposition));
+    assert_eq!(
+        e.take_composition_end(),
+        Some(CompositionEnd::Committed {
+            revision: e.revision()
+        })
+    );
+}
+
+#[test]
+fn an_edit_commits_the_composition_first_and_lands_on_the_same_text() {
+    let mut e = open("abcd", 600.0, 200.0);
+    let mut context = ctx();
+    e.select(b(1)..b(1), &mut context);
+    ime(&mut e, "\u{4e2d}", 1);
+    // Replaces "cd" as the text stood.
+    e.replace_range(b(2)..b(4), "Z", &mut context);
+    assert_eq!(e.text().unwrap(), "a\u{4e2d}bZ");
+    assert!(e.composition().is_none());
+    // Each step comes back on its own: the edit, then the commit.
+    press(&mut e, 0x5a, true);
+    assert_eq!(e.text().unwrap(), "a\u{4e2d}bcd");
+    press(&mut e, 0x5a, true);
+    assert_eq!(e.text().unwrap(), "abcd");
+}
+
+#[test]
+fn undo_during_a_composition_commits_it_first_and_takes_back_that_commit() {
+    let mut e = open("ab", 600.0, 200.0);
+    let mut context = ctx();
+    e.replace_range(b(2)..b(2), "c", &mut context);
+    e.select(b(0)..b(0), &mut context);
+    ime(&mut e, "x", 1);
+    press(&mut e, 0x5a, true);
+    assert!(e.composition().is_none());
+    assert_eq!(e.text().unwrap(), "abc", "the undo took back the commit");
+    press(&mut e, 0x5a, true);
+    assert_eq!(
+        e.text().unwrap(),
+        "ab",
+        "and the next one the edit before it"
+    );
+}
+
+#[test]
+fn only_esc_or_an_explicit_cancel_throws_the_text_away() {
+    let mut e = open("ab", 600.0, 200.0);
+    ime(&mut e, "x", 1);
+    press(&mut e, ESC, false);
+    assert_eq!(e.text().unwrap(), "ab");
+    assert_eq!(e.take_composition_end(), Some(CompositionEnd::Cancelled));
+    assert_eq!(e.take_composition_end(), None, "it is told once");
+    ime(&mut e, "y", 1);
+    e.ime_cancel(&mut ctx());
+    assert_eq!(e.text().unwrap(), "ab");
+    assert_eq!(e.take_composition_end(), Some(CompositionEnd::Cancelled));
+}
+
+#[test]
+fn a_click_commits_the_composition_even_at_the_same_place() {
+    let mut e = open("abcd", 600.0, 200.0);
+    ime(&mut e, "xy", 2);
+    settle(&mut e);
+    send(
+        &mut e,
+        InputKind::MouseDown {
+            at: Point {
+                x: Dip(0.0),
+                y: Dip(1.0),
+            },
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+        },
+    );
+    assert!(e.composition().is_none());
+    assert_eq!(e.text().unwrap(), "xyabcd");
+}
+
+#[test]
+fn prevent_editing_commits_a_composition_before_it_refuses_edits() {
+    let mut e = open("ab", 600.0, 200.0);
+    ime(&mut e, "x", 1);
+    let mut context = ctx();
+    e.run_host(HostCommand::PreventEditing(true), &mut context);
+    assert_eq!(e.text().unwrap(), "xab");
+    assert!(e.composition().is_none());
+    assert!(!e.can_edit());
+}
+
+#[test]
+fn a_replace_all_prepared_before_a_composition_is_refused_and_the_text_is_kept() {
+    let mut e = open("abab", 600.0, 200.0);
+    let edits = [TextEdit {
+        range: b(0)..b(1),
+        text: "Q".into(),
+    }];
+    let snapshot = e.worker_snapshot();
+    let prepared = prepare_edits(snapshot.as_ref(), &edits, &AtomicBool::new(false)).unwrap();
+    ime(&mut e, "x", 1);
+    let answer = e.apply_edits(&prepared, b(0)..b(0), &mut ctx());
+    assert!(answer.is_err());
+    assert_eq!(
+        e.text().unwrap(),
+        "xabab",
+        "the composition went in, and the old edits did not"
+    );
+}
+
+// ---- Places inside a composition ----
+
+fn composed(text: &str) -> EditorView {
+    let mut e = open("first\nsecond", 600.0, 200.0);
+    e.select(b(6)..b(6), &mut ctx());
+    ime(&mut e, text, text.encode_utf16().count());
+    settle(&mut e);
+    e
+}
+
+#[test]
+fn part_of_a_composition_has_its_own_rectangle() {
+    let mut e = composed("\u{304b}\u{306a}\u{6f22}");
+    let whole = e.composition_rects().unwrap()[0].rect;
+    let first = e.composition_range_rects(0..1).unwrap()[0].rect;
+    let last = e.composition_range_rects(2..3).unwrap()[0].rect;
+    assert!(
+        first.x.0 >= whole.x.0 && first.width.0 < whole.width.0,
+        "{first:?} {whole:?}"
+    );
+    assert!(
+        last.x.0 > first.x.0 + first.width.0 - 1.0,
+        "{last:?} {first:?}"
+    );
+    let between = e.composition_range_rects(1..1).unwrap()[0].rect;
+    assert!(
+        (between.x.0 - (first.x.0 + first.width.0)).abs() < 1.0,
+        "{between:?} {first:?}"
+    );
+    // Newer text waits for its layout, so the old rectangles are no answer.
+    e.test_pause_workers(true);
+    ime(&mut e, "\u{304b}", 1);
+    assert_eq!(
+        e.composition_range_rects(0..1),
+        Err(GeometryError::NotLaidOut)
+    );
+    assert!(!e.composition().unwrap().current);
+    e.test_pause_workers(false);
+    settle(&mut e);
+    assert!(e.composition().unwrap().current);
+}
+
+#[test]
+fn part_of_a_composition_counts_surrogate_pairs_and_line_breaks_in_utf16() {
+    let e = composed("\u{1f600}\r\nab");
+    let emoji = e.composition_range_rects(0..2).unwrap()[0].rect;
+    let a = e.composition_range_rects(4..5).unwrap()[0].rect;
+    assert!(a.x.0 >= emoji.x.0 + emoji.width.0, "{a:?} after {emoji:?}");
+}
+
+#[test]
+fn a_point_on_a_composition_answers_from_what_shows() {
+    let e = composed("\u{304b}\u{306a}");
+    let rect = e.composition_range_rects(1..2).unwrap()[0].rect;
+    let on_second = Point {
+        x: Dip(rect.x.0 + 1.0),
+        y: Dip(rect.y.0 + rect.height.0 / 2.0),
+    };
+    assert_eq!(e.composition_place_at_point(on_second), Some(1));
+    assert_eq!(
+        e.byte_at_point(on_second).unwrap().byte,
+        b(6),
+        "where it would go"
+    );
+    // Past the composition's end, on its line: the store's text after it.
+    let past = Point {
+        x: Dip(rect.x.0 + rect.width.0 + 200.0),
+        y: on_second.y,
+    };
+    assert_eq!(e.byte_at_point(past).unwrap().byte, b(12));
+    // On the line above, nothing about the composition applies.
+    let above = Point {
+        x: Dip(1.0),
+        y: Dip(rect.y.0 - 5.0),
+    };
+    assert_eq!(e.composition_place_at_point(above), None);
+    assert_eq!(e.byte_at_point(above).unwrap().byte, b(0));
+}
+
+fn composition_lines(e: &EditorView) -> Vec<(f32, f32, f32)> {
+    let theme = Theme::new(ThemeKind::Light);
+    let mut list = DisplayList::default();
+    e.draw(&mut list, &theme, &measure());
+    list.commands
+        .iter()
+        .filter_map(|c| match c {
+            DrawCommand::Line {
+                from, to, color, ..
+            } if *color == theme.text => Some((from.x.0, to.x.0, from.y.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn clauses_get_their_own_underlines_and_the_target_a_heavier_one() {
+    let mut e = composed("\u{304b}\u{306a}\u{6f22}\u{5b57}");
+    assert_eq!(
+        composition_lines(&e).len(),
+        1,
+        "one line for all of it, with no clauses"
+    );
+    let clauses = vec![
+        CompositionClause {
+            range_utf16: 0..2,
+            target: false,
+        },
+        CompositionClause {
+            range_utf16: 2..4,
+            target: true,
+        },
+    ];
+    let mut context = ctx();
+    e.ime_set_clauses(clauses.clone(), &mut context);
+    assert_eq!(e.composition_clauses(), clauses);
+    assert!(!context.requests.is_empty(), "the line repaints");
+    let lines = composition_lines(&e);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[0].1 <= lines[1].0,
+        "a gap between the clauses: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].0, lines[2].0,
+        "the target's two lines are over each other"
+    );
+    assert!((lines[1].2 - lines[2].2).abs() == 1.0, "{lines:?}");
+    // The same clauses again cost nothing.
+    let mut context = ctx();
+    e.ime_set_clauses(clauses, &mut context);
+    assert!(context.requests.is_empty());
+}
+
+#[test]
+fn select_directed_keeps_the_caret_at_the_end_asked_for() {
+    let mut e = open("hello", 600.0, 200.0);
+    e.select_directed(b(4), b(1), &mut ctx());
+    assert_eq!(e.selection(), b(1)..b(4));
+    assert_eq!(e.caret(), b(1));
+}
+
+#[test]
+fn a_new_document_says_its_composition_was_dropped() {
+    let mut e = open("ab", 600.0, 200.0);
+    ime(&mut e, "x", 1);
+    e.adopt(LoadedFile::Editable {
+        store: PieceStore::new("new"),
+        ending: "\n",
+    })
+    .unwrap();
+    assert_eq!(e.take_composition_end(), Some(CompositionEnd::Cancelled));
+}
+
+#[test]
+fn a_point_on_a_later_row_of_a_composition_that_wraps_is_on_the_composition() {
+    let mut e = open("ab\ncdef", 120.0, 400.0);
+    e.run_host(HostCommand::Wrap(true), &mut ctx());
+    settle(&mut e);
+    ime(&mut e, &"w".repeat(60), 60);
+    settle(&mut e);
+    let rows = e.composition_range_rects(0..60).unwrap();
+    assert!(rows.len() >= 3, "the test needs rows: {}", rows.len());
+    let last = rows[rows.len() - 1].rect;
+    let hit = e
+        .byte_at_point(Point {
+            x: Dip(last.x.0 + 1.0),
+            y: Dip(last.y.0 + 2.0),
+        })
+        .unwrap();
+    assert!(
+        hit.byte <= ByteOffset(2),
+        "on the composition's line: {hit:?}"
+    );
+}
+
+#[test]
+fn a_point_on_a_composition_in_a_long_line_answers_from_what_shows() {
+    let mut e = open(&"a".repeat(9_000), 800.0, 200.0);
+    ime(&mut e, "wwwwwwww", 8);
+    settle(&mut e);
+    let rows = e.composition_range_rects(0..8).unwrap();
+    let last = rows[rows.len() - 1].rect;
+    let hit = e
+        .byte_at_point(Point {
+            x: Dip(last.x.0 + last.width.0 + 1.0),
+            y: Dip(last.y.0 + 2.0),
+        })
+        .unwrap();
+    assert!(
+        hit.byte <= ByteOffset(1),
+        "just past the composition: {hit:?}"
+    );
 }

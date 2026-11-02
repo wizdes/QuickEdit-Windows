@@ -19,7 +19,10 @@ mod checker;
 mod ranges;
 mod worker;
 
-pub use checker::{Action, Checker, RawError, WindowsChecker, default_language};
+pub use checker::{
+    Action, Checker, RawError, WindowsChecker, choose_language, default_language,
+    without_sort_order,
+};
 pub use ranges::CheckedRanges;
 
 use qe_api::{ByteOffset, Point, ViewContext};
@@ -48,6 +51,8 @@ pub const AHEAD_BYTES: usize = 4096;
 /// takes time in proportion to the list.
 const MAX_MARKS: usize = 20_000;
 const KEEP_NEAR_BYTES: usize = 1024 * 1024;
+/// Each edit walks the list of checked ranges, so a long scroll must not make it long.
+const MAX_CHECKED_RANGES: usize = 4096;
 
 /// Why spelling does not run for a view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +108,9 @@ pub struct FixMenu {
     revision: u64,
     document: u64,
 }
-/// One line of the fix menu, in the Mac's order.
+/// One line of the fix menu. The Mac's menu comes from AppKit, not from its own source. This
+/// order is AppKit's from memory: the suggestions, Ignore Spelling, then Learn Spelling.
+/// AppKit also lists more, such as autocorrect, which belongs to other milestones of this row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FixItem {
     /// Replaces the word with this text.
@@ -124,8 +131,8 @@ impl FixMenu {
         if items.is_empty() {
             items.push(FixItem::NoSuggestions);
         }
-        items.push(FixItem::AddToDictionary);
         items.push(FixItem::Ignore);
+        items.push(FixItem::AddToDictionary);
         items
     }
 }
@@ -150,8 +157,18 @@ pub enum SpellState {
 pub struct SpellPoll {
     /// The marks changed.
     pub marks_changed: bool,
-    /// The answer to [`SpellService::find_next`]. `Some(None)` means no misspelling at all.
-    pub found: Option<Option<Misspelling>>,
+    /// The answer to [`SpellService::find_next`], when it has come.
+    pub found: Option<FindResult>,
+}
+
+/// How a [`SpellService::find_next`] ended. Each call gets exactly one of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindResult {
+    Found(Misspelling),
+    /// The whole document has no misspelling.
+    NoneLeft,
+    /// The text changed, or spelling turned off, so the search stopped. Ask again if needed.
+    TextChanged,
 }
 
 /// Counts for tests and for measuring.
@@ -165,6 +182,13 @@ pub struct SpellCounts {
 }
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
+/// A newer number tells the worker to stop what is older. A search has its own number, so
+/// that a check does not stop it, and it does not stop a check.
+#[derive(Default)]
+pub(crate) struct Latest {
+    pub(crate) check: AtomicU64,
+    pub(crate) find: AtomicU64,
+}
 /// Makes the checker on the worker, the only thread that touches it.
 pub type MakeChecker = Box<dyn FnOnce() -> Result<Box<dyn Checker>, String> + Send>;
 
@@ -172,20 +196,31 @@ pub type MakeChecker = Box<dyn FnOnce() -> Result<Box<dyn Checker>, String> + Se
 pub struct SpellService {
     jobs: Sender<Command>,
     answers: Receiver<Answer>,
-    /// A newer generation tells the worker to skip the rest of an old job.
-    generation: Arc<AtomicU64>,
+    latest: Arc<Latest>,
     marks: Vec<Misspelling>,
     checked: CheckedRanges,
     revision: u64,
     document: u64,
     in_flight: bool,
     finding: bool,
+    /// A search stopped, and the next `poll` says so.
+    find_stopped: bool,
     ignored: HashSet<String>,
     failed: bool,
     /// Why the worker never began, for the first `poll` to say.
     start_failure: Option<String>,
     off: Option<SpellOff>,
     counts: SpellCounts,
+    max_marks: usize,
+    keep_near_bytes: usize,
+    max_checked_ranges: usize,
+}
+impl Drop for SpellService {
+    /// The worker must not go on with a long check for a tab that has closed. A search stops
+    /// by itself, because it sees the commands' channel close between pieces.
+    fn drop(&mut self) {
+        self.latest.check.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl SpellService {
@@ -214,26 +249,30 @@ impl SpellService {
     pub fn start_with(view: &EditorView, make: MakeChecker, wake: Wake) -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let (answer_tx, answer_rx) = mpsc::channel();
-        let generation = Arc::new(AtomicU64::new(0));
-        let latest = generation.clone();
+        let latest = Arc::new(Latest::default());
+        let for_worker = latest.clone();
         let spawned = thread::Builder::new()
             .name("qe-spell".into())
-            .spawn(move || worker::run(make, job_rx, answer_tx, wake, latest));
+            .spawn(move || worker::run(make, job_rx, answer_tx, wake, for_worker));
         let mut service = Self {
             jobs: job_tx,
             answers: answer_rx,
-            generation,
+            latest,
             marks: Vec::new(),
             checked: CheckedRanges::default(),
             revision: view.revision(),
             document: view.document_number(),
             in_flight: false,
             finding: false,
+            find_stopped: false,
             ignored: HashSet::new(),
             failed: false,
             start_failure: None,
             off: None,
             counts: SpellCounts::default(),
+            max_marks: MAX_MARKS,
+            keep_near_bytes: KEEP_NEAR_BYTES,
+            max_checked_ranges: MAX_CHECKED_RANGES,
         };
         if let Err(e) = spawned {
             service.failed = true;
@@ -243,6 +282,37 @@ impl SpellService {
     }
     pub fn counts(&self) -> SpellCounts {
         self.counts
+    }
+    /// Smaller limits for the marks' list, so that a test can reach them quickly.
+    #[doc(hidden)]
+    pub fn set_limits_for_test(&mut self, max_marks: usize, keep_near_bytes: usize) {
+        self.max_marks = max_marks;
+        self.keep_near_bytes = keep_near_bytes;
+    }
+    /// A smaller limit for the checked ranges, so that a test can reach it quickly.
+    #[doc(hidden)]
+    pub fn set_range_limit_for_test(&mut self, max_checked_ranges: usize) {
+        self.max_checked_ranges = max_checked_ranges;
+    }
+    /// How many separate checked ranges the service holds.
+    #[doc(hidden)]
+    pub fn checked_range_count(&self) -> usize {
+        self.checked.ranges().len()
+    }
+    /// Fills the lists to their limits, as a very long session would, to measure an edit.
+    #[doc(hidden)]
+    pub fn fill_lists_for_test(&mut self, view: &EditorView) {
+        self.catch_up(view);
+        for at in 0..MAX_MARKS {
+            self.marks.push(Misspelling {
+                range: ByteOffset(1_000 + at * 16)..ByteOffset(1_000 + at * 16 + 4),
+                word: "fill".to_owned(),
+                suggestions: Vec::new(),
+            });
+        }
+        for at in 0..MAX_CHECKED_RANGES {
+            self.checked.add(1_000 + at * 64..1_000 + at * 64 + 32);
+        }
     }
     pub fn marks(&self) -> &[Misspelling] {
         &self.marks
@@ -277,7 +347,7 @@ impl SpellService {
             return SpellState::Done;
         }
         self.prune(&window, view, ctx);
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self.latest.check.fetch_add(1, Ordering::Relaxed) + 1;
         self.counts.jobs_sent += 1;
         self.counts.bytes_asked += gaps.iter().map(|g| g.len() as u64).sum::<u64>();
         let job = Job {
@@ -303,6 +373,7 @@ impl SpellService {
     ) -> Result<SpellPoll, String> {
         let mut out = SpellPoll::default();
         self.catch_up(view);
+        let off_now = why_off(view, true);
         let mut changed = false;
         let mut failure = self.start_failure.take();
         loop {
@@ -334,14 +405,11 @@ impl SpellService {
                     self.in_flight = false;
                     self.counts.answers_dropped += 1;
                 }
-                Answer::Found {
-                    revision,
-                    document,
-                    found,
-                } => {
-                    self.finding = false;
-                    if document == view.document_number() && revision == view.revision() {
-                        out.found = Some(found);
+                Answer::Found { generation, found } => {
+                    // A search that stopped or was replaced has its answer elsewhere.
+                    if self.finding && generation == self.latest.find.load(Ordering::Relaxed) {
+                        self.finding = false;
+                        out.found = Some(found.map_or(FindResult::NoneLeft, FindResult::Found));
                     } else {
                         self.counts.answers_dropped += 1;
                     }
@@ -358,11 +426,19 @@ impl SpellService {
             self.clear_marks(view, ctx);
             return Err(message);
         }
-        if changed {
+        if let Some(off) = off_now {
+            out.marks_changed = !view
+                .decorations(DecorationKind::SpellingUnderline)
+                .is_empty();
+            self.turn_off(view, off, ctx);
+        } else if changed {
             self.show_marks(view, ctx);
             out.marks_changed = true;
         }
-        if !self.failed && !self.in_flight {
+        if std::mem::take(&mut self.find_stopped) {
+            out.found = Some(FindResult::TextChanged);
+        }
+        if !self.failed && !self.in_flight && off_now.is_none() {
             let _ = self.refresh(view, ctx);
         }
         Ok(out)
@@ -439,20 +515,26 @@ impl SpellService {
     }
     /// Looks for the next misspelling after the selection, through the whole document and
     /// around to its start. This is the Mac's Check Document Now. The answer comes in `poll`,
-    /// and the host selects it.
+    /// and the host selects it. An edit stops the search, and so does a new `find_next`.
     pub fn find_next(&mut self, view: &EditorView) -> Result<(), String> {
         if let Some(off) = why_off(view, true) {
             return Err(off.to_string());
         }
+        self.catch_up(view);
+        // The text is the same, so a search still running gets no answer of its own.
+        self.find_stopped = false;
+        let generation = self.latest.find.fetch_add(1, Ordering::Relaxed) + 1;
         self.finding = true;
         self.jobs
             .send(Command::FindNext {
                 snapshot: view.worker_snapshot(),
                 from: view.selection().end.0,
-                revision: view.revision(),
-                document: view.document_number(),
+                generation,
             })
-            .map_err(|_| stopped())
+            .map_err(|_| {
+                self.finding = false;
+                stopped()
+            })
     }
     /// Takes the marks away. The host drops the service after this.
     pub fn stop(mut self, view: &mut EditorView, ctx: &mut ViewContext) {
@@ -464,6 +546,14 @@ impl SpellService {
             return Err(stopped());
         }
         self.jobs.send(command).map_err(|_| stopped())
+    }
+    /// Stops a search whose text has changed. The next `poll` tells the host.
+    fn stop_find(&mut self) {
+        if self.finding {
+            self.finding = false;
+            self.find_stopped = true;
+            self.latest.find.fetch_add(1, Ordering::Relaxed);
+        }
     }
     fn forget_word(&mut self, view: &mut EditorView, word: &str, ctx: &mut ViewContext) {
         self.ignored.insert(word.to_owned());
@@ -481,6 +571,9 @@ impl SpellService {
             ChangesSince::Current => {}
             ChangesSince::Rescan => self.forget_all(view),
             ChangesSince::Changes(list) => {
+                if !list.is_empty() {
+                    self.stop_find();
+                }
                 for change in &list {
                     let c = &change.change;
                     edit_marks(
@@ -497,13 +590,20 @@ impl SpellService {
         }
     }
     fn forget_all(&mut self, view: &EditorView) {
+        self.stop_find();
         self.marks.clear();
         self.checked.clear();
-        self.ignored.clear();
+        // Ignore lasts as long as the document does, so a new look at its text keeps it.
+        if view.document_number() != self.document && !self.ignored.is_empty() {
+            self.ignored.clear();
+            if self.jobs.send(Command::ForgetIgnored).is_err() {
+                self.failed = true;
+            }
+        }
         self.revision = view.revision();
         self.document = view.document_number();
         // A job for the old text is of no use. The worker skips what it has not begun.
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.latest.check.fetch_add(1, Ordering::Relaxed);
     }
     fn apply_answer(
         &mut self,
@@ -570,19 +670,23 @@ impl SpellService {
     fn turn_off(&mut self, view: &mut EditorView, off: SpellOff, ctx: &mut ViewContext) {
         if self.off != Some(off) {
             self.off = Some(off);
-            self.generation.fetch_add(1, Ordering::Relaxed);
-            self.clear_marks(view, ctx);
+            self.latest.check.fetch_add(1, Ordering::Relaxed);
+            self.stop_find();
         }
+        // Every time, because a mark can arrive with no change of reason.
+        self.clear_marks(view, ctx);
         self.revision = view.revision();
         self.document = view.document_number();
     }
     /// Keeps the marks' list short on a very misspelled file that has been scrolled through.
     fn prune(&mut self, window: &Range<usize>, view: &mut EditorView, ctx: &mut ViewContext) {
-        if self.marks.len() <= MAX_MARKS {
+        if self.marks.len() <= self.max_marks
+            && self.checked.ranges().len() <= self.max_checked_ranges
+        {
             return;
         }
-        let keep = window.start.saturating_sub(KEEP_NEAR_BYTES)
-            ..window.end.saturating_add(KEEP_NEAR_BYTES);
+        let keep = window.start.saturating_sub(self.keep_near_bytes)
+            ..window.end.saturating_add(self.keep_near_bytes);
         self.marks
             .retain(|m| m.range.end.0 > keep.start && m.range.start.0 < keep.end);
         self.checked.keep_only(&keep);
@@ -594,15 +698,18 @@ fn stopped() -> String {
     "The spell checker has stopped. Turn spelling off and on to start it again.".into()
 }
 
-/// The same rule that the editor uses for its marks, in `HOOKS.md`.
+/// Stricter than the editor's rule for its own marks in `HOOKS.md`: a fix must never come from
+/// a word that was not checked as it stands now.
 fn edit_marks(marks: &mut Vec<Misspelling>, start: usize, old_end: usize, new_len: usize) {
     let shift = |x: usize| (x + new_len).saturating_sub(old_end - start);
     marks.retain_mut(|m| {
         let (a, b) = (m.range.start.0, m.range.end.0);
-        if b <= start {
+        // A mark that touches the edit, even at its edge, may be part of a changed word. Only a
+        // new check can say, and until then it offers no fix.
+        if b < start {
             return true;
         }
-        if a >= old_end {
+        if a > old_end {
             m.range = ByteOffset(shift(a))..ByteOffset(shift(b));
             return true;
         }

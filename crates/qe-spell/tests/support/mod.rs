@@ -67,7 +67,10 @@ pub struct FakeLog {
     pub checked: Mutex<Vec<String>>,
     pub suggested: AtomicUsize,
     pub added: Mutex<Vec<String>>,
-    pub ignored: Mutex<Vec<String>>,
+    /// Set when the worker has let go of the checker, which it does as it ends.
+    pub dropped: std::sync::atomic::AtomicBool,
+    /// How many checks have begun, counted before each waits at the gate.
+    pub entered: AtomicUsize,
     /// While true, `check` waits. It shows that the UI thread does not wait with it.
     pub gate: Mutex<bool>,
     pub gate_changed: Condvar,
@@ -84,6 +87,14 @@ impl FakeLog {
     pub fn checked_text(&self) -> Vec<String> {
         self.checked.lock().unwrap().clone()
     }
+    /// Waits until the worker is inside a check, held at the gate.
+    pub fn wait_until_held(&self) {
+        let until = Instant::now() + Duration::from_secs(30);
+        while self.entered.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < until, "the worker never began");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     pub fn clear(&self) {
         self.checked.lock().unwrap().clear();
     }
@@ -97,6 +108,7 @@ pub struct FakeChecker {
 }
 impl Checker for FakeChecker {
     fn check(&mut self, text: &[u16]) -> Result<Vec<RawError>, String> {
+        self.log.entered.fetch_add(1, Ordering::Relaxed);
         let mut gate = self.log.gate.lock().unwrap();
         while *gate {
             gate = self.log.gate_changed.wait(gate).unwrap();
@@ -124,7 +136,8 @@ impl Checker for FakeChecker {
                 }
                 word.push(*c);
             } else if !word.is_empty() {
-                if self.bad.contains(&word) && !self.log.ignored.lock().unwrap().contains(&word) {
+                if self.bad.contains(&word) || (self.bad.contains("qqq") && word.starts_with("qqq"))
+                {
                     let action = if word.starts_with("dup") {
                         Action::Delete
                     } else if word.starts_with("fix") {
@@ -152,9 +165,10 @@ impl Checker for FakeChecker {
         self.log.added.lock().unwrap().push(word.to_owned());
         Ok(())
     }
-    fn ignore(&mut self, word: &str) -> Result<(), String> {
-        self.log.ignored.lock().unwrap().push(word.to_owned());
-        Ok(())
+}
+impl Drop for FakeChecker {
+    fn drop(&mut self) {
+        self.log.dropped.store(true, Ordering::Relaxed);
     }
 }
 

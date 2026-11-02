@@ -9,8 +9,14 @@ use qe_api::{
     TextMetrics, Theme, ThemeKind, View, ViewContext,
 };
 use qe_render::{BitmapRenderer, TextSettings};
-use qe_ui::{MenuView, MenuWindows, POPUP_DISMISSED_MESSAGE, caret_menu};
+use qe_ui::{
+    MenuBar, MenuView, MenuWindows, POPUP_DISMISSED_MESSAGE, menu_bar_groups, place_popup,
+};
 use std::time::Instant;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
@@ -63,7 +69,7 @@ fn main() -> Result<(), String> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("STATIC"),
-            w!("Caret list example"),
+            w!("Menu bar example"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             60,
             60,
@@ -80,18 +86,69 @@ fn main() -> Result<(), String> {
     unsafe {
         let _ = SetForegroundWindow(owner);
     }
-    let model = caret_menu();
-    let (width, height) = model.preferred_size(&Measure);
-    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", model);
-    view.layout(
+    let theme = Theme::new(ThemeKind::Light);
+    let mut bar = MenuBar::new(qe_api::WidgetId(10));
+    bar.layout(
         Rect {
-            x: Dip(100.0),
-            y: Dip(200.0),
-            width: Dip(width),
-            height: Dip(height),
+            x: Dip(0.0),
+            y: Dip(0.0),
+            width: Dip(300.0),
+            height: theme.menu_bar_height,
         },
         &Measure,
     );
+    let mut bar_list = DisplayList::default();
+    bar_list.push(qe_api::DrawCommand::FillRect {
+        rect: Rect {
+            x: Dip(0.0),
+            y: Dip(0.0),
+            width: Dip(300.0),
+            height: Dip(120.0),
+        },
+        color: theme.text_background,
+    });
+    bar.draw(&mut bar_list, &theme, &Measure);
+    let mut bar_renderer = BitmapRenderer::new(300, 120).map_err(|e| e.message)?;
+    bar_renderer
+        .set_text_settings(TextSettings::reference())
+        .map_err(|e| e.message)?;
+    bar_renderer.begin_frame().map_err(|e| e.message)?;
+    bar_renderer.draw(&bar_list).map_err(|e| e.message)?;
+    bar_renderer.end_frame().map_err(|e| e.message)?;
+    bar_renderer.present(owner).map_err(|e| e.message)?;
+    let file = menu_bar_groups().remove(0);
+    let model = file.submenu.unwrap();
+    let (width, height) = model.preferred_size(&Measure);
+    let label = bar.label_rect(0);
+    let mut at = POINT {
+        x: label.x.0 as i32,
+        y: label.y.0 as i32,
+    };
+    if !unsafe { ClientToScreen(owner, &mut at) }.as_bool() {
+        return Err("placing the File menu failed".into());
+    }
+    let anchor = Rect {
+        x: Dip(at.x as f32),
+        y: Dip(at.y as f32),
+        ..label
+    };
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err("reading the work area failed".into());
+    }
+    let work = Rect {
+        x: Dip(info.rcWork.left as f32),
+        y: Dip(info.rcWork.top as f32),
+        width: Dip((info.rcWork.right - info.rcWork.left) as f32),
+        height: Dip((info.rcWork.bottom - info.rcWork.top) as f32),
+    };
+    let bounds = place_popup(anchor, (width, height), work, false);
+    let mut view = MenuView::new(qe_api::WidgetId(1), "File", model);
+    view.layout(bounds, &Measure);
     view.open_keyboard();
     let mut windows = MenuWindows::new(owner, 1.0);
     windows.sync(&view)?;
@@ -102,7 +159,10 @@ fn main() -> Result<(), String> {
         // SAFETY: `msg` is a valid out pointer.
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if got.0 <= 0 || msg.message == POPUP_DISMISSED_MESSAGE {
-            eprintln!("list closed: message {:#x}, wparam {}", msg.message, msg.wParam.0);
+            eprintln!(
+                "list closed: message {:#x}, wparam {}",
+                msg.message, msg.wParam.0
+            );
             break;
         }
         // SAFETY: `msg` came from GetMessageW. It runs for every message, handled or not.

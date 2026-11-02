@@ -520,7 +520,7 @@ fn capture_holder() -> HWND {
     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
 }
 fn caret_view(x: f32, y: f32) -> MenuView {
-    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", caret_menu());
+    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", legacy_caret_menu());
     view.bounds = qe_api::Rect {
         x: qe_api::Dip(x),
         y: qe_api::Dip(y),

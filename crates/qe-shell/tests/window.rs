@@ -274,7 +274,7 @@ fn window_size_comes_from_the_dpi_before_the_first_draw() {
     assert_eq!(f.window.dpi().unwrap(), 144);
     let (columns, rows, row): (f32, f32, f32) = (90.0, 30.0, 40.0);
     let width = (columns * 2.0 + 138.0).max(500.0) * 1.5;
-    let height = (rows * 5.0 + row) * 1.5;
+    let height = (rows * 5.0 + row + 32.0) * 1.5;
     assert_eq!(f.client().right, width.ceil() as i32);
     assert_eq!(f.client().bottom, height.ceil() as i32);
     assert!(log.contains(&format!(
@@ -290,8 +290,8 @@ fn window_size_comes_from_the_dpi_before_the_first_draw() {
     // The 40-dip row ends at 60 pixels, not at 40.
     // Dips 320 is the empty part of the row in this 500-wide window.
     let x = (320.0 * 1.5) as u32;
-    assert_ne!(pixel(&image, x, 50), pixel(&image, x, 70));
-    assert_eq!(pixel(&image, x, 62), pixel(&image, x, 200));
+    assert_ne!(pixel(&image, x, 50), pixel(&image, x, 110));
+    assert_eq!(pixel(&image, x, 62), pixel(&image, x, 70));
 }
 
 #[test]
@@ -310,7 +310,8 @@ fn real_renderer_paints_a_window_that_is_not_blank() {
         bg,
         "the row starts 1 pixel down, so 40 is in it"
     );
-    assert_eq!(pixel(&image, 300, 41), text, "the row stops at 41");
+    assert_eq!(pixel(&image, 300, 41), bg, "the menu bar starts at 41");
+    assert_eq!(pixel(&image, 300, 73), text, "the menu bar stops at 73");
     let log = f.renderer.took();
     assert!(!log.iter().any(|l| l == "render_to_bitmap"), "{log:?}");
 }
@@ -711,7 +712,7 @@ fn maximize_in_full_screen_leaves_full_screen_first() {
 }
 
 #[test]
-fn alt_alone_opens_the_list_through_the_window_and_skips_the_menu_loop() {
+fn alt_alone_focuses_the_bar_and_skips_the_menu_loop() {
     let f = fixture(None);
     let alt = usize::from(VK_MENU.0);
     assert_eq!(f.send(WM_SYSKEYDOWN, alt, 1 << 29), 0);
@@ -722,9 +723,15 @@ fn alt_alone_opens_the_list_through_the_window_and_skips_the_menu_loop() {
     );
     assert_eq!(f.send(WM_SYSKEYUP, alt, 1 << 29), 0);
     assert!(
-        f.events()
+        !f.events()
             .iter()
             .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
+    );
+    assert_eq!(f.send(WM_SYSKEYDOWN, usize::from(b'F'), 1 << 29), 0);
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(0, _)))
     );
     // A repeat of the press does not arm a release.
     f.send(WM_SYSKEYDOWN, alt, 1 << 29);
@@ -1061,7 +1068,7 @@ fn alt_chords_reach_the_owner_and_alt_letters_do_not_ask_for_a_menu() {
 }
 
 #[test]
-fn f10_and_alt_never_start_the_invisible_menu_loop() {
+fn f10_and_alt_focus_the_bar_without_the_invisible_menu_loop() {
     let f = fixture(None);
     for key in [usize::from(VK_F10.0), usize::from(VK_MENU.0)] {
         f.send(WM_SYSKEYDOWN, key, 0);
@@ -1073,7 +1080,7 @@ fn f10_and_alt_never_start_the_invisible_menu_loop() {
     }
     let f10 = content_events(&f);
     assert!(
-        f10.iter().any(
+        !f10.iter().any(
             |k| matches!(k, InputKind::KeyDown { virtual_key, .. } if *virtual_key == VK_F10.0)
         )
     );
@@ -1395,12 +1402,12 @@ fn the_owner_paints_the_text_area_through_the_hook() {
     let content = f.window.content_rect().unwrap();
     assert_eq!(*seen.borrow(), Some(content));
     assert_eq!(
-        content.y.0, 41.0,
-        "under the row, which starts 1 pixel down"
+        content.y.0, 73.0,
+        "under the row and menu bar, which start 1 pixel down"
     );
-    assert_eq!(content.height.0, f.client().bottom as f32 - 41.0);
+    assert_eq!(content.height.0, f.client().bottom as f32 - 73.0);
     let image = f.renderer.bitmap();
-    assert_eq!(pixel(&image, 50, 61), [10, 200, 30], "under the row");
+    assert_eq!(pixel(&image, 50, 93), [10, 200, 30], "under the menu bar");
     assert_ne!(pixel(&image, 50, 30), [10, 200, 30], "clipped off the row");
     assert_eq!(f.renderer_problems(), vec![]);
 
@@ -1760,7 +1767,7 @@ fn restored_row_starts_below_the_top_border_as_in_terminal() {
     assert_eq!(px(50.0, 8), HTCAPTION, "over the tab");
     assert_eq!(px(50.0, 9), HTCLIENT, "the tab's first row");
     assert_eq!(px(50.0, 40), HTCLIENT, "the tab's last row");
-    assert_eq!(f.window.content_rect().unwrap().y.0, 41.0);
+    assert_eq!(f.window.content_rect().unwrap().y.0, 73.0);
 }
 
 #[test]
@@ -1783,14 +1790,71 @@ fn maximized_and_full_screen_do_not_shift() {
     set_maximized_style(&f);
     f.send(WM_SIZE, 0, 0);
     assert_eq!(f.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
-    assert_eq!(f.window.content_rect().unwrap().y.0, 32.0);
+    assert_eq!(f.window.content_rect().unwrap().y.0, 64.0);
     let g = fixture(None);
     full_screen_key(&g, false);
     assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
-    assert_eq!(g.window.content_rect().unwrap().y.0, 32.0);
+    assert_eq!(g.window.content_rect().unwrap().y.0, 64.0);
     full_screen_key(&g, false);
     assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 13.0);
-    assert_eq!(g.window.content_rect().unwrap().y.0, 41.0);
+    assert_eq!(g.window.content_rect().unwrap().y.0, 73.0);
+}
+
+#[test]
+fn menu_bar_is_client_area_and_stops_at_the_content_edge() {
+    let f = fixture(None);
+    let top = f.window.content_rect().unwrap().y.0 - 32.0;
+    assert_eq!(top, 41.0);
+    assert_eq!(f.hit(50.0, top + 0.1), HTCLIENT);
+    assert_eq!(f.hit(f.width_dips() - 5.0, top + 31.9), HTCLIENT);
+    assert_eq!(f.hit(50.0, top + 32.0), HTCLIENT);
+    f.events();
+    f.send(WM_LBUTTONDOWN, 0, f.at(50.0, top + 10.0));
+    assert!(
+        !f.events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::ContentInput(_)))
+    );
+    let tree = f.window.handle().widgets().unwrap();
+    let bar = tree
+        .children
+        .iter()
+        .find(|child| child.name == "Menu bar")
+        .unwrap();
+    assert_eq!(
+        bar.children
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["File", "Edit", "Format", "View", "Window"]
+    );
+    assert!(bar.children.iter().all(|item| item.states.has_popup));
+}
+
+#[test]
+fn hovering_a_second_label_switches_the_open_group() {
+    let f = fixture(None);
+    let tree = f.window.handle().widgets().unwrap();
+    let bar = tree
+        .children
+        .iter()
+        .find(|child| child.name == "Menu bar")
+        .unwrap();
+    let file = bar.children[0].bounds;
+    let edit = bar.children[1].bounds;
+    f.events();
+    f.send(WM_LBUTTONDOWN, 0, f.at(file.x.0 + 4.0, file.y.0 + 12.0));
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(0, _)))
+    );
+    f.send(WM_MOUSEMOVE, 0, f.at(edit.x.0 + 4.0, edit.y.0 + 12.0));
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(1, _)))
+    );
 }
 
 fn refresh_fixture(fault: Option<TestFault>) -> (ShellWindow, Logged, Rc<RefCell<Vec<usize>>>) {

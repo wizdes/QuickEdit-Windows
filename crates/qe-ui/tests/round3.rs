@@ -511,7 +511,7 @@ fn every_key_has_a_name() {
     }
 }
 #[test]
-fn every_default_key_in_the_caret_list_is_named() {
+fn every_default_key_in_the_menu_bar_is_named() {
     for command in CommandId::ALL {
         if let Some(binding) = command.default_key() {
             let text = key_text(binding);
@@ -526,7 +526,13 @@ fn every_default_key_in_the_caret_list_is_named() {
             item.submenu.as_ref().and_then(zoom_key)
         })
     }
-    assert_eq!(zoom_key(&caret_menu()).as_deref(), Some("Ctrl+="));
+    assert_eq!(
+        zoom_key(&MenuModel {
+            items: menu_bar_groups()
+        })
+        .as_deref(),
+        Some("Ctrl+=")
+    );
 }
 
 // Item 16
@@ -936,7 +942,7 @@ fn encoding_panel_has_the_mac_line_above_the_list() {
 }
 #[test]
 fn open_recent_rows_name_their_files() {
-    let mut model = caret_menu();
+    let mut model = menu_bar_groups()[0].submenu.clone().unwrap();
     assert!(set_recent_files(
         &mut model,
         &[("notes.txt".into(), r"C:\notes.txt".into())]
@@ -945,7 +951,6 @@ fn open_recent_rows_name_their_files() {
     let mut menu = MenuView::new(WidgetId(1), "All menus", model);
     menu.layout(r(0.0, 0.0, w, h), &Measure);
     menu.open_keyboard();
-    send(&mut menu, &press(0x27)); // File
     send(&mut menu, &ev(InputKind::Char('r'))); // Open Recent
     let ctx = send(&mut menu, &press(0x0d)); // The file
     assert!(
@@ -981,7 +986,7 @@ fn a_second_alt_tap_closes_the_list() {
 // Item 3: what a host needs for one window per level.
 #[test]
 fn a_menu_gives_its_levels_and_paints_each_at_its_own_origin() {
-    let mut menu = MenuView::new(WidgetId(1), "All menus", caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "All menus", legacy_caret_menu());
     menu.layout(r(100.0, 200.0, 200.0, 300.0), &Measure);
     menu.open_keyboard();
     assert_eq!(menu.levels().len(), 1);

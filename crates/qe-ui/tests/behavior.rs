@@ -1737,7 +1737,7 @@ fn child_ids_do_not_collide_across_a_whole_dialog() {
     );
     tabs.bounds = r(0.0, 600.0, 400.0, 30.0);
     frame.add(Box::new(tabs));
-    let mut menu = MenuView::new(WidgetId(4), "Test", caret_menu());
+    let mut menu = MenuView::new(WidgetId(4), "Test", legacy_caret_menu());
     menu.bounds = r(400.0, 0.0, 300.0, 400.0);
     menu.open_keyboard();
     send(&mut menu, &press(0x27));
@@ -1981,8 +1981,14 @@ fn commands_of(model: &MenuModel, out: &mut Vec<CommandId>) {
     }
 }
 #[test]
-fn caret_list_has_every_command_once() {
+fn menu_bar_and_caret_have_every_command_once() {
     let mut found = vec![];
+    commands_of(
+        &MenuModel {
+            items: menu_bar_groups(),
+        },
+        &mut found,
+    );
     commands_of(&caret_menu(), &mut found);
     for command in CommandId::ALL {
         assert_eq!(
@@ -1994,22 +2000,19 @@ fn caret_list_has_every_command_once() {
     assert_eq!(found.len(), CommandId::ALL.len());
 }
 #[test]
-fn caret_list_has_the_groups_in_order_and_no_mac_only_rows() {
-    let model = caret_menu();
+fn menu_bar_has_the_groups_in_order_and_no_mac_only_rows() {
+    let model = MenuModel {
+        items: menu_bar_groups(),
+    };
     let names: Vec<&str> = model.items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(names, ["File", "Edit", "Format", "View", "Window"]);
     assert_eq!(
-        names,
-        [
-            "File",
-            "Edit",
-            "Format",
-            "View",
-            "Window",
-            "",
-            "About QuickEdit",
-            "Settings…",
-            "Quit QuickEdit"
-        ]
+        caret_menu()
+            .items
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect::<Vec<_>>(),
+        ["About QuickEdit", "Settings…", "Quit QuickEdit"]
     );
     fn labels(model: &MenuModel, out: &mut Vec<String>) {
         for item in &model.items {
@@ -2049,8 +2052,10 @@ fn caret_list_has_the_groups_in_order_and_no_mac_only_rows() {
     );
 }
 #[test]
-fn caret_list_shows_windows_keys() {
-    let model = caret_menu();
+fn menu_bar_groups_show_windows_keys() {
+    let model = MenuModel {
+        items: menu_bar_groups(),
+    };
     let file = model.items[0].submenu.as_ref().unwrap();
     let key_of = |label: &str| {
         file.items
@@ -2067,16 +2072,17 @@ fn caret_list_shows_windows_keys() {
     assert!(view.items.iter().any(|i| i.key_text == "F11"));
 }
 #[test]
-fn caret_list_runs_a_command_by_keyboard_alone() {
-    let mut menu = MenuView::new(WidgetId(1), "Test", caret_menu());
-    let (w, h) = caret_menu().preferred_size(&Measure);
+fn menu_bar_group_runs_a_command_by_keyboard_alone() {
+    let model = menu_bar_groups()[1].submenu.clone().unwrap();
+    let (w, h) = model.preferred_size(&Measure);
+    let mut menu = MenuView::new(WidgetId(1), "Edit", model);
     menu.layout(r(0.0, 0.0, w, h), &Measure);
     menu.open_keyboard();
-    send(&mut menu, &ev(InputKind::Char('e')));
-    assert_eq!(menu.selected, Some(1));
-    assert!(menu.child.is_some(), "a group's mnemonic opens it");
+    assert_eq!(menu.selected, Some(0));
     send(&mut menu, &press(0x23));
+    assert_eq!(menu.selected, Some(14));
     send(&mut menu, &press(0x27));
+    assert!(menu.child.is_some(), "Transformations opens its submenu");
     send(&mut menu, &press(0x28));
     let ctx = send(&mut menu, &press(0x0d));
     assert!(
@@ -2087,7 +2093,9 @@ fn caret_list_runs_a_command_by_keyboard_alone() {
 }
 #[test]
 fn set_command_state_reaches_nested_rows() {
-    let mut model = caret_menu();
+    let mut model = MenuModel {
+        items: menu_bar_groups(),
+    };
     assert!(set_command_state(
         &mut model,
         CommandId::SmartQuotes,

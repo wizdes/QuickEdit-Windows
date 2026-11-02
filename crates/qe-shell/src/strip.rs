@@ -42,6 +42,8 @@ pub enum ShellEvent {
         to: usize,
     },
     OpenCaretList(Rect),
+    /// A menu bar label opened. The owner hosts its popup at this rectangle.
+    OpenMenuGroup(usize, Rect),
     TearOffTab {
         tab: TabId,
         at: Point,
@@ -307,13 +309,10 @@ const TAB_CLOSE_IDS: u64 = 2 << 32;
 
 const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0d;
-const VK_MENU: u16 = 0x12;
 const VK_ESCAPE: u16 = 0x1b;
 const VK_SPACE: u16 = 0x20;
 const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
-const VK_LMENU: u16 = 0xa4;
-const VK_RMENU: u16 = 0xa5;
 
 fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect {
@@ -447,7 +446,6 @@ pub struct TabStrip {
     contrast: Option<ContrastColors>,
     drag: Option<TabDrag>,
     capturing: bool,
-    alt_armed: bool,
     reveal_on_layout: bool,
     release_capture: bool,
     next_id: u64,
@@ -478,7 +476,6 @@ impl TabStrip {
             contrast: None,
             drag: None,
             capturing: false,
-            alt_armed: false,
             reveal_on_layout: true,
             release_capture: false,
             next_id: 0,
@@ -525,10 +522,6 @@ impl TabStrip {
     /// then releases capture, because no button-up will reach the press.
     pub fn take_capture_release(&mut self) -> bool {
         std::mem::take(&mut self.release_capture)
-    }
-    /// A key table used this key, so that Alt was not alone.
-    pub fn disarm_alt(&mut self) {
-        self.alt_armed = false;
     }
     pub fn active(&self) -> usize {
         self.active
@@ -1196,36 +1189,10 @@ impl View for TabStrip {
     fn handle(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
         match event.kind {
             InputKind::KeyDown {
-                virtual_key: VK_MENU | VK_LMENU | VK_RMENU,
-                modifiers,
-                repeat,
-            } => {
-                // The first press arms. A repeat changes nothing: another key may have
-                // already disarmed this press.
-                if !repeat {
-                    self.alt_armed = !modifiers.ctrl && !modifiers.shift && !modifiers.win;
-                }
-                Handled::No
-            }
-            InputKind::KeyUp {
-                virtual_key: VK_MENU | VK_LMENU | VK_RMENU,
-                modifiers,
-            } => {
-                let open = self.alt_armed && !modifiers.ctrl && !modifiers.shift && !modifiers.win;
-                self.alt_armed = false;
-                if open {
-                    self.events.push(ShellEvent::OpenCaretList(self.split));
-                    Handled::Yes
-                } else {
-                    Handled::No
-                }
-            }
-            InputKind::KeyDown {
                 virtual_key,
                 modifiers,
                 repeat,
             } => {
-                self.alt_armed = false;
                 // Chords belong to the system and the command table.
                 if modifiers.alt || modifiers.ctrl || modifiers.win {
                     return Handled::No;
@@ -1234,7 +1201,6 @@ impl View for TabStrip {
             }
             InputKind::MouseMove { at } => self.mouse_move(at, ctx),
             InputKind::MouseDown { at, button, .. } => {
-                self.alt_armed = false;
                 self.mouse_down(at, button == MouseButton::Left, ctx)
             }
             InputKind::MouseUp {
@@ -1272,7 +1238,6 @@ impl View for TabStrip {
             }
             InputKind::Blur => {
                 self.window_active = false;
-                self.alt_armed = false;
                 self.cancel_pointer(ctx);
                 ctx.invalidate(self.row_rect());
                 Handled::Yes

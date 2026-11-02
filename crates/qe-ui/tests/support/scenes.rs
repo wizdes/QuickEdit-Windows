@@ -275,7 +275,7 @@ fn caret_list(theme: &Theme) -> Scene {
     let t = UiTokens::from_theme(theme);
     let mut l = DisplayList::default();
     background(&mut l, t.background, width, height);
-    let model = caret_menu();
+    let model = legacy_caret_menu();
     let (w, h) = model.preferred_size(&RealMeasure);
     let mut menu = MenuView::new(WidgetId(20), "Test", model.clone()).named("All menus");
     menu.layout(r(16.0, 16.0, w, h), &RealMeasure);

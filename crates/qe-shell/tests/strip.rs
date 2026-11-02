@@ -16,8 +16,6 @@ const VK_RETURN: u16 = 0x0d;
 const VK_MENU: u16 = 0x12;
 const VK_ESCAPE: u16 = 0x1b;
 const VK_RIGHT: u16 = 0x27;
-const VK_F4: u16 = 0x73;
-const VK_CONTROL: u16 = 0x11;
 
 fn measure() -> FixedTextMeasurer {
     FixedTextMeasurer {
@@ -789,66 +787,32 @@ fn opened(s: &mut TabStrip) -> bool {
         .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
 }
 #[test]
-fn alt_opens_the_list_on_release_only_when_alone() {
-    let none = Modifiers::default();
+fn alt_no_longer_opens_the_caret_list() {
     let mut s = strip(1, 800.0);
+    let none = Modifiers::default();
     key(&mut s, VK_MENU, alt(none));
     assert!(!opened(&mut s), "not on key down");
-    assert_eq!(key_up(&mut s, VK_MENU, none), Handled::Yes);
-    assert!(opened(&mut s), "alone");
+    key_up(&mut s, VK_MENU, none);
+    assert!(!opened(&mut s), "Alt alone belongs to the menu bar");
     key_up(&mut s, VK_MENU, none);
     assert!(!opened(&mut s), "a second release does nothing");
-
-    // A repeat neither opens nor arms again.
-    key(&mut s, VK_MENU, alt(none));
-    key(&mut s, VK_F4, alt(none));
-    send(
-        &mut s,
-        InputKind::KeyDown {
-            virtual_key: VK_MENU,
-            modifiers: alt(none),
-            repeat: true,
-        },
-    );
-    key_up(&mut s, VK_MENU, none);
-    assert!(!opened(&mut s), "Alt+F4, then a repeat");
-
-    key(&mut s, VK_MENU, alt(none));
-    key(&mut s, VK_TAB, alt(none));
-    key_up(&mut s, VK_MENU, none);
-    assert!(!opened(&mut s), "Alt+Tab");
-
-    let ctrl = Modifiers {
-        ctrl: true,
-        ..Default::default()
-    };
-    key(&mut s, VK_CONTROL, ctrl);
-    key(&mut s, 0xa5, alt(ctrl));
-    key_up(&mut s, 0xa5, ctrl);
-    assert!(!opened(&mut s), "AltGr is Ctrl and right Alt");
-
-    // AltGr can release Ctrl first, so that the release of Alt looks plain.
+    for chord in [0x73, VK_TAB, b'F' as u16] {
+        key(&mut s, VK_MENU, alt(none));
+        key(&mut s, chord, alt(none));
+        key_up(&mut s, VK_MENU, none);
+        assert!(!opened(&mut s), "Alt+{chord:#x} never opens the caret");
+    }
+    let ctrl = Modifiers { ctrl: true, ..none };
     key(&mut s, 0xa5, alt(ctrl));
     key_up(&mut s, 0xa5, none);
-    assert!(!opened(&mut s), "an Alt pressed with Ctrl never arms");
-
+    assert!(!opened(&mut s), "AltGr never opens the caret");
     let shift = Modifiers {
         shift: true,
-        ..Default::default()
+        ..none
     };
     key(&mut s, VK_MENU, alt(shift));
     key_up(&mut s, VK_MENU, shift);
-    assert!(!opened(&mut s), "Shift+Alt");
-
-    key(&mut s, VK_MENU, alt(none));
-    send(&mut s, InputKind::Blur);
-    key_up(&mut s, VK_MENU, none);
-    assert!(!opened(&mut s), "blur disarms");
-
-    key(&mut s, VK_MENU, alt(none));
-    down(&mut s, 400.0, 300.0);
-    key_up(&mut s, VK_MENU, none);
-    assert!(!opened(&mut s), "a click disarms");
+    assert!(!opened(&mut s), "Shift+Alt never opens the caret");
 }
 
 #[test]

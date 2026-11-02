@@ -139,6 +139,7 @@ version = "0.1.0"
 dependencies = [
  "qe-api",
  "qe-render",
+ "qe-ui",
  "windows",
 ]
 

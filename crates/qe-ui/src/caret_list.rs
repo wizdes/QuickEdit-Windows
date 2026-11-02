@@ -1,4 +1,4 @@
-//! The contents of the caret list. Every Mac menu that Windows keeps lives here
+//! The menu bar groups and the small caret list live here.
 //! (parity rows I01 to I10 and W06). Each row's command is in `CommandId`.
 use crate::{MenuItem, MenuModel};
 use qe_api::{CommandId, KeyBinding};
@@ -85,8 +85,33 @@ pub fn caret_menu() -> MenuModel {
     caret_menu_with_keys(&CommandId::default_key)
 }
 
-/// The caret list with the keys that the settings give.
+/// The five menu bar groups, in the same order as the Mac menu.
+pub fn menu_bar_groups() -> Vec<MenuItem> {
+    menu_bar_groups_with_keys(&CommandId::default_key)
+}
+
+pub fn menu_bar_groups_with_keys(
+    key_of: &dyn Fn(CommandId) -> Option<KeyBinding>,
+) -> Vec<MenuItem> {
+    legacy_caret_menu_with_keys(key_of)
+        .items
+        .drain(..5)
+        .collect()
+}
+
+/// The caret list contains the commands outside the five groups.
 pub fn caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>) -> MenuModel {
+    let mut old = legacy_caret_menu_with_keys(key_of);
+    old.items.drain(..6);
+    old
+}
+
+/// The old combined model, kept as a command-parity reference for tests.
+pub fn legacy_caret_menu() -> MenuModel {
+    legacy_caret_menu_with_keys(&CommandId::default_key)
+}
+
+fn legacy_caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>) -> MenuModel {
     use CommandId::*;
     let r = |label: &str, command: CommandId| row(label, command, key_of);
     let sep = MenuItem::separator;

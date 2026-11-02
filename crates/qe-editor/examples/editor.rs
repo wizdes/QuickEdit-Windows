@@ -23,31 +23,41 @@
 //! nothing, so this measures our work up to and including the present call.
 use qe_api::{
     Bitmap, Dip, DisplayList, DrawCommand, InputEvent, InputKind, Modifiers, MouseCursor,
-    PixelRect, Rect, RenderError, Renderer, View, ViewContext, ViewRequest,
+    PixelRect, Point, Rect, RenderError, Renderer, View, ViewContext, ViewRequest, WidgetId,
 };
 use qe_buffer::Notify;
 use qe_editor::{Clipboard, ClipboardPreparer, EditorView, FileLoad, LoadOptions, LoadResult};
 use qe_layout::DirectWriteLayout;
-use qe_render::BitmapRenderer;
+use qe_render::{BitmapRenderer, TextSettings};
 use qe_shell::{
     ShellEvent, ShellHandle, ShellWindow, Tab, VIEW_TIMER, WindowConfig, quit_message_loop,
     run_message_loop,
 };
-use qe_ui::ClipboardAccess;
+use qe_ui::{
+    ClipboardAccess, MenuModel, MenuView, MenuWindows, POPUP_DISMISSED_MESSAGE, PopupDismissed,
+    caret_menu, menu_bar_groups, place_popup,
+};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
-use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, SetFocus, VK_CONTROL, VK_F4, VK_MENU, VK_SHIFT, VK_SPACE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_GETWHEELSCROLLLINES,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SystemParametersInfoW, WM_KILLFOCUS,
-    WM_PAINT,
+    DispatchMessageW, GetMessageW, GetSystemMetrics, MSG, PostQuitMessage, SC_KEYMENU,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SendMessageW, SystemParametersInfoW, TranslateMessage, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const HELP: &str = "\
@@ -646,6 +656,250 @@ fn run_key_bench(
     Ok(())
 }
 
+fn show_menu_popup(handle: &ShellHandle, anchor: Rect, model: MenuModel) -> Result<(), String> {
+    let owner = HWND(handle.hwnd().map_err(|e| e.to_string())?);
+    let scale = handle.dpi().map_err(|e| e.to_string())? as f32 / 96.0;
+    let theme = handle.theme().map_err(|e| e.to_string())?;
+    let measure = DirectWriteLayout::new().map_err(|e| e.to_string())?;
+    let mut screen = POINT {
+        x: (anchor.x.0 * scale).round() as i32,
+        y: (anchor.y.0 * scale).round() as i32,
+    };
+    if !unsafe { ClientToScreen(owner, &mut screen) }.as_bool() {
+        return Err("placing the menu on screen failed".into());
+    }
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err("reading the menu work area failed".into());
+    }
+    let work = Rect {
+        x: Dip(info.rcWork.left as f32 / scale),
+        y: Dip(info.rcWork.top as f32 / scale),
+        width: Dip((info.rcWork.right - info.rcWork.left) as f32 / scale),
+        height: Dip((info.rcWork.bottom - info.rcWork.top) as f32 / scale),
+    };
+    let anchor = Rect {
+        x: Dip(screen.x as f32 / scale),
+        y: Dip(screen.y as f32 / scale),
+        width: anchor.width,
+        height: anchor.height,
+    };
+    let (width, height) = model.preferred_size(&measure);
+    let bounds = place_popup(anchor, (width, height), work, false);
+    let mut view = MenuView::new(WidgetId(20_000), "QuickEdit menu", model);
+    view.work_area = Some(work);
+    view.layout(bounds, &measure);
+    view.open_keyboard();
+    let mut windows = MenuWindows::new(owner, scale);
+    windows.sync(&view)?;
+    let repaint = |view: &MenuView, windows: &MenuWindows| -> Result<(), String> {
+        for (depth, popup) in windows.levels().iter().enumerate() {
+            let rect = view.levels()[depth];
+            let mut renderer = BitmapRenderer::new(
+                (rect.width.0 * scale).ceil() as u32,
+                (rect.height.0 * scale).ceil() as u32,
+            )
+            .map_err(|e| e.message)?;
+            renderer
+                .set_dpi((scale * 96.0) as u32)
+                .map_err(|e| e.message)?;
+            renderer
+                .set_text_settings(TextSettings::reference())
+                .map_err(|e| e.message)?;
+            let mut list = DisplayList::default();
+            view.draw_level(depth, &mut list, &theme, &measure);
+            renderer.begin_frame().map_err(|e| e.message)?;
+            renderer.draw(&list).map_err(|e| e.message)?;
+            renderer.end_frame().map_err(|e| e.message)?;
+            renderer.present(popup.hwnd()).map_err(|e| e.message)?;
+        }
+        Ok(())
+    };
+    repaint(&view, &windows)?;
+    let mut origin = POINT { x: 0, y: 0 };
+    if !unsafe { ClientToScreen(owner, &mut origin) }.as_bool() {
+        return Err("reading the owner position failed".into());
+    }
+    let bar_tree = handle.widgets().map_err(|e| e.to_string())?;
+    let bar = bar_tree
+        .children
+        .iter()
+        .find(|node| node.name == "Menu bar");
+    let current_group =
+        bar.and_then(|node| node.children.iter().position(|child| child.states.expanded));
+    let mut switched = false;
+    let mut chosen = false;
+    let mut msg = MSG::default();
+    loop {
+        let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if got.0 == -1 {
+            return Err(format!(
+                "reading menu messages failed: {}",
+                windows::core::Error::from_thread()
+            ));
+        }
+        if got.0 == 0 {
+            unsafe {
+                PostQuitMessage(msg.wParam.0 as i32);
+            }
+            break;
+        }
+        if msg.message == POPUP_DISMISSED_MESSAGE {
+            if windows
+                .levels()
+                .first()
+                .is_some_and(|root| root.hwnd().0 as usize == msg.wParam.0)
+            {
+                break;
+            }
+            continue;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+        }
+        let pointer = windows.pointer(msg.lParam);
+        let down = |key: i32| unsafe { GetKeyState(key) } < 0;
+        let modifiers = Modifiers {
+            ctrl: down(i32::from(VK_CONTROL.0)),
+            alt: down(i32::from(VK_MENU.0)),
+            shift: down(i32::from(VK_SHIFT.0)),
+            win: false,
+        };
+        if msg.message == WM_SYSKEYDOWN
+            && modifiers.alt
+            && !modifiers.ctrl
+            && (msg.wParam.0 == usize::from(VK_F4.0) || msg.wParam.0 == usize::from(VK_SPACE.0))
+        {
+            view.closed = true;
+            windows.sync(&view)?;
+            if msg.wParam.0 == usize::from(VK_F4.0) {
+                unsafe {
+                    SendMessageW(owner, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            } else {
+                unsafe {
+                    SendMessageW(
+                        owner,
+                        WM_SYSCOMMAND,
+                        Some(WPARAM(SC_KEYMENU as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+            }
+            break;
+        }
+        if msg.message == WM_MOUSEMOVE
+            && let (Some(at), Some(bar)) = (pointer, bar)
+        {
+            let client = Point {
+                x: Dip(at.x.0 - origin.x as f32 / scale),
+                y: Dip(at.y.0 - origin.y as f32 / scale),
+            };
+            let next = bar.children.iter().position(|label| {
+                let r = label.bounds;
+                client.x.0 >= r.x.0
+                    && client.x.0 < r.x.0 + r.width.0
+                    && client.y.0 >= r.y.0
+                    && client.y.0 < r.y.0 + r.height.0
+            });
+            if current_group.is_some() && next.is_some() && next != current_group {
+                view.closed = true;
+                windows.sync(&view)?;
+                handle
+                    .menu_bar_input(InputKind::MouseMove { at: client })
+                    .map_err(|e| e.to_string())?;
+                switched = true;
+                break;
+            }
+        }
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+            && current_group.is_some()
+            && view.child.is_none()
+            && (msg.wParam.0 == 0x25 || msg.wParam.0 == 0x27)
+            && (msg.wParam.0 == 0x25
+                || view
+                    .selected
+                    .and_then(|i| view.model.items.get(i))
+                    .is_none_or(|item| item.submenu.is_none()))
+        {
+            view.closed = true;
+            windows.sync(&view)?;
+            handle
+                .menu_bar_input(InputKind::KeyDown {
+                    virtual_key: msg.wParam.0 as u16,
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                })
+                .map_err(|e| e.to_string())?;
+            switched = true;
+            break;
+        }
+        let kind = match msg.message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => Some(InputKind::KeyDown {
+                virtual_key: msg.wParam.0 as u16,
+                modifiers,
+                repeat: msg.lParam.0 & (1 << 30) != 0,
+            }),
+            WM_KEYUP | WM_SYSKEYUP => Some(InputKind::KeyUp {
+                virtual_key: msg.wParam.0 as u16,
+                modifiers,
+            }),
+            WM_CHAR => char::from_u32(msg.wParam.0 as u32).map(InputKind::Char),
+            WM_MOUSEMOVE => pointer.map(|at| InputKind::MouseMove { at }),
+            WM_LBUTTONDOWN => pointer.map(|at| InputKind::MouseDown {
+                at,
+                button: qe_api::MouseButton::Left,
+                modifiers,
+            }),
+            WM_LBUTTONUP => pointer.map(|at| InputKind::MouseUp {
+                at,
+                button: qe_api::MouseButton::Left,
+                modifiers,
+            }),
+            _ => None,
+        };
+        unsafe {
+            DispatchMessageW(&msg);
+        }
+        if let Some(kind) = kind {
+            let mut ctx = ViewContext::default();
+            view.handle(&InputEvent { time_us: 0, kind }, &mut ctx);
+            for request in ctx.requests {
+                if let ViewRequest::Run(command) = request {
+                    chosen = true;
+                    println!("{command:?}");
+                }
+            }
+            if view.closed {
+                break;
+            }
+            windows.sync(&view)?;
+            repaint(&view, &windows)?;
+        }
+    }
+    if switched {
+        return Ok(());
+    }
+    if chosen || windows.dismissed() == Some(PopupDismissed::OutsideClick) {
+        handle
+            .menu_bar_input(InputKind::MouseDown {
+                at: Point {
+                    x: Dip(-1.0),
+                    y: Dip(-1.0),
+                },
+                button: qe_api::MouseButton::Left,
+                modifiers: Modifiers::default(),
+            })
+            .map_err(|e| e.to_string())
+    } else {
+        handle.close_menu_popup().map_err(|e| e.to_string())
+    }
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args()?;
     // Only the timers use this, so its failure must not stop the program from opening.
@@ -786,6 +1040,18 @@ fn main() -> Result<(), String> {
             return;
         }
         let result = match event {
+            ShellEvent::OpenMenuGroup(index, anchor) => {
+                if let Some(group) = menu_bar_groups().into_iter().nth(index) {
+                    if let Err(problem) = show_menu_popup(handle, anchor, group.submenu.unwrap_or_default()) {
+                        eprintln!("{problem}");
+                    }
+                } else { eprintln!("menu group {index} does not exist"); }
+                Ok(())
+            }
+            ShellEvent::OpenCaretList(anchor) => {
+                if let Err(problem) = show_menu_popup(handle, anchor, caret_menu()) { eprintln!("{problem}"); }
+                Ok(())
+            }
             ShellEvent::ContentInput(input) => {
                 let is_key = matches!(input.kind, InputKind::KeyDown { .. } | InputKind::Char(_));
                 let started = input_time(input.time_us, Instant::now());

@@ -13,8 +13,9 @@ use crate::{
 use qe_api::{
     Color, Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, Modifiers, MouseButton,
     MouseCursor, PixelRect, Point, Rect as ApiRect, Renderer, TextMeasurer, Theme, ThemeKind, View,
-    ViewContext, ViewRequest,
+    ViewContext, ViewRequest, Widget, WidgetId, WidgetRole, WidgetStates,
 };
+use qe_ui::MenuBar;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -445,6 +446,7 @@ impl RendererHolder for Box<dyn Renderer> {
 }
 struct State {
     strip: TabStrip,
+    menu_bar: MenuBar,
     renderer: Box<dyn RendererHolder>,
     measurer: Box<dyn TextMeasurer>,
     theme: Theme,
@@ -461,7 +463,7 @@ struct State {
 impl State {
     fn content_rect(&self) -> ApiRect {
         let row = self.strip.row_rect();
-        let top = row.y.0 + row.height.0;
+        let top = row.y.0 + row.height.0 + self.theme.menu_bar_height.0;
         ApiRect {
             x: Dip(0.0),
             y: Dip(top),
@@ -493,6 +495,8 @@ impl State {
                 });
             }
             self.strip
+                .draw(&mut list, &self.theme, self.measurer.as_ref());
+            self.menu_bar
                 .draw(&mut list, &self.theme, self.measurer.as_ref());
             if let Err(e) = self.renderer.renderer().begin_frame() {
                 problems.push(renderer_error("begin_frame", e));
@@ -791,8 +795,44 @@ impl Shared {
         let event = self.make_event(kind);
         let result = self.with_state(message, |state| {
             let mut ctx = ViewContext::default();
-            let handled = state.strip.handle(&event, &mut ctx);
-            (handled, ctx.requests, state.strip.take_events())
+            let was_focused = state.menu_bar.focused().is_some();
+            let bar_key = match event.kind {
+                InputKind::KeyDown {
+                    virtual_key,
+                    modifiers,
+                    ..
+                } => {
+                    virtual_key == VK_F10.0
+                        || matches!(virtual_key, 0x12 | 0xa4 | 0xa5)
+                        || (modifiers.alt && !modifiers.ctrl)
+                }
+                InputKind::KeyUp { virtual_key, .. } => matches!(virtual_key, 0x12 | 0xa4 | 0xa5),
+                InputKind::MouseMove { .. }
+                | InputKind::MouseDown { .. }
+                | InputKind::MouseUp { .. }
+                | InputKind::Wheel { .. }
+                | InputKind::Blur => true,
+                _ => false,
+            };
+            let bar_handled = if was_focused || bar_key {
+                state.menu_bar.handle(&event, &mut ctx)
+            } else {
+                Handled::No
+            };
+            let bar_open = state.menu_bar.take_open_request();
+            let handled = if bar_handled == Handled::Yes {
+                bar_handled
+            } else {
+                state.strip.handle(&event, &mut ctx)
+            };
+            let mut events = state.strip.take_events();
+            if let Some((i, anchor)) = bar_open {
+                events.push(ShellEvent::OpenMenuGroup(i, anchor));
+            }
+            if was_focused && state.menu_bar.focused().is_none() {
+                events.push(ShellEvent::FocusContent);
+            }
+            (handled, ctx.requests, events)
         });
         let Some((handled, requests, events)) = result else {
             return (Handled::No, event);
@@ -1137,6 +1177,15 @@ impl Shared {
                 height: Dip(state.strip.row_height()),
             };
             state.strip.layout(row, state.measurer.as_ref());
+            state.menu_bar.layout(
+                ApiRect {
+                    x: Dip(0.0),
+                    y: Dip(row.y.0 + row.height.0),
+                    width: row.width,
+                    height: state.theme.menu_bar_height,
+                },
+                state.measurer.as_ref(),
+            );
             let content = state.content_rect();
             let moved = content != content_before;
             (problem, mode_changed, size_changed, moved, content)
@@ -1356,13 +1405,12 @@ impl Shared {
         }
         consumed
     }
-    fn on_key_table(&self, msg: u32, vk: u16, repeat: bool) -> bool {
+    fn on_key_table(&self, vk: u16, repeat: bool) -> bool {
         let Some(action) = self.keys.borrow().action(vk, modifiers()) else {
             return false;
         };
         self.swallow_up.set(Some(vk));
         self.swallow_char.set(true);
-        self.strip_action(msg, |strip, _| strip.disarm_alt());
         if !repeat {
             match action {
                 ShellAction::NewTab => self.queue.borrow_mut().push_back(ShellEvent::NewTab),
@@ -1602,14 +1650,16 @@ impl Shared {
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 // Bit 30 says that the key was already down: this is a repeat.
-                if self.on_key_table(msg, w.0 as u16, l.0 & (1 << 30) != 0) {
+                if self.on_key_table(w.0 as u16, l.0 & (1 << 30) != 0) {
                     return LRESULT(0);
                 }
+                let mut key_mods = modifiers();
+                key_mods.alt |= msg == WM_SYSKEYDOWN;
                 let (handled, event) = self.input(
                     msg,
                     InputKind::KeyDown {
                         virtual_key: w.0 as u16,
-                        modifiers: modifiers(),
+                        modifiers: key_mods,
                         repeat: l.0 & (1 << 30) != 0,
                     },
                 );
@@ -1620,11 +1670,13 @@ impl Shared {
                     self.swallow_up.set(None);
                     return LRESULT(0);
                 }
+                let mut key_mods = modifiers();
+                key_mods.alt |= msg == WM_SYSKEYUP;
                 let (handled, event) = self.input(
                     msg,
                     InputKind::KeyUp {
                         virtual_key: w.0 as u16,
-                        modifiers: modifiers(),
+                        modifiers: key_mods,
                     },
                 );
                 self.after_key(msg, w, handled, event, default)
@@ -1872,6 +1924,88 @@ impl ShellHandle {
             .map_err(|_| ShellError::Reentered { message: 0 })?;
         Ok(state.content_rect())
     }
+    pub fn theme(&self) -> Result<Theme, ShellError> {
+        let shared = self.live()?;
+        let state = shared
+            .state
+            .try_borrow()
+            .map_err(|_| ShellError::Reentered { message: 0 })?;
+        Ok(state.theme)
+    }
+    /// The top row and menu bar for the screen reader provider.
+    pub fn widgets(&self) -> Result<Widget, ShellError> {
+        let shared = self.live()?;
+        let state = shared
+            .state
+            .try_borrow()
+            .map_err(|_| ShellError::Reentered { message: 0 })?;
+        let mut children = Vec::with_capacity(2);
+        if let Some(strip) = state.strip.widgets() {
+            children.push(strip);
+        }
+        children.push(state.menu_bar.widgets());
+        Ok(Widget {
+            id: WidgetId(9_999),
+            bounds: ApiRect {
+                x: Dip(0.0),
+                y: Dip(0.0),
+                width: Dip(state.client_dips.0),
+                height: Dip(state.content_rect().y.0),
+            },
+            role: WidgetRole::Group,
+            name: "Window controls".into(),
+            value: None,
+            states: WidgetStates {
+                enabled: true,
+                ..Default::default()
+            },
+            selection: None,
+            range_value: None,
+            description: None,
+            children,
+        })
+    }
+    /// Marks a popup closed while keeping keyboard focus on its label.
+    pub fn close_menu_popup(&self) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        let requests = {
+            let mut state = shared
+                .state
+                .try_borrow_mut()
+                .map_err(|_| ShellError::Reentered { message: 0 })?;
+            let mut ctx = ViewContext::default();
+            state.menu_bar.close_popup(&mut ctx);
+            ctx.requests
+        };
+        shared.apply(requests, Vec::new());
+        Ok(())
+    }
+    /// Lets a popup pass a pointer move or an arrow key back to its owning bar.
+    pub fn menu_bar_input(&self, kind: InputKind) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        let (requests, events) = {
+            let mut state = shared
+                .state
+                .try_borrow_mut()
+                .map_err(|_| ShellError::Reentered { message: 0 })?;
+            let mut ctx = ViewContext::default();
+            let old_focus = state.menu_bar.focused().is_some();
+            state
+                .menu_bar
+                .handle(&InputEvent { time_us: 0, kind }, &mut ctx);
+            let mut events = Vec::new();
+            if let Some((index, anchor)) = state.menu_bar.take_open_request() {
+                events.push(ShellEvent::OpenMenuGroup(index, anchor));
+            }
+            if old_focus && state.menu_bar.focused().is_none() {
+                events.push(ShellEvent::FocusContent);
+            }
+            (ctx.requests, events)
+        };
+        shared.apply(requests, events);
+        shared.dispatch();
+        Ok(())
+    }
     /// Asks the next paint to repaint the whole text area.
     pub fn invalidate_content(&self) -> Result<(), ShellError> {
         let rect = self.content_rect()?;
@@ -2101,6 +2235,7 @@ impl ShellWindow {
             tracking: Cell::new(Tracking::None),
             state: RefCell::new(State {
                 strip: TabStrip::new(vec![Tab::new("Untitled")]),
+                menu_bar: MenuBar::new(qe_api::WidgetId(10_000)),
                 renderer,
                 measurer,
                 theme: Theme::new(ThemeKind::Light),
@@ -2201,7 +2336,9 @@ impl ShellWindow {
         let scale = shared.scale();
         let width_dips = (t.new_window_columns * config.cell_width + t.caption_width * 3.0)
             .max(t.min_window_width);
-        let height_dips = t.new_window_rows * config.line_height + t.row_height;
+        let height_dips = t.new_window_rows * config.line_height
+            + t.row_height
+            + Theme::new(ThemeKind::Light).menu_bar_height.0;
         unsafe {
             SetWindowPos(
                 hwnd,

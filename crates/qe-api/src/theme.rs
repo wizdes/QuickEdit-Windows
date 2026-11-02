@@ -31,6 +31,8 @@ pub struct Theme {
     pub font_family: &'static str,
     pub font_pt: f32,
     pub top_row_height: Dip,
+    /// The flat menu bar below the tabs.
+    pub menu_bar_height: Dip,
     pub tab_height: Dip,
     pub caption_button_width: Dip,
     pub map_width: Dip,
@@ -124,6 +126,7 @@ impl Theme {
             font_family: "Cascadia Mono",
             font_pt: 10.0,
             top_row_height: Dip(32.0),
+            menu_bar_height: Dip(32.0),
             tab_height: Dip(32.0),
             caption_button_width: Dip(46.0),
             map_width: Dip(100.0),
@@ -134,5 +137,16 @@ impl Theme {
             gutter_right_padding: Dip(8.0),
             page_margin_pt: 72.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_bar_tests {
+    use super::{Theme, ThemeKind};
+
+    #[test]
+    fn menu_bar_height_is_one_shared_value() {
+        assert_eq!(Theme::new(ThemeKind::Light).menu_bar_height.0, 32.0);
+        assert_eq!(Theme::new(ThemeKind::Dark).menu_bar_height.0, 32.0);
     }
 }

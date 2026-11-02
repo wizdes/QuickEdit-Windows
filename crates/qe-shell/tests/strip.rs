@@ -1410,7 +1410,8 @@ fn the_split_button_values_come_from_winui_and_terminal() {
     };
     // The fixed measurer gives one character 7 wide, and starts round to whole pixels.
     let split = s.split_rect().x.0;
-    assert_eq!(at("E96E"), (split + 32.0 + 13.0 - 3.5).round());
+    // Its start moves 0.55 left, because its ink sits right of the middle of its em box.
+    assert_eq!(at("E96E"), (split + 32.0 + 13.0 - 3.5 - 0.55).round());
     assert_eq!(at("E710"), (split + 15.5 - 3.5).round());
 }
 

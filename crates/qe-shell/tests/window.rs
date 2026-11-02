@@ -305,7 +305,12 @@ fn real_renderer_paints_a_window_that_is_not_blank() {
     assert!(ink.is_some(), "the row has ink");
     let text = pixel(&image, 300, 300);
     assert_ne!(bg, text, "the text area is not the row color");
-    assert_eq!(pixel(&image, 300, 40), text, "the row stops at 40");
+    assert_eq!(
+        pixel(&image, 300, 40),
+        bg,
+        "the row starts 1 pixel down, so 40 is in it"
+    );
+    assert_eq!(pixel(&image, 300, 41), text, "the row stops at 41");
     let log = f.renderer.took();
     assert!(!log.iter().any(|l| l == "render_to_bitmap"), "{log:?}");
 }
@@ -355,8 +360,22 @@ fn nchittest_gives_the_right_code_at_each_dpi() {
         let f = fixture(Some(dpi));
         let w = f.width_dips();
         assert_eq!(f.hit(w - 7.0, 20.0), HTCLOSE, "{dpi} close at 7 from right");
-        assert_eq!(f.hit(w - 23.0, 0.0), HTCLOSE, "{dpi} close at the very top");
-        assert_eq!(f.hit(w - 69.0, 0.0), HTMAXBUTTON, "{dpi} all of maximize");
+        // The top border's row resizes, and the buttons start on the row below it.
+        assert_eq!(
+            f.hit_px((w - 23.0) as i32 * dpi as i32 / 96, 0),
+            HTTOP,
+            "{dpi}"
+        );
+        assert_eq!(
+            f.hit_px((f.client().right as f32 - 23.0 * f.scale) as i32, 1),
+            HTCLOSE,
+            "{dpi} close from its first row"
+        );
+        assert_eq!(
+            f.hit_px((f.client().right as f32 - 69.0 * f.scale) as i32, 1),
+            HTMAXBUTTON,
+            "{dpi} all of maximize"
+        );
         assert_eq!(f.hit(w - 69.0, 39.0), HTMAXBUTTON, "{dpi}");
         assert_eq!(f.hit(w - 115.0, 20.0), HTMINBUTTON, "{dpi}");
         assert_eq!(f.hit(7.0, 20.0), HTCLIENT, "{dpi} tab 0 at 7 from left");
@@ -1375,10 +1394,13 @@ fn the_owner_paints_the_text_area_through_the_hook() {
     f.send(WM_PAINT, 0, 0);
     let content = f.window.content_rect().unwrap();
     assert_eq!(*seen.borrow(), Some(content));
-    assert_eq!(content.y.0, 40.0);
-    assert_eq!(content.height.0, f.client().bottom as f32 - 40.0);
+    assert_eq!(
+        content.y.0, 41.0,
+        "under the row, which starts 1 pixel down"
+    );
+    assert_eq!(content.height.0, f.client().bottom as f32 - 41.0);
     let image = f.renderer.bitmap();
-    assert_eq!(pixel(&image, 50, 60), [10, 200, 30], "under the row");
+    assert_eq!(pixel(&image, 50, 61), [10, 200, 30], "under the row");
     assert_ne!(pixel(&image, 50, 30), [10, 200, 30], "clipped off the row");
     assert_eq!(f.renderer_problems(), vec![]);
 
@@ -1673,4 +1695,187 @@ fn a_failed_move_into_full_screen_changes_nothing() {
             ..
         }
     )));
+}
+
+fn ink_rows(image: &Bitmap, x0: u32, x1: u32, y1: u32) -> (u32, u32) {
+    let bg = pixel(image, x0, y1 - 1);
+    let ink = ink_box(image, (x0, 1, x1, y1), bg, 60).expect("ink");
+    (ink.1, ink.3)
+}
+/// Root measured these on a real Terminal at 100%: `+` ink at y 19 to 29 and caret ink at
+/// y 22 to 26, both inclusive, with the row starting below the 1-pixel top border.
+#[test]
+fn restored_row_starts_below_the_top_border_as_in_terminal() {
+    let f = fixture(None);
+    f.send(WM_PAINT, 0, 0);
+    let image = f.renderer.bitmap();
+    let split = f.window.with_strip(|s| s.split_rect()).unwrap();
+    assert_eq!(split.y.0, 13.0, "the split button starts on row 13");
+    let x = split.x.0 as u32;
+    assert_eq!(ink_rows(&image, x + 2, x + 29, 36), (19, 30), "plus");
+    assert_eq!(ink_rows(&image, x + 34, x + 60, 36), (22, 27), "caret");
+    let tab = f.window.with_strip(|s| s.tab_rects()[0]).unwrap();
+    assert_eq!(tab.y.0, 9.0, "the tab's top is 1 pixel lower");
+    let row = pixel(&image, x + 100, 30);
+    assert_eq!(pixel(&image, 100, 8), row, "above the tab is the row");
+    assert_ne!(pixel(&image, 100, 10), row, "the tab starts at 9");
+    // The window buttons move with the row: their ink center is 21, as in Terminal.
+    let w = f.client().right as u32;
+    let ink = ink_box(&image, (w - 40, 1, w - 8, 40), row, 60).unwrap();
+    assert_eq!((ink.1 + ink.3) / 2, 21, "close button ink {ink:?}");
+    // Hit tests follow it.
+    let px = |x: f32, y: i32| f.hit_px(x as i32, y);
+    assert_eq!(
+        px(split.x.0 + 5.0, 12),
+        HTCAPTION,
+        "just above the split button"
+    );
+    assert_eq!(px(split.x.0 + 5.0, 13), HTCLIENT, "its first row");
+    assert_eq!(px(split.x.0 + 5.0, 36), HTCLIENT, "its last row");
+    assert_eq!(px(split.x.0 + 5.0, 37), HTCAPTION, "just below it");
+    assert_eq!(
+        px(50.0, 7),
+        HTTOP,
+        "the band is 8 rows from the window's top"
+    );
+    assert_eq!(px(50.0, 8), HTCAPTION, "over the tab");
+    assert_eq!(px(50.0, 9), HTCLIENT, "the tab's first row");
+    assert_eq!(px(50.0, 40), HTCLIENT, "the tab's last row");
+    assert_eq!(f.window.content_rect().unwrap().y.0, 41.0);
+}
+
+#[test]
+fn the_row_starts_one_device_pixel_down_at_each_scale() {
+    for dpi in [96u32, 120, 144, 192] {
+        let f = fixture(Some(dpi));
+        let scale = dpi as f32 / 96.0;
+        let split = f.window.with_strip(|s| s.split_rect()).unwrap();
+        assert!(
+            (split.y.0 * scale - (12.0 * scale + 1.0)).abs() < 0.01,
+            "{dpi}: {}",
+            split.y.0
+        );
+    }
+}
+
+#[test]
+fn maximized_and_full_screen_do_not_shift() {
+    let f = fixture(None);
+    set_maximized_style(&f);
+    f.send(WM_SIZE, 0, 0);
+    assert_eq!(f.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
+    assert_eq!(f.window.content_rect().unwrap().y.0, 32.0);
+    let g = fixture(None);
+    full_screen_key(&g, false);
+    assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
+    assert_eq!(g.window.content_rect().unwrap().y.0, 32.0);
+    full_screen_key(&g, false);
+    assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 13.0);
+    assert_eq!(g.window.content_rect().unwrap().y.0, 41.0);
+}
+
+fn refresh_fixture(fault: Option<TestFault>) -> (ShellWindow, Logged, Rc<RefCell<Vec<usize>>>) {
+    thread_local! {
+        static CALLS: RefCell<Option<Rc<RefCell<Vec<usize>>>>> = const { RefCell::new(None) };
+        static ANSWER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let calls: Rc<RefCell<Vec<usize>>> = Rc::default();
+    CALLS.with(|c| *c.borrow_mut() = Some(calls.clone()));
+    let renderer = Logged::new();
+    let window = ShellWindow::create_with_refresh(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            record_system_commands: true,
+            fault,
+            ..Default::default()
+        },
+        renderer.clone(),
+        |_, hwnd| {
+            CALLS.with(|c| {
+                if let Some(calls) = &*c.borrow() {
+                    calls.borrow_mut().push(hwnd as usize);
+                }
+            });
+            Ok(true)
+        },
+        Box::new(RealMeasurer),
+    )
+    .unwrap();
+    (window, renderer, calls)
+}
+#[test]
+fn text_settings_refresh_on_each_message_that_can_change_them() {
+    let (window, renderer, calls) = refresh_fixture(None);
+    let hwnd = HWND(window.hwnd().unwrap());
+    let send = |msg: u32, w: usize, l: isize| unsafe {
+        SendMessageW(hwnd, msg, Some(WPARAM(w)), Some(LPARAM(l)));
+    };
+    calls.borrow_mut().clear();
+    send(WM_SETTINGCHANGE, 0, 0);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [hwnd.0 as usize],
+        "WM_SETTINGCHANGE"
+    );
+    send(WM_DISPLAYCHANGE, 32, 0);
+    assert_eq!(calls.borrow().len(), 2, "WM_DISPLAYCHANGE");
+    let mut outer = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut outer) }.unwrap();
+    send(
+        WM_DPICHANGED,
+        96 | (96 << 16),
+        &outer as *const RECT as isize,
+    );
+    assert_eq!(calls.borrow().len(), 3, "WM_DPICHANGED");
+    // A move on the same monitor costs nothing.
+    send(WM_MOVE, 0, 0);
+    send(WM_MOVE, 0, 0);
+    assert!(
+        calls.borrow().len() <= 4,
+        "at most the first move: {:?}",
+        calls.borrow()
+    );
+    // A paint draws what the refresh asked for.
+    send(WM_PAINT, 0, 0);
+    renderer.took();
+    send(WM_PAINT, 0, 0);
+    assert!(
+        !renderer.took().contains(&"draw".to_string()),
+        "nothing waits"
+    );
+    send(WM_DISPLAYCHANGE, 32, 0);
+    send(WM_PAINT, 0, 0);
+    assert!(renderer.took().contains(&"draw".to_string()));
+}
+#[test]
+fn a_move_to_another_monitor_refreshes_text_settings() {
+    let (window, _renderer, calls) = refresh_fixture(Some(TestFault::MoveChangesMonitor));
+    let hwnd = HWND(window.hwnd().unwrap());
+    calls.borrow_mut().clear();
+    unsafe { SendMessageW(hwnd, WM_MOVE, None, None) };
+    assert_eq!(calls.borrow().len(), 1);
+}
+#[test]
+fn the_real_renderer_refresh_runs_on_a_hidden_window() {
+    let window = ShellWindow::create_with_refresh(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            ..Default::default()
+        },
+        BitmapRenderer::new(64, 64).unwrap(),
+        |renderer, hwnd| renderer.refresh_text_settings_for_window(HWND(hwnd)),
+        Box::new(RealMeasurer),
+    )
+    .unwrap();
+    let hwnd = HWND(window.hwnd().unwrap());
+    unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE, None, None) };
+    let problems = window.problems().unwrap();
+    assert!(
+        !problems
+            .iter()
+            .any(|p| matches!(p, ShellError::Renderer { .. })),
+        "{problems:?}"
+    );
 }

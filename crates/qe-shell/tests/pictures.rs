@@ -95,10 +95,11 @@ fn saved_images_in_three_themes_at_three_scales() {
             let saved = decode_own_png(&std::fs::read(&path).unwrap());
             let current = raw_pixels(&image);
             assert_eq!(saved.len(), current.len(), "{}", path.display());
-            // In a few runs out of 60, on one PC and one account, the same 3 pixels of one
-            // glyph draw differently: 9 values of 302,400 at 150%, the most by 59. The cause
-            // is not found, and root has the note. So the count is what decides. A real
-            // change moves far more values than this allows, and fails.
+            // The same 3 pixels of one glyph sometimes draw differently: 9 values of
+            // 302,400 at 150%, the most by 59. The M5 builder proved with
+            // `crates/qe-render/examples/repeat_stress.rs` that this comes from DirectWrite,
+            // so no code here can fix it. So the count is what decides: 1 in 10,000 may
+            // differ. A real change moves far more values than this, and fails.
             let far: Vec<(usize, u8)> = saved
                 .iter()
                 .zip(&current)
@@ -360,6 +361,7 @@ fn caret_has_winuis_ink_and_position() {
             let cx = (ink.0 + ink.2) as f32 / 2.0 - area.0 as f32;
             let cy = (ink.1 + ink.3) as f32 / 2.0 - area.1 as f32;
             assert!((cx - 13.0 * scale).abs() <= 1.0, "{name} {dpi}: x {cx}");
+            println!("measured {name} {dpi}: caret ink center x {cx}, y {cy}");
             assert!((cy - 12.0 * scale).abs() <= 1.0, "{name} {dpi}: y {cy}");
         }
     }

@@ -1,7 +1,8 @@
 //! A visible window on the real renderer, for root's visible checks. Tests never run it.
-use qe_api::{InputKind, Renderer};
+use qe_api::InputKind;
 use qe_render::BitmapRenderer;
-use qe_shell::{ShellEvent, ShellWindow, Tab, quit_message_loop, run_message_loop};
+use qe_shell::{ShellEvent, ShellWindow, Tab, WindowConfig, quit_message_loop, run_message_loop};
+use windows::Win32::Foundation::HWND;
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -9,10 +10,17 @@ mod support;
 const VK_TAB: u16 = 0x09;
 
 fn main() -> Result<(), String> {
-    let renderer: Box<dyn Renderer> =
-        Box::new(BitmapRenderer::new(800, 600).map_err(|e| e.to_string())?);
-    let window = ShellWindow::create(renderer, Box::new(support::RealMeasurer), 8.0, 17.0)
-        .map_err(|e| e.to_string())?;
+    let window = ShellWindow::create_with_refresh(
+        WindowConfig {
+            cell_width: 8.0,
+            line_height: 17.0,
+            ..Default::default()
+        },
+        BitmapRenderer::new(800, 600).map_err(|e| e.to_string())?,
+        |renderer, hwnd| renderer.refresh_text_settings_for_window(HWND(hwnd)),
+        Box::new(support::RealMeasurer),
+    )
+    .map_err(|e| e.to_string())?;
     window
         .add_tab(Tab::new("Example.rs"))
         .map_err(|e| e.to_string())?;

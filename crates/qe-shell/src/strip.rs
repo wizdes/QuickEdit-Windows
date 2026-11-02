@@ -126,6 +126,11 @@ pub struct ShellTokens {
     pub caret_icon: f32,
     pub caret_box: f32,
     pub caret_right_padding: f32,
+    /// E96E's ink sits above the middle of its em box. This moves it down to the center
+    /// at 200%, and is too small to move the baseline's whole pixel at 100%.
+    pub caret_nudge: f32,
+    /// Its ink also sits right of the middle. Terminal's center is at x = 13 of the part.
+    pub caret_nudge_x: f32,
     pub focus_width: f32,
     pub drag_threshold: f32,
     pub text_inset: f32,
@@ -189,6 +194,8 @@ impl ShellTokens {
             caret_icon: 10.0,
             caret_box: 12.0,
             caret_right_padding: 12.0,
+            caret_nudge: 0.3,
+            caret_nudge_x: -0.55,
             focus_width: 2.0,
             drag_threshold: 12.0,
             text_inset: 16.0,
@@ -682,7 +689,19 @@ impl TabStrip {
     /// The one hit test. Clicks, hover, `WM_NCHITTEST` and `WM_NCMOUSEMOVE` all use it.
     pub fn hit_test(&self, at: Point) -> CaptionHit {
         let t = light_tokens();
-        if !inside(at, self.row_rect()) {
+        // Terminal's main window answers HTTOP above its drag bar, which starts below the
+        // top border (`NonClientIslandWindow.cpp`, `_ResizeDragBarWindow` and
+        // `_OnNcHitTest`), so the border's row resizes even over the window buttons.
+        let row = self.row_rect();
+        if self.mode == FrameMode::Restored
+            && at.y.0 >= 0.0
+            && at.y.0 < row.y.0
+            && at.x.0 >= row.x.0
+            && at.x.0 < row.x.0 + row.width.0
+        {
+            return CaptionHit::ResizeTop;
+        }
+        if !inside(at, row) {
             return CaptionHit::None;
         }
         let x = at.x.0;
@@ -696,7 +715,8 @@ impl TabStrip {
         if x >= end - 3.0 * t.caption_width {
             return CaptionHit::Minimize;
         }
-        if self.mode == FrameMode::Restored && at.y.0 < self.bounds.y.0 + t.top_band {
+        // The band is measured from the window's top, as Terminal's is.
+        if self.mode == FrameMode::Restored && at.y.0 < t.top_band {
             return CaptionHit::ResizeTop;
         }
         if self.overflow {
@@ -1652,8 +1672,8 @@ impl TabStrip {
         icon(
             list,
             r(
-                caret_x + t.split_part - t.caret_right_padding - t.caret_box,
-                s.y.0 + (t.split_height - t.caret_box) / 2.0,
+                caret_x + t.split_part - t.caret_right_padding - t.caret_box + t.caret_nudge_x,
+                s.y.0 + (t.split_height - t.caret_box) / 2.0 + t.caret_nudge,
                 t.caret_box,
                 t.caret_box,
             ),

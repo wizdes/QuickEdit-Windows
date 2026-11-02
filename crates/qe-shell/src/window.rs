@@ -71,6 +71,8 @@ pub enum TestFault {
     AfterCreate,
     /// `SetWindowPos` fails on the way into full screen.
     FullScreenMove,
+    /// Every `WM_MOVE` counts as a move to another monitor.
+    MoveChangesMonitor,
     /// `WM_CREATE` returns -1, so that Windows destroys the window inside
     /// `CreateWindowExW`, which then fails.
     FailWmCreate,
@@ -412,9 +414,37 @@ struct SavedFrame {
     placement: WINDOWPLACEMENT,
     was_maximized: bool,
 }
+/// `Renderer` has no call for the monitor's text settings, and `BitmapRenderer` lives in a
+/// crate this one cannot name. So the owner gives a function for its own renderer type.
+pub type TextSettingsRefresh<R> = fn(&mut R, *mut c_void) -> Result<bool, qe_api::RenderError>;
+trait RendererHolder {
+    fn renderer(&mut self) -> &mut dyn Renderer;
+    fn refresh(&mut self, hwnd: *mut c_void) -> Result<bool, qe_api::RenderError>;
+}
+struct WithRefresh<R> {
+    renderer: R,
+    refresh: TextSettingsRefresh<R>,
+}
+impl<R: Renderer> RendererHolder for WithRefresh<R> {
+    fn renderer(&mut self) -> &mut dyn Renderer {
+        &mut self.renderer
+    }
+    fn refresh(&mut self, hwnd: *mut c_void) -> Result<bool, qe_api::RenderError> {
+        (self.refresh)(&mut self.renderer, hwnd)
+    }
+}
+/// `create` and `create_with` have no refresh function: text keeps the settings it has.
+impl RendererHolder for Box<dyn Renderer> {
+    fn renderer(&mut self) -> &mut dyn Renderer {
+        self.as_mut()
+    }
+    fn refresh(&mut self, _hwnd: *mut c_void) -> Result<bool, qe_api::RenderError> {
+        Ok(false)
+    }
+}
 struct State {
     strip: TabStrip,
-    renderer: Box<dyn Renderer>,
+    renderer: Box<dyn RendererHolder>,
     measurer: Box<dyn TextMeasurer>,
     theme: Theme,
     dark: bool,
@@ -429,12 +459,13 @@ struct State {
 }
 impl State {
     fn content_rect(&self) -> ApiRect {
-        let row = self.strip.row_height();
+        let row = self.strip.row_rect();
+        let top = row.y.0 + row.height.0;
         ApiRect {
             x: Dip(0.0),
-            y: Dip(row),
+            y: Dip(top),
             width: Dip(self.client_dips.0),
-            height: Dip((self.client_dips.1 - row).max(0.0)),
+            height: Dip((self.client_dips.1 - top).max(0.0)),
         }
     }
     /// Draws `list`, and the row over it, then copies the rectangle that Windows asked
@@ -447,20 +478,33 @@ impl State {
     ) -> Vec<ShellError> {
         let mut problems = Vec::new();
         if let Some(mut list) = list {
+            // The top border's row, which `on_paint` then paints black on the window.
+            let row = self.strip.row_rect();
+            if row.y.0 > 0.0 {
+                list.push(DrawCommand::FillRect {
+                    rect: ApiRect {
+                        x: Dip(0.0),
+                        y: Dip(0.0),
+                        width: row.width,
+                        height: row.y,
+                    },
+                    color: self.theme.tab_background,
+                });
+            }
             self.strip
                 .draw(&mut list, &self.theme, self.measurer.as_ref());
-            if let Err(e) = self.renderer.begin_frame() {
+            if let Err(e) = self.renderer.renderer().begin_frame() {
                 problems.push(renderer_error("begin_frame", e));
             }
-            if let Err(e) = self.renderer.draw(&list) {
+            if let Err(e) = self.renderer.renderer().draw(&list) {
                 problems.push(renderer_error("draw", e));
             }
-            if let Err(e) = self.renderer.end_frame() {
+            if let Err(e) = self.renderer.renderer().end_frame() {
                 problems.push(renderer_error("end_frame", e));
             }
             self.list = list;
         }
-        if let Err(e) = self.renderer.present_rect(dc, rect) {
+        if let Err(e) = self.renderer.renderer().present_rect(dc, rect) {
             problems.push(renderer_error("present_rect", e));
         }
         problems
@@ -475,6 +519,7 @@ struct Shared {
     record_commands: bool,
     tracking: Cell<Tracking>,
     fault: Option<TestFault>,
+    monitor: Cell<isize>,
     /// The window took the count from `Rc::into_raw`. From then on, `WM_NCDESTROY` gives
     /// it back. A null handle cannot say this, because `WM_NCDESTROY` also clears it.
     adopted: Cell<bool>,
@@ -553,7 +598,7 @@ impl Shared {
         }
         let done = self.with_state(WM_PAINT, |state| {
             for b in &live {
-                state.renderer.invalidate(*b);
+                state.renderer.renderer().invalidate(*b);
             }
             state.needs_draw = true;
         });
@@ -575,7 +620,7 @@ impl Shared {
     }
     fn invalidate_all(&self) {
         let done = self.with_state(WM_PAINT, |state| {
-            state.renderer.invalidate_all();
+            state.renderer.renderer().invalidate_all();
             state.needs_draw = true;
         });
         if done.is_some() {
@@ -1019,7 +1064,7 @@ impl Shared {
             let mut problem = None;
             let size_changed = size != state.size;
             if size_changed {
-                match state.renderer.resize(size.0, size.1) {
+                match state.renderer.renderer().resize(size.0, size.1) {
                     Ok(()) => state.size = size,
                     Err(e) => problem = Some(renderer_error("resize", e)),
                 }
@@ -1027,9 +1072,13 @@ impl Shared {
             let content_before = state.content_rect();
             state.client_dips = (width as f32 / scale, height as f32 / scale);
             state.strip.set_scale(scale);
+            // Terminal places its whole island, tabs and window buttons alike, below the
+            // 1-pixel top border when restored (`_UpdateIslandPosition`). Its -1 when
+            // maximized works around a XAML click bug that this window does not have.
+            let border = top_border_height(state.strip.frame_mode()) as f32 / scale;
             let row = ApiRect {
                 x: Dip(0.0),
-                y: Dip(0.0),
+                y: Dip(border),
                 width: Dip(state.client_dips.0),
                 height: Dip(state.strip.row_height()),
             };
@@ -1109,10 +1158,25 @@ impl Shared {
         });
         LRESULT(code.unwrap_or(HTCLIENT) as isize)
     }
+    /// A monitor can have its own text settings. If they changed, the renderer has asked
+    /// for a full repaint, and Windows must be told too.
+    fn refresh_text_settings(&self, hwnd: HWND) {
+        match self.with_state(WM_DISPLAYCHANGE, |s| s.renderer.refresh(hwnd.0)) {
+            Some(Ok(true)) => {
+                self.with_state(WM_DISPLAYCHANGE, |s| s.needs_draw = true);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            Some(Err(e)) => self.report(renderer_error("refresh_text_settings", e)),
+            Some(Ok(false)) | None => {}
+        }
+    }
     fn on_dpi_changed(&self, hwnd: HWND, w: WPARAM, l: LPARAM) {
         let dpi = (w.0 & 0xffff) as u32;
         self.dpi.set(dpi);
-        if let Some(Err(e)) = self.with_state(WM_DPICHANGED, |s| s.renderer.set_dpi(dpi)) {
+        if let Some(Err(e)) = self.with_state(WM_DPICHANGED, |s| s.renderer.renderer().set_dpi(dpi))
+        {
             self.report(renderer_error("set_dpi", e));
         }
         self.to_content(InputKind::DpiChange { dpi });
@@ -1305,10 +1369,27 @@ impl Shared {
             }
             WM_SETTINGCHANGE | WM_THEMECHANGED => {
                 self.refresh_theme();
+                if msg == WM_SETTINGCHANGE {
+                    self.refresh_text_settings(hwnd);
+                }
                 LRESULT(0)
+            }
+            WM_DISPLAYCHANGE => {
+                self.refresh_text_settings(hwnd);
+                default()
+            }
+            WM_MOVE => {
+                let now = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+                let moved = self.monitor.replace(now) != now
+                    || self.fault == Some(TestFault::MoveChangesMonitor);
+                if moved {
+                    self.refresh_text_settings(hwnd);
+                }
+                default()
             }
             WM_DPICHANGED => {
                 self.on_dpi_changed(hwnd, w, l);
+                self.refresh_text_settings(hwnd);
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
@@ -1640,7 +1721,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             (*raw).dpi.set(dpi);
             if let Some(()) = (*raw).with_state(msg, |s| s.strip.set_scale(dpi as f32 / 96.0)) {}
             // The DPI is set before anything can draw.
-            if let Some(Err(e)) = (*raw).with_state(msg, |s| s.renderer.set_dpi(dpi)) {
+            if let Some(Err(e)) = (*raw).with_state(msg, |s| s.renderer.renderer().set_dpi(dpi)) {
                 (*raw).report(renderer_error("set_dpi", e));
             }
             return DefWindowProcW(hwnd, msg, w, l);
@@ -1881,6 +1962,29 @@ impl ShellWindow {
         renderer: Box<dyn Renderer>,
         measurer: Box<dyn TextMeasurer>,
     ) -> Result<Self, ShellError> {
+        Self::create_inner(config, Box::new(renderer), measurer)
+    }
+    /// `create_with`, and the window calls `refresh` with its `HWND` after
+    /// `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`, `WM_DPICHANGED` and a move to another
+    /// monitor. For `qe-render`, pass a function that calls
+    /// `BitmapRenderer::refresh_text_settings_for_window`.
+    pub fn create_with_refresh<R: Renderer + 'static>(
+        config: WindowConfig,
+        renderer: R,
+        refresh: TextSettingsRefresh<R>,
+        measurer: Box<dyn TextMeasurer>,
+    ) -> Result<Self, ShellError> {
+        Self::create_inner(
+            config,
+            Box::new(WithRefresh { renderer, refresh }),
+            measurer,
+        )
+    }
+    fn create_inner(
+        config: WindowConfig,
+        renderer: Box<dyn RendererHolder>,
+        measurer: Box<dyn TextMeasurer>,
+    ) -> Result<Self, ShellError> {
         let awareness = ensure_dpi_awareness();
         let instance = unsafe { GetModuleHandleW(PCWSTR::null()) }
             .map_err(|e| win32("GetModuleHandleW", e))?;
@@ -1911,6 +2015,7 @@ impl ShellWindow {
             fake_dpi: config.fake_dpi,
             record_commands: config.record_system_commands,
             fault: config.fault,
+            monitor: Cell::new(0),
             adopted: Cell::new(false),
             top_margin: Cell::new(0),
             default_log: RefCell::new(Vec::new()),

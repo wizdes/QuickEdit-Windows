@@ -1,7 +1,7 @@
 //! Wrap points for printable ASCII in a fixed-width font, without DirectWrite.
 //!
 //! The rules follow the Unicode line breaking rules (UAX 14) as DirectWrite
-//! applies them. `wrap_matches_directwrite` in `tests/wrap.rs` compares the
+//! applies them. `wrap_matches_directwrite` in `tests/agreement.rs` compares the
 //! result with DirectWrite on random text.
 
 /// How many cells fit in a width. DirectWrite adds advances up in `f32` and a row

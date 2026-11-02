@@ -308,7 +308,7 @@ fn slice_does_not_read_the_whole_line() {
     assert_eq!(result.rows[0].range.end, ByteOffset(50_000_100));
     // Checking that each slice edge cuts no cluster reads 128 bytes on each side
     // of it, and finding the line's content reads its last 3 bytes.
-    assert!(store.visited.load(Ordering::Relaxed) <= 100 + 2 * 256 + 3);
+    assert_eq!(store.visited.load(Ordering::Relaxed), 100 + 2 * 256 + 3);
 }
 
 #[test]

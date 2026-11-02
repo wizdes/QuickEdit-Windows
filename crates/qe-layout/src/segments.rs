@@ -1,24 +1,36 @@
 //! Long lines are cut into segments on grapheme boundaries. Every read here is
 //! bounded, whatever the length of the line.
 use crate::{DirectWriteLayout, HeightMap, LayoutError, shaped};
-use qe_api::{ByteOffset, Dip, LineIndex, LineLayout, TextSnapshot};
+use qe_api::{Affinity, ByteOffset, Dip, LineIndex, LineLayout, TextSnapshot};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Lines with more content bytes than this are laid out only in segments.
+/// A line on the fast path stays whole up to this many content bytes. Past it, every
+/// line is laid out only in segments.
 pub const LONG_LINE_BYTES: usize = 16 * 1024;
-/// The nominal size of one segment. A real segment ends at the first good
-/// boundary at or after a multiple of this, up to 1 KiB later. DirectWrite's
-/// shaping sets this size. Arabic took about 1.9 ms per KiB on a PC at 100% CPU, so
-/// 2 KiB keeps a cold segment under the 5 ms limit even then. A screen costs the
-/// same in total, because it just uses more small segments.
+/// A line that needs shaping stays whole up to this many content bytes. Shaping has
+/// no fast form, so past this it is laid out in segments too.
+pub const SHAPED_LINE_BYTES: usize = 4 * 1024;
+/// The nominal size of one segment. A real segment ends at the first good boundary
+/// at or after a multiple of this, up to 1 KiB later.
+///
+/// DirectWrite's shaping sets this size. Plain Arabic meets 5 ms a segment at this
+/// size. Text that changes script at each character does not. A smaller size would
+/// cost little in time but would break wrapped rows every row or two, because a row
+/// ends at each segment edge. So those texts rely on workers. See the crate docs.
 pub const SEGMENT_BYTES: usize = 2 * 1024;
 const SNAP_BEHIND: usize = 256;
 const SNAP_AHEAD: usize = 1024;
+/// A segment's end depends on text up to this far past it.
+pub(crate) const SEGMENT_READ_AHEAD: usize = SNAP_AHEAD;
 const PREFER_SPACE_WITHIN: usize = 64;
 const LOOK_BACK_FOR_TAB: usize = 1024;
+/// How far back to look for the start of a run of regional indicators. A run longer
+/// than this pairs up by its distance from the line start, which can cut flags.
+const FLAG_RUN_LOOK_BACK: usize = 1024 * 1024;
 /// How far each side of a slice edge is read to check that it cuts no cluster.
 const EDGE_CONTEXT: usize = 128;
+const FLAG_BYTES: usize = 8;
 
 const ZWJ: char = '\u{200D}';
 pub(crate) const LINE_ENDINGS: [char; 5] = ['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}'];
@@ -32,38 +44,88 @@ fn is_lam_alef(before: Option<char>, after: Option<char>) -> bool {
         && after.is_some_and(|c| matches!(c, '\u{622}' | '\u{623}' | '\u{625}' | '\u{627}'))
 }
 
-/// Byte offsets in `s` where a caret may stop by Unicode's grapheme rules, plus
-/// two rules of ours. A caret never stops right after a zero-width joiner, so that
-/// `a ZWJ b` stays whole. It never stops between lam and alef, which draw as one
-/// letter even in a font that keeps two glyphs for them. `line_offset` is how far `s` starts from the line start. It
-/// settles which regional indicators pair up when `s` starts inside a run of them.
-fn grapheme_stops(s: &str, line_offset: usize) -> Vec<usize> {
+/// A caret may stop where Unicode's grapheme rules say, except right after a
+/// zero-width joiner, so that `a ZWJ b` stays whole, and between lam and alef, which
+/// draw as one letter even in a font that keeps two glyphs for them.
+fn allowed(s: &str, at: usize) -> bool {
+    let before = s[..at].chars().next_back();
+    before != Some(ZWJ) && !is_lam_alef(before, s[at..].chars().next())
+}
+
+/// Byte offsets in `s` where a caret may stop. `flag_phase` is how many bytes of a
+/// flag lie before `s`, when `s` starts inside a run of regional indicators: 0 or 4.
+fn grapheme_stops(s: &str, flag_phase: usize) -> Vec<usize> {
+    let natural = |from: usize| {
+        s[from..]
+            .grapheme_indices(true)
+            .map(move |(at, _)| from + at)
+            .chain(Some(s.len()))
+            .filter(|at| allowed(s, *at))
+    };
+    if flag_phase == 0 {
+        return natural(0).collect();
+    }
     let run_end = s
         .char_indices()
         .find(|(_, c)| !is_regional(*c))
         .map_or(s.len(), |(at, _)| at);
-    let mut stops: Vec<usize> = s
-        .grapheme_indices(true)
-        .map(|(at, _)| at)
-        .chain(Some(s.len()))
-        .filter(|at| {
-            let before = s[..*at].chars().next_back();
-            before != Some(ZWJ) && !is_lam_alef(before, s[*at..].chars().next())
-        })
-        .collect();
-    if line_offset > 0 && run_end > 0 {
-        stops.retain(|at| *at >= run_end || (line_offset + at).is_multiple_of(8));
+    // The first flag edge in `s`, then one flag at a time to the end of the run.
+    let first = FLAG_BYTES - flag_phase;
+    if first > run_end {
+        return natural(run_end).collect();
     }
+    let mut stops: Vec<usize> = (first..run_end).step_by(FLAG_BYTES).collect();
+    let tail = stops.pop().unwrap_or(first);
+    stops.extend(natural(tail));
     stops
 }
 
-/// For each byte of `s`, and its end, whether a caret may stop there.
+/// For each byte of `s`, and its end, whether a caret may stop there. `s` starts on
+/// a real edge, so its flags pair up from its own start.
 pub(crate) fn stop_table(s: &str) -> Vec<bool> {
     let mut table = vec![false; s.len() + 1];
     for at in grapheme_stops(s, 0) {
         table[at] = true;
     }
     table
+}
+
+/// When a window starts in a run of regional indicators, how many bytes of a flag
+/// lie before it. It finds the start of the run, reading a bounded amount and
+/// allocating nothing.
+fn flag_phase(text: &dyn TextSnapshot, line_start: usize, at: usize, window: &str) -> usize {
+    if at <= line_start || !window.chars().next().is_some_and(is_regional) {
+        return 0;
+    }
+    let limit = at.saturating_sub(FLAG_RUN_LOOK_BACK).max(line_start);
+    let mut pos = at;
+    let mut run_start = None;
+    while pos > limit && run_start.is_none() {
+        let from = char_edge_forward(text, pos.saturating_sub(4096).max(limit), pos);
+        if from == pos {
+            break;
+        }
+        let mut trailing = 0;
+        text.visit_chunks(ByteOffset(from)..ByteOffset(pos), &mut |part| {
+            let tail: usize = part
+                .chars()
+                .rev()
+                .take_while(|c| is_regional(*c))
+                .map(char::len_utf8)
+                .sum();
+            trailing = if tail == part.len() {
+                trailing + tail
+            } else {
+                tail
+            };
+        });
+        if trailing < pos - from {
+            run_start = Some(pos - trailing);
+        }
+        pos = from;
+    }
+    let start = run_start.unwrap_or(line_start);
+    (at - start) % FLAG_BYTES
 }
 
 pub(crate) fn read(
@@ -128,7 +190,7 @@ fn snap(
     let from = char_edge_forward(text, nominal.saturating_sub(SNAP_BEHIND).max(start), end);
     let to = char_edge_backward(text, nominal.saturating_add(SNAP_AHEAD).min(end), from);
     let window = read(text, ByteOffset(from)..ByteOffset(to))?;
-    let stops = grapheme_stops(&window, from - start);
+    let stops = grapheme_stops(&window, flag_phase(text, start, from, &window));
     let target = nominal - from;
     let candidates = || {
         stops
@@ -147,32 +209,78 @@ fn snap(
     Ok(char_edge_forward(text, nominal, end))
 }
 
-fn segment_count_of(content: &Range<ByteOffset>) -> usize {
-    let bytes = content.end.0 - content.start.0;
-    if bytes <= LONG_LINE_BYTES {
-        1
-    } else {
-        bytes.div_ceil(SEGMENT_BYTES)
-    }
+/// How a line is laid out: its content, and how many segments it has. One means whole.
+struct LinePlan {
+    content: Range<ByteOffset>,
+    count: usize,
 }
 
 impl DirectWriteLayout {
+    /// Only the bytes of a line can tell if it may stay whole between the two limits.
+    /// That read is bounded by `LONG_LINE_BYTES`.
+    fn plan(&self, text: &dyn TextSnapshot, line: LineIndex) -> Result<LinePlan, LayoutError> {
+        let content = content_range(text, line)?;
+        let bytes = content.end.0 - content.start.0;
+        let whole = bytes <= SHAPED_LINE_BYTES
+            || (bytes <= LONG_LINE_BYTES && {
+                let mut fast = true;
+                let read_all = text.visit_chunks(content.clone(), &mut |part| {
+                    fast = fast && self.takes_fast_path(part.as_bytes());
+                });
+                if !read_all {
+                    return Err(LayoutError::BadRange(content));
+                }
+                fast
+            });
+        let mut count = 1;
+        if !whole {
+            count = bytes.div_ceil(SEGMENT_BYTES);
+            // Snapping can carry the second last edge right to the end of the line.
+            // No empty segment follows it.
+            let last = content.start.0 + (count - 1) * SEGMENT_BYTES;
+            if count > 1 && snap(text, &content, last)? >= content.end.0 {
+                count -= 1;
+            }
+        }
+        Ok(LinePlan { content, count })
+    }
     /// True when `layout_line` gives only the first segment of this line.
     pub fn is_long_line(
         &self,
         text: &dyn TextSnapshot,
         line: LineIndex,
     ) -> Result<bool, LayoutError> {
-        let range = content_range(text, line)?;
-        Ok(range.end.0 - range.start.0 > LONG_LINE_BYTES)
+        Ok(self.plan(text, line)?.count > 1)
     }
-    /// How many segments a line has. A line that is not long has one.
+    /// How many segments a line has. A line that stays whole has one.
     pub fn segment_count(
         &self,
         text: &dyn TextSnapshot,
         line: LineIndex,
     ) -> Result<usize, LayoutError> {
-        Ok(segment_count_of(&content_range(text, line)?))
+        Ok(self.plan(text, line)?.count)
+    }
+    fn range_in_plan(
+        &self,
+        text: &dyn TextSnapshot,
+        plan: &LinePlan,
+        line: LineIndex,
+        index: usize,
+    ) -> Result<Range<ByteOffset>, LayoutError> {
+        if index >= plan.count {
+            return Err(LayoutError::NoSuchSegment { line, index });
+        }
+        if plan.count == 1 {
+            return Ok(plan.content.clone());
+        }
+        let base = plan.content.start.0;
+        let start = snap(text, &plan.content, base + index * SEGMENT_BYTES)?;
+        let end = if index + 1 == plan.count {
+            plan.content.end.0
+        } else {
+            snap(text, &plan.content, base + (index + 1) * SEGMENT_BYTES)?
+        };
+        Ok(ByteOffset(start)..ByteOffset(end))
     }
     /// The bytes of one segment. Reads a bounded amount of text.
     pub fn segment_range(
@@ -181,39 +289,41 @@ impl DirectWriteLayout {
         line: LineIndex,
         index: usize,
     ) -> Result<Range<ByteOffset>, LayoutError> {
-        let range = content_range(text, line)?;
-        let count = segment_count_of(&range);
-        if index >= count {
-            return Err(LayoutError::NoSuchSegment { line, index });
-        }
-        if count == 1 {
-            return Ok(range);
-        }
-        let start = snap(text, &range, range.start.0 + index * SEGMENT_BYTES)?;
-        let end = snap(text, &range, range.start.0 + (index + 1) * SEGMENT_BYTES)?;
-        Ok(ByteOffset(start)..ByteOffset(end))
+        self.range_in_plan(text, &self.plan(text, line)?, line, index)
     }
-    /// The segment that holds a byte: its line, its index and its bytes.
+    /// The segment that holds a caret: its line, its index and its bytes.
+    ///
+    /// The byte where two segments meet has two places, as at a wrap point. With
+    /// `Affinity::Before` it is the end of the earlier segment, and with `After` the
+    /// start of the later one. Pass the affinity that `hit_test_point` gave, then
+    /// call `caret_rect` on that segment's layout with the same affinity.
     pub fn segment_at(
         &self,
         text: &dyn TextSnapshot,
         byte: ByteOffset,
+        affinity: Affinity,
     ) -> Result<(LineIndex, usize, Range<ByteOffset>), LayoutError> {
         let line = text
             .byte_to_position(byte)
             .ok_or(LayoutError::BadRange(byte..byte))?
             .line;
-        let content = content_range(text, line)?;
-        let count = segment_count_of(&content);
-        let at = byte.0.min(content.end.0).saturating_sub(content.start.0);
-        let mut index = (at / SEGMENT_BYTES).min(count - 1);
-        let mut range = self.segment_range(text, line, index)?;
+        let plan = self.plan(text, line)?;
+        let at = byte
+            .0
+            .min(plan.content.end.0)
+            .saturating_sub(plan.content.start.0);
+        let mut index = (at / SEGMENT_BYTES).min(plan.count - 1);
+        let mut range = self.range_in_plan(text, &plan, line, index)?;
         if byte < range.start && index > 0 {
             index -= 1;
-            range = self.segment_range(text, line, index)?;
-        } else if byte >= range.end && index + 1 < count {
+            range = self.range_in_plan(text, &plan, line, index)?;
+        } else if byte >= range.end && index + 1 < plan.count {
             index += 1;
-            range = self.segment_range(text, line, index)?;
+            range = self.range_in_plan(text, &plan, line, index)?;
+        }
+        if affinity == Affinity::Before && byte == range.start && index > 0 {
+            index -= 1;
+            range = self.range_in_plan(text, &plan, line, index)?;
         }
         Ok((line, index, range))
     }
@@ -225,15 +335,15 @@ impl DirectWriteLayout {
         index: usize,
         width: Dip,
     ) -> Result<LineLayout, LayoutError> {
-        let range = self.segment_range(text, line, index)?;
+        let plan = self.plan(text, line)?;
+        let range = self.range_in_plan(text, &plan, line, index)?;
         let s = read(text, range.clone())?;
         let column = if s.contains('\t') {
             self.column_before(text, line, range.start)?
         } else {
             0
         };
-        let partial = self.is_long_line(text, line)?;
-        self.layout_text(&s, range.start, line, width, column, partial)
+        self.layout_text(&s, range.start, line, width, column, plan.count > 1)
     }
     /// The tab column at `at`. The look-back is bounded. With no tab inside it,
     /// each byte since the line start counts as one cell, which is right for
@@ -266,27 +376,62 @@ impl DirectWriteLayout {
         };
         Ok(column % self.tab_width())
     }
-    /// A map with one entry per segment, for scrolling inside a long line. With
-    /// wrap on, its values are heights. With wrap off they are widths, because
-    /// the segments then sit side by side. The estimate comes from the character
-    /// count of the first segment. The crate documentation shows how to use it.
+    /// A map with one entry per segment, for scrolling inside a long line. With wrap
+    /// on, its values are heights. With wrap off they are widths, because the
+    /// segments then sit side by side.
+    ///
+    /// The estimate comes from really laying out the first and the middle segment,
+    /// and those two entries are already correct. It costs those two layouts, so it
+    /// can run on a worker. A line that changes its kind of text along the way is
+    /// estimated less well, and the entries correct themselves as segments are seen.
     pub fn long_line_map(
         &self,
         text: &dyn TextSnapshot,
         line: LineIndex,
         width: Dip,
     ) -> Result<HeightMap, LayoutError> {
-        let count = self.segment_count(text, line)?;
-        let sample = read(text, self.segment_range(text, line, 0)?)?;
-        let chars_per_byte = sample.chars().count() as f64 / sample.len().max(1) as f64;
-        let across = SEGMENT_BYTES as f64 * chars_per_byte * self.font().advance_exact;
-        let estimate = if self.wrap_enabled() {
-            let rows = (across / (width.0 as f64).max(self.font().advance_exact)).ceil();
-            rows.max(1.0) * self.font().height as f64
-        } else {
-            across
+        let count = self.plan(text, line)?.count;
+        let extent_of = |index: usize| -> Result<Dip, LayoutError> {
+            Ok(self.segment_extent(&self.layout_segment(text, line, index, width)?))
         };
-        HeightMap::new(count, Dip(estimate as f32)).map_err(LayoutError::Height)
+        let first = extent_of(0)?;
+        let middle = count / 2;
+        let middle_extent = if middle > 0 {
+            extent_of(middle)?
+        } else {
+            first
+        };
+        let estimate = Dip(((first.0 as f64 + middle_extent.0 as f64) / 2.0) as f32);
+        let mut map = HeightMap::new(count, estimate).map_err(LayoutError::Height)?;
+        map.set(LineIndex(0), first).map_err(LayoutError::Height)?;
+        if middle > 0 {
+            map.set(LineIndex(middle), middle_extent)
+                .map_err(LayoutError::Height)?;
+        }
+        Ok(map)
+    }
+    /// Keeps a `long_line_map` usable after an edit inside its line, by matching its
+    /// entry count to the line's new segment count. It adds or removes entries at the
+    /// end only.
+    ///
+    /// Measured values stay. Those at or after the edit become close guesses, since
+    /// their byte edges moved by the size of the edit, and `map.set` corrects each one
+    /// when its segment is next laid out. The cost is one segment count, a bounded read.
+    pub fn update_long_line_map(
+        &self,
+        map: &mut HeightMap,
+        text: &dyn TextSnapshot,
+        line: LineIndex,
+    ) -> Result<(), LayoutError> {
+        let count = self.plan(text, line)?.count;
+        if count > map.len() {
+            map.insert_lines(LineIndex(map.len()), count - map.len())
+                .map_err(LayoutError::Height)?;
+        } else if count < map.len() {
+            map.remove_lines(count..map.len())
+                .map_err(LayoutError::Height)?;
+        }
+        Ok(())
     }
     /// The value to give `long_line_map` once a segment has its real layout.
     pub fn segment_extent(&self, layout: &LineLayout) -> Dip {
@@ -300,6 +445,17 @@ impl DirectWriteLayout {
             .map(|s| s.x.0.max(s.x_before.0))
             .fold(0.0, f32::max);
         Dip(widest)
+    }
+    /// The height a long line takes in the document's `HeightMap`. With wrap on it is
+    /// the map's total. With wrap off the map holds widths, and the line is one row:
+    /// use the larger of this and the `height` of the segments on screen, because a
+    /// fallback font can make a row taller.
+    pub fn long_line_height(&self, map: &HeightMap) -> Dip {
+        if self.wrap_enabled() {
+            Dip(map.total_height() as f32)
+        } else {
+            Dip(self.font().height)
+        }
     }
     /// A slice around `byte`, at most `max_bytes` long, that cuts no cluster. It
     /// uses this engine's font. `Ok(None)` means one cluster overflows the window
@@ -332,8 +488,9 @@ impl DirectWriteLayout {
             byte.0,
         );
         let window = read(text, ByteOffset(left)..ByteOffset(right))?;
+        let phase = flag_phase(text, content.start.0, left, &window);
         let edges: Vec<usize> = self
-            .stops_in_window(&window, left - content.start.0)?
+            .stops_in_window(&window, phase)?
             .into_iter()
             .filter(|at| {
                 (*at > 0 || left == content.start.0)
@@ -354,15 +511,19 @@ impl DirectWriteLayout {
         Ok(end.map(|end| ByteOffset(start)..ByteOffset(end)))
     }
     /// Offsets in `window` that are both grapheme stops and DirectWrite cluster edges.
-    fn stops_in_window(&self, window: &str, line_offset: usize) -> Result<Vec<usize>, LayoutError> {
+    fn stops_in_window(&self, window: &str, phase: usize) -> Result<Vec<usize>, LayoutError> {
         // Ligatures are off for ASCII only in fonts that can take the fast path.
         // Another font, such as Calibri, can join "fi" into one cluster.
         if window.is_ascii() && self.font().fast_ok {
             return Ok((0..=window.len()).collect());
         }
         let clusters = shaped::cluster_edges(self.font(), window)?;
-        let mut stops = grapheme_stops(window, line_offset);
-        stops.retain(|at| clusters.binary_search(at).is_ok());
+        let mut stops = grapheme_stops(window, phase);
+        // DirectWrite pairs flags from the window's start, so it says nothing useful
+        // about a window that starts in the middle of a flag.
+        if phase == 0 {
+            stops.retain(|at| clusters.binary_search(at).is_ok());
+        }
         Ok(stops)
     }
     /// An error when `at` falls inside a cluster, judged from text on both sides.
@@ -386,8 +547,9 @@ impl DirectWriteLayout {
             at.0,
         );
         let window = read(text, ByteOffset(from)..ByteOffset(to))?;
+        let phase = flag_phase(text, content.start.0, from, &window);
         if self
-            .stops_in_window(&window, from - content.start.0)?
+            .stops_in_window(&window, phase)?
             .binary_search(&(at.0 - from))
             .is_err()
         {

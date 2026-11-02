@@ -1,8 +1,15 @@
 //! Scroll positions for lines of uneven height.
 //!
-//! The map stores runs of lines that share one height, in a balanced tree. A
-//! file with few measured lines stays a few runs, whatever its line count.
-//! Set, insert, remove and both lookups are O(log runs).
+//! The map stores runs of lines that share one height, in a treap: a binary tree
+//! kept balanced by a random priority on each run. A file with few measured lines
+//! stays a few runs, whatever its line count. Set, insert, remove and both lookups
+//! take O(log runs) expected time. Splits and merges recurse, to the tree's depth,
+//! which `height_map_stays_balanced_at_a_million_runs` holds under a fixed limit.
+//!
+//! Removing lines only puts the root of the removed subtree on a free list, so it does
+//! not visit the removed runs. Each new run takes one free node and puts that node's
+//! children on the list. The memory stays with the map until new runs reuse it, so the
+//! map's memory is bounded by the most runs it has ever held, at 48 bytes each.
 use qe_api::{Dip, LineIndex};
 use std::{fmt, ops::Range};
 
@@ -17,6 +24,7 @@ struct Node {
     count: u64,
     total_count: u64,
     total_height: f64,
+    total_runs: u32,
 }
 
 /// Why the map refused a change. The map keeps its old value.
@@ -81,9 +89,6 @@ impl HeightMap {
             return NIL;
         }
         let priority = self.random();
-        self.node_with(count, height, priority)
-    }
-    fn node_with(&mut self, count: u64, height: f32, priority: u32) -> u32 {
         let value = Node {
             left: NIL,
             right: NIL,
@@ -92,8 +97,16 @@ impl HeightMap {
             count,
             total_count: count,
             total_height: count as f64 * height as f64,
+            total_runs: 1,
         };
         if let Some(at) = self.free.pop() {
+            let old = self.nodes[at as usize];
+            if old.left != NIL {
+                self.free.push(old.left);
+            }
+            if old.right != NIL {
+                self.free.push(old.right);
+            }
             self.nodes[at as usize] = value;
             at
         } else {
@@ -115,14 +128,23 @@ impl HeightMap {
             self.nodes[at as usize].total_height
         }
     }
+    fn runs_in(&self, at: u32) -> u32 {
+        if at == NIL {
+            0
+        } else {
+            self.nodes[at as usize].total_runs
+        }
+    }
     fn pull(&mut self, at: u32) {
         let n = self.nodes[at as usize];
         let count = self.lines_in(n.left) + n.count + self.lines_in(n.right);
         let height =
             self.height_in(n.left) + n.count as f64 * n.height as f64 + self.height_in(n.right);
+        let runs = self.runs_in(n.left) + 1 + self.runs_in(n.right);
         let node = &mut self.nodes[at as usize];
         node.total_count = count;
         node.total_height = height;
+        node.total_runs = runs;
     }
     /// Splits off the first `lines` lines.
     fn split(&mut self, at: u32, lines: u64) -> (u32, u32) {
@@ -143,16 +165,15 @@ impl HeightMap {
             (at, b)
         } else {
             let keep = lines - before;
-            // The second half takes the same priority, so its right child stays
-            // below it and the tree stays a heap.
-            let rest = self.node_with(n.count - keep, n.height, n.priority);
-            self.nodes[rest as usize].right = n.right;
-            self.pull(rest);
+            // The second half gets its own random priority and goes through a real
+            // merge. Copying this node's priority would make the tree a long chain.
+            let rest = self.node(n.count - keep, n.height);
             let node = &mut self.nodes[at as usize];
             node.count = keep;
             node.right = NIL;
             self.pull(at);
-            (at, rest)
+            let tail = self.merge(rest, n.right);
+            (at, tail)
         }
     }
     fn merge(&mut self, a: u32, b: u32) -> u32 {
@@ -203,20 +224,10 @@ impl HeightMap {
         let joined = self.merge(rest_a, run_a);
         self.merge(joined, rest_b)
     }
+    /// O(1). The next new runs take these nodes one at a time.
     fn release(&mut self, at: u32) {
-        if at == NIL {
-            return;
-        }
-        let mut stack = vec![at];
-        while let Some(next) = stack.pop() {
-            let n = self.nodes[next as usize];
-            if n.left != NIL {
-                stack.push(n.left);
-            }
-            if n.right != NIL {
-                stack.push(n.right);
-            }
-            self.free.push(next);
+        if at != NIL {
+            self.free.push(at);
         }
     }
     pub fn len(&self) -> usize {
@@ -229,9 +240,24 @@ impl HeightMap {
     pub fn total_height(&self) -> f64 {
         self.height_in(self.root)
     }
+    /// The depth of the tree. Tests use it to check the balance.
+    #[doc(hidden)]
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(self.root, 1)];
+        while let Some((at, depth)) = stack.pop() {
+            if at != NIL {
+                deepest = deepest.max(depth);
+                let n = self.nodes[at as usize];
+                stack.push((n.left, depth + 1));
+                stack.push((n.right, depth + 1));
+            }
+        }
+        deepest
+    }
     /// How many runs of equal height the map holds.
     pub fn run_count(&self) -> usize {
-        self.nodes.len() - self.free.len()
+        self.runs_in(self.root) as usize
     }
     /// Bytes the map holds, including its spare capacity.
     pub fn memory_bytes(&self) -> usize {

@@ -634,3 +634,321 @@ fn runs_carry_their_em_size_and_a_resolvable_face() {
     assert!(qe_layout::font_face(0).is_none());
     assert!(qe_layout::font_face(u32::MAX).is_none());
 }
+
+// Round 3, item 1.
+const SET_LIMIT_US: f64 = if cfg!(debug_assertions) { 60.0 } else { 10.0 };
+const DEPTH_LIMIT: usize = 90;
+
+#[test]
+fn height_map_stays_balanced_at_a_million_runs() {
+    let lines = 1 << 20;
+    let mut map = HeightMap::new(lines, Dip(10.0)).unwrap();
+    let start = std::time::Instant::now();
+    for line in 0..lines {
+        let height = if line % 2 == 0 { 20.0 } else { 30.0 };
+        map.set(LineIndex(line), Dip(height)).unwrap();
+    }
+    let per_set = start.elapsed().as_secs_f64() * 1e6 / lines as f64;
+    println!("in order: {per_set:.2} us per set, depth {}", map.depth());
+    assert!(map.run_count() >= 1_000_000, "{}", map.run_count());
+    assert!(map.depth() <= DEPTH_LIMIT, "depth {}", map.depth());
+    assert!(per_set < SET_LIMIT_US, "{per_set} us per set");
+    for line in (0..lines).step_by(9973) {
+        assert_eq!(
+            map.scroll_to_line(map.line_to_scroll(LineIndex(line))),
+            LineIndex(line)
+        );
+    }
+    let start = std::time::Instant::now();
+    for i in 0..1000 {
+        map.insert_lines(LineIndex(500_000 + i), 1).unwrap();
+        map.remove_lines(700_000 + i..700_001 + i).unwrap();
+    }
+    let per_edit = start.elapsed().as_secs_f64() * 1e6 / 2000.0;
+    println!(
+        "insert and remove: {per_edit:.2} us each, depth {}",
+        map.depth()
+    );
+    assert!(per_edit < SET_LIMIT_US, "{per_edit} us per edit");
+    assert!(map.depth() <= DEPTH_LIMIT, "depth {}", map.depth());
+}
+
+#[test]
+fn height_map_stays_balanced_in_random_order() {
+    // A multiplier of 5 mod 2^20 with an odd step visits every line once.
+    let lines = 1usize << 20;
+    let mut map = HeightMap::new(lines, Dip(10.0)).unwrap();
+    let mut line = 0usize;
+    let start = std::time::Instant::now();
+    for _ in 0..lines {
+        line = (line * 5 + 12345) % lines;
+        let height = [20.0, 30.0, 40.0][line % 3];
+        map.set(LineIndex(line), Dip(height)).unwrap();
+    }
+    let per_set = start.elapsed().as_secs_f64() * 1e6 / lines as f64;
+    println!(
+        "random: {per_set:.2} us per set, depth {}, {} runs",
+        map.depth(),
+        map.run_count()
+    );
+    assert!(map.run_count() >= 1_000_000, "{}", map.run_count());
+    assert!(map.depth() <= DEPTH_LIMIT, "depth {}", map.depth());
+    assert!(per_set < SET_LIMIT_US, "{per_set} us per set");
+}
+
+// Round 3, item 13.
+#[test]
+fn last_error_is_per_thread_and_cleared_by_the_next_call() {
+    let engine = Arc::new(DirectWriteLayout::new().unwrap());
+    let store = StringStore::new("abc");
+    assert!(
+        engine
+            .layout_line(&store, LineIndex(9), Dip(100.0))
+            .is_none()
+    );
+    assert_eq!(
+        engine.last_error(),
+        Some(LayoutError::NoSuchLine(LineIndex(9)))
+    );
+    let other = engine.clone();
+    let seen = std::thread::spawn(move || {
+        let before = other.last_error();
+        let store = StringStore::new("abc");
+        assert!(
+            other
+                .layout_line(&store, LineIndex(0), Dip(100.0))
+                .is_some()
+        );
+        (before, other.last_error())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(seen, (None, None));
+    assert_eq!(
+        engine.last_error(),
+        Some(LayoutError::NoSuchLine(LineIndex(9)))
+    );
+    assert!(
+        engine
+            .layout_line(&store, LineIndex(0), Dip(100.0))
+            .is_some()
+    );
+    assert_eq!(engine.last_error(), None);
+    engine.measure("x", "No Such Font 10");
+    assert!(engine.last_measure_fallback().is_some());
+    engine.measure("x", "Segoe UI 10");
+    assert_eq!(engine.last_measure_fallback(), None);
+}
+
+// Round 3, items 7 and 14.
+#[test]
+fn stand_in_spaces_never_make_a_row() {
+    for family in ["Cascadia Mono", "Consolas", "Courier New"] {
+        let engine = DirectWriteLayout::with_font(family, 10.0, NORMAL).unwrap();
+        let store = StringStore::new("ab\tcd");
+        for width in [1.0, 5.0, 7.0, 12.0, 20.0, 40.0, 60.0] {
+            let l = engine
+                .layout_slice_from_column(&store, ByteOffset(0)..ByteOffset(5), Dip(width), 5)
+                .unwrap();
+            assert_eq!(
+                l.rows[0].range.start,
+                ByteOffset(0),
+                "{family} width {width}"
+            );
+            assert!(
+                l.rows[0].range.end > ByteOffset(0),
+                "{family} width {width}: empty row"
+            );
+            assert_eq!(l.rows[0].y, Dip(0.0));
+            let click = Point {
+                x: Dip(0.5),
+                y: Dip(1.0),
+            };
+            let hit = engine.hit_test_point(&l, click);
+            let caret = engine.caret_rect(&l, hit.byte, hit.affinity).unwrap();
+            assert_eq!(
+                caret.y,
+                Dip(0.0),
+                "{family} width {width}: caret on another row"
+            );
+            let bottom = l.rows.last().unwrap();
+            assert!((bottom.y.0 + bottom.height.0 - l.height.0).abs() < 0.01);
+            for row in &l.rows {
+                for run in &row.glyph_runs {
+                    assert!(run.origin.y.0 >= row.y.0 && run.origin.y.0 <= row.y.0 + row.height.0);
+                    assert!(run.origin.x.0 >= -0.01, "{family} width {width}");
+                }
+            }
+        }
+    }
+}
+
+// Astra finding A.
+fn assert_no_stop_inside(text: &str, unit: &str, prefix: usize, layout: &qe_api::LineLayout) {
+    for row in &layout.rows {
+        for edge in [row.range.start.0, row.range.end.0] {
+            assert!(
+                edge <= prefix || (edge - prefix).is_multiple_of(unit.len()),
+                "{text:?}: row edge {edge} is inside a cluster"
+            );
+        }
+        for stop in &row.caret_stops {
+            assert!(
+                stop.byte.0 <= prefix || (stop.byte.0 - prefix).is_multiple_of(unit.len()),
+                "{text:?}: stop {} is inside a cluster",
+                stop.byte.0
+            );
+        }
+    }
+    let ends: Vec<_> = layout.rows.iter().map(|r| r.range.clone()).collect();
+    for pair in ends.windows(2) {
+        assert_eq!(pair[0].end, pair[1].start, "{text:?}: rows must touch");
+    }
+    assert_eq!(ends.last().unwrap().end.0, text.len(), "{text:?}");
+}
+
+#[test]
+fn wrapping_keeps_clusters_whole_at_any_width() {
+    let units = [
+        "\u{1F1FA}\u{1F1F8}",
+        "1\u{FE0F}\u{20E3}",
+        "\u{1F469}\u{200D}\u{1F4BB}",
+        "a\u{200D}b",
+        "\u{1100}\u{1161}\u{11A8}",
+        "\u{644}\u{627}",
+        "e\u{301}\u{302}",
+    ];
+    for family in ["Cascadia Mono", "Consolas", "Segoe UI"] {
+        let engine = DirectWriteLayout::with_font(family, 10.0, NORMAL).unwrap();
+        let cell = engine.cell_width().0;
+        for unit in units {
+            for prefix in ["", "x", "abc ", "abcdefg"] {
+                for count in [1, 2, 7] {
+                    let text = format!("{prefix}{}", unit.repeat(count));
+                    for width in [
+                        1.0,
+                        cell,
+                        cell * 1.5,
+                        cell * 2.0,
+                        cell * 3.0,
+                        cell * 5.5,
+                        cell * 9.0,
+                    ] {
+                        let layout = line(&engine, &text, width);
+                        assert_no_stop_inside(&text, unit, prefix.len(), &layout);
+                        let mut bottom = 0.0;
+                        for row in &layout.rows {
+                            assert!((row.y.0 - bottom).abs() < 0.01, "{text:?} width {width}");
+                            bottom += row.height.0;
+                            for run in &row.glyph_runs {
+                                assert!(
+                                    run.origin.y.0 >= row.y.0
+                                        && run.origin.y.0 <= row.y.0 + row.height.0,
+                                    "{text:?} width {width}: a run sits outside its row"
+                                );
+                            }
+                        }
+                        assert!((layout.height.0 - bottom).abs() < 0.01);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cluster_wider_than_the_row_stays_on_one_row() {
+    let engine = DirectWriteLayout::new().unwrap();
+    let flag = "\u{1F1FA}\u{1F1F8}";
+    let l = line(&engine, flag, 1.0);
+    assert_eq!(
+        l.rows.len(),
+        1,
+        "{:?}",
+        l.rows.iter().map(|r| r.range.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(stops(&l), [0, 8]);
+    let two = line(&engine, &flag.repeat(2), 1.0);
+    assert_eq!(two.rows.len(), 2);
+    assert_eq!(stops(&two), [0, 8, 8, 16]);
+}
+
+#[test]
+fn a_run_edge_inside_a_cluster_is_no_caret_stop() {
+    // The joiner keeps `a` and the Hebrew letter whole, though they run in two directions.
+    let engine = DirectWriteLayout::new().unwrap();
+    let text = "a\u{200D}\u{5D0}b";
+    let got = stops(&line(&engine, text, 1000.0));
+    assert!(!got.contains(&1) && !got.contains(&4), "{got:?}");
+}
+
+// Astra finding C.
+#[test]
+fn removing_many_runs_costs_about_one_edit_and_memory_is_reused() {
+    let lines = 1usize << 20;
+    let mut map = HeightMap::new(lines, Dip(10.0)).unwrap();
+    for line in 0..lines {
+        map.set(
+            LineIndex(line),
+            Dip(if line % 2 == 0 { 20.0 } else { 30.0 }),
+        )
+        .unwrap();
+    }
+    let runs = map.run_count();
+    let bytes = map.memory_bytes();
+    let start = std::time::Instant::now();
+    map.remove_lines(100..lines - 100).unwrap();
+    let micros = start.elapsed().as_secs_f64() * 1e6;
+    println!(
+        "removing {} runs at once: {micros:.1} us",
+        runs - map.run_count()
+    );
+    assert!(map.run_count() <= 201, "{}", map.run_count());
+    assert_eq!(map.len(), 200);
+    assert!(micros < 200.0, "{micros} us: it visited the removed runs");
+    assert_eq!(map.line_height(LineIndex(150)), Some(Dip(20.0)));
+    map.insert_lines(LineIndex(100), lines - 200).unwrap();
+    for line in 0..lines {
+        map.set(
+            LineIndex(line),
+            Dip(if line % 2 == 0 { 20.0 } else { 30.0 }),
+        )
+        .unwrap();
+    }
+    assert!(
+        map.memory_bytes() <= bytes + bytes / 8,
+        "the removed runs were not reused"
+    );
+    assert_eq!(
+        map.scroll_to_line(map.line_to_scroll(LineIndex(777))),
+        LineIndex(777)
+    );
+}
+
+// The font bound.
+#[test]
+fn requested_font_sizes_stay_bounded() {
+    let engine = DirectWriteLayout::new().unwrap();
+    for size in 0..1000 {
+        let token = format!("Segoe UI {}", 8.0 + size as f32 / 10.0);
+        assert!(engine.measure("x", &token).width.0 > 0.0);
+    }
+    assert!(qe_layout::loaded_font_count() <= qe_layout::MAX_LOADED_FONTS);
+    assert!(qe_layout::thread_format_count() <= qe_layout::MAX_LOADED_FONTS);
+    // A font dropped from the cache keeps working for the engine that holds it.
+    assert!(line(&engine, "abc", 1000.0).rows[0].glyph_runs[0].font_id != 0);
+}
+
+#[test]
+fn the_face_registry_does_not_grow_with_repeat_layouts() {
+    let text = "abc \u{6F22}\u{645}\u{1F600}";
+    let engine = DirectWriteLayout::new().unwrap();
+    line(&engine, text, 1000.0);
+    let before = qe_layout::registered_face_count();
+    for size in 0..200 {
+        let other = DirectWriteLayout::with_font("Cascadia Mono", 9.0 + size as f32 / 10.0, NORMAL);
+        line(&other.unwrap(), text, 1000.0);
+    }
+    // Other test threads may add their own fonts at the same time, but only a few.
+    assert!(qe_layout::registered_face_count() < before + 40);
+}

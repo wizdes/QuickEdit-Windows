@@ -420,3 +420,246 @@ fn caret_places_match_directwrite() {
         }
     }
 }
+
+/// One text laid out once by DirectWrite alone, in a named font.
+struct DirectWriteText {
+    units: Vec<u16>,
+    layout: IDWriteTextLayout,
+}
+impl DirectWriteText {
+    fn new(family: &str, text: &str, width: f32) -> Self {
+        let factory: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap() };
+        let name: Vec<u16> = family.encode_utf16().chain(Some(0)).collect();
+        let locale: Vec<u16> = "en-US\0".encode_utf16().collect();
+        let format = unsafe {
+            factory
+                .CreateTextFormat(
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    10.0 * 96.0 / 72.0,
+                    PCWSTR(locale.as_ptr()),
+                )
+                .unwrap()
+        };
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let layout = unsafe {
+            factory
+                .CreateTextLayout(&units, &format, width, 1e6)
+                .unwrap()
+        };
+        // The same settings as the engine: ligatures off for ASCII in a fixed-width font.
+        let typography = unsafe { factory.CreateTypography().unwrap() };
+        for tag in [
+            DWRITE_FONT_FEATURE_TAG_STANDARD_LIGATURES,
+            DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_LIGATURES,
+            DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_ALTERNATES,
+        ] {
+            let feature = DWRITE_FONT_FEATURE {
+                nameTag: tag,
+                parameter: 0,
+            };
+            unsafe { typography.AddFontFeature(feature).unwrap() };
+        }
+        let mut at = 0;
+        while at < units.len() {
+            if units[at] >= 0x80 {
+                at += 1;
+                continue;
+            }
+            let begin = at;
+            while at < units.len() && units[at] < 0x80 {
+                at += 1;
+            }
+            let range = DWRITE_TEXT_RANGE {
+                startPosition: begin as u32,
+                length: (at - begin) as u32,
+            };
+            unsafe { layout.SetTypography(&typography, range).unwrap() };
+        }
+        Self { units, layout }
+    }
+    fn hit(&self, x: f32, y: f32) -> usize {
+        let (mut trailing, mut inside) = (BOOL(0), BOOL(0));
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            self.layout
+                .HitTestPoint(x, y, &mut trailing, &mut inside, &mut metrics)
+                .unwrap();
+        }
+        let position = metrics.textPosition as usize
+            + if trailing.as_bool() {
+                metrics.length as usize
+            } else {
+                0
+            };
+        String::from_utf16(&self.units[..position]).unwrap().len()
+    }
+}
+
+const RLM_PIECES: [&str; 21] = [
+    "abc", " ", "  ", "123", "\u{200F}", "\u{200E}", "\u{2066}", "\u{2067}", "\u{2068}",
+    "\u{2069}", HEB, ARB, "x", "9", ",", "(", "\u{202A}", "\u{202B}", "\u{202C}", "\u{202D}",
+    "\u{202E}",
+];
+
+fn random_mixed_text(random: &mut Random) -> String {
+    let pieces = 3 + random.next(12);
+    (0..pieces)
+        .map(|_| RLM_PIECES[random.next(RLM_PIECES.len())])
+        .collect()
+}
+
+#[test]
+fn the_review_rlm_click_matches_directwrite() {
+    let engine = DirectWriteLayout::new().unwrap();
+    let text = "  abc \u{200F}\u{5E9}\u{5DC}\u{5D5}\u{5DD} 123123\u{200F}\u{200F}123 ";
+    let l = engine
+        .layout_line(&StringStore::new(text), LineIndex(0), Dip(1000.0))
+        .unwrap();
+    let hit = engine.hit_test_point(
+        &l,
+        Point {
+            x: Dip(102.0),
+            y: Dip(1.0),
+        },
+    );
+    assert_eq!(
+        hit.byte.0,
+        DirectWriteText::new("Cascadia Mono", text, 1000.0).hit(102.0, 1.0)
+    );
+    assert_eq!(hit.byte.0, 22);
+}
+
+/// Direction marks and isolates, in all 3 fixed-width fonts, against HitTestPoint.
+#[test]
+fn random_mixed_direction_clicks_match_directwrite() {
+    let mut random = Random(2024);
+    for family in ["Cascadia Mono", "Consolas", "Courier New"] {
+        let engine = DirectWriteLayout::with_font(family, 10.0, NORMAL).unwrap();
+        for _ in 0..400 {
+            let text = random_mixed_text(&mut random);
+            let store = StringStore::new(text.clone());
+            let l = engine
+                .layout_line(&store, LineIndex(0), Dip(100_000.0))
+                .unwrap();
+            let row = &l.rows[0];
+            assert!(
+                row.visual_stops.windows(2).all(|p| p[0].x.0 <= p[1].x.0),
+                "{family} {text:?}: stops out of order"
+            );
+            let direct = DirectWriteText::new(family, &text, 100_000.0);
+            let right = row
+                .caret_stops
+                .iter()
+                .map(|s| s.x.0.max(s.x_before.0))
+                .fold(0.0, f32::max);
+            let edges: Vec<usize> = row.caret_stops.iter().map(|s| s.byte.0).collect();
+            for _ in 0..15 {
+                let x = random.next(((right + 20.0) * 100.0) as usize) as f32 / 100.0 - 10.0;
+                let hit = engine.hit_test_point(
+                    &l,
+                    Point {
+                        x: Dip(x),
+                        y: Dip(1.0),
+                    },
+                );
+                let expected = direct.hit(x, 1.0);
+                // A click on a zero-width mark's own place has two right answers only
+                // when DirectWrite's answer is not a caret stop: see finding 9.
+                if edges.contains(&expected) {
+                    assert_eq!(hit.byte.0, expected, "{family} {text:?} at x={x}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn random_wrapped_mixed_direction_clicks_match_directwrite() {
+    let mut random = Random(31);
+    for family in ["Cascadia Mono", "Consolas", "Courier New"] {
+        let engine = DirectWriteLayout::with_font(family, 10.0, NORMAL).unwrap();
+        let width = engine.cell_width().0 * 12.0;
+        for _ in 0..200 {
+            let text = random_mixed_text(&mut random);
+            let store = StringStore::new(text.clone());
+            let l = engine
+                .layout_line(&store, LineIndex(0), Dip(width))
+                .unwrap();
+            let direct = DirectWriteText::new(family, &text, width);
+            for row in &l.rows {
+                let edges: Vec<usize> = row.caret_stops.iter().map(|s| s.byte.0).collect();
+                for _ in 0..6 {
+                    let x = random.next((width as usize + 40) * 100) as f32 / 100.0 - 20.0;
+                    let y = row.y.0 + row.height.0 / 2.0;
+                    let hit = engine.hit_test_point(
+                        &l,
+                        Point {
+                            x: Dip(x),
+                            y: Dip(y),
+                        },
+                    );
+                    let expected = direct.hit(x, y);
+                    if edges.contains(&expected) {
+                        assert_eq!(hit.byte.0, expected, "{family} {text:?} at {x},{y}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Item 14: below one cell both paths use DirectWrite's own rule.
+#[test]
+fn widths_below_one_cell_agree_with_shaping() {
+    let mut random = Random(5);
+    for family in ["Cascadia Mono", "Consolas", "Courier New"] {
+        let (fast, slow) = engines(family);
+        let cell = fast.cell_width().0;
+        for width in [0.5, 1.0, 3.0, 5.0, 7.0, cell - 0.01, cell, cell + 0.01] {
+            for _ in 0..20 {
+                let len = random.next(60);
+                let text: String = (0..len)
+                    .map(|_| b"word wrap, test-1 "[random.next(18)] as char)
+                    .collect();
+                let store = StringStore::new(text.clone());
+                let a = fast.layout_line(&store, LineIndex(0), Dip(width)).unwrap();
+                let b = slow.layout_line(&store, LineIndex(0), Dip(width)).unwrap();
+                assert_same_layout(&a, &b, &format!("{family} width {width}: {text:?}"));
+            }
+        }
+    }
+}
+
+// Astra finding E.
+#[test]
+fn left_of_row_clicks_around_direction_controls_match_directwrite() {
+    let engine = DirectWriteLayout::new().unwrap();
+    for text in [
+        "\u{202A} ",
+        "\u{202B} ",
+        "\u{200E}a",
+        "\u{200F}a",
+        "\u{2066}a\u{2069}",
+        " \u{202C}",
+    ] {
+        let l = engine
+            .layout_line(&StringStore::new(text), LineIndex(0), Dip(1000.0))
+            .unwrap();
+        let direct = DirectWriteText::new("Cascadia Mono", text, 1000.0);
+        for x in [-50.0, -1.0, 0.0, 0.5, 3.0, 7.0, 8.0, 500.0] {
+            let hit = engine.hit_test_point(
+                &l,
+                Point {
+                    x: Dip(x),
+                    y: Dip(1.0),
+                },
+            );
+            assert_eq!(hit.byte.0, direct.hit(x, 1.0), "{text:?} at x={x}");
+        }
+    }
+}

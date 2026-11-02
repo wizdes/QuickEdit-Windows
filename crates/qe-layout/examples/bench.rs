@@ -91,16 +91,26 @@ fn screens(name: &str, engine: &DirectWriteLayout, text: &StringStore, width: f3
     let cold = median(&format!("{name}: {rows} lines cold"), || {
         let mut cache = LineCache::new(16_000_000);
         for i in 0..rows {
-            std::hint::black_box(cache.get_or_layout(engine, text, LineIndex(i), Dip(width)));
+            std::hint::black_box(
+                cache
+                    .get_or_layout(engine, text, LineIndex(i), Dip(width))
+                    .expect("layout"),
+            );
         }
     });
     let mut cache = LineCache::new(16_000_000);
     for i in 0..rows {
-        cache.get_or_layout(engine, text, LineIndex(i), Dip(width));
+        cache
+            .get_or_layout(engine, text, LineIndex(i), Dip(width))
+            .expect("layout");
     }
     median(&format!("{name}: {rows} lines warm"), || {
         for i in 0..rows {
-            std::hint::black_box(cache.get_or_layout(engine, text, LineIndex(i), Dip(width)));
+            std::hint::black_box(
+                cache
+                    .get_or_layout(engine, text, LineIndex(i), Dip(width))
+                    .expect("layout"),
+            );
         }
     });
     cold
@@ -193,6 +203,31 @@ fn main() {
                 "OVER one frame"
             }
         );
+    }
+
+    println!("--- one cold segment of mixed text");
+    for (name, unit) in [
+        ("a and CJK", "a漢"),
+        ("a and Hebrew", "aש"),
+        ("Japanese with words", "日本語の文章 "),
+        ("CJK with spaces", "漢字 "),
+        ("Hebrew and digits", "שלום 123 "),
+    ] {
+        let text = LongLine {
+            bytes: unit.repeat(1_000_000 / unit.len()),
+        };
+        let middle = engine.segment_count(&text, LineIndex(0)).expect("line") / 2;
+        median(&format!("{name}: one segment"), || {
+            std::hint::black_box(engine.layout_segment(&text, LineIndex(0), middle, Dip(800.0)))
+                .expect("segment");
+        });
+        let whole = LongLine {
+            bytes: unit.repeat(4000 / unit.len()),
+        };
+        median(&format!("{name}: whole line just under 4 KiB"), || {
+            std::hint::black_box(engine.layout_line(&whole, LineIndex(0), Dip(800.0)))
+                .expect("line");
+        });
     }
 
     println!("--- long lines");

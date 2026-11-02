@@ -20,6 +20,7 @@ const IS_RTL: u16 = 1 << 4;
 /// DWRITE_CLUSTER_METRICS bit: a hard break, such as VT or FF inside a line.
 const IS_NEWLINE: u16 = 1 << 2;
 const NBSP: u16 = 0xA0;
+const OUTSIDE_THE_ROW: f32 = 4_000_000.0;
 const TAB_STOP_NUDGE: f64 = 1.0 - 1e-5;
 
 struct RawRun {
@@ -37,6 +38,19 @@ struct RawRun {
 struct Collected {
     runs: Vec<RawRun>,
     error: Option<LayoutError>,
+}
+
+/// DirectWrite may pass a null pointer with a count of zero, and `from_raw_parts`
+/// must never see a null pointer.
+///
+/// # Safety
+/// A pointer that is not null must point at `count` values.
+unsafe fn raw_slice<'a, T>(pointer: *const T, count: usize) -> &'a [T] {
+    if pointer.is_null() || count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pointer, count) }
+    }
 }
 
 #[implement(IDWriteTextRenderer)]
@@ -82,8 +96,8 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
         let run = unsafe { &*run };
         let desc = unsafe { &*desc };
         let n = run.glyphCount as usize;
-        let glyph_ids = unsafe { std::slice::from_raw_parts(run.glyphIndices, n) }.to_vec();
-        let advances = unsafe { std::slice::from_raw_parts(run.glyphAdvances, n) }
+        let glyph_ids = unsafe { raw_slice(run.glyphIndices, n) }.to_vec();
+        let advances = unsafe { raw_slice(run.glyphAdvances, n) }
             .iter()
             .copied()
             .map(Dip)
@@ -91,7 +105,7 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
         let offsets = if run.glyphOffsets.is_null() {
             vec![Point::default(); n]
         } else {
-            unsafe { std::slice::from_raw_parts(run.glyphOffsets, n) }
+            unsafe { raw_slice(run.glyphOffsets, n) }
                 .iter()
                 .map(|o| Point {
                     x: Dip(o.advanceOffset),
@@ -182,6 +196,8 @@ struct Edge {
     byte: u32,
     x: f32,
     affinity: Affinity,
+    /// False for an edge of a cluster with no width. A click never lands on one.
+    has_width: bool,
 }
 
 /// One call for the whole text: per row and direction change, where that text
@@ -210,8 +226,18 @@ fn hit_ranges(
 }
 
 /// Lays out `s` with DirectWrite. `start_column` keeps tabs on the same stops as
-/// the text before a slice: a few no-break spaces stand in for that text, and
-/// their width comes off every position on the first row.
+/// the text before a slice: a few no-break spaces stand in for that text, and their
+/// width comes off every position on their row. They also take room on that row, so
+/// it stays inside `width` measured from where the slice's text would really sit. In
+/// a width too narrow to hold them and one cell, they are left out and tabs start
+/// from the slice's own left edge.
+///
+/// DirectWrite's emergency wrap can break inside a cluster, such as between the two
+/// letters of a flag. When it does, the text is cut before that cluster and laid out
+/// in pieces, each on its own rows, so the cluster moves whole to the next row. A
+/// cluster wider than the row gets a row of its own, past the right edge. Text
+/// direction and joining are worked out per piece, so a cut can change them at its
+/// edge. The rows after a cut are laid out again, which costs another layout per cut.
 pub(crate) fn shape(
     engine: &DirectWriteLayout,
     s: &str,
@@ -221,244 +247,430 @@ pub(crate) fn shape(
     start_column: usize,
     partial: bool,
 ) -> Result<LineLayout, LayoutError> {
-    let font = engine.font();
-    let lead = if s.contains('\t') {
-        start_column % engine.tab_width()
-    } else {
-        0
-    };
-    let mut utf16: Vec<u16> = Vec::with_capacity(s.len() + lead);
-    utf16.resize(lead, NBSP);
-    utf16.extend(s.encode_utf16());
-    let lead_width = lead as f64 * font.advance_exact;
     let wrap = engine.wrap_enabled();
-    let layout_width = if wrap {
-        (width.0 as f64 + lead_width).max(1.0) as f32
-    } else {
-        NO_WRAP_WIDTH
+    let request = Request {
+        engine,
+        line,
+        width,
+        partial,
     };
-    let layout = font.create_layout(&utf16, layout_width, 1_000_000.0)?;
-    unsafe {
-        layout
-            .SetWordWrapping(if wrap {
-                DWRITE_WORD_WRAPPING_WRAP
-            } else {
-                DWRITE_WORD_WRAPPING_NO_WRAP
-            })
-            .map_err(dw("SetWordWrapping"))?;
-        // A tab exactly on a stop must go to the next stop. DirectWrite adds advances
-        // in f32, so a sum can land a hair short of the stop and the tab would get no
-        // width. A stop a hair closer prevents that and moves text by far under a pixel.
-        layout
-            .SetIncrementalTabStop(
-                (font.advance_exact * engine.tab_width() as f64 * TAB_STOP_NUDGE) as f32,
-            )
-            .map_err(dw("SetIncrementalTabStop"))?;
-    }
-    if font.fast_ok {
-        turn_off_ascii_ligatures(&layout, &utf16)?;
-    }
-    let mut text_metrics = DWRITE_TEXT_METRICS::default();
-    unsafe {
-        layout
-            .GetMetrics(&mut text_metrics)
-            .map_err(dw("GetMetrics"))?;
-    }
-    let mut line_count = 0;
-    let mut lines = vec![DWRITE_LINE_METRICS::default(); text_metrics.lineCount.max(1) as usize];
-    unsafe {
-        layout
-            .GetLineMetrics(Some(&mut lines), &mut line_count)
-            .map_err(dw("GetLineMetrics"))?;
-    }
-    lines.truncate(line_count as usize);
-    let mut cluster_count = 0;
-    let mut clusters = vec![DWRITE_CLUSTER_METRICS::default(); utf16.len().max(1)];
-    unsafe {
-        layout
-            .GetClusterMetrics(Some(&mut clusters), &mut cluster_count)
-            .map_err(dw("GetClusterMetrics"))?;
-    }
-    clusters.truncate(cluster_count as usize);
-
-    let unit_byte = unit_to_byte(s);
-    let byte_of = |unit: usize| unit_byte[unit.saturating_sub(lead).min(unit_byte.len() - 1)];
-    let allowed = stop_table(s);
-    // Which cluster holds each UTF-16 unit.
-    let mut cluster_at = Vec::with_capacity(utf16.len() + 1);
-    let mut cluster_start = Vec::with_capacity(clusters.len() + 1);
-    let mut unit = 0;
-    for (index, cluster) in clusters.iter().enumerate() {
-        cluster_start.push(unit);
-        for _ in 0..cluster.length {
-            cluster_at.push(index as u32);
-        }
-        unit += cluster.length as usize;
-    }
-    cluster_start.push(unit);
-
-    let ranges = hit_ranges(&layout, utf16.len() as u32)?;
-    let mut rows = Vec::with_capacity(lines.len());
-    let mut range_at = 0;
-    let mut first_unit = 0;
-    let mut y = 0.0f64;
-    for (row_index, metric) in lines.iter().enumerate() {
-        let last_unit = first_unit + metric.length as usize;
-        let row_start = byte_of(first_unit);
-        let row_end = byte_of(last_unit);
-        let shift = if row_index == 0 { lead_width } else { 0.0 };
-        // The ranges for this row. They come in row order.
-        let from = range_at;
-        while range_at < ranges.len() && (ranges[range_at].textPosition as usize) < last_unit {
-            range_at += 1;
-        }
-        let mut row_ranges: Vec<_> = ranges[from..range_at].to_vec();
-        row_ranges.sort_by(|a, b| a.left.total_cmp(&b.left));
-        let mut edges: Vec<Edge> = Vec::with_capacity((last_unit - first_unit) * 2 + 2);
-        let mut has_rtl = false;
-        for range in &row_ranges {
-            let rtl = range.bidiLevel % 2 == 1;
-            has_rtl |= rtl;
-            let begin = range.textPosition as usize;
-            let end = (begin + range.length as usize).min(last_unit);
-            let run_start = edges.len();
-            let sign = if rtl { -1.0 } else { 1.0 };
-            let mut x = if rtl {
-                range.left as f64 + range.width as f64
-            } else {
-                range.left as f64
-            };
-            let mut unit = begin;
-            let mut lead_x = x;
-            let mut lead_unit = begin;
-            let mut open = false;
-            while unit < end {
-                let index = cluster_at[unit] as usize;
-                // A caret never sits after a hard break on the break's own row, and
-                // DirectWrite never gives that place for a click.
-                if clusters[index]._bitfield & IS_NEWLINE != 0 {
-                    unit = cluster_start[index + 1];
-                    open = false;
-                    continue;
-                }
-                if !open {
-                    lead_x = x;
-                    lead_unit = cluster_start[index].max(begin);
-                    open = true;
-                }
-                x += sign * clusters[index].width as f64;
-                has_rtl |= clusters[index]._bitfield & IS_RTL != 0;
-                unit = cluster_start[index + 1];
-                let trail_byte = byte_of(unit);
-                let closes = unit >= end || allowed[trail_byte as usize] || trail_byte == row_end;
-                if closes {
-                    open = false;
-                    if lead_unit >= lead && unit > lead_unit {
-                        edges.push(Edge {
-                            byte: byte_of(lead_unit),
-                            x: (lead_x - shift) as f32,
-                            affinity: Affinity::After,
-                        });
-                        edges.push(Edge {
-                            byte: trail_byte,
-                            x: (x - shift) as f32,
-                            affinity: Affinity::Before,
-                        });
+    let mut done: Option<LineLayout> = None;
+    let mut at = 0;
+    let mut column = start_column;
+    loop {
+        let rest = &s[at..];
+        let begin = ByteOffset(start.0 + at);
+        let piece = match request.shape_piece(rest, begin, column, wrap)? {
+            Piece::Whole(layout) => {
+                at = s.len();
+                layout
+            }
+            Piece::RowEndsInside(byte) => {
+                let table = stop_table(rest);
+                let before = (0..byte).rev().find(|b| table[*b]).unwrap_or(0);
+                let after = (byte + 1..=rest.len())
+                    .find(|b| table[*b])
+                    .unwrap_or(rest.len());
+                if before > 0 {
+                    at += before;
+                    shape(engine, &rest[..before], begin, line, width, column, partial)?
+                } else {
+                    at += after;
+                    match request.shape_piece(&rest[..after], begin, column, false)? {
+                        Piece::Whole(layout) => layout,
+                        // With no wrapping, no row ends inside anything.
+                        Piece::RowEndsInside(byte) => {
+                            return Err(LayoutError::CutCluster(ByteOffset(begin.0 + byte)));
+                        }
                     }
                 }
             }
-            if rtl {
-                edges[run_start..].reverse();
-            }
-        }
-        let ends_in_break = last_unit > first_unit
-            && clusters[cluster_at[last_unit - 1] as usize]._bitfield & IS_NEWLINE != 0;
-        rows.push(row_from_edges(
-            start,
-            row_start..row_end,
-            ends_in_break,
-            &edges,
-            has_rtl,
-            Dip(y as f32),
-            Dip(metric.height),
-        ));
-        first_unit = last_unit;
-        y += metric.height as f64;
-    }
-    if rows.is_empty() {
-        return Err(LayoutError::DirectWrite {
-            call: "GetLineMetrics",
-            message: "no rows".into(),
+        };
+        column = 0;
+        done = Some(match done {
+            Some(earlier) => join_rows(earlier, piece),
+            None => piece,
         });
+        if at >= s.len() {
+            break;
+        }
     }
-    let collected = std::sync::Arc::new(Mutex::new(Collected::default()));
-    let renderer: IDWriteTextRenderer = RunCollector {
-        collected: collected.clone(),
-    }
-    .into();
-    unsafe {
-        layout
-            .Draw(None, &renderer, 0.0, 0.0)
-            .map_err(dw("IDWriteTextLayout::Draw"))?;
-    }
-    let mut collected = collected
-        .lock()
-        .map_err(|_| LayoutError::Poisoned("glyph run collector"))?;
-    if let Some(error) = collected.error.take() {
-        return Err(error);
-    }
-    for raw in collected.runs.drain(..) {
-        place_run(raw, &mut rows, &unit_byte, lead, lead_width, start);
-    }
-    Ok(LineLayout {
-        line,
-        rows,
-        height: Dip(y as f32),
-        partial,
+    done.ok_or(LayoutError::DirectWrite {
+        call: "GetLineMetrics",
+        message: "no rows".into(),
     })
 }
 
-fn place_run(
-    mut raw: RawRun,
-    rows: &mut [LayoutRow],
-    unit_byte: &[u32],
+/// Puts `lower`'s rows under `upper`'s.
+fn join_rows(mut upper: LineLayout, mut lower: LineLayout) -> LineLayout {
+    let offset = upper.height.0;
+    for row in &mut lower.rows {
+        row.y = Dip(row.y.0 + offset);
+        for run in &mut row.glyph_runs {
+            run.origin.y = Dip(run.origin.y.0 + offset);
+        }
+    }
+    upper.height = Dip(offset + lower.height.0);
+    upper.rows.append(&mut lower.rows);
+    upper
+}
+
+struct Request<'a> {
+    engine: &'a DirectWriteLayout,
+    line: LineIndex,
+    width: Dip,
+    partial: bool,
+}
+enum Piece {
+    Whole(LineLayout),
+    /// A row ends at this byte of the piece, which is inside a cluster.
+    RowEndsInside(usize),
+}
+
+impl Request<'_> {
+    fn shape_piece(
+        &self,
+        s: &str,
+        start: ByteOffset,
+        start_column: usize,
+        wrap: bool,
+    ) -> Result<Piece, LayoutError> {
+        let (engine, line, width, partial) = (self.engine, self.line, self.width, self.partial);
+        let font = engine.font();
+        let lead = if s.contains('\t') {
+            start_column % engine.tab_width()
+        } else {
+            0
+        };
+        let lead = if wrap && (lead + 1) as f64 * font.advance_exact > width.0 as f64 {
+            0
+        } else {
+            lead
+        };
+        let mut utf16: Vec<u16> = Vec::with_capacity(s.len() + lead);
+        utf16.resize(lead, NBSP);
+        utf16.extend(s.encode_utf16());
+        let layout_width = if wrap {
+            width.0.max(1.0)
+        } else {
+            NO_WRAP_WIDTH
+        };
+        let layout = font.create_layout(&utf16, layout_width, 1_000_000.0)?;
+        unsafe {
+            layout
+                .SetWordWrapping(if wrap {
+                    DWRITE_WORD_WRAPPING_WRAP
+                } else {
+                    DWRITE_WORD_WRAPPING_NO_WRAP
+                })
+                .map_err(dw("SetWordWrapping"))?;
+            // A tab exactly on a stop must go to the next stop. DirectWrite adds advances
+            // in f32, so a sum can land a hair short of the stop and the tab would get no
+            // width. A stop a hair closer prevents that and moves text by far under a pixel.
+            layout
+                .SetIncrementalTabStop(
+                    (font.advance_exact * engine.tab_width() as f64 * TAB_STOP_NUDGE) as f32,
+                )
+                .map_err(dw("SetIncrementalTabStop"))?;
+        }
+        if font.fast_ok {
+            turn_off_ascii_ligatures(&layout, &utf16)?;
+        }
+        let mut text_metrics = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            layout
+                .GetMetrics(&mut text_metrics)
+                .map_err(dw("GetMetrics"))?;
+        }
+        let mut line_count = 0;
+        let mut lines =
+            vec![DWRITE_LINE_METRICS::default(); text_metrics.lineCount.max(1) as usize];
+        unsafe {
+            layout
+                .GetLineMetrics(Some(&mut lines), &mut line_count)
+                .map_err(dw("GetLineMetrics"))?;
+        }
+        lines.truncate(line_count as usize);
+        let mut cluster_count = 0;
+        let mut clusters = vec![DWRITE_CLUSTER_METRICS::default(); utf16.len().max(1)];
+        unsafe {
+            layout
+                .GetClusterMetrics(Some(&mut clusters), &mut cluster_count)
+                .map_err(dw("GetClusterMetrics"))?;
+        }
+        clusters.truncate(cluster_count as usize);
+
+        let unit_byte = unit_to_byte(s);
+        let byte_of = |unit: usize| unit_byte[unit.saturating_sub(lead).min(unit_byte.len() - 1)];
+        let allowed = stop_table(s);
+        let mut row_end_unit = 0;
+        for metric in &lines {
+            row_end_unit += metric.length as usize;
+            let byte = byte_of(row_end_unit) as usize;
+            if wrap && byte < s.len() && !allowed[byte] {
+                return Ok(Piece::RowEndsInside(byte));
+            }
+        }
+        // Which cluster holds each UTF-16 unit.
+        let mut cluster_at = Vec::with_capacity(utf16.len() + 1);
+        let mut cluster_start = Vec::with_capacity(clusters.len() + 1);
+        let mut unit = 0;
+        for (index, cluster) in clusters.iter().enumerate() {
+            cluster_start.push(unit);
+            for _ in 0..cluster.length {
+                cluster_at.push(index as u32);
+            }
+            unit += cluster.length as usize;
+        }
+        cluster_start.push(unit);
+
+        let ranges = hit_ranges(&layout, utf16.len() as u32)?;
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut range_at = 0;
+        let mut first_unit = 0;
+        let mut y = 0.0f64;
+        // Rows with only stand-in spaces are not rows of the text.
+        let mut skipped_height = 0.0f64;
+        let mut row_shifts = Vec::with_capacity(lines.len());
+        for metric in &lines {
+            let last_unit = first_unit + metric.length as usize;
+            let row_start = byte_of(first_unit);
+            let row_end = byte_of(last_unit);
+            // The ranges for this row. They come in row order.
+            let from = range_at;
+            while range_at < ranges.len() && (ranges[range_at].textPosition as usize) < last_unit {
+                range_at += 1;
+            }
+            if lead > 0 && last_unit <= lead {
+                first_unit = last_unit;
+                skipped_height += metric.height as f64;
+                continue;
+            }
+            let mut shift = 0.0;
+            let mut unit = first_unit;
+            while unit < lead {
+                let index = cluster_at[unit] as usize;
+                shift += clusters[index].width as f64;
+                unit = cluster_start[index + 1];
+            }
+            row_shifts.push(shift);
+            let mut row_ranges: Vec<_> = ranges[from..range_at].to_vec();
+            row_ranges.sort_by(|a, b| a.left.total_cmp(&b.left));
+            let mut edges: Vec<Edge> = Vec::with_capacity((last_unit - first_unit) * 2 + 2);
+            let mut has_rtl = false;
+            for range in &row_ranges {
+                let rtl = range.bidiLevel % 2 == 1;
+                has_rtl |= rtl;
+                let begin = range.textPosition as usize;
+                let end = (begin + range.length as usize).min(last_unit);
+                let run_start = edges.len();
+                let sign = if rtl { -1.0 } else { 1.0 };
+                let mut x = if rtl {
+                    range.left as f64 + range.width as f64
+                } else {
+                    range.left as f64
+                };
+                let mut unit = begin;
+                let mut lead_x = x;
+                let mut lead_unit = begin;
+                let mut open = false;
+                while unit < end {
+                    let index = cluster_at[unit] as usize;
+                    // A caret never sits after a hard break on the break's own row, and
+                    // DirectWrite never gives that place for a click.
+                    if clusters[index]._bitfield & IS_NEWLINE != 0 {
+                        unit = cluster_start[index + 1];
+                        open = false;
+                        continue;
+                    }
+                    if !open {
+                        lead_x = x;
+                        lead_unit = cluster_start[index].max(begin);
+                        open = true;
+                    }
+                    has_rtl |= clusters[index]._bitfield & IS_RTL != 0;
+                    unit = cluster_start[index + 1];
+                    x += sign * clusters[index].width as f64;
+                    let trail_byte = byte_of(unit);
+                    let closes =
+                        unit >= end || allowed[trail_byte as usize] || trail_byte == row_end;
+                    if closes {
+                        open = false;
+                        if lead_unit >= lead && unit > lead_unit {
+                            let has_width = x != lead_x;
+                            let lead_byte = byte_of(lead_unit);
+                            // A direction change can fall inside a cluster. That place is
+                            // no caret stop, so a click there goes to the cluster's edges.
+                            if allowed[lead_byte as usize] || lead_byte == row_start {
+                                edges.push(Edge {
+                                    byte: lead_byte,
+                                    x: (lead_x - shift) as f32,
+                                    affinity: Affinity::After,
+                                    has_width,
+                                });
+                            }
+                            if allowed[trail_byte as usize] || trail_byte == row_end {
+                                edges.push(Edge {
+                                    byte: trail_byte,
+                                    x: (x - shift) as f32,
+                                    affinity: Affinity::Before,
+                                    has_width,
+                                });
+                            }
+                        }
+                    }
+                }
+                if rtl {
+                    edges[run_start..].reverse();
+                }
+            }
+            let ends_in_break = last_unit > first_unit
+                && clusters[cluster_at[last_unit - 1] as usize]._bitfield & IS_NEWLINE != 0;
+            rows.push(row_from_edges(
+                start,
+                row_start..row_end,
+                ends_in_break,
+                &edges,
+                has_rtl,
+                Dip(y as f32),
+                Dip(metric.height),
+            ));
+            if edges.iter().any(|e| !e.has_width)
+                && let Some(row) = rows.last_mut()
+            {
+                let middle = (skipped_height + y) as f32 + metric.height / 2.0;
+                let answer = |x: f32| -> Result<(u32, Affinity), LayoutError> {
+                    let (mut trailing, mut inside) = (BOOL(0), BOOL(0));
+                    let mut hit = DWRITE_HIT_TEST_METRICS::default();
+                    unsafe {
+                        layout
+                            .HitTestPoint(x, middle, &mut trailing, &mut inside, &mut hit)
+                            .map_err(dw("HitTestPoint"))?;
+                    }
+                    let unit = hit.textPosition as usize;
+                    Ok(if trailing.as_bool() {
+                        (byte_of(unit + hit.length as usize), Affinity::Before)
+                    } else {
+                        (byte_of(unit), Affinity::After)
+                    })
+                };
+                let left = answer(-OUTSIDE_THE_ROW)?;
+                let right = answer(OUTSIDE_THE_ROW)?;
+                add_outer_stops(row, start, left, right);
+            }
+            first_unit = last_unit;
+            y += metric.height as f64;
+        }
+        if rows.is_empty() {
+            return Err(LayoutError::DirectWrite {
+                call: "GetLineMetrics",
+                message: "no rows".into(),
+            });
+        }
+        let collected = std::sync::Arc::new(Mutex::new(Collected::default()));
+        let renderer: IDWriteTextRenderer = RunCollector {
+            collected: collected.clone(),
+        }
+        .into();
+        unsafe {
+            layout
+                .Draw(None, &renderer, 0.0, 0.0)
+                .map_err(dw("IDWriteTextLayout::Draw"))?;
+        }
+        let mut collected = collected
+            .lock()
+            .map_err(|_| LayoutError::Poisoned("glyph run collector"))?;
+        if let Some(error) = collected.error.take() {
+            return Err(error);
+        }
+        let placing = RunPlacing {
+            unit_byte: &unit_byte,
+            lead,
+            skipped_height,
+            row_shifts: &row_shifts,
+            start,
+        };
+        for raw in collected.runs.drain(..) {
+            placing.place(raw, &mut rows);
+        }
+        Ok(Piece::Whole(LineLayout {
+            line,
+            rows,
+            height: Dip(y as f32),
+            partial,
+        }))
+    }
+}
+
+struct RunPlacing<'a> {
+    unit_byte: &'a [u32],
     lead: usize,
-    lead_width: f64,
+    skipped_height: f64,
+    row_shifts: &'a [f64],
     start: ByteOffset,
+}
+impl RunPlacing<'_> {
+    fn place(&self, mut raw: RawRun, rows: &mut [LayoutRow]) {
+        let (lead, unit_byte, start) = (self.lead, self.unit_byte, self.start);
+        let mut first = raw.text_position as usize;
+        let last = first + raw.text_length as usize;
+        if last <= lead {
+            return;
+        }
+        raw.origin.y = Dip((raw.origin.y.0 as f64 - self.skipped_height) as f32);
+        let at = rows.partition_point(|r| r.y.0 + r.height.0 < raw.origin.y.0);
+        let row_index = at.min(rows.len() - 1);
+        if first < lead {
+            // This run starts with the stand-in spaces, one glyph each.
+            let skip = lead - first;
+            let skipped: f64 = raw.advances[..skip].iter().map(|a| a.0 as f64).sum();
+            raw.glyph_ids.drain(..skip);
+            raw.advances.drain(..skip);
+            raw.offsets.drain(..skip);
+            raw.origin.x = Dip((raw.origin.x.0 as f64 + skipped) as f32);
+            first = lead;
+        }
+        raw.origin.x = Dip((raw.origin.x.0 as f64 - self.row_shifts[row_index]) as f32);
+        let to_byte = |unit: usize| {
+            ByteOffset(start.0 + unit_byte[(unit - lead).min(unit_byte.len() - 1)] as usize)
+        };
+        rows[row_index].glyph_runs.push(LayoutGlyphRun {
+            range: to_byte(first)..to_byte(last),
+            origin: raw.origin,
+            bidi_level: raw.bidi_level,
+            font_id: raw.font_id,
+            font_em_size: Dip(raw.em_size),
+            glyph_ids: raw.glyph_ids,
+            advances: raw.advances,
+            offsets: raw.offsets,
+        });
+    }
+}
+
+/// Puts DirectWrite's answers for a click past each end of a row at the ends of its
+/// visual order, when they are caret stops.
+fn add_outer_stops(
+    row: &mut LayoutRow,
+    start: ByteOffset,
+    left: (u32, Affinity),
+    right: (u32, Affinity),
 ) {
-    let at = rows.partition_point(|r| r.y.0 + r.height.0 < raw.origin.y.0);
-    let row_index = at.min(rows.len() - 1);
-    let mut first = raw.text_position as usize;
-    let last = first + raw.text_length as usize;
-    if last <= lead {
-        return;
-    }
-    if first < lead {
-        // This run starts with the stand-in spaces, one glyph each.
-        let skip = lead - first;
-        let skipped: f64 = raw.advances[..skip].iter().map(|a| a.0 as f64).sum();
-        raw.glyph_ids.drain(..skip);
-        raw.advances.drain(..skip);
-        raw.offsets.drain(..skip);
-        raw.origin.x = Dip((raw.origin.x.0 as f64 + skipped) as f32);
-        first = lead;
-    }
-    if row_index == 0 && lead > 0 {
-        raw.origin.x = Dip((raw.origin.x.0 as f64 - lead_width) as f32);
-    }
-    let to_byte = |unit: usize| {
-        ByteOffset(start.0 + unit_byte[(unit - lead).min(unit_byte.len() - 1)] as usize)
+    let stop = |(byte, affinity): (u32, Affinity), x: Dip| {
+        let byte = ByteOffset(start.0 + byte as usize);
+        row.caret_stops
+            .binary_search_by_key(&byte, |s| s.byte)
+            .is_ok()
+            .then_some(VisualStop { x, byte, affinity })
     };
-    rows[row_index].glyph_runs.push(LayoutGlyphRun {
-        range: to_byte(first)..to_byte(last),
-        origin: raw.origin,
-        bidi_level: raw.bidi_level,
-        font_id: raw.font_id,
-        font_em_size: Dip(raw.em_size),
-        glyph_ids: raw.glyph_ids,
-        advances: raw.advances,
-        offsets: raw.offsets,
-    });
+    let (low, high) = match (row.visual_stops.first(), row.visual_stops.last()) {
+        (Some(first), Some(last)) => (first.x, last.x),
+        _ => (Dip(0.0), Dip(0.0)),
+    };
+    let (first, last) = (stop(left, low), stop(right, high));
+    row.visual_stops.extend(last);
+    if let Some(first) = first {
+        row.visual_stops.insert(0, first);
+    }
 }
 
 fn row_from_edges(
@@ -515,15 +727,30 @@ fn row_from_edges(
             x_before: Dip(right),
         });
     }
-    let visual_stops = if has_rtl {
-        edges
+    // A click inside a row never lands on a cluster with no width, such as U+200F. Its
+    // edges tie with their neighbors and would hide them from the search, so they stay
+    // out of the visual order. They keep their caret stops. `shape` adds the row's two
+    // outer stops afterward, from DirectWrite's own answer.
+    let has_empty_cluster = edges.iter().any(|e| !e.has_width);
+    let visual_stops = if has_rtl || has_empty_cluster {
+        let mut visual: Vec<VisualStop> = edges
             .iter()
+            .filter(|e| e.has_width)
             .map(|e| VisualStop {
                 x: Dip(e.x),
                 byte: absolute(e.byte),
                 affinity: e.affinity,
             })
-            .collect()
+            .collect();
+        // The edges are already in screen order, and the search needs sorted x. Rounding
+        // in the sums can put an edge a hair before the one to its left. Holding it at
+        // that edge keeps the order. Sorting would swap them and lose a run's edge.
+        let mut right = f32::NEG_INFINITY;
+        for stop in &mut visual {
+            right = right.max(stop.x.0);
+            stop.x = Dip(right);
+        }
+        visual
     } else {
         Vec::new()
     };
@@ -612,4 +839,19 @@ pub(crate) fn cluster_edges(font: &Font, s: &str) -> Result<Vec<usize>, LayoutEr
         edges.push(map[unit] as usize);
     }
     Ok(edges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raw_slice;
+
+    #[test]
+    fn a_null_pointer_with_no_glyphs_is_an_empty_slice() {
+        let empty: &[u16] = unsafe { raw_slice(std::ptr::null(), 0) };
+        assert!(empty.is_empty());
+        let still_empty: &[u16] = unsafe { raw_slice(std::ptr::null(), 3) };
+        assert!(still_empty.is_empty());
+        let values = [1u16, 2];
+        assert_eq!(unsafe { raw_slice(values.as_ptr(), 2) }, &values);
+    }
 }

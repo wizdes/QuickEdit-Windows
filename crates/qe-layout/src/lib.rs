@@ -8,35 +8,72 @@
 //! shaping features.
 //!
 //! # Long lines
-//! A line with more than [`LONG_LINE_BYTES`] of content is only ever laid out in
-//! segments of [`SEGMENT_BYTES`] or a little more, cut on grapheme boundaries.
-//! `layout_line` on such a line gives the first segment and sets
-//! `LineLayout::partial`, so it can never do unbounded work. `layout_slice` refuses
-//! a range longer than [`LONG_LINE_BYTES`].
+//! A line on the fast path stays whole up to [`LONG_LINE_BYTES`]. A line that needs
+//! shaping stays whole up to [`SHAPED_LINE_BYTES`]. Past those, a line is only ever
+//! laid out in segments of [`SEGMENT_BYTES`] or a little more, cut on grapheme
+//! boundaries. `layout_line` on such a line gives the first segment and sets
+//! `LineLayout::partial`, so it can never do unbounded work. `layout_slice` refuses a
+//! range over the same limits.
 //!
-//! While scrolling a 100 MB line, the editor does this:
-//! 1. Ask `is_long_line`. If true, call `long_line_map` once and keep the map. It
-//!    has one estimated entry per segment and a few runs of memory.
-//! 2. Give the document's `HeightMap` the line's height with
-//!    `doc.set(line, Dip(map.total_height() as f32))`.
-//! 3. For a scroll offset `y` inside the line, call `map.scroll_to_line(y)` to get
-//!    the segment. Its top is `map.line_to_scroll(segment)`.
-//! 4. Call `LineCache::get_or_layout_segment` for that segment and for the next
-//!    ones until the window is full. Draw each at its top minus `y`.
-//! 5. After each cold layout, call `map.set(segment, engine.segment_extent(&layout))`,
-//!    then update the document map again, so the estimate becomes real as you go.
-//! 6. Hit test with the segment's own layout. Find it with `scroll_to_line` for a
-//!    click, or with `segment_at` for a caret byte.
+//! The editor scrolls a very long line like this. "Along" means down with wrap on and
+//! across with wrap off, since with wrap off the segments sit side by side on one row.
+//! 1. Ask `is_long_line`. If true, call `long_line_map` once and keep the map. It has
+//!    one entry per segment, in very few runs. Entries are heights with wrap on and
+//!    widths with wrap off.
+//! 2. Give the document's `HeightMap` the line's height:
+//!    `doc.set(line, engine.long_line_height(&map))`. Do not use `map.total_height()`
+//!    directly, which with wrap off is a total width.
+//! 3. For an offset `y` along the line, `map.scroll_to_line(y)` gives the segment and
+//!    `map.line_to_scroll(segment)` gives its start.
+//! 4. Get that segment and the next ones until the window is full, from
+//!    `LineCache::cached_segment` or a worker (below). Draw each at its start minus `y`.
+//! 5. After each cold layout, call `map.set(segment, engine.segment_extent(&layout))`.
+//!    With wrap on, also repeat step 2. With wrap off, raise the line's height in the
+//!    document map if `layout.height` is taller than what it holds.
+//! 6. For a click, find the segment with `scroll_to_line` and call `hit_test_point` on
+//!    its layout. For a caret, call `segment_at(byte, affinity)` with that affinity,
+//!    then `caret_rect` on that segment's layout with the same affinity. The byte
+//!    where two segments meet belongs to the earlier one with `Before` and to the later
+//!    one with `After`, so the caret stays on the row that was clicked.
 //!
-//! With wrap off, the same map holds widths instead of heights and the segments
-//! sit side by side, so steps 3 to 6 work along x.
-//! After an edit inside the line, make a new map.
+//! Keeping the view still: when step 5 corrects a segment above the first one on
+//! screen, what the user sees must not move. Read
+//! `before = map.line_to_scroll(top_segment)` before the `set` and
+//! `after = map.line_to_scroll(top_segment)` after it, then add `after - before` to the
+//! scroll offset. Do the same with the document map for a correction to a line above.
 //!
-//! Known limits of long lines: a wrapped row ends at each segment edge. Shaping
-//! and text direction are worked out per segment, so a joined letter at an edge
-//! takes its end form. A cluster longer than 1 KiB can be cut at an edge. A tab
-//! with no tab in the 1 KiB before its segment assumes one cell per byte since
-//! the line start.
+//! After an edit inside the line, call `update_long_line_map`. It keeps every measured
+//! value and matches the entry count. `LineCache::invalidate` keeps the cached segments
+//! that end before the edit. Segments after the edit are laid out again when seen,
+//! because their byte edges moved. Typing near the start of a line therefore loses the
+//! cached layouts of its later segments, and costs one segment layout for each one on
+//! screen. Their measured sizes stay as close guesses.
+//!
+//! Known limits of long lines: a wrapped row ends at each segment edge. Shaping and text
+//! direction are worked out per segment, so a joined letter at an edge takes its end
+//! form. A cluster longer than 1 KiB can be cut at an edge. A run of flags longer than
+//! 1 MiB can be cut too, because the look-back for the run's start stops there. A tab
+//! with no tab in the 1 KiB before its segment assumes one cell per byte since the line
+//! start.
+//!
+//! # Laying out ahead on workers
+//! Shaping can take more than a frame: a screen of wide CJK takes tens of milliseconds,
+//! and DirectWrite's cost cannot be reduced from here. So the UI thread must not shape
+//! on a miss. `DirectWriteLayout` is safe to share, and a worker needs no cache lock.
+//! 1. On the UI thread, for each line of the next and previous page, call
+//!    `cache.cached(...)`. On a `None`, call `cache.ticket(...)` (or `segment_ticket`).
+//! 2. Send the ticket and an `Arc` of the snapshot to a worker.
+//! 3. On the worker, call `ticket.layout(&engine, snapshot)`. It takes no cache.
+//! 4. Send the result back. On the UI thread, call `cache.insert(&ticket, layout)`. It
+//!    returns false and keeps nothing if that line changed after the ticket was made,
+//!    or if the cache started over. If the line only moved, it is kept, and the next
+//!    get moves it.
+//! 5. To paint, use `cached`. For a line that is still a miss, paint it blank or from the
+//!    last frame, or call `get_or_layout` if the frame can afford it.
+//!
+//! An edit between steps 1 and 4 needs no special care: call `invalidate` as usual.
+//! Tickets of snapshots older than the cache are never trusted, and a get with an older
+//! snapshot never disturbs newer entries.
 //!
 //! # Slices
 //! `layout_slice_from_column` keeps tabs on the same stops as the text before the
@@ -62,10 +99,12 @@ mod segments;
 mod shaped;
 mod wrap;
 
-pub use cache::LineCache;
-pub use fonts::{font_face, loaded_font_count};
+pub use cache::{CacheTicket, LineCache};
+pub use fonts::{
+    MAX_LOADED_FONTS, font_face, loaded_font_count, registered_face_count, thread_format_count,
+};
 pub use heights::{HeightError, HeightMap};
-pub use segments::{LONG_LINE_BYTES, SEGMENT_BYTES};
+pub use segments::{LONG_LINE_BYTES, SEGMENT_BYTES, SHAPED_LINE_BYTES};
 
 use fonts::{Font, family_exists, font};
 use qe_api::{
@@ -73,12 +112,8 @@ use qe_api::{
     TextMeasurer, TextMetrics, TextSnapshot,
 };
 use segments::{LINE_ENDINGS, content_range, read};
-use std::{
-    fmt,
-    ops::Range,
-    result::Result,
-    sync::{Arc, Mutex},
-};
+use std::cell::RefCell;
+use std::{fmt, ops::Range, result::Result, sync::Arc};
 use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL};
 
 /// The default editor fonts, in the order they are tried.
@@ -107,7 +142,8 @@ pub enum LayoutError {
     /// The range is outside the text, is not on character edges, or holds a line
     /// ending.
     BadRange(Range<ByteOffset>),
-    /// A slice is longer than `LONG_LINE_BYTES`. Use segments.
+    /// A slice is longer than its limit: `LONG_LINE_BYTES`, or `SHAPED_LINE_BYTES` if
+    /// it needs shaping. Use segments.
     SliceTooLong {
         bytes: usize,
         limit: usize,
@@ -116,6 +152,15 @@ pub enum LayoutError {
     /// `DirectWriteLayout::slice_around` to pick a safe range.
     CutCluster(ByteOffset),
     Height(HeightError),
+    /// A `CacheTicket` was given a snapshot of another revision.
+    StaleTicket {
+        ticket: u64,
+        snapshot: u64,
+    },
+}
+thread_local! {
+    static LAST_ERROR: RefCell<Option<LayoutError>> = const { RefCell::new(None) };
+    static LAST_FALLBACK: RefCell<Option<MeasureFallback>> = const { RefCell::new(None) };
 }
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -135,6 +180,12 @@ impl fmt::Display for LayoutError {
             }
             Self::CutCluster(at) => write!(f, "byte {} is inside a cluster", at.0),
             Self::Height(error) => error.fmt(f),
+            Self::StaleTicket { ticket, snapshot } => {
+                write!(
+                    f,
+                    "a ticket of revision {ticket} got a snapshot of revision {snapshot}"
+                )
+            }
         }
     }
 }
@@ -175,8 +226,6 @@ pub struct DirectWriteLayout {
     wrap: bool,
     force_shaping: bool,
     tab_width: usize,
-    last_error: Mutex<Option<LayoutError>>,
-    last_fallback: Mutex<Option<MeasureFallback>>,
 }
 
 /// Splits a font token such as "Segoe UI 9". A name that exists as written is a
@@ -243,8 +292,6 @@ impl DirectWriteLayout {
             wrap: true,
             force_shaping: false,
             tab_width: 8,
-            last_error: Mutex::new(None),
-            last_fallback: Mutex::new(None),
         })
     }
     pub fn with_wrap(mut self, value: bool) -> Self {
@@ -268,15 +315,17 @@ impl DirectWriteLayout {
     pub fn cell_width(&self) -> Dip {
         Dip(self.font.advance)
     }
-    /// The reason the last `Layout` call on this engine returned `None`. The trait
-    /// can only return `None`, so the reason waits here. The `try_` methods return it.
+    /// Why the last `Layout` or `TextMeasurer` call on this thread failed, or `None`
+    /// if it worked. Every such call clears it, and other threads do not touch it. The
+    /// traits can only return `None` or sizes, so the reason waits here. Prefer the
+    /// `try_` methods and `measure_with_font`, which return it directly.
     pub fn last_error(&self) -> Option<LayoutError> {
-        self.last_error.lock().ok()?.clone()
+        LAST_ERROR.with(|last| last.borrow().clone())
     }
-    /// The last font that `TextMeasurer::measure` had to replace. That trait returns
-    /// only sizes. `measure_with_font` returns this value directly.
+    /// The font that the last `TextMeasurer::measure` call on this thread had to
+    /// replace, if any. `measure_with_font` returns this value directly.
     pub fn last_measure_fallback(&self) -> Option<MeasureFallback> {
-        self.last_fallback.lock().ok()?.clone()
+        LAST_FALLBACK.with(|last| last.borrow().clone())
     }
     pub(crate) fn font(&self) -> &Font {
         &self.font
@@ -294,15 +343,19 @@ impl DirectWriteLayout {
         self.tab_width
     }
     fn record<T>(&self, result: Result<T, LayoutError>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(error) => {
-                if let Ok(mut last) = self.last_error.lock() {
-                    *last = Some(error);
-                }
-                None
-            }
-        }
+        let (value, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
+        };
+        LAST_ERROR.with(|last| *last.borrow_mut() = error);
+        value
+    }
+    pub(crate) fn takes_fast_path(&self, bytes: &[u8]) -> bool {
+        !self.force_shaping
+            && self.font.fast_ok
+            && bytes
+                .iter()
+                .all(|b| *b == b'\t' || (0x20..0x7F).contains(b))
     }
     /// Like `Layout::layout_line`, with the reason for a failure.
     pub fn try_layout_line(
@@ -345,6 +398,12 @@ impl DirectWriteLayout {
         if s.contains(LINE_ENDINGS) {
             return Err(LayoutError::BadRange(range));
         }
+        if bytes > SHAPED_LINE_BYTES && !self.takes_fast_path(s.as_bytes()) {
+            return Err(LayoutError::SliceTooLong {
+                bytes,
+                limit: SHAPED_LINE_BYTES,
+            });
+        }
         let content = content_range(text, line)?;
         self.check_edge(text, &content, range.start)?;
         self.check_edge(text, &content, range.end)?;
@@ -359,9 +418,7 @@ impl DirectWriteLayout {
         start_column: usize,
         partial: bool,
     ) -> Result<LineLayout, LayoutError> {
-        let fast = !self.force_shaping
-            && self.font.fast_ok
-            && s.bytes().all(|b| b == b'\t' || (0x20..0x7F).contains(&b));
+        let fast = self.takes_fast_path(s.as_bytes());
         let lead = start_column % self.tab_width;
         if fast && let Some(rows) = self.fast_rows(s.as_bytes(), width, lead) {
             Ok(self.fast(s.as_bytes(), &rows, start, line, lead, partial))
@@ -412,6 +469,10 @@ impl DirectWriteLayout {
         }
         let widest_possible = s.len().saturating_mul(self.tab_width);
         let max_columns = wrap::columns_that_fit(self.font.advance, width.0, widest_possible);
+        // Below one cell, DirectWrite has its own rule for what goes on a row.
+        if max_columns == 0 {
+            return None;
+        }
         let mut column = 0;
         let mut has_tab = false;
         let fits = s.iter().all(|&b| {
@@ -500,19 +561,14 @@ impl DirectWriteLayout {
     /// family whose own name ends in a number. A missing family uses this engine's
     /// font, and the result says so.
     pub fn measure_with_font(&self, text: &str, font_token: &str) -> Result<Measured, LayoutError> {
-        let lookup_error = Mutex::new(None);
+        let lookup_error = RefCell::new(None);
         let (family, points) = parse_font_token(font_token, |name| {
             family_exists(name).unwrap_or_else(|e| {
-                if let Ok(mut slot) = lookup_error.lock() {
-                    *slot = Some(e);
-                }
+                *lookup_error.borrow_mut() = Some(e);
                 false
             })
         });
-        if let Some(error) = lookup_error
-            .into_inner()
-            .map_err(|_| LayoutError::Poisoned("font lookup"))?
-        {
+        if let Some(error) = lookup_error.into_inner() {
             return Err(error);
         }
         let em_size = points.map_or(self.font.em_size, |p| p * 96.0 / 72.0);
@@ -554,28 +610,52 @@ impl Layout for DirectWriteLayout {
 }
 
 impl TextMeasurer for DirectWriteLayout {
-    /// See `measure_with_font`. A DirectWrite failure gives zero sizes and is kept
-    /// in `last_error`.
+    /// See `measure_with_font`. If DirectWrite fails, the result is an estimate from
+    /// the character count in this engine's font, so that widgets stay visible, and
+    /// `last_error` names the failure.
     fn measure(&self, text: &str, font_token: &str) -> TextMetrics {
-        let Some(measured) = self.record(self.measure_with_font(text, font_token)) else {
-            return TextMetrics {
-                width: Dip(0.0),
-                height: Dip(0.0),
-                baseline: Dip(0.0),
-            };
+        self.metrics_or_estimate(text, self.measure_with_font(text, font_token))
+    }
+}
+
+impl DirectWriteLayout {
+    fn metrics_or_estimate(
+        &self,
+        text: &str,
+        result: Result<Measured, LayoutError>,
+    ) -> TextMetrics {
+        let (metrics, fallback) = match self.record(result) {
+            Some(measured) => (measured.metrics, measured.fallback),
+            None => {
+                let rows = text.split('\n').map(|row| row.chars().count());
+                let widest = rows.clone().max().unwrap_or(0);
+                let estimate = TextMetrics {
+                    width: Dip((widest as f64 * self.font.advance_exact) as f32),
+                    height: Dip(rows.count() as f32 * self.font.height),
+                    baseline: Dip(self.font.baseline),
+                };
+                (estimate, None)
+            }
         };
-        if let Some(fallback) = measured.fallback
-            && let Ok(mut last) = self.last_fallback.lock()
-        {
-            *last = Some(fallback);
-        }
-        measured.metrics
+        LAST_FALLBACK.with(|last| *last.borrow_mut() = fallback);
+        metrics
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_font_token;
+    use super::{DirectWriteLayout, LayoutError, parse_font_token};
+    use qe_api::Dip;
+
+    #[test]
+    fn a_failed_measure_gives_an_estimate_and_names_the_failure() {
+        let engine = DirectWriteLayout::new().unwrap();
+        let failure = LayoutError::NoFontCollection;
+        let got = engine.metrics_or_estimate("abc\nabcd", Err(failure.clone()));
+        assert!((got.width.0 - engine.cell_width().0 * 4.0).abs() < 0.01);
+        assert!(got.height.0 > Dip(0.0).0);
+        assert_eq!(engine.last_error(), Some(failure));
+    }
 
     #[test]
     fn family_names_ending_in_a_number_are_not_sizes() {

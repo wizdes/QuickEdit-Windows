@@ -4,6 +4,7 @@ use crate::clusters::{is_regional, is_stop};
 use qe_api::{ByteOffset, LineIndex, LookupError, TextSnapshot, Utf16Offset};
 use std::{
     ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -13,8 +14,22 @@ pub const GET_TEXT_CAP: usize = 1 << 20;
 /// One read. A mapped store refuses a single read over 448 KiB, and this many UTF-16 units
 /// are at most 384 KiB.
 const READ_SLICE: usize = 128 * 1024;
-/// A move with a huge count stops here and returns how far it got, as UIA allows.
+/// A move stops here and returns how far it got, as UIA allows, because it runs on the window's
+/// thread. It always makes one step, so a pause on a busy machine cannot look like the document's
+/// edge to a client that moves by one.
 pub const MOVE_BUDGET: Duration = Duration::from_millis(8);
+static MOVE_LIMIT_MICROS: AtomicU64 = AtomicU64::new(MOVE_BUDGET.as_micros() as u64);
+
+/// A test that checks exact counts can widen the limit, because a pause on a busy machine would
+/// otherwise stop its move short, as the limit allows.
+#[doc(hidden)]
+pub fn set_move_limit_for_tests(limit: Duration) {
+    MOVE_LIMIT_MICROS.store(limit.as_micros() as u64, Ordering::Relaxed);
+}
+
+fn within_limit(began: Instant) -> bool {
+    began.elapsed().as_micros() as u64 <= MOVE_LIMIT_MICROS.load(Ordering::Relaxed)
+}
 const FIRST_WINDOW: usize = 64;
 const WIDE_WINDOW: usize = 2048;
 /// Runs of blank text a word move crosses before it counts the run's end as a stop.
@@ -22,9 +37,6 @@ const WORD_STEPS: usize = 8;
 /// How far back a character move looks for the start of a run of flags, in UTF-16 units. A run
 /// of up to 16,384 flags stays paired in both directions. In a longer run the pairs can differ.
 pub const FLAG_RUN_LIMIT: usize = 64 * 1024;
-/// A move always makes this many steps, however slow the machine, so the budget cannot change
-/// the answer to an ordinary call.
-const SURE_STEPS: i32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextRange {
@@ -73,7 +85,8 @@ pub trait TextDoc {
     fn snapshot(&self) -> &dyn TextSnapshot;
     /// The word or the run of other text at a byte, within its line.
     fn word_at(&mut self, byte: usize) -> Answer<Range<usize>>;
-    /// First bytes of the rows on screen on this line. Empty when no layout is known.
+    /// Where the rows on screen on this line start and end, in bytes. Empty when no layout is
+    /// known. A row's end matters where the next row is not on screen.
     fn row_stops(&mut self, line: usize) -> Vec<usize>;
     fn line_of(&self, byte: usize) -> Answer<usize> {
         Ok(self
@@ -236,8 +249,9 @@ fn char_next(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<Option<us
             return Ok(Some(len));
         }
     }
-    // A cluster longer than the widest window ends at the window, as in the editor.
-    Ok(Some(at + WIDE_WINDOW))
+    // A cluster longer than the widest window ends at the window, as in the editor, but always
+    // on a character's edge.
+    Ok(Some(utf16_of(text, byte_of(text, at + WIDE_WINDOW)?)?))
 }
 
 fn char_at_or_before(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<usize> {
@@ -264,7 +278,7 @@ fn char_at_or_before(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<u
             return Ok(0);
         }
     }
-    Ok(at.saturating_sub(WIDE_WINDOW))
+    utf16_of(text, byte_of(text, at.saturating_sub(WIDE_WINDOW))?)
 }
 
 fn char_prev(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<Option<usize>> {
@@ -373,7 +387,8 @@ fn word_prev(doc: &mut dyn TextDoc, byte: usize) -> Answer<Option<usize>> {
 
 fn row_edges(doc: &mut dyn TextDoc, line: &LineSpan) -> Vec<usize> {
     let mut stops = doc.row_stops(line.index);
-    stops.retain(|s| *s > line.start && *s < line.end);
+    // The last row holds the line's ending, so no stop stands between the text and its ending.
+    stops.retain(|s| *s > line.start && *s < line.content_end);
     stops.sort_unstable();
     stops.dedup();
     stops.insert(0, line.start);
@@ -527,7 +542,7 @@ impl Mover<'_> {
             self.unit_at(unit, range.start)?.start
         };
         let mut moved = 0i32;
-        while moved != count && (moved.abs() < SURE_STEPS || began.elapsed() <= MOVE_BUDGET) {
+        while moved != count && (moved == 0 || within_limit(began)) {
             let step = if count > 0 {
                 self.next(unit, at)?
             } else {
@@ -563,7 +578,7 @@ impl Mover<'_> {
         let began = Instant::now();
         let mut at = if moving_start { range.start } else { range.end };
         let mut moved = 0i32;
-        while moved != count && (moved.abs() < SURE_STEPS || began.elapsed() <= MOVE_BUDGET) {
+        while moved != count && (moved == 0 || within_limit(began)) {
             let step = if count > 0 {
                 self.next(unit, at)?
             } else {

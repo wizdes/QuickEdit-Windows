@@ -2091,3 +2091,18 @@ fn byte_of_utf16(text: &str, utf16: usize) -> usize {
     }
     text.len()
 }
+
+// ---- For the UI Automation bridge (qe-a11y) ----
+
+impl EditorView {
+    /// True when long lines wrap, so a line can have several rows. With wrap off, a row in
+    /// `visible_rows` can be only the part of a long line at the view's left edge.
+    pub fn wraps(&self) -> bool {
+        self.wrap
+    }
+    /// The byte after the last byte of this row from `visible_rows`. `None` when its layout
+    /// has gone. It reads a layout already made, so it does not shape text or wait for disk.
+    pub fn visible_row_end(&self, row: &VisibleRow) -> Option<ByteOffset> {
+        self.row_end(row)
+    }
+}

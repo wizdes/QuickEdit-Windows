@@ -333,3 +333,60 @@ fn a_range_outside_the_text_is_refused() {
         Err(ReadError::OutOfRange)
     );
 }
+
+/// A call on the window's own thread must say "ask again", not wait for the disk.
+#[test]
+fn a_direct_read_on_the_window_thread_says_ask_again_for_text_not_in_memory() {
+    let body: String = (0..600_000)
+        .map(|i| {
+            format!(
+                "line {i}
+"
+            )
+        })
+        .collect();
+    let (view, _temp) = mapped_view("direct", body.as_bytes(), Some(Duration::from_millis(5)));
+    settle(&view);
+    let window = TestWindow::new(view);
+    let ui = window.accessibility();
+    let doc = document_range(&ui.document().unwrap());
+    assert_code(
+        unsafe { doc.GetText(-1) },
+        NOT_YET,
+        "a read of text not in memory",
+    );
+}
+
+/// A mapped file's length and lines change as its index finishes, with no edit, so a client must
+/// hear that as a text change.
+#[test]
+fn a_mapped_file_finishing_its_index_counts_as_a_text_change() {
+    let body: String = (0..4_000_000)
+        .map(|i| {
+            format!(
+                "line {i}
+"
+            )
+        })
+        .collect();
+    let (view, _temp) = mapped_view("index", body.as_bytes(), Some(Duration::from_millis(20)));
+    drop(body);
+    assert!(
+        !view.store_status().complete,
+        "the test needs an index that is still growing"
+    );
+    let window = TestWindow::new(view);
+    let ui = window.accessibility();
+    ui.after_input_when(true).expect("the baseline");
+    let view = window.ui.view.borrow();
+    let revision = view.revision();
+    settle(&view);
+    assert_eq!(view.revision(), revision, "no edit");
+    drop(view);
+    assert!(
+        ui.after_input_when(true)
+            .expect("the next batch")
+            .text_changed,
+        "a client did not hear about the rest of the file"
+    );
+}

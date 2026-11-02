@@ -36,6 +36,11 @@ pub(crate) fn not_supported(what: &str) -> Error {
 pub(crate) fn not_enabled(what: &str) -> Error {
     Error::new(HRESULT(UIA_E_ELEMENTNOTENABLED as i32), what)
 }
+/// The call cannot work on this element as it is. The .NET docs for ValuePattern.SetValue give
+/// InvalidOperationException for a read-only control, and it maps to this.
+pub(crate) fn invalid_operation(what: &str) -> Error {
+    Error::new(HRESULT(UIA_E_INVALIDOPERATION as i32), what)
+}
 /// S_OK with a null result, which is how UIA says "none". The generated glue turns this
 /// empty error into S_OK and leaves the out pointer alone. Every caller of these methods,
 /// UIA's own stubs included, starts that pointer at null.
@@ -57,6 +62,14 @@ pub(crate) fn not_supported_value() -> Result<VARIANT> {
     Ok(VARIANT::from(value))
 }
 
+/// An array Windows just made. Null means it had no memory, and the element is still there.
+fn allocated(array: *mut SAFEARRAY) -> Result<*mut SAFEARRAY> {
+    if array.is_null() {
+        return Err(Error::new(E_OUTOFMEMORY, "Windows has no memory for this."));
+    }
+    Ok(array)
+}
+
 fn check(status: Result<()>, array: *mut SAFEARRAY) -> Result<()> {
     if status.is_err() {
         unsafe { SafeArrayDestroy(array) }?;
@@ -67,10 +80,7 @@ fn check(status: Result<()>, array: *mut SAFEARRAY) -> Result<()> {
 /// A SAFEARRAY of COM pointers. Each element takes its own reference.
 pub(crate) fn interface_array<T: Interface>(items: &[T]) -> Result<*mut SAFEARRAY> {
     let count = u32::try_from(items.len()).map_err(|_| invalid("Too many items."))?;
-    let array = unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, count) };
-    if array.is_null() {
-        return Err(gone());
-    }
+    let array = allocated(unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, count) })?;
     for (index, item) in items.iter().enumerate() {
         let at = i32::try_from(index).map_err(|_| invalid("Too many items."))?;
         let status = unsafe { SafeArrayPutElement(array, &at, item.as_raw()) };
@@ -86,10 +96,7 @@ pub(crate) fn rectangle_array(rectangles: &[[f64; 4]]) -> Result<*mut SAFEARRAY>
         .checked_mul(4)
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| invalid("Too many rectangles."))?;
-    let array = unsafe { SafeArrayCreateVector(VT_R8, 0, count) };
-    if array.is_null() {
-        return Err(gone());
-    }
+    let array = allocated(unsafe { SafeArrayCreateVector(VT_R8, 0, count) })?;
     for (index, value) in rectangles.iter().flatten().enumerate() {
         let at = i32::try_from(index).map_err(|_| invalid("Too many rectangles."))?;
         let status =
@@ -101,10 +108,7 @@ pub(crate) fn rectangle_array(rectangles: &[[f64; 4]]) -> Result<*mut SAFEARRAY>
 
 pub(crate) fn int_array(values: &[i32]) -> Result<*mut SAFEARRAY> {
     let count = u32::try_from(values.len()).map_err(|_| invalid("Too many items."))?;
-    let array = unsafe { SafeArrayCreateVector(VT_I4, 0, count) };
-    if array.is_null() {
-        return Err(gone());
-    }
+    let array = allocated(unsafe { SafeArrayCreateVector(VT_I4, 0, count) })?;
     for (index, value) in values.iter().enumerate() {
         let at = i32::try_from(index).map_err(|_| invalid("Too many items."))?;
         let status =
@@ -168,4 +172,15 @@ pub(crate) fn bstr(text: &str) -> Result<BSTR> {
         return Err(Error::from_hresult(E_OUTOFMEMORY));
     }
     Ok(answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_array_windows_could_not_make_says_out_of_memory_and_not_gone() {
+        let error = allocated(std::ptr::null_mut()).expect_err("null is a failure");
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+    }
 }

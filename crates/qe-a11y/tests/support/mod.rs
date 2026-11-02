@@ -13,7 +13,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, Once,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::ThreadId,
@@ -33,6 +33,8 @@ pub struct Counts {
     pub widget_calls: AtomicUsize,
     pub made: AtomicUsize,
     pub actions: Mutex<Vec<(WidgetId, WidgetAction)>>,
+    /// Posted actions that failed after their call had said yes, with the error code.
+    pub failed: Mutex<Vec<(WidgetId, WidgetAction, i32)>>,
     /// The thread each `Ui` ended on. A leak leaves this empty.
     pub ended_on: Mutex<Vec<ThreadId>>,
 }
@@ -70,7 +72,7 @@ pub struct TestHost {
 impl UiaHost for TestHost {
     fn widgets(&self) -> Option<Widget> {
         self.counts.widget_calls.fetch_add(1, Ordering::SeqCst);
-        Some(self.ui.get()?.tree.borrow().clone())
+        Some(self.ui.get()?.tree.try_borrow().ok()?.clone())
     }
     fn action(&self, id: WidgetId, action: WidgetAction) -> windows::core::Result<()> {
         self.counts
@@ -87,7 +89,7 @@ impl UiaHost for TestHost {
         Ok(())
     }
     fn document_widget(&self) -> Option<Widget> {
-        self.ui.get()?.document.borrow().clone()
+        self.ui.get()?.document.try_borrow().ok()?.clone()
     }
     fn view_id(&self) -> Option<u64> {
         self.ui.get()?.view_id.get()
@@ -105,7 +107,7 @@ impl UiaHost for TestHost {
         true
     }
     fn font(&self) -> Option<(String, f64)> {
-        self.ui.get()?.font.borrow().clone()
+        self.ui.get()?.font.try_borrow().ok()?.clone()
     }
     fn dpi(&self) -> Option<u32> {
         self.ui.get()?.dpi.get()
@@ -113,7 +115,14 @@ impl UiaHost for TestHost {
     fn is_checkable(&self, id: WidgetId) -> bool {
         self.ui
             .get()
-            .is_some_and(|ui| ui.checkable.borrow().contains(&id))
+            .is_some_and(|ui| ui.checkable.try_borrow().is_ok_and(|ids| ids.contains(&id)))
+    }
+    fn action_failed(&self, id: WidgetId, action: &WidgetAction, error: &windows::core::Error) {
+        self.counts
+            .failed
+            .lock()
+            .expect("failed lock")
+            .push((id, action.clone(), error.code().0));
     }
 }
 
@@ -191,6 +200,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
+static REAL_MOVE_LIMIT: AtomicBool = AtomicBool::new(false);
+
+/// Keeps the real limit on moves. Other test windows widen it, because they check exact counts,
+/// and a pause on a busy machine would stop a move short. `tests/move_limit.rs` tests the limit.
+pub fn keep_the_real_move_limit() {
+    REAL_MOVE_LIMIT.store(true, Ordering::Relaxed);
+    qe_a11y::text::set_move_limit_for_tests(qe_a11y::text::MOVE_BUDGET);
+}
+
 pub struct TestWindow {
     pub hwnd: HWND,
     pub ui: Rc<Ui>,
@@ -206,6 +224,9 @@ impl TestWindow {
         Self::new(EditorView::from_text(text).expect("a view"))
     }
     pub fn with_tree(view: EditorView, tree: Widget) -> Self {
+        if !REAL_MOVE_LIMIT.load(Ordering::Relaxed) {
+            qe_a11y::text::set_move_limit_for_tests(Duration::from_secs(5));
+        }
         static CLASS: Once = Once::new();
         CLASS.call_once(|| {
             let class = WNDCLASSW {

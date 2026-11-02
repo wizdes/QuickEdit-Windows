@@ -839,3 +839,122 @@ fn a_real_client_keeps_two_windows_apart_and_one_closing_leaves_the_other() {
     result.expect("an answer").expect("the client");
     second.close();
 }
+
+const HEAP_ROLE: &str = "QE_A11Y_HEAP_ROLE";
+const HEAP_ROUNDS: usize = 4000;
+
+/// Calls that pass a string to the provider, over and over. With OANOCACHE set, a string freed
+/// twice corrupts the heap, and the process dies. The string cache hides that otherwise.
+fn string_rounds(hwnd: isize, rounds: usize) -> Result<(), String> {
+    let client = automation()?;
+    let element = call("ElementFromHandle", unsafe {
+        client.ElementFromHandle(HWND(hwnd as *mut std::ffi::c_void))
+    })?;
+    let condition = call("CreatePropertyCondition", unsafe {
+        client.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_DocumentControlTypeId.0),
+        )
+    })?;
+    let document = call("FindFirst", unsafe {
+        element.FindFirst(TreeScope_Descendants, &condition)
+    })?;
+    let text: IUIAutomationTextPattern = call("the text pattern", unsafe {
+        document.GetCurrentPatternAs(UIA_TextPatternId)
+    })?;
+    let range = call("DocumentRange", unsafe { text.DocumentRange() })?;
+    let same = VARIANT::from("Cascadia Mono");
+    let other = VARIANT::from("Some other font");
+    let query = BSTR::from("Hello");
+    for round in 0..rounds {
+        let found = call("FindAttribute, same", unsafe {
+            range.FindAttribute(UIA_FontNameAttributeId, &same, false)
+        })?;
+        ensure!(
+            read(&found)? == body(),
+            "round {round}: the same font found the wrong text"
+        );
+        null("FindAttribute, other", unsafe {
+            range.FindAttribute(UIA_FontNameAttributeId, &other, false)
+        })?;
+        call("FindText", unsafe { range.FindText(&query, false, false) })?;
+        ensure!(
+            BSTR::try_from(&same).map_err(|e| e.to_string())? == "Cascadia Mono",
+            "round {round}: the client's own string changed"
+        );
+    }
+    Ok(())
+}
+
+/// Pumps with no sleep, so thousands of rounds take seconds.
+fn pump_until_answer(heard: &mpsc::Receiver<Result<(), String>>) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        pump();
+        if let Ok(answer) = heard.try_recv() {
+            return answer;
+        }
+        if Instant::now() > deadline {
+            return Err("the client timed out".into());
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Runs only when the test below starts this program again, with OANOCACHE set.
+#[test]
+fn heap_child_entry() {
+    let Ok(role) = std::env::var(HEAP_ROLE) else {
+        return;
+    };
+    if let Some(hwnd) = role.strip_prefix("client:") {
+        let hwnd: isize = hwnd.parse().expect("a window number");
+        string_rounds(hwnd, HEAP_ROUNDS / 4).expect("the client's calls");
+        return;
+    }
+    let _one_at_a_time = one_ui_thread();
+    let window = make_window();
+    let hwnd = window.hwnd.0 as isize;
+    let (say, heard) = mpsc::channel();
+    std::thread::spawn(move || {
+        say.send(string_rounds(hwnd, HEAP_ROUNDS)).expect("report");
+    });
+    pump_until_answer(&heard).expect("a client on another thread");
+    // The same, from a client in another process, where UIA's own code owns the string.
+    let (say, heard) = mpsc::channel();
+    let mut child = Command::new(std::env::current_exe().expect("this program"))
+        .args(["--exact", "heap_child_entry", "--nocapture"])
+        .env(HEAP_ROLE, format!("client:{hwnd}"))
+        .env("OANOCACHE", "1")
+        .spawn()
+        .expect("start the client");
+    std::thread::spawn(move || {
+        let status = child.wait().map_err(|e| e.to_string());
+        say.send(status.and_then(|status| {
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| format!("the client process ended with {status}"))
+        }))
+        .expect("report");
+    });
+    pump_until_answer(&heard).expect("a client in another process");
+    window.close();
+}
+
+#[test]
+fn strings_a_client_passes_are_not_freed_twice_with_the_string_cache_off() {
+    let output = Command::new(std::env::current_exe().expect("this program"))
+        .args(["--exact", "heap_child_entry", "--nocapture"])
+        .env(HEAP_ROLE, "window")
+        .env("OANOCACHE", "1")
+        .output()
+        .expect("start the child");
+    assert!(
+        output.status.success(),
+        "the child ended with {}: 0xC0000374 is heap corruption.\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

@@ -1,9 +1,9 @@
 //! FindText. The search runs on the thread that called, not on the window's thread.
 //!
-//! UIA calls a provider on its own worker thread, so that thread waits for the answer. A
-//! client's normal patience is about 20 seconds (from memory of UIA's default transaction
-//! timeout), so a search stops at `FIND_PATIENCE` and fails once, honestly, instead of
-//! returning "not found" for text it did not reach.
+//! UIA calls a provider on its own worker thread, so that thread waits for the answer. One long
+//! search holds up other UIA calls to this process, a measured review found, so a search stops
+//! at `FIND_PATIENCE` and fails once, honestly, instead of returning "not found" for text it did
+//! not reach.
 //!
 //! The cost is linear in the text plus the query. Only a direct caller on the window's own
 //! thread stays inside `FIND_ON_WINDOW` units, and it never waits for disk.
@@ -12,7 +12,7 @@ use qe_api::{ByteOffset, TextSnapshot, Utf16Offset};
 use std::time::{Duration, Instant};
 
 /// The longest one search runs before it gives up.
-pub const FIND_PATIENCE: Duration = Duration::from_secs(15);
+pub const FIND_PATIENCE: Duration = Duration::from_secs(5);
 /// The most text searched by a direct call on the window's thread, in UTF-16 units.
 pub const FIND_ON_WINDOW: usize = 64 * 1024;
 /// A query this long or shorter uses the standard library's search, which is fastest. It

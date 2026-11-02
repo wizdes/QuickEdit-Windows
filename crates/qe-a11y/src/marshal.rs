@@ -26,7 +26,7 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         UI::WindowsAndMessaging::{
-            PostMessageW, RegisterWindowMessageW, SMTO_ERRORONEXIT, SMTO_NORMAL,
+            IsWindow, PostMessageW, RegisterWindowMessageW, SMTO_ERRORONEXIT, SMTO_NORMAL,
             SendMessageTimeoutW,
         },
     },
@@ -145,8 +145,9 @@ impl WindowThread {
     pub(crate) fn begin_close(&self) {
         self.closing.store(true, Ordering::Release);
     }
-    /// Ends the host here, and drops any posted work this window never reached.
-    pub(crate) fn finish_close(&self) {
+    /// Drops any posted work this window never reached, and gives back the host. The caller
+    /// ends it last, because the host may hold the last reference to what holds the caller.
+    pub(crate) fn finish_close(&self) -> Option<Arc<dyn UiaHost>> {
         let mut dropped = Vec::new();
         if let Ok(mut table) = waiting().lock() {
             let ids: Vec<u64> = table
@@ -159,13 +160,9 @@ impl WindowThread {
             }
         }
         drop(dropped);
-        if let Some(cell) = self.host.get()
-            && let Ok(mut host) = cell.try_borrow_mut()
-        {
-            let last = host.take();
-            drop(host);
-            drop(last);
-        }
+        self.host
+            .get()
+            .and_then(|cell| cell.try_borrow_mut().ok()?.take())
     }
     /// Runs `body` on the window's thread and gives its answer. If the window stays busy past
     /// the wait, this says to ask again, whatever `body` was going to answer, and `body`
@@ -219,6 +216,10 @@ impl WindowThread {
         match finished {
             Some(Answered(out)) => out,
             None if self.closing.load(Ordering::Acquire) => Err(gone()),
+            // The window went without a shutdown, so asking again can never work.
+            None if !unsafe { IsWindow(Some(HWND(self.window as *mut c_void))) }.as_bool() => {
+                Err(gone())
+            }
             None => Err(not_yet("The window is busy. Ask again soon.")),
         }
     }

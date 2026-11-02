@@ -95,7 +95,9 @@ struct EditorDoc<'a> {
     window: isize,
     scale: f64,
     text: Arc<dyn TextSnapshot>,
-    rows: Option<Vec<qe_editor::VisibleRow>>,
+    /// Each row on screen: its line, its first byte, and the byte after it. Kept for this one
+    /// call, so a move through many lines looks once.
+    rows: Option<Vec<(usize, usize, Option<usize>)>>,
 }
 
 impl TextDoc for EditorDoc<'_> {
@@ -108,10 +110,23 @@ impl TextDoc for EditorDoc<'_> {
     }
     fn row_stops(&mut self, line: usize) -> Vec<usize> {
         let view = &*self.view;
-        let rows = self.rows.get_or_insert_with(|| view.visible_rows().rows);
+        let rows = self.rows.get_or_insert_with(|| {
+            // With wrap off a line is one row, even if the view shows only part of a long one.
+            if !view.wraps() {
+                return Vec::new();
+            }
+            view.visible_rows()
+                .rows
+                .iter()
+                .map(|row| {
+                    let end = view.visible_row_end(row).map(|byte| byte.0);
+                    (row.line.0, row.first_byte.0, end)
+                })
+                .collect()
+        });
         rows.iter()
-            .filter(|row| row.line.0 == line)
-            .map(|row| row.first_byte.0)
+            .filter(|row| row.0 == line)
+            .flat_map(|row| std::iter::once(row.1).chain(row.2))
             .collect()
     }
     fn line_of(&self, byte: usize) -> Answer<usize> {

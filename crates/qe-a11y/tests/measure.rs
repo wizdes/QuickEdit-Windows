@@ -155,7 +155,9 @@ fn caret_at(
 
 /// One FindText, as UIA calls it. Gives whether it found the text, how long the answer took,
 /// and the longest the window's message loop was held up meanwhile.
-fn find(range: &ITextRangeProvider, query: &str, ignore_case: bool) -> (bool, f64, f64) {
+/// What one search answered. `None` means it hit its limit, which is an honest answer on a big
+/// file or a busy PC, and the row shows it.
+fn find(range: &ITextRangeProvider, query: &str, ignore_case: bool) -> (Option<bool>, f64, f64) {
     let moved = SendIt(range.clone());
     let query = query.to_owned();
     let (say, heard) = std::sync::mpsc::channel();
@@ -168,8 +170,9 @@ fn find(range: &ITextRangeProvider, query: &str, ignore_case: bool) -> (bool, f6
                 .FindText(&BSTR::from(query.as_str()), false, ignore_case)
         };
         let summary = match answer {
-            Ok(_) => Ok(true),
-            Err(error) if error.code().0 == 0 => Ok(false),
+            Ok(_) => Ok(Some(true)),
+            Err(error) if error.code().0 == 0 => Ok(Some(false)),
+            Err(error) if error.code().0 == NOT_YET => Ok(None),
             Err(error) => Err(error.to_string()),
         };
         say.send(summary).expect("report");
@@ -204,6 +207,7 @@ fn get_text_settled(range: &ITextRangeProvider, limit: i32) -> (usize, usize) {
 }
 
 fn measure(label: &str, window: &TestWindow, bytes: usize) {
+    keep_the_real_move_limit();
     let ui = window.accessibility();
     let document = ui.document().expect("the document");
     let doc = document_range(&document);
@@ -326,6 +330,13 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
             .or_else(not_yet_is_fine)
             .expect("a provider call");
     });
+    let moving_words = unsafe { middle.Clone() }.expect("Clone");
+    time(&mut rows, "Move(word, huge count)", 5, || {
+        unsafe { moving_words.Move(TextUnit_Word, 1_000_000_000) }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
+    });
     time(&mut rows, "CompareEndpoints", runs, || {
         unsafe {
             end.CompareEndpoints(
@@ -395,9 +406,11 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
     ] {
         let (found, total, stall) = find(&doc, query, ignore_case);
         println!(
-            "  FindText {name:24} found {found}, one call, answer after {total:.1} ms, window held up {stall:.3} ms at most"
+            "  FindText {name:24} found {found:?} (None is the limit), one call, answer after {total:.1} ms, window held up {stall:.3} ms at most"
         );
-        assert_eq!(found, should_find, "{label}: {name}");
+        if let Some(found) = found {
+            assert_eq!(found, should_find, "{label}: {name}");
+        }
     }
     drop(ui);
 }

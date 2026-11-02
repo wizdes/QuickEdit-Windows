@@ -467,7 +467,7 @@ fn read_only_view_reports_it_and_refuses_value_changes() {
     assert_eq!(unsafe { value.Value() }.unwrap(), "abc");
     assert_code(
         unsafe { value.SetValue(windows::core::w!("new")) },
-        UIA_E_ELEMENTNOTENABLED as i32,
+        UIA_E_INVALIDOPERATION as i32,
         "SetValue on read-only text",
     );
     assert_eq!(window.ui.view.borrow().text().unwrap(), "abc");

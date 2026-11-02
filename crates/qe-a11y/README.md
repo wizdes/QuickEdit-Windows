@@ -21,6 +21,8 @@ UIA calls a provider on its own worker thread, not on the window's thread. `src/
 
 1. **Keep one `qe_a11y::UiaSlot` for each window**, somewhere the window procedure can reach it, such as `Rc<UiaSlot>` in the window's state. It starts empty. Its methods take `&self`, and none holds a borrow while host code runs. So host code may call any of them from anywhere: inside an action, inside a dialog, or in WM_DESTROY. Do not put the slot itself in a `RefCell`.
 
+   The host may hold the last reference to the state that holds the slot. Then `shutdown` frees the slot, as the very last thing it does, and `tests/closing.rs` proves that order. If the window procedure reaches its state through a raw pointer, it must clone an `Rc` of the state for the length of the message, or use nothing of the state after `shutdown` returns.
+
 2. **Add one call at the top of the window procedure.** It handles WM_GETOBJECT and the crate's own message:
 
    ```rust
@@ -59,6 +61,8 @@ UIA calls a provider on its own worker thread, not on the window's thread. `src/
 
    Except for `action`, these calls must not wait for disk, shape text or pump messages.
 
+   **Never use a plain `borrow()` or `borrow_mut()` in these calls.** They run from a sent message, which arrives whenever the window's thread is inside a call that takes sent messages. A borrow that is held across such a call would then panic, and the app runs with `panic=abort`, so the user's text is lost. Use `try_borrow`. `widgets` and `document_widget` answer `None` when busy, and the client hears `UIA_E_ELEMENTNOTAVAILABLE`. `with_editor` answers false, and the client hears `UIA_E_TIMEOUT`. So also hold no `RefCell` borrow of the widget tree across a modal loop, a cross-thread `SendMessage` or any other call that can take sent messages. `tests/second_review.rs` runs this case.
+
 4. **Report input.** After each input batch, and after `poll_layout` changes the text, call `slot.after_input()?`. After any change a client can read in a widget, call `slot.widgets_changed()?`. See "For M14" for the list. With no client ever, each reads one `Option`. With a provider and no listener, each makes one system call. Neither needs a timer.
 
 5. **Close.** In WM_DESTROY, call `slot.shutdown()?`, and show its error if it gives one. It must run while the window still exists. After it, every object a client holds says `UIA_E_ELEMENTNOTAVAILABLE`, and WM_GETOBJECT falls through to `DefWindowProcW`. It works inside a sent message too. It first calls `ReplyMessage(0)`, because UIA refuses to disconnect while a sender waits, so that sender then hears 0 or "gone". If it still fails, it keeps what it needs, and a later call tries again.
@@ -67,7 +71,7 @@ UIA calls a provider on its own worker thread, not on the window's thread. `src/
 
 ## Actions
 
-- **Invoke, Toggle, Expand, Collapse and Select** run from a posted message after the client's call has returned S_OK. The call checks that the control exists and is turned on. Later failures go to `UiaHost::action_failed`, and the default prints them, so a shell that wants them on screen overrides it.
+- **Invoke, Toggle, Expand, Collapse and Select** run from a posted message after the client's call has returned S_OK. The call checks that the control exists and is turned on, and the posted message checks again just before it runs. Later failures, including a control that left or turned off in between, go to `UiaHost::action_failed`. The default prints them, so a shell that wants them on screen overrides it.
 - **A modal dialog** may open from these. Pump messages through the same window procedure, and hold no `RefCell` borrow of the view or the widget tree while the dialog runs. WM_GETOBJECT and read calls keep working during the dialog, and a test proves this. A borrowed view makes a call say `UIA_E_TIMEOUT`, not fail for good.
 - **The action may destroy the window.** A posted action on a Close item that leads to WM_DESTROY inside the action is safe.
 - **SetValue, SetRange, SelectText and Focus** run inside the call, so they can report a failure. They must not open a dialog or pump messages. If they run past the 2-second wait, the client hears `UIA_E_TIMEOUT` and the work still finishes.
@@ -76,22 +80,26 @@ UIA itself sets focus on an element before it invokes it, so a host sees a Focus
 
 ## The rules a client sees
 
-- **Line:** a visible row where a layout is on hand. Text off screen, or with no layout yet, counts by logical line, because shaping on the UI thread is not allowed. So a range's line can change as the view scrolls, and a 100 MB line off screen is one line.
+- **Line:** with wrap on, each row on screen is its own line, from its first byte to its last, even a row only partly in view at the top or the bottom. The last row of a logical line includes the line's ending. Text off screen, or with no layout yet, counts as what is left of its logical line, because shaping on the UI thread is not allowed. So on a wrapped line that runs past both edges of the view, the text above the first row is one line, and the text below the last row is one line. A range's line can change as the view scrolls. With wrap off a logical line is always one line, and a 100 MB line is one line.
 - **Paragraph:** a logical line with its ending.
 - **Word:** a run of word characters, or one other character, with the blank text after it. Runs come from the editor's `word_range_at`.
 - **Character:** a grapheme cluster, by the table in `src/clusters.rs`. See the gaps below.
 - **Format and Page:** the whole document, because plain text has one format and no pages.
-- **Move:** an empty range stays empty. A range with text first goes to the start of the unit it is in, then moves, and it stays one unit long. A move makes at least 64 steps, then stops at 8 ms and returns how far it got, as UIA allows. A range with text moves to the very end only by line or paragraph, onto a final empty line, and it then stands there as an empty range. That rule is from memory of what Edit and RichEdit do.
+- **Move:** an empty range stays empty. A range with text first goes to the start of the unit it is in, then moves, and it stays one unit long. A move makes one step, then stops at 8 ms and returns the count it reached, as UIA allows. This holds for every unit, because a move runs on the window's thread. So a client that asks for many units must read the count, and ask again from there. A count short of the request does not mean the document's edge. A count of 0 does. A range with text moves to the very end only by line or paragraph, onto a final empty line, and it then stands there as an empty range. That rule is from memory of what Edit and RichEdit do.
 - **GetText:** at most `GET_TEXT_CAP` units (1,048,576), whatever the limit. **A whole-file read of a huge file cannot be served in one call, and `GetText(-1)` shortens silently: the client gets the first part, with no sign that more exists.** A client reads on with a later range. A limit that ends inside a surrogate pair stops before the pair. The read runs on the calling UIA thread on a snapshot, so it answers in one call even for text not in memory. If any part cannot be read, the answer is an error, so a short answer always means the limit or the cap. A direct call on the window's own thread reads only text in memory, and otherwise says `UIA_E_TIMEOUT`.
-- **FindText:** the search runs on the calling UIA thread on a snapshot, so the window's thread is held only long enough to hand it over, and one call gets the answer. It costs the text's length plus the query's length, not their product. It stops at `FIND_PATIENCE` (15 seconds) and then says `UIA_E_TIMEOUT` once, rather than claim text is absent. UIA's default transaction timeout is 20 seconds, from memory. No match is a real null, with null written over whatever the caller's out value held.
+- **FindText:** the search runs on the calling UIA thread on a snapshot, so the window's thread is held only long enough to hand it over, and one call gets the answer. It costs the text's length plus the query's length, not their product. It stops at `FIND_PATIENCE` (5 seconds) and then says `UIA_E_TIMEOUT` once, rather than claim text is absent. The limit is short because one search makes other UIA calls to this process wait, a screen reader's among them. The window's own thread does not wait. No match is a real null, with null written over whatever the caller's out value held.
 - **A direct FindText on the window's own thread:** UIA does not do this. It reads only text in memory, up to 64 KiB, and otherwise says `UIA_E_TIMEOUT`.
 - **Not yet:** a busy window or a borrowed view says `UIA_E_TIMEOUT`, on every call that needs them. So does a move or a line lookup on text not in memory, and a page read starts by itself. While a mapped file's index grows, DocumentRange covers the known part. A window that stays busy for 2 seconds makes a call say the same, and the work either never runs or finishes with nobody listening.
 - **Stale:** a range from another tab or document, or older than the editor's 4,096-change log, says `UIA_E_ELEMENTNOTAVAILABLE`, on every method. Within those limits a range follows edits and undo. A position inside replaced text goes to where that text began.
 - **Rectangles:** only text on screen has them, clipped to the text area. An empty range has none, as UIA's contract says, so a caret range gives an empty list. A range off screen, or with no layout yet, gives an empty list too.
 - **RangeFromPoint:** any point gets the nearest text, as UIA's contract says, even far outside the window. A point that is not a number is `E_INVALIDARG`. In a text field the position is an estimate, by share of the field's width.
-- **ScrollIntoView:** it puts the range's start at the top or its end at the bottom, and the selection stays. Text with a layout lands exactly. Other text is placed by estimate, so on wrapped text it can land off by the rows the estimate does not know.
-- **Read-only:** `IsReadOnly` is true, and the document offers Value with `IsReadOnly` true and `SetValue` refused. Value stops at the same cap as GetText. An editable document offers no Value.
-- **Events:** at most one text change and one selection change per `after_input`. UIA has no caret event, so a caret move raises the selection change. The first batch after a client starts listening always raises both, even if nothing changed. `widgets_changed` raises focus, structure, field text, field selection, element selected, and property events for name, value, on or off, turned on or off, expanded and range value. Its first report after a client arrives only sets the baseline for these.
+- **ScrollIntoView:** it puts the range's start at the top or its end at the bottom, and the selection stays. Text with a layout lands exactly. Other text is placed by estimate, so on wrapped text it can land off by the rows the estimate does not know. **It never scrolls sideways.** With wrap off, text past the view's right edge stays out of view while the call says S_OK. See "For M14".
+- **Read-only:** `IsReadOnly` is true, and the document offers Value with `IsReadOnly` true. Value stops at the same cap as GetText. An editable document offers no Value.
+- **SetValue on the document:** always refused, with `UIA_E_INVALIDOPERATION`, even through a Value pattern a client kept from when the view was read-only. The host never hears it. A read-only field or range control says the same. A control that is turned off says `UIA_E_ELEMENTNOTENABLED`. Those two codes are what the .NET docs for ValuePattern.SetValue give.
+- **IsOffscreen:** true for a widget or document with no size, one outside the window, or one scrolled out of a list or table that holds it. Other parents do not clip, because a popup paints outside the item that owns it.
+- **IsKeyboardFocusable:** false for a control that is turned off.
+- **A window destroyed with no `shutdown`:** calls say `UIA_E_ELEMENTNOTAVAILABLE`, and not "ask again".
+- **Events:** at most one text change and one selection change per `after_input`. UIA has no caret event, so a caret move raises the selection change. The first batch after a client starts listening always raises both, even if nothing changed. `widgets_changed` raises focus, structure, field text, field selection, element selected, and property events for name, value, on or off, turned on or off, expanded and range value. Its first report after a client arrives only sets the baseline for these. If a raise fails, the call returns the error, and the next report or batch raises everything from that one again. So a client can hear an event twice, but it does not lose one.
 - **Runtime IDs:** a widget's is its number. The document's has a fourth part, so a widget and the document can share a number.
 
 ## For root
@@ -109,7 +117,8 @@ UIA itself sets focus on an element before it invokes it, so a host sees a Focus
    ```
 
    `src/text.rs` then calls them through `TextDoc`, in place of `src/clusters.rs`. These are proposed and not compiled.
-3. **ScrollIntoView:** add `EditorView::reveal_range(range, align_top, ctx)`.
+3. **ScrollIntoView:** add `EditorView::reveal_range(range, align_top, ctx)`. See "For M14" for the sideways part.
+4. **`crates/qe-editor/HOOKS.md`** needs two lines for the new hooks in `src/hooks.rs`: `wraps()` says whether long lines wrap, and `visible_row_end(&row)` gives the byte after a visible row. Both read state already on hand.
 
 ## For M14
 
@@ -119,7 +128,8 @@ These need the shell or `qe-ui`, so the crate cannot do them alone.
 2. **Keep widget IDs unique inside the painted tree.** Check this in `qe-ui`, because a duplicate makes navigation find the wrong node.
 3. **Give fields their character boxes,** for `GetBoundingRectangles` and `RangeFromPoint`. This needs a new field on `qe_api::Widget`.
 4. **Give `WidgetRange` a step,** for `SmallChange` and `LargeChange`.
-5. **Check these in a visible window with Narrator:**
+5. **Let ScrollIntoView scroll sideways.** No public call sets `scroll_x` without moving the caret, so the crate cannot do this. `qe-editor` needs a call that sets it, within its limits, such as `EditorView::set_horizontal_position(x, ctx)`, or the `reveal_range` above. `EditorDoc::scroll` then calls it when wrap is off.
+6. **Check these in a visible window with Narrator:**
    1. A focus event reaches a client, because a hidden window cannot show this.
    2. Reading and magnifying still follow the caret, because an empty caret range now has no rectangle.
 
@@ -127,7 +137,7 @@ These need the shell or `qe-ui`, so the crate cannot do them alone.
 
 - **Grapheme stops.** The rule here is not the editor's. It differs from `unicode-segmentation` 1.12 on 0.032% of 24.5 million tested pairs, mostly rare and historic scripts. Emoji, flags, ZWJ, keycaps, CRLF, Hangul, combining marks and Indic conjuncts matched in the sequences tested.
 - **A run of flags** stays paired in both directions up to `FLAG_RUN_LIMIT`, which is 65,536 UTF-16 units, or 16,384 flags. Past that, forward and backward stops can differ.
-- **A cluster longer than 2,048 units** ends at the window, as in the editor, so forward and backward stops can differ inside it. A test case had 3,000 combining marks on one letter.
+- **A cluster longer than 2,048 units** ends at the window, as in the editor, so forward and backward stops can differ inside it. A stop there is always on a character's edge, never inside a surrogate pair. A test case had 3,000 combining marks on one letter.
 - **A text field** gives the whole field's box for any range with text, and an estimated position for a point, because `Widget` does not say where its characters are.
 - **RangeValue** reports a step of 1, because `WidgetRange` has no step.
 - **Focus events cannot reach a real client from a hidden window.** UIA gives a focus handler only the real keyboard focus, and it refuses a focus handler on one element. The tests check that the event was raised without error.
@@ -145,8 +155,10 @@ cargo clippy -p qe-a11y --locked --tests -- -D warnings
 ```
 
 - `tests/real_client.rs`, `tests/real_events.rs` and `tests/recipe.rs` run a real IUIAutomation client against a hidden window, on another thread or in another process.
-- `tests/com.rs`, `tests/widgets.rs`, `tests/mapped.rs`, `tests/threads.rs`, `tests/busy.rs`, `tests/events.rs`, `tests/review.rs` and `tests/astra.rs` call COM directly.
+- `tests/com.rs`, `tests/widgets.rs`, `tests/mapped.rs`, `tests/threads.rs`, `tests/busy.rs`, `tests/events.rs`, `tests/review.rs`, `tests/astra.rs`, `tests/second_review.rs` and `tests/closing.rs` call COM directly.
+- `strings_a_client_passes_are_not_freed_twice_with_the_string_cache_off` in `tests/real_client.rs` runs its child with `OANOCACHE=1`, because the string cache hides a string freed twice. To check the other real-client tests the same way, set `OANOCACHE=1` for the whole run.
 - `tests/model.rs` runs seeded random moves and edits against a plain model.
+- `tests/move_limit.rs` tests the 8 ms limit on moves. Every test window widens that limit to 5 seconds, because those tests check exact counts, and a pause on a busy machine would stop a move short.
 - `tests/measure.rs` and `tests/measure_key.rs` write real 512 MiB and 1 GiB files and are run by name, in release:
 
 ```
@@ -180,7 +192,20 @@ GetText(-1) and FindText run on the UIA thread, so each row is one call from ano
 | FindText absent, exact case | 82.0 ms, 0.051 ms | 688.6 ms, 0.148 ms | 1,989.8 ms, 10.770 ms |
 | FindText absent, ignoring case | 2,304.9 ms, 0.066 ms | 2,455.4 ms, 0.267 ms | 8,651.4 ms, 36.266 ms |
 
-At 8.7 seconds per GiB in the slowest run, 15 seconds covers about 1.7 GiB ignoring case on this PC while it is loaded, and a bigger file fails honestly once.
+These rows ran before the limit moved from 15 to 5 seconds. See "What 5 seconds covers" below for the new limit.
+
+**What 5 seconds covers.** These are from one run on 2026-11-02 with the 5-second limit, in the same build, with other builds running on the PC. Each number is one call.
+
+| One call | 512 MiB in memory | 512 MiB mapped | 1 GiB mapped |
+| --- | --- | --- | --- |
+| FindText far, exact case | 167 ms | 1,109 ms | 2,013 ms |
+| FindText far, ignoring case | 4,119 ms | hit the limit | hit the limit |
+| FindText absent, exact case | 197 ms | 1,203 ms | 3,006 ms |
+| FindText absent, ignoring case | 3,876 ms | 5,012 ms, just inside | hit the limit |
+
+So on this loaded PC a search ignoring case covers about 512 MiB, and an exact search covers about 1.7 GiB of a mapped file. The earlier table's lighter runs took 2.3 seconds for 512 MiB and 5.0 to 8.7 seconds for 1 GiB ignoring case, so an idle PC may reach about 1 GiB. Past that, the search fails honestly once with `UIA_E_TIMEOUT`. A client hears "ask again", and a new search starts over, so a file past the limit stays unsearched through UIA.
+
+**Word moves with the limit.** In the same run, Move(word) with a huge count had a median of 8.07 ms in memory, 8.62 ms on 512 MiB mapped and 8.56 ms on 1 GiB mapped, down from about 63 to 120 ms worked out from the old rule's 64 steps. The worst single calls were 8.12, 58.18 and 23.84 ms. Move(character) reached 39.65 ms in the same run, so load from other builds is the likely cause of those peaks. This is not proven, and the app's own build was not measured.
 
 - **Over a frame:** one pass of the message loop took 36.266 ms during a 1 GiB search. That pass only ran the test's pump, and the search runs on another thread, so load from other builds is the likely cause. This is not proven.
 - **Repetitive ignore-case search, on the window thread:** an all-a document with a half-length run of a followed by b. 4,096 units took 0.043 ms, 8,192 took 0.081 ms, 16,384 took 0.198 ms, and 65,536 took 0.819 ms. A review measured 232 ms at 16,384 units before the linear search.

@@ -3,8 +3,8 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 use crate::{
     com::{
-        bstr, gone, int_array, interface_array, invalid, none, not_enabled, not_supported,
-        read_error, scale_of, to_screen, to_window,
+        bstr, gone, int_array, interface_array, invalid, invalid_operation, none, not_enabled,
+        not_supported, read_error, scale_of, to_screen, to_window,
     },
     events::{EventFlags, EventTracker},
     host::{UiaHost, WidgetAction},
@@ -12,7 +12,7 @@ use crate::{
     provider::{Shared, Source, make_range, with_doc},
     text::{TextRange, known_len},
 };
-use qe_api::{Rect, Widget, WidgetId, WidgetRole};
+use qe_api::{Dip, Rect, Widget, WidgetId, WidgetRole};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -25,7 +25,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{E_FAIL, HWND, LPARAM, LRESULT, WPARAM},
         System::{Com::SAFEARRAY, Variant::VARIANT},
         UI::{
             Accessibility::*,
@@ -100,6 +100,40 @@ fn hit(node: &Widget, x: f32, y: f32) -> Option<WidgetId> {
     node.children.iter().rev().find_map(|child| {
         hit(child, x, y).or_else(|| contains(child.bounds, x, y).then_some(child.id))
     })
+}
+
+fn overlap(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.0.max(b.x.0);
+    let top = a.y.0.max(b.y.0);
+    let right = (a.x.0 + a.width.0).min(b.x.0 + b.width.0);
+    let bottom = (a.y.0 + a.height.0).min(b.y.0 + b.height.0);
+    (right > left && bottom > top).then_some(Rect {
+        x: Dip(left),
+        y: Dip(top),
+        width: Dip(right - left),
+        height: Dip(bottom - top),
+    })
+}
+
+/// True when none of this rectangle can show: it has no size, it is outside the window, or it is
+/// scrolled out of a list that holds it. Only lists clip, because a popup paints outside the item
+/// that owns it.
+fn is_offscreen(root: &Widget, path: &[usize], bounds: Rect) -> bool {
+    let mut showing = overlap(bounds, bounds);
+    if root.bounds.width.0 > 0.0 && root.bounds.height.0 > 0.0 {
+        showing = showing.and_then(|rect| overlap(rect, root.bounds));
+    }
+    let mut node = root;
+    for &index in path {
+        if matches!(node.role, WidgetRole::List | WidgetRole::Table) {
+            showing = showing.and_then(|rect| overlap(rect, node.bounds));
+        }
+        let Some(next) = node.children.get(index) else {
+            break;
+        };
+        node = next;
+    }
+    showing.is_none()
 }
 
 /// UIA's control type for a role. A table here has no Grid pattern, so it shows as a list
@@ -271,34 +305,80 @@ fn walk(
     }
 }
 
+fn refuse_read_only(widget: &Widget) -> Result<()> {
+    if widget.states.read_only {
+        return Err(invalid_operation("This control is read only."));
+    }
+    Ok(())
+}
+
 impl Node {
     fn widget(&self) -> Result<Widget> {
         let target = self.target;
         self.shared.ui.on_ui(move |host| lookup(host, target))
     }
-    /// Runs now, inside the call. The action must not open a dialog.
+    /// Runs now, inside the call. The action must not open a dialog. The check and the action
+    /// share one crossing to the window's thread, so nothing can change between them.
     fn send(&self, action: WidgetAction) -> Result<()> {
+        self.send_if(|_| Ok(()), action)
+    }
+    fn send_if(
+        &self,
+        check: impl FnOnce(&Widget) -> Result<()> + 'static,
+        action: WidgetAction,
+    ) -> Result<()> {
         let target = self.target;
         self.shared.ui.on_ui(move |host| {
             let widget = lookup(host, target)?;
             if !widget.states.enabled {
                 return Err(not_enabled("This control is turned off."));
             }
+            check(&widget)?;
             host.action(widget.id, action)
         })
     }
     /// Checks the control, then queues the action to run after this call returns, so an
-    /// action that opens a dialog does not hold up the client. A failure goes to the host.
+    /// action that opens a dialog does not hold up the client. It checks again when it runs,
+    /// because the control can change in between. A failure goes to the host.
     fn post(&self, action: WidgetAction) -> Result<()> {
         let widget = self.widget()?;
         if !widget.states.enabled {
             return Err(not_enabled("This control is turned off."));
         }
         let id = widget.id;
+        let target = self.target;
         self.shared.ui.post(move |host| {
-            if let Err(error) = host.action(id, action.clone()) {
+            let answer = lookup(host, target).and_then(|now| {
+                if now.states.enabled {
+                    host.action(id, action.clone())
+                } else {
+                    Err(not_enabled("This control was turned off."))
+                }
+            });
+            if let Err(error) = answer {
                 host.action_failed(id, &action, &error);
             }
+        })
+    }
+    fn offscreen(&self) -> Result<bool> {
+        let target = self.target;
+        self.shared.ui.on_ui(move |host| {
+            let root = host.widgets().ok_or_else(gone)?;
+            Ok(match target {
+                Target::Root => false,
+                Target::Document => {
+                    let bounds = host.document_widget().ok_or_else(gone)?.bounds;
+                    is_offscreen(&root, &[], bounds)
+                }
+                Target::Widget(id) => {
+                    let mut path = Vec::new();
+                    if !path_to(&root, id, &mut path) {
+                        return Err(gone());
+                    }
+                    let bounds = at_path(&root, &path).ok_or_else(gone)?.bounds;
+                    is_offscreen(&root, &path, bounds)
+                }
+            })
         })
     }
     fn text_source(&self) -> Result<Source> {
@@ -359,10 +439,11 @@ impl Node {
             UIA_IsEnabledPropertyId => VARIANT::from(widget.states.enabled),
             UIA_HasKeyboardFocusPropertyId => VARIANT::from(widget.states.focused),
             UIA_IsKeyboardFocusablePropertyId => {
-                VARIANT::from(self.target == Target::Document || focusable(widget.role))
+                let can = self.target == Target::Document || focusable(widget.role);
+                VARIANT::from(can && widget.states.enabled)
             }
             UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => VARIANT::from(true),
-            UIA_IsOffscreenPropertyId => VARIANT::from(false),
+            UIA_IsOffscreenPropertyId => VARIANT::from(self.offscreen()?),
             UIA_IsDialogPropertyId => VARIANT::from(widget.role == WidgetRole::Dialog),
             UIA_HeadingLevelPropertyId if widget.states.section => VARIANT::from(HeadingLevel2.0),
             _ => VARIANT::default(),
@@ -522,11 +603,16 @@ impl IValueProvider_Impl for Node_Impl {
         if value.is_null() {
             return Err(invalid("No text was given."));
         }
-        if self.is_read_only()? {
-            return Err(not_enabled("This text is read only."));
+        // A document never takes a whole new value, whatever a pattern kept from when it was
+        // read-only says. It is changed through its keys and commands.
+        if self.target == Target::Document {
+            self.shared.ui.check_open()?;
+            return Err(invalid_operation(
+                "This document does not take a new value.",
+            ));
         }
         let value = unsafe { value.to_string() }.map_err(|_| invalid("This text is not valid."))?;
-        self.send(WidgetAction::SetValue(value))
+        self.send_if(refuse_read_only, WidgetAction::SetValue(value))
     }
     /// A document's value stops at the same cap as GetText, because tools ask for this
     /// property with no limit.
@@ -623,15 +709,17 @@ impl IExpandCollapseProvider_Impl for Node_Impl {
 }
 impl IRangeValueProvider_Impl for Node_Impl {
     fn SetValue(&self, value: f64) -> Result<()> {
-        let widget = self.widget()?;
-        if widget.states.read_only {
-            return Err(not_enabled("This control is read only."));
-        }
-        let range = widget.range_value.ok_or_else(gone)?;
-        if !value.is_finite() || value < range.minimum || value > range.maximum {
-            return Err(invalid("This value is outside the control's range."));
-        }
-        self.send(WidgetAction::SetRange(value))
+        self.send_if(
+            move |widget| {
+                refuse_read_only(widget)?;
+                let range = widget.range_value.ok_or_else(gone)?;
+                if !value.is_finite() || value < range.minimum || value > range.maximum {
+                    return Err(invalid("This value is outside the control's range."));
+                }
+                Ok(())
+            },
+            WidgetAction::SetRange(value),
+        )
     }
     fn Value(&self) -> Result<f64> {
         Ok(self.widget()?.range_value.ok_or_else(gone)?.value)
@@ -912,8 +1000,12 @@ impl UiaSlot {
         self.closed.set(true);
         // If this fails, the provider stays here, so a later call can try again.
         if let Some(ui) = self.current() {
-            ui.shutdown()?;
+            let host = ui.close()?;
             self.current.borrow_mut().take();
+            drop(ui);
+            // This must stay last. The host may hold the last reference to what holds this slot,
+            // so `self` may be gone after this.
+            drop(host);
         }
         Ok(())
     }
@@ -968,6 +1060,35 @@ fn remember(node: &Widget, into: &mut HashMap<WidgetId, SeenWidget>) {
     }
 }
 
+thread_local! {
+    static FAIL_RAISES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Makes the next `count` raises on this thread fail, because a test has no other way to reach
+/// that failure.
+#[doc(hidden)]
+pub fn fail_next_raises_for_tests(count: u32) {
+    FAIL_RAISES.with(|left| left.set(count));
+}
+
+fn check_raise() -> Result<()> {
+    FAIL_RAISES.with(|left| {
+        if left.get() == 0 {
+            return Ok(());
+        }
+        left.set(left.get() - 1);
+        Err(windows::core::Error::new(
+            E_FAIL,
+            "A test made this raise fail.",
+        ))
+    })
+}
+
+fn raise_event(node: &IRawElementProviderSimple, id: UIA_EVENT_ID) -> Result<()> {
+    check_raise()?;
+    unsafe { UiaRaiseAutomationEvent(node, id) }
+}
+
 fn raise_property(
     node: &IRawElementProviderSimple,
     id: UIA_PROPERTY_ID,
@@ -975,6 +1096,7 @@ fn raise_property(
     new: VARIANT,
     raised: &mut WidgetEvents,
 ) -> Result<()> {
+    check_raise()?;
     unsafe { UiaRaiseAutomationPropertyChangedEvent(node, id, &old, &new) }?;
     raised.properties += 1;
     Ok(())
@@ -1029,12 +1151,12 @@ fn raise_changes(
             raised,
         )?;
         if new.role == WidgetRole::TextField {
-            unsafe { UiaRaiseAutomationEvent(node, UIA_Text_TextChangedEventId) }?;
+            raise_event(node, UIA_Text_TextChangedEventId)?;
             raised.text_changed += 1;
         }
     }
     if old.selection != new.selection && new.role == WidgetRole::TextField {
-        unsafe { UiaRaiseAutomationEvent(node, UIA_Text_TextSelectionChangedEventId) }?;
+        raise_event(node, UIA_Text_TextSelectionChangedEventId)?;
         raised.selection_changed += 1;
     }
     if old.selected != new.selected {
@@ -1046,7 +1168,7 @@ fn raise_changes(
             raised,
         )?;
         if new.selected {
-            unsafe { UiaRaiseAutomationEvent(node, UIA_SelectionItem_ElementSelectedEventId) }?;
+            raise_event(node, UIA_SelectionItem_ElementSelectedEventId)?;
             raised.element_selected += 1;
         }
     }
@@ -1188,15 +1310,23 @@ impl Accessibility {
         if flags == EventFlags::default() {
             return Ok(flags);
         }
+        let answer = self.raise_input(flags);
+        if answer.is_err() {
+            // The next batch then speaks for this one, so a client does not miss the change.
+            self.tracker.borrow_mut().no_client();
+        }
+        answer.map(|()| flags)
+    }
+    fn raise_input(&self, flags: EventFlags) -> Result<()> {
         let document = self.document()?;
         if flags.text_changed {
-            unsafe { UiaRaiseAutomationEvent(&document, UIA_Text_TextChangedEventId) }?;
+            raise_event(&document, UIA_Text_TextChangedEventId)?;
         }
         // UIA has no event for the caret alone. A caret move is a selection change.
         if flags.selection_changed || flags.caret_moved {
-            unsafe { UiaRaiseAutomationEvent(&document, UIA_Text_TextSelectionChangedEventId) }?;
+            raise_event(&document, UIA_Text_TextSelectionChangedEventId)?;
         }
-        Ok(flags)
+        Ok(())
     }
     /// It raises a focus event if focus moved, a structure event if the shape of the tree
     /// changed, and an event for each change a client can read in a widget.
@@ -1218,8 +1348,34 @@ impl Accessibility {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape_of(&root, &mut hasher);
         let shape = std::hash::Hasher::finish(&hasher);
+        let now = match focused_child(&root) {
+            Some(id) => Focus::Widget(id),
+            None if host.document_widget().is_some_and(|d| d.states.focused) => Focus::Document,
+            None => Focus::Nowhere,
+        };
+        let mut states = HashMap::new();
+        remember(&root, &mut states);
+        let document_name = host.document_widget().map(|d| d.name);
         let mut raised = WidgetEvents::default();
-        if self.last_shape.replace(Some(shape)) != Some(shape) {
+        // Nothing is saved until every event is out. If one fails, the error shows now and the
+        // next report raises the lot again. A client can take an event twice, but not none.
+        self.raise_widgets(shape, now, &states, document_name.as_ref(), &mut raised)?;
+        self.last_shape.set(Some(shape));
+        self.last_focus.set(Some(now));
+        self.last_states.replace(Some(states));
+        self.last_document_name.replace(document_name);
+        Ok(raised)
+    }
+    fn raise_widgets(
+        &self,
+        shape: u64,
+        now: Focus,
+        states: &HashMap<WidgetId, SeenWidget>,
+        document_name: Option<&String>,
+        raised: &mut WidgetEvents,
+    ) -> Result<()> {
+        if self.last_shape.get() != Some(shape) {
+            check_raise()?;
             unsafe {
                 UiaRaiseStructureChangedEvent(
                     &self.root,
@@ -1230,64 +1386,63 @@ impl Accessibility {
             }?;
             raised.structure = true;
         }
-        let now = match focused_child(&root) {
-            Some(id) => Focus::Widget(id),
-            None if host.document_widget().is_some_and(|d| d.states.focused) => Focus::Document,
-            None => Focus::Nowhere,
-        };
-        if self.last_focus.replace(Some(now)) != Some(now) {
+        if self.last_focus.get() != Some(now) {
             match now {
                 Focus::Widget(id) => {
                     let node: IRawElementProviderSimple =
                         make_node(&self.shared, Target::Widget(id))?.cast()?;
-                    unsafe { UiaRaiseAutomationEvent(&node, UIA_AutomationFocusChangedEventId) }?;
+                    raise_event(&node, UIA_AutomationFocusChangedEventId)?;
                     raised.focus = true;
                 }
                 Focus::Document => {
                     let document = self.document()?;
-                    unsafe {
-                        UiaRaiseAutomationEvent(&document, UIA_AutomationFocusChangedEventId)
-                    }?;
+                    raise_event(&document, UIA_AutomationFocusChangedEventId)?;
                     raised.focus = true;
                 }
                 Focus::Nowhere => {}
             }
         }
-        let mut states = HashMap::new();
-        remember(&root, &mut states);
-        let before = self.last_states.replace(Some(states.clone()));
-        if let Some(before) = before {
-            for (id, new) in &states {
-                if let Some(old) = before.get(id)
+        // Taken for the raises, because a raise can take a sent message that reaches this object.
+        let before = self.last_states.take();
+        let answer: Result<()> = (|| {
+            for (id, new) in states {
+                if let Some(old) = before.as_ref().and_then(|map| map.get(id))
                     && old != new
                 {
                     let node: IRawElementProviderSimple =
                         make_node(&self.shared, Target::Widget(*id))?.cast()?;
-                    raise_changes(&node, old, new, &mut raised)?;
+                    raise_changes(&node, old, new, raised)?;
                 }
             }
-        }
-        let document_name = host.document_widget().map(|d| d.name);
-        let last_name = self.last_document_name.replace(document_name.clone());
+            Ok(())
+        })();
+        self.last_states.replace(before);
+        answer?;
+        let last_name = self.last_document_name.borrow().clone();
         if let (Some(old), Some(new)) = (last_name, document_name)
-            && old != new
+            && old != *new
         {
             raise_property(
                 &self.document()?,
                 UIA_NamePropertyId,
                 VARIANT::from(old.as_str()),
                 VARIANT::from(new.as_str()),
-                &mut raised,
+                raised,
             )?;
         }
-        Ok(raised)
+        Ok(())
     }
     /// Call on the window's thread. After this, every object a client holds says
     /// UIA_E_ELEMENTNOTAVAILABLE. A second call does nothing, unless the first one failed: it
     /// then tries again, with what it needs still in place.
     pub fn shutdown(&self) -> Result<()> {
+        self.close().map(drop)
+    }
+    /// `shutdown`, which gives back the host. The caller ends it when it no longer needs
+    /// anything the host could be keeping alive.
+    fn close(&self) -> Result<Option<Arc<dyn UiaHost>>> {
         if self.closed.get() {
-            return Ok(());
+            return Ok(None);
         }
         // Calls from other threads now fail at once, so nothing here waits for them.
         self.shared.ui.begin_close();
@@ -1320,15 +1475,14 @@ impl Accessibility {
             unsafe { UiaDisconnectProvider(&document) }?;
         }
         self.closed.set(true);
-        self.finish();
-        Ok(())
+        Ok(self.finish())
     }
-    /// Lets go of the host and the cached objects.
-    fn finish(&self) {
+    /// Lets go of the cached objects, and gives back the host.
+    fn finish(&self) -> Option<Arc<dyn UiaHost>> {
         if let Ok(mut nodes) = self.shared.nodes.lock() {
             nodes.take();
         }
-        self.shared.ui.finish_close();
+        self.shared.ui.finish_close()
     }
 }
 
@@ -1341,7 +1495,7 @@ impl Drop for Accessibility {
         if let Err(error) = self.shutdown() {
             eprintln!("UI Automation did not close cleanly: {error}");
             self.closed.set(true);
-            self.finish();
+            drop(self.finish());
         }
     }
 }

@@ -9,9 +9,10 @@ use qe_editor::EditorView;
 use std::{
     ffi::c_void,
     io::{BufRead, Write},
+    mem::ManuallyDrop,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -26,11 +27,11 @@ use windows::{
                 CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
                 SAFEARRAY,
             },
-            Variant::VARIANT,
+            Variant::{VARIANT, VariantCopy},
         },
         UI::Accessibility::*,
     },
-    core::{Ref, Result, implement},
+    core::{HRESULT, Interface, Ref, Result, implement},
 };
 
 // The `implement` macro names `windows_core` directly.
@@ -78,6 +79,40 @@ impl IUIAutomationEventHandler_Impl for Counter_Impl {
         Ok(())
     }
 }
+
+type PropertyTable = IUIAutomationPropertyChangedEventHandler_Vtbl;
+static PROPERTY_TABLES: OnceLock<(PropertyTable, PropertyTable)> = OnceLock::new();
+
+/// UIA owns the value it passes here, but the generated glue takes it by value and its `Drop`
+/// clears it, which frees a string twice. `src/abi.rs` explains this trap in the provider. So
+/// the glue gets its own copy to clear.
+unsafe extern "system" fn property_changed_with_a_copy(
+    this: *mut c_void,
+    sender: *mut c_void,
+    id: UIA_PROPERTY_ID,
+    value: VARIANT,
+) -> HRESULT {
+    let value = ManuallyDrop::new(value);
+    let mut copy = VARIANT::default();
+    if let Err(error) = unsafe { VariantCopy(&mut copy, &*value) } {
+        return error.code();
+    }
+    let tables = PROPERTY_TABLES.get().expect("the table was installed");
+    unsafe { (tables.0.HandlePropertyChangedEvent)(this, sender, id, copy) }
+}
+
+fn keep_uia_values(handler: &IUIAutomationPropertyChangedEventHandler) {
+    let slot = handler.as_raw().cast::<*const PropertyTable>();
+    let tables = PROPERTY_TABLES.get_or_init(|| {
+        // SAFETY: a method table is a plain struct of function pointers.
+        let (original, mut copy) = unsafe { (std::ptr::read(*slot), std::ptr::read(*slot)) };
+        copy.HandlePropertyChangedEvent = property_changed_with_a_copy;
+        (original, copy)
+    });
+    // SAFETY: the object is new, and UIA has not seen it yet.
+    unsafe { *slot = &tables.1 };
+}
+
 impl IUIAutomationPropertyChangedEventHandler_Impl for Counter_Impl {
     fn HandlePropertyChangedEvent(
         &self,
@@ -128,6 +163,7 @@ fn child_entry() {
         }
         let property: IUIAutomationPropertyChangedEventHandler =
             Counter { hits: hits.clone() }.into();
+        keep_uia_values(&property);
         unsafe {
             client.AddPropertyChangedEventHandlerNativeArray(
                 &element,

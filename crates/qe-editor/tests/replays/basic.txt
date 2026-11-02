@@ -1,0 +1,8 @@
+# Type, move, insert, and check the model result.
+event	0	char	a
+event	1	char	b
+event	2	key_down	37	-	false
+event	3	char	x
+expect	text	axb
+expect	caret	2
+expect	selection	2:2

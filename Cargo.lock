@@ -90,7 +90,9 @@ name = "qe-ime"
 version = "0.1.0"
 dependencies = [
  "qe-api",
+ "qe-buffer",
  "qe-editor",
+ "qe-layout",
  "windows",
 ]
 
@@ -148,7 +150,10 @@ name = "qe-spell"
 version = "0.1.0"
 dependencies = [
  "qe-api",
+ "qe-buffer",
  "qe-editor",
+ "qe-layout",
+ "qe-render",
  "windows",
 ]
 

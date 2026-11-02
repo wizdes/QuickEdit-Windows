@@ -1,362 +1,618 @@
-//! Optional spelling, owned by an editor view only while enabled.
-use qe_api::{ByteOffset, TextSnapshot, ViewContext};
-use qe_editor::{DecorationKind, EditorView};
+//! Spell check through Windows' `ISpellChecker`, on a worker thread.
+//!
+//! # What runs where
+//! - The UI thread owns a [`SpellService`], only while spelling is on. It never waits for
+//!   the checker. It sends text as a snapshot, and reads answers in [`SpellService::poll`].
+//! - The worker owns the checker, and is the only thread that loads the checker's DLL.
+//!
+//! # The host's calls
+//! 1. [`SpellService::start`] when spelling turns on. With spelling off, nothing of this
+//!    crate runs and no spelling DLL loads.
+//! 2. [`SpellService::refresh`] after an edit, a scroll, or a `poll_layout`.
+//! 3. [`SpellService::poll`] when the wake it was given fires.
+//! 4. [`SpellService::menu_at`] on `ViewRequest::ContextMenu`.
+//!
+//! # What a check covers
+//! The text on screen and [`AHEAD_BYTES`] below it, less what was already checked. After an
+//! edit, only the words that it touched go back to the checker.
+mod checker;
+mod ranges;
+mod worker;
+
+pub use checker::{Action, Checker, RawError, WindowsChecker, default_language};
+pub use ranges::CheckedRanges;
+
+use qe_api::{ByteOffset, Point, ViewContext};
+use qe_editor::{ChangesSince, DecorationKind, EditorView, TextEdit, prepare_edits};
 use std::{
+    collections::HashSet,
+    fmt,
     ops::Range,
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
 };
-use windows::{
-    Win32::{
-        Globalization::{ISpellChecker, ISpellCheckerFactory, SpellCheckerFactory},
-        System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-            CoTaskMemFree, CoUninitialize,
-        },
-    },
-    core::{PCWSTR, PWSTR},
-};
+use worker::{Answer, Command, Job};
 
+/// Over this many bytes, spelling turns off, as on the Mac.
 pub const MAX_BYTES: usize = 50 * 1024 * 1024;
+/// The fix menu shows at most this many suggestions. The Mac leaves the number to AppKit,
+/// and its source does not state one, so this number is a choice for the user to check.
+pub const MAX_SUGGESTIONS: usize = 5;
+/// How far below the screen a check reaches, so that a small scroll finds it done.
+pub const AHEAD_BYTES: usize = 4096;
+/// Marks past this count are dropped when far from the screen, because setting the marks
+/// takes time in proportion to the list.
+const MAX_MARKS: usize = 20_000;
+const KEEP_NEAR_BYTES: usize = 1024 * 1024;
+
+/// Why spelling does not run for a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpellOff {
+    /// The setting is off.
+    NotOn,
+    /// Over 50 MB, or a mapped file. The host shows the large-file title.
+    TooLarge,
+    /// A read-only view shows no underlines, and offers no fixes.
+    ReadOnly,
+}
+impl fmt::Display for SpellOff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotOn => "Spelling is off.",
+            Self::TooLarge => "Spelling is off for files over 50 MB.",
+            Self::ReadOnly => "Spelling is off while this document cannot be edited.",
+        })
+    }
+}
+
+/// Why this view gets no spelling now, if any reason applies. A mapped file is always over
+/// the limit, even while its index knows less than 50 MB of it.
+pub fn why_off(view: &EditorView, enabled: bool) -> Option<SpellOff> {
+    if !enabled {
+        return Some(SpellOff::NotOn);
+    }
+    let bytes = view.store_status().known_bytes.0;
+    if bytes > MAX_BYTES || view.worker_snapshot().is_read_only() {
+        return Some(SpellOff::TooLarge);
+    }
+    if !view.can_edit() {
+        return Some(SpellOff::ReadOnly);
+    }
+    None
+}
+
+/// One misspelled word.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Misspelling {
     pub range: Range<ByteOffset>,
     pub word: String,
     pub suggestions: Vec<String>,
 }
+
+/// The fix menu's data, for a right click on a misspelled word. The host builds and paints
+/// the menu, because `qe-ui` is not a dependency here. See the items in [`FixMenu::items`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixMenu {
     pub range: Range<ByteOffset>,
     pub word: String,
     pub suggestions: Vec<String>,
-    pub add_to_dictionary: bool,
-    pub ignore: bool,
-}
-pub enum SpellAction {
-    Add(String),
-    Ignore(String),
-}
-struct Job {
-    snapshot: Arc<dyn TextSnapshot>,
-    range: Range<ByteOffset>,
-    revision: u64,
-}
-enum Command {
-    Check(Job),
-    Action(SpellAction),
-}
-struct Answer {
-    revision: u64,
-    range: Range<ByteOffset>,
-    errors: Vec<Misspelling>,
-    error: Option<String>,
-}
-
-/// All COM calls live on a single-threaded apartment worker.
-pub struct SpellService {
-    jobs: Sender<Command>,
-    answers: Receiver<Answer>,
-    errors: Vec<Misspelling>,
     revision: u64,
     document: u64,
 }
-impl SpellService {
-    pub fn eligible(bytes: usize, enabled: bool) -> bool {
-        enabled && bytes <= MAX_BYTES
+/// One line of the fix menu, in the Mac's order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FixItem {
+    /// Replaces the word with this text.
+    Suggestion(String),
+    /// Shown as a gray line when there are no suggestions.
+    NoSuggestions,
+    AddToDictionary,
+    Ignore,
+}
+impl FixMenu {
+    pub fn items(&self) -> Vec<FixItem> {
+        let mut items: Vec<FixItem> = self
+            .suggestions
+            .iter()
+            .cloned()
+            .map(FixItem::Suggestion)
+            .collect();
+        if items.is_empty() {
+            items.push(FixItem::NoSuggestions);
+        }
+        items.push(FixItem::AddToDictionary);
+        items.push(FixItem::Ignore);
+        items
     }
+}
+
+/// What a [`SpellService::refresh`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpellState {
+    /// All that is on screen has been checked.
+    Done,
+    /// A check is on the worker. The wake fires when it ends.
+    Working,
+    /// The layout has not settled. Call `refresh` after the next `poll_layout`.
+    WaitingForLayout,
+    /// Spelling turned off for this reason, and the marks are gone.
+    Off(SpellOff),
+    /// The checker failed, and `poll` has reported why. Spelling stays off for this view.
+    Failed,
+}
+
+/// What a [`SpellService::poll`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpellPoll {
+    /// The marks changed.
+    pub marks_changed: bool,
+    /// The answer to [`SpellService::find_next`]. `Some(None)` means no misspelling at all.
+    pub found: Option<Option<Misspelling>>,
+}
+
+/// Counts for tests and for measuring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpellCounts {
+    pub jobs_sent: u64,
+    pub bytes_asked: u64,
+    pub answers_applied: u64,
+    pub answers_dropped: u64,
+    pub marks_set: u64,
+}
+
+type Wake = Arc<dyn Fn() + Send + Sync>;
+/// Makes the checker on the worker, the only thread that touches it.
+pub type MakeChecker = Box<dyn FnOnce() -> Result<Box<dyn Checker>, String> + Send>;
+
+/// Spelling for one view.
+pub struct SpellService {
+    jobs: Sender<Command>,
+    answers: Receiver<Answer>,
+    /// A newer generation tells the worker to skip the rest of an old job.
+    generation: Arc<AtomicU64>,
+    marks: Vec<Misspelling>,
+    checked: CheckedRanges,
+    revision: u64,
+    document: u64,
+    in_flight: bool,
+    finding: bool,
+    ignored: HashSet<String>,
+    failed: bool,
+    /// Why the worker never began, for the first `poll` to say.
+    start_failure: Option<String>,
+    off: Option<SpellOff>,
+    counts: SpellCounts,
+}
+
+impl SpellService {
+    /// Starts the worker when this view can have spelling. `language` is a tag such as
+    /// `en-US`, or `None` for the user's language, which is what the Mac follows. Returns
+    /// the reason when it stays off, and then loads nothing.
     pub fn start(
         view: &EditorView,
         enabled: bool,
-        language: &str,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<Option<Self>, String> {
-        if !Self::eligible(view.store_status().known_bytes.0, enabled) {
-            return Ok(None);
+        language: Option<String>,
+        wake: Wake,
+    ) -> Result<Self, SpellOff> {
+        if let Some(off) = why_off(view, enabled) {
+            return Err(off);
         }
+        Ok(Self::start_with(
+            view,
+            Box::new(move || {
+                WindowsChecker::new(language.as_deref())
+                    .map(|checker| Box::new(checker) as Box<dyn Checker>)
+            }),
+            wake,
+        ))
+    }
+    /// [`SpellService::start`] with another checker. Tests use this.
+    pub fn start_with(view: &EditorView, make: MakeChecker, wake: Wake) -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let (answer_tx, answer_rx) = mpsc::channel();
-        let language = language.to_owned();
-        thread::Builder::new()
+        let generation = Arc::new(AtomicU64::new(0));
+        let latest = generation.clone();
+        let spawned = thread::Builder::new()
             .name("qe-spell".into())
-            .spawn(move || worker(language, job_rx, answer_tx, wake))
-            .map_err(|e| format!("Cannot start spelling worker: {e}"))?;
-        Ok(Some(Self {
+            .spawn(move || worker::run(make, job_rx, answer_tx, wake, latest));
+        let mut service = Self {
             jobs: job_tx,
             answers: answer_rx,
-            errors: Vec::new(),
+            generation,
+            marks: Vec::new(),
+            checked: CheckedRanges::default(),
             revision: view.revision(),
             document: view.document_number(),
-        }))
+            in_flight: false,
+            finding: false,
+            ignored: HashSet::new(),
+            failed: false,
+            start_failure: None,
+            off: None,
+            counts: SpellCounts::default(),
+        };
+        if let Err(e) = spawned {
+            service.failed = true;
+            service.start_failure = Some(format!("The spell checker could not start: {e}"));
+        }
+        service
     }
-    pub fn schedule_visible(&mut self, view: &EditorView) -> Result<(), String> {
-        if !Self::eligible(view.store_status().known_bytes.0, true) {
-            return Err("Spelling is off for files over 50 MiB.".into());
-        }
-        if view.document_number() != self.document {
-            self.document = view.document_number();
-            self.errors.clear();
-        }
-        let visible = view
-            .visible_range()
-            .map_err(|e| format!("Spelling waits for layout: {e:?}"))?;
-        let snapshot = view.worker_snapshot();
-        let mut end = (visible.end.0 + 4096).min(view.store_status().known_bytes.0);
-        while end > visible.end.0 && snapshot.try_byte_to_utf16(ByteOffset(end)).is_err() {
-            end -= 1;
-        }
-        let range = visible.start..ByteOffset(end);
-        self.jobs
-            .send(Command::Check(Job {
-                snapshot,
-                range,
-                revision: view.revision(),
-            }))
-            .map_err(|_| "Spelling worker stopped.".to_owned())
+    pub fn counts(&self) -> SpellCounts {
+        self.counts
     }
-    pub fn poll(&mut self, view: &mut EditorView, ctx: &mut ViewContext) -> Result<bool, String> {
+    pub fn marks(&self) -> &[Misspelling] {
+        &self.marks
+    }
+    /// True while a check or a search is on the worker.
+    pub fn is_working(&self) -> bool {
+        self.in_flight || self.finding
+    }
+
+    /// Sends what still needs a check. It takes one look at the change log, and it never
+    /// waits for the checker. One job runs at a time, and `poll` sends the next.
+    pub fn refresh(&mut self, view: &mut EditorView, ctx: &mut ViewContext) -> SpellState {
+        if self.failed {
+            return SpellState::Failed;
+        }
+        if let Some(off) = why_off(view, true) {
+            self.turn_off(view, off, ctx);
+            return SpellState::Off(off);
+        }
+        self.off = None;
+        self.catch_up(view);
+        if self.in_flight {
+            return SpellState::Working;
+        }
+        let Ok(visible) = view.visible_range() else {
+            return SpellState::WaitingForLayout;
+        };
+        let known = view.store_status().known_bytes.0;
+        let window = visible.start.0..visible.end.0.saturating_add(AHEAD_BYTES).min(known);
+        let gaps = self.checked.gaps(&window);
+        if gaps.is_empty() {
+            return SpellState::Done;
+        }
+        self.prune(&window, view, ctx);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.counts.jobs_sent += 1;
+        self.counts.bytes_asked += gaps.iter().map(|g| g.len() as u64).sum::<u64>();
+        let job = Job {
+            snapshot: view.worker_snapshot(),
+            ranges: gaps,
+            revision: view.revision(),
+            document: view.document_number(),
+            generation,
+        };
+        if self.jobs.send(Command::Check(job)).is_err() {
+            self.failed = true;
+            return SpellState::Failed;
+        }
+        self.in_flight = true;
+        SpellState::Working
+    }
+    /// Reads the worker's answers, sets the marks, and sends the next check. A failure comes
+    /// back once, in plain words, and spelling then stays off for this view.
+    pub fn poll(
+        &mut self,
+        view: &mut EditorView,
+        ctx: &mut ViewContext,
+    ) -> Result<SpellPoll, String> {
+        let mut out = SpellPoll::default();
+        self.catch_up(view);
         let mut changed = false;
-        while let Ok(answer) = self.answers.try_recv() {
-            if let Some(error) = answer.error {
-                return Err(error);
-            }
-            if answer.revision != view.revision() || self.document != view.document_number() {
-                continue;
-            }
-            self.errors
-                .retain(|e| e.range.end <= answer.range.start || e.range.start >= answer.range.end);
-            self.errors.extend(answer.errors);
-            self.errors.sort_by_key(|e| e.range.start.0);
-            self.revision = answer.revision;
-            changed = true;
-        }
-        if changed {
-            view.set_decorations(
-                DecorationKind::SpellingUnderline,
-                self.errors.iter().map(|e| e.range.clone()).collect(),
-                ctx,
-            );
-        }
-        Ok(changed)
-    }
-    pub fn menu_at(&self, view: &EditorView, byte: ByteOffset) -> Option<FixMenu> {
-        if self.revision != view.revision() || self.document != view.document_number() {
-            return None;
-        }
-        let e = self
-            .errors
-            .iter()
-            .find(|e| e.range.start <= byte && byte < e.range.end)?;
-        Some(FixMenu {
-            range: e.range.clone(),
-            word: e.word.clone(),
-            suggestions: e.suggestions.clone(),
-            add_to_dictionary: true,
-            ignore: true,
-        })
-    }
-    pub fn act(&self, action: SpellAction) -> Result<(), String> {
-        self.jobs
-            .send(Command::Action(action))
-            .map_err(|_| "Spelling worker stopped.".into())
-    }
-}
-pub fn apply_fix(
-    view: &mut EditorView,
-    range: Range<ByteOffset>,
-    replacement: &str,
-    ctx: &mut ViewContext,
-) -> Result<(), String> {
-    if !view.can_edit() {
-        return Err("This document is read only.".into());
-    }
-    view.replace_range(range, replacement, ctx);
-    Ok(())
-}
-pub fn word_is_candidate(token: &str) -> bool {
-    !token.contains("://")
-        && !token.contains("www.")
-        && !token.contains('@')
-        && !token.contains('.')
-        && token.chars().any(char::is_alphabetic)
-}
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-fn worker(
-    language: String,
-    jobs: Receiver<Command>,
-    answers: Sender<Answer>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-) {
-    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    let checker = if initialized.is_ok() {
-        (|| -> windows::core::Result<ISpellChecker> {
-            let factory: ISpellCheckerFactory =
-                unsafe { CoCreateInstance(&SpellCheckerFactory, None, CLSCTX_INPROC_SERVER)? };
-            let tag = wide(&language);
-            unsafe { factory.CreateSpellChecker(PCWSTR(tag.as_ptr())) }
-        })()
-    } else {
-        Err(initialized.into())
-    };
-    for command in jobs {
-        match command {
-            Command::Action(action) => {
-                if let Ok(checker) = &checker {
-                    let (word, add) = match action {
-                        SpellAction::Add(w) => (w, true),
-                        SpellAction::Ignore(w) => (w, false),
-                    };
-                    let w = wide(&word);
-                    let result = unsafe {
-                        if add {
-                            checker.Add(PCWSTR(w.as_ptr()))
-                        } else {
-                            checker.Ignore(PCWSTR(w.as_ptr()))
-                        }
-                    };
-                    if let Err(e) = result {
-                        let _ = answers.send(Answer {
-                            revision: 0,
-                            range: ByteOffset(0)..ByteOffset(0),
-                            errors: Vec::new(),
-                            error: Some(format!("Cannot update spelling dictionary: {e}")),
-                        });
-                        wake();
+        let mut failure = self.start_failure.take();
+        loop {
+            let answer = match self.answers.try_recv() {
+                Ok(answer) => answer,
+                Err(TryRecvError::Empty) => break,
+                // The worker has gone with work unanswered, so no answer can come.
+                Err(TryRecvError::Disconnected) => {
+                    if self.in_flight || self.finding {
+                        self.in_flight = false;
+                        self.finding = false;
+                        self.failed = true;
+                        failure = Some(stopped());
                     }
-                }
-            }
-            Command::Check(job) => {
-                let result = match &checker {
-                    Ok(checker) => check_job(checker, &job),
-                    Err(e) => Err(format!("Windows spelling is unavailable: {e}")),
-                };
-                let (errors, error) = match result {
-                    Ok(v) => (v, None),
-                    Err(e) => (Vec::new(), Some(e)),
-                };
-                if answers
-                    .send(Answer {
-                        revision: job.revision,
-                        range: job.range,
-                        errors,
-                        error,
-                    })
-                    .is_err()
-                {
                     break;
                 }
-                wake();
+            };
+            match answer {
+                Answer::Checked {
+                    revision,
+                    document,
+                    checked,
+                    errors,
+                } => {
+                    self.in_flight = false;
+                    changed |= self.apply_answer(view, revision, document, checked, errors);
+                }
+                Answer::Skipped => {
+                    self.in_flight = false;
+                    self.counts.answers_dropped += 1;
+                }
+                Answer::Found {
+                    revision,
+                    document,
+                    found,
+                } => {
+                    self.finding = false;
+                    if document == view.document_number() && revision == view.revision() {
+                        out.found = Some(found);
+                    } else {
+                        self.counts.answers_dropped += 1;
+                    }
+                }
+                Answer::Failed(message) => {
+                    self.in_flight = false;
+                    self.finding = false;
+                    self.failed = true;
+                    failure = Some(message);
+                }
+            }
+        }
+        if let Some(message) = failure {
+            self.clear_marks(view, ctx);
+            return Err(message);
+        }
+        if changed {
+            self.show_marks(view, ctx);
+            out.marks_changed = true;
+        }
+        if !self.failed && !self.in_flight {
+            let _ = self.refresh(view, ctx);
+        }
+        Ok(out)
+    }
+    /// The fix menu for a byte, when it is in a misspelled word.
+    pub fn menu_at(&mut self, view: &EditorView, byte: ByteOffset) -> Option<FixMenu> {
+        if why_off(view, true).is_some() {
+            return None;
+        }
+        self.catch_up(view);
+        let at = self.marks.partition_point(|m| m.range.end <= byte);
+        let mark = self.marks.get(at).filter(|m| m.range.start <= byte)?;
+        Some(FixMenu {
+            range: mark.range.clone(),
+            word: mark.word.clone(),
+            suggestions: mark.suggestions.clone(),
+            revision: view.revision(),
+            document: view.document_number(),
+        })
+    }
+    /// [`SpellService::menu_at`] for `ViewRequest::ContextMenu`. A point with no layout under
+    /// it has no menu. The Mac selects the word when it opens this menu, so the host calls
+    /// `select(menu.range)` too.
+    pub fn menu_at_point(&mut self, view: &EditorView, at: Point) -> Option<FixMenu> {
+        let hit = view.byte_at_point(at).ok()?;
+        self.menu_at(view, hit.byte)
+    }
+    /// Replaces the word with a suggestion, as one edit and one undo step.
+    pub fn apply_fix(
+        &mut self,
+        view: &mut EditorView,
+        menu: &FixMenu,
+        replacement: &str,
+        ctx: &mut ViewContext,
+    ) -> Result<(), String> {
+        if !view.can_edit() {
+            return Err("This document cannot be edited, so the word stays as it is.".into());
+        }
+        if menu.revision != view.revision() || menu.document != view.document_number() {
+            return Err("The text changed after this menu opened. Open the menu again.".into());
+        }
+        let edit = TextEdit {
+            range: menu.range.clone(),
+            text: replacement.to_owned(),
+        };
+        let snapshot = view.worker_snapshot();
+        let prepared = prepare_edits(snapshot.as_ref(), &[edit], &AtomicBool::new(false))?;
+        let caret = ByteOffset(menu.range.start.0 + replacement.len());
+        view.apply_edits(&prepared, caret..caret, ctx)?;
+        let _ = self.refresh(view, ctx);
+        Ok(())
+    }
+    /// Adds the word to the user's dictionary, for every document. Marks of it go at once.
+    pub fn add_to_dictionary(
+        &mut self,
+        view: &mut EditorView,
+        menu: &FixMenu,
+        ctx: &mut ViewContext,
+    ) -> Result<(), String> {
+        self.send_word(Command::Add(menu.word.clone()))?;
+        self.forget_word(view, &menu.word, ctx);
+        Ok(())
+    }
+    /// Ignores the word in this document until it closes. Marks of it go at once.
+    pub fn ignore(
+        &mut self,
+        view: &mut EditorView,
+        menu: &FixMenu,
+        ctx: &mut ViewContext,
+    ) -> Result<(), String> {
+        self.send_word(Command::Ignore(menu.word.clone()))?;
+        self.forget_word(view, &menu.word, ctx);
+        Ok(())
+    }
+    /// Looks for the next misspelling after the selection, through the whole document and
+    /// around to its start. This is the Mac's Check Document Now. The answer comes in `poll`,
+    /// and the host selects it.
+    pub fn find_next(&mut self, view: &EditorView) -> Result<(), String> {
+        if let Some(off) = why_off(view, true) {
+            return Err(off.to_string());
+        }
+        self.finding = true;
+        self.jobs
+            .send(Command::FindNext {
+                snapshot: view.worker_snapshot(),
+                from: view.selection().end.0,
+                revision: view.revision(),
+                document: view.document_number(),
+            })
+            .map_err(|_| stopped())
+    }
+    /// Takes the marks away. The host drops the service after this.
+    pub fn stop(mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        self.clear_marks(view, ctx);
+    }
+
+    fn send_word(&self, command: Command) -> Result<(), String> {
+        if self.failed {
+            return Err(stopped());
+        }
+        self.jobs.send(command).map_err(|_| stopped())
+    }
+    fn forget_word(&mut self, view: &mut EditorView, word: &str, ctx: &mut ViewContext) {
+        self.ignored.insert(word.to_owned());
+        self.catch_up(view);
+        self.marks.retain(|m| m.word != word);
+        self.show_marks(view, ctx);
+    }
+    /// Brings the marks and the checked ranges up to the view's text.
+    fn catch_up(&mut self, view: &EditorView) {
+        if view.document_number() != self.document {
+            self.forget_all(view);
+            return;
+        }
+        match view.changes_since(self.revision) {
+            ChangesSince::Current => {}
+            ChangesSince::Rescan => self.forget_all(view),
+            ChangesSince::Changes(list) => {
+                for change in &list {
+                    let c = &change.change;
+                    edit_marks(
+                        &mut self.marks,
+                        c.replaced.start.0,
+                        c.replaced.end.0,
+                        c.new_len,
+                    );
+                    self.checked
+                        .edit(c.replaced.start.0, c.replaced.end.0, c.new_len);
+                }
+                self.revision = view.revision();
             }
         }
     }
-    drop(checker);
-    if initialized.is_ok() {
-        unsafe { CoUninitialize() };
+    fn forget_all(&mut self, view: &EditorView) {
+        self.marks.clear();
+        self.checked.clear();
+        self.ignored.clear();
+        self.revision = view.revision();
+        self.document = view.document_number();
+        // A job for the old text is of no use. The worker skips what it has not begun.
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
-}
-fn check_job(checker: &ISpellChecker, job: &Job) -> Result<Vec<Misspelling>, String> {
-    let mut text = String::new();
-    let mut end = job
-        .range
-        .end
-        .0
-        .min(job.range.start.0.saturating_add(64 * 1024));
-    while end > job.range.start.0 && job.snapshot.try_byte_to_utf16(ByteOffset(end)).is_err() {
-        end -= 1;
+    fn apply_answer(
+        &mut self,
+        view: &EditorView,
+        revision: u64,
+        document: u64,
+        mut checked: Vec<Range<usize>>,
+        mut errors: Vec<Misspelling>,
+    ) -> bool {
+        if document != view.document_number() {
+            self.counts.answers_dropped += 1;
+            return false;
+        }
+        // Typing went on during the check. The answer moves along with the text.
+        let mut answer_ranges = CheckedRanges::from_ranges(std::mem::take(&mut checked));
+        match view.changes_since(revision) {
+            ChangesSince::Current => {}
+            ChangesSince::Rescan => {
+                self.counts.answers_dropped += 1;
+                return false;
+            }
+            ChangesSince::Changes(list) => {
+                for change in &list {
+                    let c = &change.change;
+                    edit_marks(&mut errors, c.replaced.start.0, c.replaced.end.0, c.new_len);
+                    answer_ranges.edit(c.replaced.start.0, c.replaced.end.0, c.new_len);
+                }
+            }
+        }
+        self.counts.answers_applied += 1;
+        errors.retain(|e| !self.ignored.contains(&e.word));
+        let in_answer = |m: &Misspelling| {
+            answer_ranges
+                .ranges()
+                .iter()
+                .any(|r| m.range.start.0 < r.end && r.start < m.range.end.0)
+        };
+        self.marks.retain(|m| !in_answer(m));
+        self.marks.extend(errors);
+        self.marks.sort_by_key(|m| m.range.start);
+        self.marks.dedup_by(|a, b| a.range.start < b.range.end);
+        for range in answer_ranges.ranges() {
+            self.checked.add(range.clone());
+        }
+        true
     }
-    let end = ByteOffset(end);
-    job.snapshot
-        .try_visit_chunks(job.range.start..end, &mut |s| text.push_str(s))
-        .map_err(|e| format!("Spelling text is not ready: {e:?}"))?;
-    let w = wide(&text);
-    let enumerator = unsafe { checker.Check(PCWSTR(w.as_ptr())) }
-        .map_err(|e| format!("Cannot check spelling: {e}"))?;
-    let mut out = Vec::new();
-    loop {
-        let mut error = None;
-        let status = unsafe { enumerator.Next(&mut error) };
-        if status.0 == 1 {
-            break;
+    fn show_marks(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        let ranges: Vec<Range<ByteOffset>> = self.marks.iter().map(|m| m.range.clone()).collect();
+        if ranges != view.decorations(DecorationKind::SpellingUnderline) {
+            view.set_decorations(DecorationKind::SpellingUnderline, ranges, ctx);
         }
-        status
-            .ok()
-            .map_err(|e| format!("Cannot read spelling results: {e}"))?;
-        let Some(error) = error else { break };
-        let start = unsafe { error.StartIndex() }.map_err(|e| e.to_string())? as usize;
-        let end = start + unsafe { error.Length() }.map_err(|e| e.to_string())? as usize;
-        let Some(local_start) = utf16_to_byte(&text, start) else {
-            continue;
-        };
-        let Some(local_end) = utf16_to_byte(&text, end) else {
-            continue;
-        };
-        let Some(word) = text.get(local_start..local_end) else {
-            continue;
-        };
-        if !word_is_candidate(word) {
-            continue;
-        }
-        let before = text.get(..local_start).unwrap_or("");
-        let after = text.get(local_end..).unwrap_or("");
-        let token_start = before
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        let token_end = local_end + after.find(char::is_whitespace).unwrap_or(after.len());
-        let token = text.get(token_start..token_end).unwrap_or("");
-        if token.contains("://")
-            || token.contains("www.")
-            || token.contains('@')
-            || token.contains('.')
-                && token
-                    .trim_end_matches(|c: char| !c.is_alphanumeric())
-                    .contains('.')
+        self.counts.marks_set = self.marks.len() as u64;
+    }
+    fn clear_marks(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
+        self.marks.clear();
+        self.checked.clear();
+        if !view
+            .decorations(DecorationKind::SpellingUnderline)
+            .is_empty()
         {
-            continue;
+            view.set_decorations(DecorationKind::SpellingUnderline, Vec::new(), ctx);
         }
-        let suggestions = suggest(checker, word)?;
-        out.push(Misspelling {
-            range: ByteOffset(job.range.start.0 + local_start)
-                ..ByteOffset(job.range.start.0 + local_end),
-            word: word.to_owned(),
-            suggestions,
-        });
     }
-    Ok(out)
+    fn turn_off(&mut self, view: &mut EditorView, off: SpellOff, ctx: &mut ViewContext) {
+        if self.off != Some(off) {
+            self.off = Some(off);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.clear_marks(view, ctx);
+        }
+        self.revision = view.revision();
+        self.document = view.document_number();
+    }
+    /// Keeps the marks' list short on a very misspelled file that has been scrolled through.
+    fn prune(&mut self, window: &Range<usize>, view: &mut EditorView, ctx: &mut ViewContext) {
+        if self.marks.len() <= MAX_MARKS {
+            return;
+        }
+        let keep = window.start.saturating_sub(KEEP_NEAR_BYTES)
+            ..window.end.saturating_add(KEEP_NEAR_BYTES);
+        self.marks
+            .retain(|m| m.range.end.0 > keep.start && m.range.start.0 < keep.end);
+        self.checked.keep_only(&keep);
+        self.show_marks(view, ctx);
+    }
 }
-fn suggest(checker: &ISpellChecker, word: &str) -> Result<Vec<String>, String> {
-    let w = wide(word);
-    let values = unsafe { checker.Suggest(PCWSTR(w.as_ptr())) }
-        .map_err(|e| format!("Cannot get spelling suggestions: {e}"))?;
-    let mut out = Vec::new();
-    for _ in 0..5 {
-        let mut item = [PWSTR::null()];
-        let status = unsafe { values.Next(&mut item, None) };
-        if status.0 == 1 {
-            break;
-        }
-        status.ok().map_err(|e| e.to_string())?;
-        if item[0].is_null() {
-            break;
-        }
-        let word = unsafe { item[0].to_string() }.map_err(|e| e.to_string());
-        unsafe { CoTaskMemFree(Some(item[0].0.cast())) };
-        out.push(word?);
-    }
-    Ok(out)
+
+fn stopped() -> String {
+    "The spell checker has stopped. Turn spelling off and on to start it again.".into()
 }
-fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
-    let mut units = 0;
-    for (byte, ch) in text.char_indices() {
-        if units == offset {
-            return Some(byte);
+
+/// The same rule that the editor uses for its marks, in `HOOKS.md`.
+fn edit_marks(marks: &mut Vec<Misspelling>, start: usize, old_end: usize, new_len: usize) {
+    let shift = |x: usize| (x + new_len).saturating_sub(old_end - start);
+    marks.retain_mut(|m| {
+        let (a, b) = (m.range.start.0, m.range.end.0);
+        if b <= start {
+            return true;
         }
-        units += ch.len_utf16();
-    }
-    (units == offset).then_some(text.len())
+        if a >= old_end {
+            m.range = ByteOffset(shift(a))..ByteOffset(shift(b));
+            return true;
+        }
+        false
+    });
+}
+
+/// Whether a word is part of a token that the Mac leaves alone: a web address, an email
+/// address, or a file or domain name with a dot inside it. Windows alone would mark some.
+pub fn token_is_skipped(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| !c.is_alphanumeric());
+    token.contains("://") || token.starts_with("www.") || token.contains('@') || token.contains('.')
 }

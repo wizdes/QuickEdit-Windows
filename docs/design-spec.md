@@ -54,3 +54,7 @@ Written in M1. Plain data and traits, so that each crate can be tested with no w
 
 ## 6. Files
 - `docs/plan.md`: the approved plan. `docs/STATE.md`: where things stand. `docs/parity-windows.md`: every behavior and its status. `POST_MVP.md`: follow-ups.
+
+## 7. Top row (user decisions, 2026-11-01)
+- Top row direction B: a rounded tab, as in Windows Terminal. Row 40 tall (32 maximized), tab 32 tall with 8 radius, neutral `#f0f0f0` light and `#262626` dark, and the active tab joins the text area with no rule. No file icon on tabs.
+- The `+` and down caret must look very close to Windows Terminal's (user request). Values from its source (`TabRowControl.xaml`) and WinUI's `SplitButton.xaml`: a split button 24 tall with margin 0,4, each part 31 wide, a 1 wide separator, `+` is U+E710 at 12 px and the caret is ChevronDownSmall U+E96E in a 12 x 12 box, both in Segoe Fluent Icons. Window buttons 46 wide use U+E921, U+E922 (U+E923 when maximized) and U+E8BB at 10 px. M6 proves this with a side-by-side picture against a real Terminal window.

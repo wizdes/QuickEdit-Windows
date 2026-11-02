@@ -7,8 +7,8 @@ use crate::dup::Capture;
 use crate::win::{self, H, KeyInput, Rect, WinPoint};
 use crate::{Child, is_spike, spawn, visible_window, wait_window};
 use qe_perf::{
-    GateFacts, Rng, ScreenRect, Target, TypingReport, WindowAbove, first_cover, gate,
-    parse_type_log, quote_windows_arg, ticks_to_ms, typing_report,
+    GateFacts, Rng, ScreenRect, Target, TypingReport, WindowAbove, first_cover,
+    foreground_thread_links, gate, parse_type_log, quote_windows_arg, ticks_to_ms, typing_report,
 };
 use std::{
     env, fs, mem, thread,
@@ -22,6 +22,46 @@ const LOST_AFTER: Duration = Duration::from_secs(1);
 /// switch to the GPU path changes pixels, so the keys wait for it.
 const SETTLE: Duration = Duration::from_secs(1);
 const SETTLE_LIMIT: Duration = Duration::from_secs(20);
+
+struct AttachedInput(Vec<(u32, u32)>);
+
+impl Drop for AttachedInput {
+    fn drop(&mut self) {
+        for &(first, second) in self.0.iter().rev() {
+            unsafe { win::AttachThreadInput(first, second, 0) };
+        }
+    }
+}
+
+fn bring_to_front(hwnd: H) -> Result<(), String> {
+    unsafe { win::SetForegroundWindow(hwnd) };
+    if unsafe { win::GetForegroundWindow() } == hwnd {
+        return Ok(());
+    }
+    let foreground = unsafe { win::GetForegroundWindow() };
+    if foreground.is_null() {
+        return Ok(()); // The unchanged gate will refuse if no window gets focus.
+    }
+    let foreground_thread =
+        unsafe { win::GetWindowThreadProcessId(foreground, std::ptr::null_mut()) };
+    let target_thread = unsafe { win::GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+    let caller_thread = unsafe { win::GetCurrentThreadId() };
+    let mut attached = AttachedInput(Vec::new());
+    for (first, second) in foreground_thread_links(caller_thread, foreground_thread, target_thread)
+    {
+        if unsafe { win::AttachThreadInput(first, second, 1) } == 0 {
+            return Err(format!("AttachThreadInput failed: error {}", unsafe {
+                win::GetLastError()
+            }));
+        }
+        attached.0.push((first, second));
+    }
+    unsafe {
+        win::BringWindowToTop(hwnd);
+        win::SetForegroundWindow(hwnd);
+    }
+    Ok(())
+}
 
 fn client_region(hwnd: H) -> Result<ScreenRect, String> {
     let mut rect = Rect::default();
@@ -243,7 +283,7 @@ fn drive(
 ) -> Result<(), String> {
     wait_window(child, Duration::from_secs(20))?;
     let hwnd = visible_window(child.info.pid).ok_or("the target window disappeared")?;
-    unsafe { win::SetForegroundWindow(hwnd) };
+    bring_to_front(hwnd)?;
     let began = Instant::now();
     while unsafe { win::GetForegroundWindow() } != hwnd && began.elapsed() < FOREGROUND_WAIT {
         thread::sleep(Duration::from_millis(10));

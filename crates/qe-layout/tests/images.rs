@@ -46,8 +46,54 @@ fn saved_image_rendering_params_are_fixed() {
         DWRITE_RENDERING_MODE_NATURAL
     );
 }
-fn pixels(sample: &str) -> Vec<u8> {
-    let engine = DirectWriteLayout::new().unwrap().with_shaping(true);
+#[test]
+fn arabic_shaping_uses_the_named_font_after_another_font_is_loaded() {
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap() };
+    let sample = "مرحبا بالعالم";
+    let shape = || {
+        let engine = DirectWriteLayout::with_font("Segoe UI", 10.0, DWRITE_FONT_WEIGHT_NORMAL)
+            .unwrap()
+            .with_shaping(true);
+        let layout = engine
+            .layout_line(&StringStore::new(sample), LineIndex(0), Dip(400.0))
+            .unwrap();
+        layout.rows[0]
+            .glyph_runs
+            .iter()
+            .map(|run| {
+                (
+                    run.glyph_ids.clone(),
+                    run.advances
+                        .iter()
+                        .map(|advance| advance.0.to_bits())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = shape();
+    assert_eq!(
+        expected,
+        vec![(
+            vec![
+                2287, 2828, 2256, 3623, 2247, 3, 2251, 2247, 2286, 2275, 2247, 2286, 3671
+            ],
+            vec![
+                1090098517, 1085415424, 1090084864, 1083080704, 1079361536, 1080672256, 1083080704,
+                1079361536, 1083080704, 1090084864, 1079361536, 1083080704, 1090084864,
+            ],
+        )]
+    );
+    let _other_font = DirectWriteLayout::new().unwrap();
+    assert_eq!(shape(), expected);
+    let explicit_pixels = pixels(sample, "Segoe UI");
+    assert_eq!(explicit_pixels.len(), 400 * 80 * 4);
+    unsafe { CoUninitialize() };
+}
+fn pixels(sample: &str, family: &str) -> Vec<u8> {
+    let engine = DirectWriteLayout::with_font(family, 10.0, DWRITE_FONT_WEIGHT_NORMAL)
+        .unwrap()
+        .with_shaping(true);
     let store = StringStore::new(sample);
     let layout = engine
         .layout_line(&store, LineIndex(0), Dip(400.0))
@@ -175,12 +221,15 @@ fn arabic_and_emoji_match_saved_pngs() {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
     }
-    for (name, sample) in [("arabic", "مرحبا بالعالم"), ("emoji", "👩‍💻 😀 👨‍👩‍👧‍👦")]
-    {
+    // System font fallback differs per user, so each saved image names its font.
+    for (name, sample, family) in [
+        ("arabic", "مرحبا بالعالم", "Segoe UI"),
+        ("emoji", "👩‍💻 😀 👨‍👩‍👧‍👦", "Segoe UI Emoji"),
+    ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/images")
             .join(format!("{name}.png"));
-        let actual = pixels(sample);
+        let actual = pixels(sample, family);
         if std::env::var_os("QE_LAYOUT_WRITE_IMAGES").is_some() {
             save_png(&path, &actual);
         }

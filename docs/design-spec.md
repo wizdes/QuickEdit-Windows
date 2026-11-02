@@ -46,6 +46,7 @@ Written in M1. Plain data and traits, so that each crate can be tested with no w
 6. Import Windows functions lazily where a DLL would otherwise load at launch and is not needed for the first frame.
 
 ## 5. Tests
+- Saved-image tests name their fonts directly, because system font fallback differs per user.
 - Each crate's tests run with `cargo test -p <crate>` and need no desktop. They work as the `agent` account over SSH.
 - UI tests replay `InputEvent`s and check the `DisplayList`, or draw it to a bitmap and compare with a saved image at fixed DPI and font.
 - Real windows, timing, Snap, IME and Explorer checks belong to root.

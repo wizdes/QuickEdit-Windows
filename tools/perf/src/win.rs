@@ -107,6 +107,7 @@ unsafe extern "system" {
     pub fn WaitForInputIdle(h: H, ms: u32) -> u32;
     pub fn GetExitCodeProcess(h: H, code: *mut u32) -> i32;
     pub fn GetCurrentProcess() -> H;
+    pub fn GetCurrentThreadId() -> u32;
     pub fn LoadLibraryExW(name: *const u16, file: H, flags: u32) -> H;
     pub fn GetProcAddress(module: H, name: *const u8) -> H;
 }
@@ -123,6 +124,8 @@ unsafe extern "system" {
     pub fn ClientToScreen(h: H, p: *mut WinPoint) -> i32;
     pub fn GetForegroundWindow() -> H;
     pub fn SetForegroundWindow(h: H) -> i32;
+    pub fn BringWindowToTop(h: H) -> i32;
+    pub fn AttachThreadInput(first: u32, second: u32, attach: i32) -> i32;
     pub fn GetWindow(h: H, cmd: u32) -> H;
     pub fn GetClassNameW(h: H, text: *mut u16, max: i32) -> i32;
     pub fn GetAsyncKeyState(vk: i32) -> i16;

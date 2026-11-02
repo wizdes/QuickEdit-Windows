@@ -4,6 +4,20 @@
 /// The first rounds warm the caches. Their rows are labeled and not counted.
 pub const WARMUP_ROUNDS: usize = 2;
 
+/// Thread pairs that share input while a background caller raises a window.
+pub fn foreground_thread_links(caller: u32, foreground: u32, target: u32) -> Vec<(u32, u32)> {
+    if foreground == 0 {
+        return Vec::new();
+    }
+    let mut links = Vec::new();
+    for thread in [caller, target] {
+        if thread != 0 && thread != foreground && !links.contains(&(thread, foreground)) {
+            links.push((thread, foreground));
+        }
+    }
+    links
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Target {
     pub exe: String,

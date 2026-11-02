@@ -1,17 +1,15 @@
-display-list-v3
+display-list-v4
 fill 0.000,0.000,800.000,32.000 #262626ff
 push-clip 0.000,0.000,480.000,32.000
-round 0.000,0.000,240.000,32.000 8.000 #1e1e1eff
-fill 0.000,24.000,240.000,8.000 #1e1e1eff
-text 16.000,10.000 "Segoe UI" #ffffffff "Tab 0"
-text 218.000,10.000 "Segoe Fluent Icons" #ffffffff "\u{e8bb}"
-round 240.000,0.000,240.000,32.000 8.000 #262626ff
-text 256.000,10.000 "Segoe UI" #ffffffff "Tab 1"
-text 458.000,10.000 "Segoe Fluent Icons" #ffffffff "\u{e8bb}"
+round 0.000,0.000,240.000,40.000 8.000 #1e1e1eff
+text 16.000,20.000 "Segoe UI" 13.000 #ffffffff "Tab 0"
+icon 220.500,20.000 "E8BB" 10.000 #ffffffff
+text 256.000,20.000 "Segoe UI" 13.000 #ffffff9e "Tab 1"
+icon 460.500,20.000 "E8BB" 10.000 #ffffffff
 pop-clip
-text 489.500,10.000 "Segoe Fluent Icons" #ffffffff "\u{e710}"
-text 521.500,10.000 "Segoe Fluent Icons" #ffffffff "\u{e96e}"
-line 511.000,4.000 511.000,28.000 1.000 #ffffff38
-text 680.000,11.000 "Segoe Fluent Icons;10px" #ffffffff "\u{e921}"
-text 726.000,11.000 "Segoe Fluent Icons;10px" #ffffffff "\u{e923}"
-text 772.000,11.000 "Segoe Fluent Icons;10px" #ffffffff "\u{e8bb}"
+icon 492.000,20.000 "E710" 12.000 #ffffffff
+icon 524.000,20.000 "E96E" 12.000 #ffffffff
+fill 511.000,4.000,1.000,24.000 #ffffff38
+icon 681.500,20.000 "E921" 10.000 #ffffffff
+icon 727.500,20.000 "E923" 10.000 #ffffffff
+icon 773.500,20.000 "E8BB" 10.000 #ffffffff

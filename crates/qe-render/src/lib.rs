@@ -13,7 +13,9 @@ mod shapes;
 mod text;
 
 use geom::{Area, Regions};
-use qe_api::{Bitmap, Color, Dip, DisplayList, DrawCommand, Point, Rect, RenderError, Renderer};
+use qe_api::{
+    Bitmap, Color, Dip, DisplayList, DrawCommand, PixelRect, Point, Rect, RenderError, Renderer,
+};
 use shapes::{Corners, Surface};
 use std::{mem, result::Result};
 use text::{RunRef, Text};
@@ -747,5 +749,32 @@ impl Renderer for BitmapRenderer {
         other.draw(list)?;
         other.end_frame()?;
         other.bitmap()
+    }
+    fn invalidate(&mut self, rect: Rect) {
+        BitmapRenderer::invalidate(self, rect);
+    }
+    fn invalidate_all(&mut self) {
+        BitmapRenderer::invalidate_all(self);
+    }
+    fn scroll(&mut self, rect: Rect, dy: Dip) -> Result<(), RenderError> {
+        BitmapRenderer::scroll(self, rect, dy)
+    }
+    fn present(&mut self, window: *mut std::ffi::c_void) -> Result<(), RenderError> {
+        BitmapRenderer::present(self, HWND(window))
+    }
+    fn present_rect(
+        &mut self,
+        dc: *mut std::ffi::c_void,
+        rect: PixelRect,
+    ) -> Result<(), RenderError> {
+        self.present_rect_to_dc(
+            HDC(dc),
+            RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+        )
     }
 }

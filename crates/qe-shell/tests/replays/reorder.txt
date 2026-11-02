@@ -1,7 +1,11 @@
-down 100 20
-move 500 20
-up 500 20
-down 580 20
-up 580 20
-expect ReorderTab { from: 0, to: 2 }
-expect CloseTab(2)
+# Drag the first tab to the end, then click the close zone of the dragged tab.
+event	0	mouse_down	100	20	left	-
+event	0	mouse_move	500	20
+event	0	mouse_up	500	20	left	-
+expect	events	ReorderTab { from: 0, to: 2 }
+expect	active	Tab 0
+event	0	mouse_down	580	20	left	-
+event	0	mouse_up	580	20	left	-
+expect	events	ReorderTab { from: 0, to: 2 }|CloseTabRequested(2)|SelectTab(1)
+expect	active	Tab 2
+expect	count	2

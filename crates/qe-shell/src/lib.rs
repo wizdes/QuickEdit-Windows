@@ -1,7 +1,8 @@
-//! QuickEdit's tab row and native frame.
+//! The top-level window, the Terminal-style top row, Snap and the tab strip.
+mod error;
 mod strip;
-pub use strip::*;
-#[cfg(windows)]
 mod window;
-#[cfg(windows)]
+
+pub use error::*;
+pub use strip::*;
 pub use window::*;

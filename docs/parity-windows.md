@@ -67,11 +67,11 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in the menu bar; omit Share. | M7, M13, M14 | changed (menu bar; Share omitted) | no |
 | I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in the menu bar with Windows keys. | M7, M12, M14 | changed (menu bar and Windows keys) | no |
 | I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in the menu bar. | M7, M12 | changed (menu bar) | no |
-| I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10 | changed (grammar omitted) | no |
+| I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10, M14 | changed (grammar omitted) | no |
 | I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | no |
 | I07 | Transformations menu has upper, lower, capitalize. | Keep all three in the menu bar. | M7, M12 | changed (menu bar) | no |
 | I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in the menu bar. | M7, M13, M14 | changed (menu bar) | no |
-| I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and caret menu) | no |
+| I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and menu bar) | no |
 | I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in the menu bar. | M6, M7, M14 | changed (Windows controls and menu bar) | no |
 | I11 | Help menu is empty. | No Help group, because the Mac Help menu is empty. About stays in the caret list. | M7 | left out (nothing to show; choice to check) | no |
 | I12 | Settings is 440 wide, fixed size, with three tabs. | Keep three tabs and 440 device-independent pixels. | M8 | same | no |
@@ -80,7 +80,7 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | I15 | New Document starts with Wrap to Page off. | Start with it off. | M8 | same | no |
 | I16 | Window size starts 90 by 30; fields accept 1–10000. | Keep values and reject junk. | M8 | same | no |
 | I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. | M8 | changed (Windows font) | no |
-| I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10 | changed (grammar omitted) | no |
+| I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10, M14 | changed (grammar omitted) | no |
 | I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep the copy, quote and dash defaults. Text Replacement has no setting, because it is left out. | M8, M12 | changed (Text Replacement omitted) | no |
 | I20 | Line numbers start off. | Start them off. | M8, M13 | same | no |
 | I21 | Add .txt starts on; encoding choices are Automatic or named. | Keep these controls. | M3, M8 | same | no |

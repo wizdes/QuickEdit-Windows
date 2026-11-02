@@ -111,7 +111,28 @@ fn theme_and_display_text_are_stable() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v2\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
+        "display-list-v3\nfill 1.000,2.000,3.000,4.000 #000000ff\n"
+    );
+}
+
+#[test]
+fn glyph_run_stable_text_includes_bidi_level() {
+    let mut list = DisplayList::default();
+    list.push(DrawCommand::GlyphRun {
+        at: Point {
+            x: Dip(2.0),
+            y: Dip(3.0),
+        },
+        bidi_level: 1,
+        font_id: 7,
+        glyph_ids: vec![42],
+        advances: vec![Dip(4.0)],
+        offsets: vec![Point::default()],
+        color: Color::rgb(0, 0, 0),
+    });
+    assert_eq!(
+        list.to_stable_text(),
+        "display-list-v3\nglyph 2.000,3.000 1 7 [42] [\"4.000\"] [\"0.000,0.000\"] #000000ff\n"
     );
 }
 

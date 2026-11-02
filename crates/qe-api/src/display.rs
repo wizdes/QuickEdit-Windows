@@ -40,6 +40,7 @@ pub enum DrawCommand {
     },
     GlyphRun {
         at: Point,
+        bidi_level: u8,
         font_id: u32,
         glyph_ids: Vec<u16>,
         advances: Vec<Dip>,
@@ -68,7 +69,7 @@ impl DisplayList {
     }
     /// Versioned, stable text for saved replay expectations. Floats use fixed 3 decimals.
     pub fn to_stable_text(&self) -> String {
-        let mut out = String::from("display-list-v2\n");
+        let mut out = String::from("display-list-v3\n");
         for command in &self.commands {
             out.push_str(&format_command(command));
             out.push('\n');
@@ -146,14 +147,16 @@ fn format_command(c: &DrawCommand) -> String {
         ),
         DrawCommand::GlyphRun {
             at,
+            bidi_level,
             font_id,
             glyph_ids,
             advances,
             offsets,
             color: c,
         } => format!(
-            "glyph {} {} {:?} {:?} {:?} {}",
+            "glyph {} {} {} {:?} {:?} {:?} {}",
             point(at),
+            bidi_level,
             font_id,
             glyph_ids,
             advances

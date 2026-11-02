@@ -19,7 +19,7 @@ use windows::{
     core::{BOOL, PCWSTR, implement},
 };
 
-type CollectedRun = (u32, u32, u32, Vec<u16>, Vec<Dip>, Vec<Point>, f32);
+type CollectedRun = (u32, u32, u32, Vec<u16>, Vec<Dip>, Vec<Point>, Point, u8);
 static FACES: OnceLock<Mutex<Vec<IDWriteFontFace>>> = OnceLock::new();
 fn register_face(face: &IDWriteFontFace) -> u32 {
     let mut faces = FACES
@@ -74,7 +74,7 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
     fn DrawGlyphRun(
         &self,
         _: *const c_void,
-        _: f32,
+        x: f32,
         y: f32,
         _: DWRITE_MEASURING_MODE,
         run: *const DWRITE_GLYPH_RUN,
@@ -115,7 +115,11 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
                 ids,
                 advances,
                 offsets,
-                y,
+                Point {
+                    x: Dip(x),
+                    y: Dip(y),
+                },
+                run.bidiLevel as u8,
             ));
         Ok(())
     }
@@ -209,14 +213,16 @@ fn font(family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<Arc<Font>
             .map_err(|e| e.to_string())?;
     }
     if !exists.as_bool() {
-        chosen = "Consolas".into();
+        // Segoe UI is the system UI fallback. The first installed family covers
+        // systems where that name is unavailable.
+        chosen = "Segoe UI".into();
         unsafe {
             collection
                 .FindFamilyName(PCWSTR(wide(&chosen).as_ptr()), &mut index, &mut exists)
                 .map_err(|e| e.to_string())?;
         }
         if !exists.as_bool() {
-            return Err("requested font and Consolas missing".into());
+            index = 0;
         }
     }
     let font_obj = unsafe {
@@ -426,6 +432,11 @@ impl DirectWriteLayout {
                 height: Dip(self.font.height),
                 glyph_runs: vec![LayoutGlyphRun {
                     range: start..end,
+                    origin: Point {
+                        x: Dip(0.0),
+                        y: Dip(self.font.baseline),
+                    },
+                    bidi_level: 0,
                     font_id: self.font.id,
                     glyph_ids: ids,
                     advances,
@@ -508,7 +519,7 @@ impl DirectWriteLayout {
                 let mut x = 0.0;
                 let mut py = 0.0;
                 let mut hit = DWRITE_HIT_TEST_METRICS::default();
-                let trailing = u == utf16.len() && u > 0;
+                let trailing = u == last_unit && u > first_unit;
                 let at = if trailing { u - 1 } else { u };
                 if unsafe { l.HitTestTextPosition(at as u32, trailing, &mut x, &mut py, &mut hit) }
                     .is_ok()
@@ -544,11 +555,12 @@ impl DirectWriteLayout {
         unsafe {
             l.Draw(None, &renderer, 0.0, 0.0).ok()?;
         }
-        for (at, len, font_id, ids, advances, offsets, baseline_y) in collected.lock().ok()?.iter()
+        for (at, len, font_id, ids, advances, offsets, origin, bidi_level) in
+            collected.lock().ok()?.iter()
         {
             if let Some(row) = rows
                 .iter_mut()
-                .find(|r| *baseline_y >= r.y.0 && *baseline_y <= r.y.0 + r.height.0)
+                .find(|r| origin.y.0 >= r.y.0 && origin.y.0 <= r.y.0 + r.height.0)
             {
                 let first = boundaries
                     .iter()
@@ -563,6 +575,8 @@ impl DirectWriteLayout {
                     .unwrap_or(row.range.end);
                 row.glyph_runs.push(LayoutGlyphRun {
                     range: first..last,
+                    origin: *origin,
+                    bidi_level: *bidi_level,
                     font_id: *font_id,
                     glyph_ids: ids.clone(),
                     advances: advances.clone(),
@@ -761,12 +775,23 @@ impl Layout for DirectWriteLayout {
     }
 }
 impl TextMeasurer for DirectWriteLayout {
-    fn measure(&self, text: &str, _font: &str) -> TextMetrics {
+    fn measure(&self, text: &str, font_token: &str) -> TextMetrics {
+        // A token may end in a point size, such as "Segoe UI 9". A family-only
+        // token keeps the configured size. Unknown families use Segoe UI, then
+        // the first installed system family. A failed lookup keeps this font.
+        let (family, size) = font_token
+            .rsplit_once(' ')
+            .and_then(|(family, value)| value.parse::<f32>().ok().map(|size| (family, size)))
+            .filter(|(family, size)| !family.is_empty() && size.is_finite() && *size > 0.0)
+            .map(|(family, points)| (family, points * 96.0 / 72.0))
+            .unwrap_or((font_token, unsafe { self.font.format.GetFontSize() }));
+        let selected =
+            font(family, size, DWRITE_FONT_WEIGHT_NORMAL).unwrap_or_else(|_| self.font.clone());
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let width = factory()
             .ok()
             .and_then(|f| unsafe {
-                f.CreateTextLayout(&utf16, &self.font.format, 1_000_000.0, 1_000_000.0)
+                f.CreateTextLayout(&utf16, &selected.format, 1_000_000.0, 1_000_000.0)
                     .ok()
             })
             .and_then(|l| {
@@ -777,8 +802,8 @@ impl TextMeasurer for DirectWriteLayout {
             .unwrap_or(0.0);
         TextMetrics {
             width: Dip(width),
-            height: Dip(self.font.height),
-            baseline: Dip(self.font.baseline),
+            height: Dip(selected.height),
+            baseline: Dip(selected.baseline),
         }
     }
 }

@@ -16,7 +16,37 @@ use windows::{
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
-fn pixels(sample: &str, bidi: u32) -> Vec<u8> {
+fn fixed_rendering_params(factory: &IDWriteFactory) -> IDWriteRenderingParams {
+    unsafe {
+        factory
+            .CreateCustomRenderingParams(
+                2.2,
+                1.0,
+                0.0,
+                DWRITE_PIXEL_GEOMETRY_FLAT,
+                DWRITE_RENDERING_MODE_NATURAL,
+            )
+            .unwrap()
+    }
+}
+#[test]
+fn saved_image_rendering_params_are_fixed() {
+    let factory: IDWriteFactory =
+        unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap() };
+    let params = fixed_rendering_params(&factory);
+    assert_eq!(unsafe { params.GetGamma() }, 2.2);
+    assert_eq!(unsafe { params.GetEnhancedContrast() }, 1.0);
+    assert_eq!(unsafe { params.GetClearTypeLevel() }, 0.0);
+    assert_eq!(
+        unsafe { params.GetPixelGeometry() },
+        DWRITE_PIXEL_GEOMETRY_FLAT
+    );
+    assert_eq!(
+        unsafe { params.GetRenderingMode() },
+        DWRITE_RENDERING_MODE_NATURAL
+    );
+}
+fn pixels(sample: &str) -> Vec<u8> {
     let engine = DirectWriteLayout::new().unwrap().with_shaping(true);
     let store = StringStore::new(sample);
     let layout = engine
@@ -32,10 +62,10 @@ fn pixels(sample: &str, bidi: u32) -> Vec<u8> {
             .unwrap()
     };
     unsafe {
+        target.SetPixelsPerDip(1.0).unwrap(); // fixed 96 DPI
         assert!(PatBlt(target.GetMemoryDC(), 0, 0, 400, 80, WHITENESS).as_bool());
     }
-    let params = unsafe { factory.CreateRenderingParams().unwrap() };
-    let mut x = if bidi == 1 { 200.0 } else { 12.0 };
+    let params = fixed_rendering_params(&factory);
     for run in layout.rows[0].glyph_runs.iter() {
         let face = font_face(run.font_id).unwrap();
         let advances: Vec<f32> = run.advances.iter().map(|a| a.0).collect();
@@ -55,13 +85,13 @@ fn pixels(sample: &str, bidi: u32) -> Vec<u8> {
             glyphAdvances: advances.as_ptr(),
             glyphOffsets: offsets.as_ptr(),
             isSideways: BOOL(0),
-            bidiLevel: bidi,
+            bidiLevel: run.bidi_level as u32,
         };
         unsafe {
             target
                 .DrawGlyphRun(
-                    x,
-                    42.0,
+                    run.origin.x.0 + 12.0,
+                    run.origin.y.0 + 28.0,
                     DWRITE_MEASURING_MODE_NATURAL,
                     &native,
                     &params,
@@ -70,7 +100,6 @@ fn pixels(sample: &str, bidi: u32) -> Vec<u8> {
                 )
                 .unwrap();
         }
-        x += advances.iter().sum::<f32>() * if bidi == 1 { -1.0 } else { 1.0 };
     }
     let bitmap = unsafe { GetCurrentObject(target.GetMemoryDC(), OBJ_BITMAP) };
     let wic: IWICImagingFactory =
@@ -146,12 +175,12 @@ fn arabic_and_emoji_match_saved_pngs() {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
     }
-    for (name, sample, bidi) in [("arabic", "مرحبا بالعالم", 1), ("emoji", "👩‍💻 😀 👨‍👩‍👧‍👦", 0)]
+    for (name, sample) in [("arabic", "مرحبا بالعالم"), ("emoji", "👩‍💻 😀 👨‍👩‍👧‍👦")]
     {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/images")
             .join(format!("{name}.png"));
-        let actual = pixels(sample, bidi);
+        let actual = pixels(sample);
         if std::env::var_os("QE_LAYOUT_WRITE_IMAGES").is_some() {
             save_png(&path, &actual);
         }

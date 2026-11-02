@@ -89,7 +89,7 @@ fn added_draw_commands_have_stable_text() {
     });
     assert_eq!(
         list.to_stable_text(),
-        "display-list-v2\nfill-rects [1.000,2.000,3.000,4.000;1.000,2.000,3.000,4.000] #010203ff\nstroke-rect 1.000,2.000,3.000,4.000 5.000 0.500 #010203ff\nwavy-underline 1.000,2.000 1.000,2.000 #010203ff\n"
+        "display-list-v3\nfill-rects [1.000,2.000,3.000,4.000;1.000,2.000,3.000,4.000] #010203ff\nstroke-rect 1.000,2.000,3.000,4.000 5.000 0.500 #010203ff\nwavy-underline 1.000,2.000 1.000,2.000 #010203ff\n"
     );
 }
 

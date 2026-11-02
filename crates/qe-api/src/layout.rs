@@ -4,6 +4,8 @@ use std::ops::Range;
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutGlyphRun {
     pub range: Range<ByteOffset>,
+    pub origin: Point,
+    pub bidi_level: u8,
     pub font_id: u32,
     pub glyph_ids: Vec<u16>,
     pub advances: Vec<Dip>,

@@ -1,6 +1,6 @@
 use qe_api::{
-    ByteOffset, Dip, Layout, LineIndex, TextPosition, TextSnapshot, TextStore, Utf16Offset,
-    testing::StringStore,
+    ByteOffset, Dip, Layout, LineIndex, Point, TextMeasurer, TextPosition, TextSnapshot, TextStore,
+    Utf16Offset, testing::StringStore,
 };
 use qe_layout::{DirectWriteLayout, HeightMap, LineCache, font_face, slice_around};
 use std::{
@@ -176,6 +176,101 @@ fn hebrew_caret_positions_follow_visual_order() {
         .x
         .0;
     assert!(first > last, "first={first} last={last}");
+}
+
+#[test]
+fn mixed_wrapped_runs_carry_visual_origins_and_levels() {
+    let engine = DirectWriteLayout::new().unwrap().with_shaping(true);
+    let sample = "abc שלום 123 def שלום 456";
+    let store = StringStore::new(sample);
+    let result = engine
+        .layout_line(&store, LineIndex(0), Dip(engine.cell_width().0 * 12.0))
+        .unwrap();
+    assert!(result.rows.len() > 1);
+    let runs: Vec<_> = result.rows.iter().flat_map(|row| &row.glyph_runs).collect();
+    assert!(runs.iter().any(|run| run.bidi_level % 2 == 1));
+    assert!(runs.iter().any(|run| run.bidi_level % 2 == 0));
+    for row in &result.rows {
+        for run in &row.glyph_runs {
+            assert!(run.origin.x.0.is_finite());
+            assert!(run.origin.y.0 >= row.y.0);
+            assert!(run.origin.y.0 <= row.y.0 + row.height.0);
+            assert!(run.range.start >= row.range.start);
+            assert!(run.range.end <= row.range.end);
+        }
+        for stop in &row.caret_stops {
+            let point = engine.hit_test_offset(&result, *stop).unwrap();
+            let hit = engine.hit_test_point(&result, point);
+            let again = engine.hit_test_offset(&result, hit).unwrap();
+            assert!(
+                (again.x.0 - point.x.0).abs() < 0.01,
+                "row={:?} stop={stop:?}",
+                row.range
+            );
+            assert_eq!(again.y, point.y);
+        }
+    }
+    for row in &result.rows {
+        let mut spans: Vec<_> = row
+            .glyph_runs
+            .iter()
+            .map(|run| {
+                let width: f32 = run.advances.iter().map(|a| a.0).sum();
+                if run.bidi_level % 2 == 1 {
+                    (run.origin.x.0 - width, run.origin.x.0)
+                } else {
+                    (run.origin.x.0, run.origin.x.0 + width)
+                }
+            })
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for pair in spans.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0 + 0.01,
+                "visual spans overlap: {spans:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn text_measurer_uses_font_family_and_point_size() {
+    let engine = DirectWriteLayout::new().unwrap();
+    let small = engine.measure("MMMMMMMM", "Segoe UI 9");
+    let large = engine.measure("MMMMMMMM", "Segoe UI 18");
+    let mono = engine.measure("MMMMMMMM", "Cascadia Mono 10");
+    assert!(large.width.0 > small.width.0 * 1.8);
+    assert!((mono.width.0 - small.width.0).abs() > 0.5);
+    assert!(large.height.0 > small.height.0);
+    assert!(engine.measure("text", "Missing Font Family 10").width.0 > 0.0);
+}
+
+#[test]
+fn fixed_width_columns_round_from_absolute_positions_at_fractional_dpi() {
+    let engine = DirectWriteLayout::new().unwrap();
+    let cell = engine.cell_width().0;
+    for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+        let store = StringStore::new("0123456789");
+        let result = engine
+            .layout_line(&store, LineIndex(0), Dip(1000.0))
+            .unwrap();
+        for column in 0..=10 {
+            let point = engine.hit_test_offset(&result, ByteOffset(column)).unwrap();
+            let pixel = (point.x.0 * scale).round() as i32;
+            let expected = (column as f32 * cell * scale).round() as i32;
+            assert_eq!(pixel, expected, "scale={scale} column={column}");
+            assert_eq!(
+                engine.hit_test_point(
+                    &result,
+                    Point {
+                        x: point.x,
+                        y: point.y
+                    }
+                ),
+                ByteOffset(column)
+            );
+        }
+    }
 }
 
 #[test]

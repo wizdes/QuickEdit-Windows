@@ -89,8 +89,11 @@ fn face_key(face: &IDWriteFontFace) -> Result<String, LayoutError> {
     name.truncate(length as usize);
     let (weight, stretch, style) =
         unsafe { (font.GetWeight().0, font.GetStretch().0, font.GetStyle().0) };
+    // Windows and Windows Terminal each install a font with this same name and style, with
+    // different glyphs. The glyph count keeps them apart, or a run would draw the wrong letters.
+    let glyphs = unsafe { face.GetGlyphCount() };
     Ok(format!(
-        "{}|{weight}|{stretch}|{style}|{simulations}",
+        "{}|{weight}|{stretch}|{style}|{simulations}|{glyphs}",
         String::from_utf16_lossy(&name)
     ))
 }

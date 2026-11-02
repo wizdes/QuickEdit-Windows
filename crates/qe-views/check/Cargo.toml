@@ -1,0 +1,23 @@
+# Tests that need qe-render, qe-buffer and qe-pdf together. They sit in a workspace of their
+# own so that the root Cargo.toml and Cargo.lock do not change. Run them with:
+#   cargo test --locked --manifest-path crates/qe-views/check/Cargo.toml
+[package]
+name = "qe-views-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+qe-api = { path = "../../qe-api" }
+qe-buffer = { path = "../../qe-buffer" }
+qe-editor = { path = "../../qe-editor" }
+qe-layout = { path = "../../qe-layout" }
+qe-pdf = { path = "../../qe-pdf" }
+qe-render = { path = "../../qe-render" }
+qe-views = { path = ".." }
+windows = { version = "=0.62.2", default-features = false, features = ["Win32_Graphics_DirectWrite", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

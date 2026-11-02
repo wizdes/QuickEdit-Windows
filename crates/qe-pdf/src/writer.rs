@@ -1,0 +1,199 @@
+//! Writes PDF objects to the temp file as they are made, so that memory does not grow with
+//! the document, and checks the finished file's structure from disk.
+use crate::deflate::Compressor;
+use crate::{PdfError, PdfOptions};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+pub const CATALOG_ID: usize = 1;
+pub const PAGES_ID: usize = 2;
+pub const RESOURCES_ID: usize = 3;
+pub const INFO_ID: usize = 4;
+const FIRST_FREE_ID: usize = 5;
+
+fn problem(error: std::io::Error) -> PdfError {
+    PdfError::Write(format!("The PDF could not be written: {error}"))
+}
+
+pub struct PdfFile {
+    out: BufWriter<File>,
+    at: u64,
+    /// Where each object starts, by id minus one. Zero means not written yet.
+    offsets: Vec<u64>,
+    compressor: Compressor,
+}
+
+impl PdfFile {
+    pub fn create(path: &Path) -> Result<Self, PdfError> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(problem)?;
+        let mut pdf = Self {
+            out: BufWriter::with_capacity(1 << 20, file),
+            at: 0,
+            offsets: vec![0; FIRST_FREE_ID - 1],
+            compressor: Compressor::default(),
+        };
+        // The comment's high bytes tell a reader that this file holds binary data.
+        pdf.raw(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")?;
+        Ok(pdf)
+    }
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), PdfError> {
+        self.out.write_all(bytes).map_err(problem)?;
+        self.at += bytes.len() as u64;
+        Ok(())
+    }
+    pub fn new_id(&mut self) -> usize {
+        self.offsets.push(0);
+        self.offsets.len()
+    }
+    pub fn object_count(&self) -> usize {
+        self.offsets.len()
+    }
+    pub fn object(&mut self, id: usize, body: &[u8]) -> Result<(), PdfError> {
+        self.mark(id)?;
+        self.raw(format!("{id} 0 obj\n").as_bytes())?;
+        self.raw(body)?;
+        self.raw(b"\nendobj\n")
+    }
+    fn mark(&mut self, id: usize) -> Result<(), PdfError> {
+        let slot = id
+            .checked_sub(1)
+            .and_then(|index| self.offsets.get_mut(index))
+            .ok_or_else(|| PdfError::Check(format!("object {id} was never made")))?;
+        *slot = self.at;
+        Ok(())
+    }
+    /// A compressed stream object. `dict` holds any keys other than the length and filter.
+    pub fn stream(&mut self, id: usize, dict: &str, data: &[u8]) -> Result<(), PdfError> {
+        let packed = self.compressor.compress(data);
+        self.mark(id)?;
+        self.raw(
+            format!(
+                "{id} 0 obj\n<< {dict} /Filter /FlateDecode /Length {} >>\nstream\n",
+                packed.len()
+            )
+            .as_bytes(),
+        )?;
+        self.raw(&packed)?;
+        self.raw(b"\nendstream\nendobj\n")
+    }
+    /// Writes the file's end and flushes it to disk. Returns its size.
+    pub fn finish(&mut self, options: &PdfOptions, _pages: usize) -> Result<u64, PdfError> {
+        let mut info = String::from("<< /Creator (QuickEdit)");
+        // The Mac names the file's title only when it prints the header.
+        if options.header_and_footer {
+            info.push_str(" /Title <FEFF");
+            for unit in options.title.encode_utf16() {
+                info.push_str(&format!("{unit:04X}"));
+            }
+            info.push('>');
+        }
+        info.push_str(" >>");
+        self.object(INFO_ID, info.as_bytes())?;
+        if let Some(missing) = self.offsets.iter().position(|offset| *offset == 0) {
+            return Err(PdfError::Check(format!(
+                "object {} was never written",
+                missing + 1
+            )));
+        }
+        let xref = self.at;
+        let count = self.offsets.len() + 1;
+        self.raw(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes())?;
+        let offsets = std::mem::take(&mut self.offsets);
+        for offset in &offsets {
+            self.raw(format!("{offset:010} 00000 n \n").as_bytes())?;
+        }
+        self.raw(
+            format!(
+                "trailer\n<< /Size {count} /Root {CATALOG_ID} 0 R /Info {INFO_ID} 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        )?;
+        self.out.flush().map_err(problem)?;
+        self.out.get_ref().sync_all().map_err(problem)?;
+        Ok(self.at)
+    }
+}
+
+fn read_at(file: &mut File, at: u64, buffer: &mut [u8]) -> Result<usize, PdfError> {
+    file.seek(SeekFrom::Start(at)).map_err(problem)?;
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let got = file.read(&mut buffer[filled..]).map_err(problem)?;
+        if got == 0 {
+            break;
+        }
+        filled += got;
+    }
+    Ok(filled)
+}
+
+/// The check before a temp file becomes the PDF: it ends properly, the table of objects
+/// points at every object, and the page tree has the pages that were written. It reads
+/// a small piece per object, so it does not hold the file in memory.
+pub fn verify_on_disk(path: &Path, pages: usize) -> Result<(), PdfError> {
+    let mut file = File::open(path).map_err(problem)?;
+    let size = file.metadata().map_err(problem)?.len();
+    let bad = |what: &str| PdfError::Check(what.to_string());
+    let mut tail = [0u8; 128];
+    let start = size.saturating_sub(tail.len() as u64);
+    let got = read_at(&mut file, start, &mut tail)?;
+    let tail = String::from_utf8_lossy(&tail[..got]).into_owned();
+    if !tail.ends_with("%%EOF\n") {
+        return Err(bad("its end is missing"));
+    }
+    let xref: u64 = tail
+        .rsplit("startxref\n")
+        .next()
+        .and_then(|rest| rest.lines().next())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| bad("its table of objects cannot be found"))?;
+    let mut head = [0u8; 32];
+    let got = read_at(&mut file, xref, &mut head)?;
+    let head_text = String::from_utf8_lossy(&head[..got]).into_owned();
+    let mut lines = head_text.lines();
+    if lines.next() != Some("xref") {
+        return Err(bad("its table of objects is in the wrong place"));
+    }
+    let count_line = lines.next().ok_or_else(|| bad("its table has no size"))?;
+    let count: usize = count_line
+        .split(' ')
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| bad("its table has no size"))?;
+    let table = xref + 5 + count_line.len() as u64 + 1;
+    for id in 1..count {
+        let mut entry = [0u8; 20];
+        read_at(&mut file, table + id as u64 * 20, &mut entry)?;
+        let offset: u64 = std::str::from_utf8(&entry[..10])
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| bad("an entry of its table is bad"))?;
+        let want = format!("{id} 0 obj\n");
+        let mut found = vec![0u8; want.len()];
+        read_at(&mut file, offset, &mut found)?;
+        if found != want.as_bytes() {
+            return Err(PdfError::Check(format!(
+                "object {id} is not where it should be"
+            )));
+        }
+    }
+    // Object 2 is the page tree, and /Count comes first in it.
+    let mut entry = [0u8; 10];
+    read_at(&mut file, table + PAGES_ID as u64 * 20, &mut entry)?;
+    let offset: u64 = std::str::from_utf8(&entry)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| bad("an entry of its table is bad"))?;
+    let mut tree = [0u8; 64];
+    let got = read_at(&mut file, offset, &mut tree)?;
+    let want = format!("/Count {pages} ");
+    if !String::from_utf8_lossy(&tree[..got]).contains(&want) {
+        return Err(bad("it does not have the pages that were written"));
+    }
+    Ok(())
+}

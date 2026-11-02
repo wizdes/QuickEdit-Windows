@@ -25,9 +25,11 @@ The first 1 MiB sets the size of one block of memory: the text that piece would 
 | UTF-8 | 1 | the file size |
 | Its start is like the rest | 1 | the text plus about 3% and a few MiB |
 | Its start gives less text per byte than the rest | 2, and part of a third | the text plus a few MiB |
-| Its start gives more text per byte than the rest | 1 | up to the first rate, at most 3.1 times the file. The extra part is reserved and not touched |
+| Its start gives more text per byte than the rest | 1 | up to the first rate, at most 3.1 times the file. The extra part is reserved and not touched, and it is given back at the end |
 
 If the first block cannot be reserved, the file is measured, and only a text that truly does not fit gives `TooLarge`.
+
+Giving the extra part back uses `shrink_to_fit`. Windows does not promise that a smaller block stays in place. If it copied, the peak would be the first block plus the text. That did not happen in the bench on this PC, but it is a measurement and not a guarantee.
 
 ### Progress
 
@@ -60,6 +62,13 @@ The backup starts as an empty reservation. Only a backup that is still empty and
 
 `prepare_large_copy` and `PreparedCopy::commit` do the same for a file too large to hold in memory, such as Save As on a file over 512 MiB. `copy_large_original` is the form for a new name. If the input changes during the copy, the result is `SourceChanged` and the partial copy is deleted. `PreparedCopy::discard` throws a copy away and reports a temp file that could not go. A drop does the same but cannot report.
 
+A prepared copy can wait a long time, so these rules apply to it:
+
+- While it waits, it holds its temp file open, so no other program can write to it or rename it.
+- A commit checks everything again: the target's state, the read-only mark, the rights to write and replace, and the temp file's state. A changed temp file gives `TempChanged`, and the target is not touched. `atomic_write` makes the same temp file check.
+- After a failed commit the temp file stays, because the source may be gone and it may be the only copy. `CodecError::left_on_disk` names it.
+- `PreparedCopy::try_commit` gives the copy back in `CommitFailure::copy`, so the caller can try again without copying. Dropping that copy deletes the temp file.
+
 ### A change since the document was opened
 
 1. Call `file_stamp` when the document opens, and again after each save, because a save changes the stamp.
@@ -70,7 +79,9 @@ The backup starts as an empty reservation. Only a backup that is still empty and
 
 ### Failures of cleanup
 
-A file of ours that could not be deleted is always named. Save errors have a `leftover` field for it. Any other error, such as `Cancelled`, is wrapped in `CleanupFailed`, which holds the first error and the file. `transcode_to_utf8_file` treats its `output` the same way.
+A file of ours that could not be deleted is always named. Save errors have a `leftover` field for it. Any other error, such as `Cancelled`, is wrapped in `CleanupFailed`, which holds the first error and the file. A second file is added the same way. `CodecError::left_on_disk` lists them all. `transcode_to_utf8_file` treats its `output` the same way.
+
+Paths in errors are exact, even for a Windows name that is not valid Unicode. Only the error's message shows a stand-in character.
 
 ## Recovery after a crash
 
@@ -87,7 +98,7 @@ A `.tmp` file beside an intact document is not offered, because a crash before t
 
 A process number can be reused. Until the new process ends, its leftovers show `owner_running` and are not offered.
 
-`delete_leftover` deletes one listed file when the user asks. It works even if the file's copied rules deny this user the delete. It refuses with `LeftoverKept` if the name is not one of ours, if the file changed since it was listed, or if another running process made it. It also refuses a file that may hold the user's text, unless the call says `IncludeRecoverable`.
+`delete_leftover` deletes one listed file when the user asks. It works even if the file's copied rules deny this user the delete. It refuses with `LeftoverKept` if the name is not one of ours, if the file changed since it was listed, or if another running process made it. It also refuses a file that may hold the user's text, unless the call says `IncludeRecoverable`. It looks for the document again at that moment and does not trust the list.
 
 ## Known limits
 
@@ -97,4 +108,5 @@ A process number can be reused. Until the new process ends, its leftovers show `
 - **Time steps:** on NTFS the file time moves about every 16 ms. A write of the same size inside one step of the last write can go unseen.
 - **Open writers:** a program that keeps its handle open may write without moving the file's time until it closes the handle. A change of the same size can then go unseen.
 - **Last instant:** no check can close the gap between the last compare and `ReplaceFileW`. Step 9 keeps the other program's bytes when that gap is hit.
+- **Untrusted mount points:** an account under this Windows policy gets error 448 when a path passes through a folder link. A save then fails with that code. The link tests skip themselves in such an account and say so, so they prove link behavior only in an account that may follow links.
 - **Parent links on odd drives:** if a file system driver cannot report a final path, the name is used as given.

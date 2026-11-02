@@ -19,6 +19,61 @@ use windows::core::HSTRING;
 
 const MIB: usize = 1 << 20;
 
+/// Windows error 448: "The path cannot be traversed because it contains an untrusted
+/// mount point." Some accounts, such as the builders' standard `agent` account, refuse
+/// to pass through a folder link. Link tests cannot prove anything there, so they skip
+/// with this reason. An account that may follow links, such as `yjli` on this PC, proves
+/// them. Any other error still fails the test.
+const UNTRUSTED_MOUNT_POINT: i32 = 448;
+fn is_untrusted_mount_point(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(UNTRUSTED_MOUNT_POINT)
+}
+fn save_hit_untrusted_mount_point(result: &Result<AtomicWriteResult, CodecError>) -> bool {
+    match result {
+        Err(CodecError::SaveFailed { code, .. }) => *code == UNTRUSTED_MOUNT_POINT as u32,
+        Err(CodecError::Io(error)) => is_untrusted_mount_point(error),
+        _ => false,
+    }
+}
+fn skip_for_untrusted_mount_point(test: &str) {
+    println!(
+        "SKIPPED {test}: Windows error 448, untrusted mount point. This account may not \
+         follow folder links, so link behavior is not verified here. Run it in an account \
+         that may, such as yjli on this PC."
+    );
+}
+/// True when this account may pass through `folder_link`.
+fn may_follow(folder_link: &Path, test: &str) -> bool {
+    match fs::metadata(folder_link) {
+        Ok(_) => true,
+        Err(error) if is_untrusted_mount_point(&error) => {
+            skip_for_untrusted_mount_point(test);
+            false
+        }
+        Err(error) => panic!("{test}: {error:?}"),
+    }
+}
+#[test]
+fn only_error_448_counts_as_an_untrusted_mount_point() {
+    let error = std::io::Error::from_raw_os_error;
+    assert!(is_untrusted_mount_point(&error(448)));
+    assert!(!is_untrusted_mount_point(&error(5)));
+    assert!(!is_untrusted_mount_point(&error(2)));
+    let failed = |code| {
+        Err(CodecError::SaveFailed {
+            path: PathBuf::new(),
+            code,
+            original_intact: true,
+            leftover: None,
+        })
+    };
+    assert!(save_hit_untrusted_mount_point(&failed(448)));
+    assert!(!save_hit_untrusted_mount_point(&failed(5)));
+    assert!(!save_hit_untrusted_mount_point(&Ok(
+        AtomicWriteResult::Replaced
+    )));
+}
+
 /// Waits out one step of the file time, which moves about every 16 ms. A write of the
 /// same size inside one step looks like no change at all. The README lists this limit.
 fn next_time_step() {
@@ -293,10 +348,18 @@ fn a_relative_dangling_link_in_a_linked_folder_writes_beside_the_real_folder() {
     std::os::windows::fs::symlink_dir(&sub, elsewhere.join("linkdir"))
         .expect("symlinks need Developer Mode");
     std::os::windows::fs::symlink_file(r"..\wanted.txt", sub.join("doc.txt")).unwrap();
-    assert_eq!(
-        atomic_write(&elsewhere.join("linkdir").join("doc.txt"), b"made").unwrap(),
-        AtomicWriteResult::Replaced
-    );
+    let test = "a_relative_dangling_link_in_a_linked_folder";
+    if !may_follow(&elsewhere.join("linkdir"), test) {
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    let saved = atomic_write(&elsewhere.join("linkdir").join("doc.txt"), b"made");
+    if save_hit_untrusted_mount_point(&saved) {
+        skip_for_untrusted_mount_point(test);
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    assert_eq!(saved.unwrap(), AtomicWriteResult::Replaced);
     assert_eq!(
         fs::read(dir.join("real").join("wanted.txt")).unwrap(),
         b"made"
@@ -320,6 +383,11 @@ fn a_dangling_link_writes_where_windows_opens_it() {
     let deep = dir.join("real").join("deep").join("er");
     fs::create_dir_all(&deep).unwrap();
     std::os::windows::fs::symlink_dir(&deep, dir.join("hop")).unwrap();
+    let test = "a_dangling_link_writes_where_windows_opens_it";
+    if !may_follow(&dir.join("hop"), test) {
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
     // Windows removes the `..` in a link's own text as text, so this is the top folder.
     std::os::windows::fs::symlink_file(r"hop\..\a.txt", dir.join("one.txt")).unwrap();
     atomic_write(&dir.join("one.txt"), b"one").unwrap();
@@ -330,7 +398,13 @@ fn a_dangling_link_writes_where_windows_opens_it() {
     // A link to a dangling link, whose second step starts from a linked folder.
     std::os::windows::fs::symlink_file(r"..\b.txt", deep.join("step.txt")).unwrap();
     std::os::windows::fs::symlink_file(r"hop\step.txt", dir.join("two.txt")).unwrap();
-    atomic_write(&dir.join("two.txt"), b"two").unwrap();
+    let saved = atomic_write(&dir.join("two.txt"), b"two");
+    if save_hit_untrusted_mount_point(&saved) {
+        skip_for_untrusted_mount_point(test);
+        fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    saved.unwrap();
     assert_eq!(fs::read(dir.join("two.txt")).unwrap(), b"two");
     assert_eq!(
         fs::read(dir.join("real").join("deep").join("b.txt")).unwrap(),
@@ -398,6 +472,210 @@ fn a_file_that_can_be_edited_but_not_replaced_gives_a_clear_error_and_no_leftove
     }
     assert_eq!(names, ["doc.txt"], "a failed save left a file");
     assert_eq!(read.unwrap(), b"before");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 1: while the copy waits for its commit, nothing else can change it.
+#[test]
+fn nothing_can_overwrite_a_prepared_copy() {
+    let dir = scratch("held-copy");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"whole text").unwrap();
+    fs::write(&dest, b"good file").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    assert!(fs::write(prepared.temp_path(), b"partial").is_err());
+    assert_eq!(fs::read(prepared.temp_path()).unwrap(), b"whole text");
+    assert_eq!(prepared.commit().unwrap(), AtomicWriteResult::Replaced);
+    assert_eq!(fs::read(&dest).unwrap(), b"whole text");
+    assert_eq!(names_in(&dir), ["dest", "input"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A program holds `path` with no sharing, so a swap cannot work.
+fn held_with_no_sharing(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+/// Round 3, item 2: the exact case the review proved. The source is gone, so the copy
+/// is the only one left.
+#[test]
+fn a_failed_commit_keeps_the_only_copy_and_names_it() {
+    let dir = scratch("commit-keeps");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"only copy").unwrap();
+    fs::write(&dest, b"old").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    fs::remove_file(&input).unwrap();
+    let holder = held_with_no_sharing(&dest);
+    let error = prepared.commit().unwrap_err();
+    drop(holder);
+    assert!(
+        matches!(error, CodecError::SharingViolation { .. }),
+        "{error:?}"
+    );
+    let left = error.left_on_disk();
+    assert_eq!(left.len(), 1, "{error:?}");
+    assert_eq!(fs::read(left[0]).unwrap(), b"only copy");
+    assert_eq!(fs::read(&dest).unwrap(), b"old");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 2: `try_commit` gives the copy back, so the caller can try again.
+#[test]
+fn a_failed_try_commit_returns_the_copy_for_a_retry() {
+    let dir = scratch("commit-retry");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"only copy").unwrap();
+    fs::write(&dest, b"old").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    fs::remove_file(&input).unwrap();
+    let holder = held_with_no_sharing(&dest);
+    let failure = prepared.try_commit().unwrap_err();
+    assert!(
+        matches!(failure.error, CodecError::SharingViolation { .. }),
+        "{:?}",
+        failure.error
+    );
+    let copy = failure.copy.expect("the copy must come back");
+    assert_eq!(fs::read(copy.temp_path()).unwrap(), b"only copy");
+    // While it waits for the retry, it is held again.
+    assert!(fs::write(copy.temp_path(), b"partial").is_err());
+    drop(holder);
+    assert_eq!(copy.try_commit().unwrap(), AtomicWriteResult::Replaced);
+    assert_eq!(fs::read(&dest).unwrap(), b"only copy");
+    assert_eq!(names_in(&dir), ["dest"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 2: the same on a new name, where a file appeared at the last moment.
+#[test]
+fn a_commit_to_a_name_that_was_taken_keeps_the_copy() {
+    let dir = scratch("commit-new-taken");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"only copy").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    fs::remove_file(&input).unwrap();
+    fs::write(&dest, b"appeared").unwrap();
+    let error = prepared.commit().unwrap_err();
+    assert!(
+        matches!(error, CodecError::TargetExists { .. }),
+        "{error:?}"
+    );
+    let left = error.left_on_disk();
+    assert_eq!(left.len(), 1, "{error:?}");
+    assert_eq!(fs::read(left[0]).unwrap(), b"only copy");
+    assert_eq!(fs::read(&dest).unwrap(), b"appeared");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 4: a rule added after the copy was prepared counts.
+#[test]
+fn a_commit_obeys_a_rule_added_after_prepare() {
+    let dir = scratch("commit-denied");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"new text").unwrap();
+    fs::write(&dest, b"old").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    set_rules(&dest, "D:P(D;;0x2;;;WD)(A;;FA;;;WD)");
+    let failure = prepared.try_commit();
+    let read = fs::read(&dest);
+    set_rules(&dest, "D:P(A;;FA;;;WD)");
+    let failure = failure.unwrap_err();
+    assert!(
+        matches!(failure.error, CodecError::AccessDenied { code: 5, .. }),
+        "{:?}",
+        failure.error
+    );
+    assert_eq!(read.unwrap(), b"old");
+    // The rule was lifted, so the retry works and the text arrives.
+    let copy = failure.copy.expect("the copy must come back");
+    assert_eq!(copy.try_commit().unwrap(), AtomicWriteResult::Replaced);
+    assert_eq!(fs::read(&dest).unwrap(), b"new text");
+
+    // The read-only mark and the lost delete right are checked again too.
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    let mut permissions = fs::metadata(&dest).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&dest, permissions.clone()).unwrap();
+    let error = prepared.commit().unwrap_err();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&dest, permissions).unwrap();
+    assert!(
+        matches!(error, CodecError::CleanupFailed { .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.left_on_disk().len(), 1, "{error:?}");
+    fs::remove_file(error.left_on_disk()[0]).unwrap();
+    assert_eq!(names_in(&dir), ["dest", "input"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 6: errors hand back a path that opens, for a name that is not valid
+/// Unicode. Such a name is legal on Windows.
+#[test]
+fn error_paths_open_in_a_folder_whose_name_is_not_valid_unicode() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let dir = scratch("surrogate");
+    let units: Vec<u16> = "odd".encode_utf16().chain([0xd800]).collect();
+    let folder = dir.join(std::ffi::OsString::from_wide(&units));
+    fs::create_dir(&folder).unwrap();
+    let (input, dest) = (folder.join("input"), folder.join("dest"));
+    fs::write(&input, b"new text").unwrap();
+    fs::write(&dest, b"old").unwrap();
+    let prepared = prepare_large_copy(&input, &dest, |_, _| {}, || false).unwrap();
+    fs::write(&dest, b"other program").unwrap();
+    let CodecError::TargetChanged {
+        path,
+        new_text: Some(new_text),
+        ..
+    } = prepared.commit().unwrap_err()
+    else {
+        panic!("wrong error");
+    };
+    assert_eq!(fs::read(&new_text).unwrap(), b"new text");
+    assert_eq!(fs::read(&path).unwrap(), b"other program");
+    let exact = |p: &Path| p.as_os_str().encode_wide().any(|unit| unit == 0xd800);
+    assert!(exact(&path) && exact(&new_text), "{path:?} {new_text:?}");
+    // Display may show a stand-in. The path itself must not change.
+    let list = find_leftovers(&folder).unwrap();
+    assert!(list[0].path.exists(), "{:?}", list[0].path);
+    assert!(list[0].likely_target.is_none() || list[0].likely_target.as_ref().unwrap().exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 3: the exact case the review proved.
+#[test]
+fn keep_recoverable_looks_again_for_the_document() {
+    let dir = scratch("recheck");
+    let doc = dir.join("doc.txt");
+    fs::write(&doc, b"current").unwrap();
+    let temp = dir.join(leftover_name(&hash_of(&doc), DEAD, "tmp"));
+    fs::write(&temp, b"only copy of the text").unwrap();
+    let list = find_leftovers(&dir).unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(!list[0].target_missing, "the fixture needs the document");
+    fs::remove_file(&doc).unwrap();
+    let kept = delete_leftover(&list[0], LeftoverDelete::KeepRecoverable);
+    assert!(
+        matches!(kept, Err(CodecError::LeftoverKept { .. })),
+        "{kept:?}"
+    );
+    assert_eq!(fs::read(&temp).unwrap(), b"only copy of the text");
+    // The user's own choice still works.
+    delete_leftover(&list[0], LeftoverDelete::IncludeRecoverable).unwrap();
+    assert!(!temp.exists());
+
+    // The other way round: the document came back, so the temp is no longer the only copy.
+    let temp = dir.join(leftover_name("00000000", DEAD, "tmp"));
+    fs::write(&temp, b"text").unwrap();
+    let list = find_leftovers(&dir).unwrap();
+    assert!(list[0].target_missing);
     fs::remove_dir_all(dir).unwrap();
 }
 

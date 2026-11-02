@@ -865,6 +865,167 @@ fn process_is_running_tells_a_live_process_from_an_ended_one() {
     );
 }
 
+/// Round 3, item 1: the temp file is checked just before the swap, on both routes.
+#[test]
+fn a_temp_file_changed_before_the_swap_is_refused() {
+    let dir = scratch("temp-changed");
+    let (input, dest) = (dir.join("input"), dir.join("dest"));
+    fs::write(&input, b"whole text").unwrap();
+    fs::write(&dest, b"good file").unwrap();
+    let overwrite = || -> PathHook {
+        Some(Box::new(|temp: &Path| {
+            std::thread::sleep(Duration::from_millis(40));
+            fs::write(temp, b"partial").unwrap();
+        }))
+    };
+    let check = |error: CodecError, what: &str| {
+        let CodecError::TempChanged {
+            temp: Some(temp), ..
+        } = &error
+        else {
+            panic!("{what}: {error:?}");
+        };
+        assert_eq!(fs::read(temp).unwrap(), b"partial", "{what}");
+        assert_eq!(error.left_on_disk(), [temp.as_path()], "{what}");
+        fs::remove_file(temp).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"good file", "{what}");
+        assert_eq!(names_in(&dir), ["dest", "input"], "{what}");
+    };
+
+    let mut env = FakeEnv {
+        on_before_commit: overwrite(),
+        ..Default::default()
+    };
+    check(
+        atomic_write_with(&dest, b"mine", &mut env).unwrap_err(),
+        "atomic_write",
+    );
+    assert_eq!(env.replace_calls, 0, "the swap ran anyway");
+
+    let mut env = FakeEnv {
+        on_before_commit: overwrite(),
+        ..Default::default()
+    };
+    let prepared = copy_with(&input, &dest, &mut FakeEnv::default()).unwrap();
+    let failure = prepared.attempt(None, &mut env).unwrap_err();
+    assert!(failure.copy.is_none(), "a changed copy must not be retried");
+    check(failure.error, "commit");
+    assert_eq!(env.replace_calls, 0, "the swap ran anyway");
+
+    // A new name is checked too.
+    let fresh = dir.join("fresh");
+    let mut env = FakeEnv {
+        on_before_commit: overwrite(),
+        ..Default::default()
+    };
+    match atomic_write_with(&fresh, b"mine", &mut env).unwrap_err() {
+        CodecError::TempChanged {
+            temp: Some(temp), ..
+        } => fs::remove_file(temp).unwrap(),
+        other => panic!("{other:?}"),
+    }
+    assert!(!fresh.exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 5: the file came back, but it is not the one the save started from.
+#[test]
+fn a_restored_file_that_differs_is_reported_as_it_is() {
+    let dir = scratch("restored-other");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let mut env = FakeEnv {
+        replace: Some(Box::new(|target, _, backup| {
+            fs::write(target, b"other program").unwrap();
+            fs::rename(target, backup).unwrap();
+            Err(1177)
+        })),
+        ..Default::default()
+    };
+    match atomic_write_with(&path, b"after", &mut env).unwrap_err() {
+        CodecError::TargetChanged {
+            new_text: Some(new_text),
+            other_version: None,
+            ..
+        } => {
+            assert_eq!(fs::read(&new_text).unwrap(), b"after");
+            fs::remove_file(new_text).unwrap();
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"other program");
+    assert_eq!(names_in(&dir), ["doc.txt"], "a backup name would be false");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Round 3, item 6: a Windows name need not be valid Unicode. Only display may change it.
+#[test]
+fn friendly_keeps_a_name_that_is_not_valid_unicode() {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<u16> = r"C:\a"
+        .encode_utf16()
+        .chain([0xd800])
+        .chain([0x62])
+        .collect();
+    let exact = PathBuf::from(OsString::from_wide(&units));
+    let wide = |p: &Path| p.as_os_str().encode_wide().collect::<Vec<u16>>();
+    assert_eq!(wide(&friendly(&verbatim(&exact))), units);
+    assert_eq!(wide(&friendly(&exact)), units);
+    let unc: Vec<u16> = r"\\host\share\".encode_utf16().chain([0xdc00]).collect();
+    let exact = PathBuf::from(OsString::from_wide(&unc));
+    assert_eq!(wide(&friendly(&verbatim(&exact))), unc);
+    // A path that a plain Windows call could not open keeps its long form.
+    let long = PathBuf::from(format!(r"\\?\C:\{}", "a".repeat(300)));
+    assert_eq!(friendly(&long), long);
+}
+
+/// Round 3, item 7: every file that stayed is named, on both failing routes.
+#[test]
+fn two_files_that_could_not_go_are_both_named() {
+    let dir = scratch("two-left");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let names = |error: &CodecError| -> Vec<String> {
+        let mut names: Vec<String> = error
+            .left_on_disk()
+            .iter()
+            .map(|p| p.extension().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    // The target is intact, and something holds the temp file and the reservation.
+    for damaged in [false, true] {
+        let held: Held = Default::default();
+        let keep = held.clone();
+        let mut env = FakeEnv {
+            replace: Some(Box::new(move |target, temp, backup| {
+                if damaged {
+                    fs::write(target, b"damaged").unwrap();
+                }
+                keep.borrow_mut().push(hold(temp));
+                keep.borrow_mut().push(hold(backup));
+                Err(87)
+            })),
+            ..Default::default()
+        };
+        let error = atomic_write_with(&path, b"after", &mut env).unwrap_err();
+        assert_eq!(names(&error), ["bak", "tmp"], "{error:?}");
+        assert!(
+            error.to_string().contains(".bak") || error.to_string().contains(".tmp"),
+            "{error}"
+        );
+        drop(env);
+        held.borrow_mut().clear();
+        for left in error.left_on_disk() {
+            fs::remove_file(left).unwrap();
+        }
+        fs::write(&path, b"before").unwrap();
+    }
+    assert_eq!(names_in(&dir), ["doc.txt"]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn leftover_names_parse_strictly() {
     let name = leftover_name(0xabcd_0123, 77, 0xfeed, "bak");

@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -70,17 +71,24 @@ fn verbatim(path: &Path) -> PathBuf {
     out.shrink_to_fit();
     OsString::from_wide(&out).into()
 }
-/// The path for messages: the plain form when it is short enough to work as typed.
+/// The plain form of a path when it is short enough to work as typed. It works on the
+/// path's own units, because a Windows name need not be valid Unicode. Going through
+/// text would swap such a unit for U+FFFD and name a file that does not exist.
 fn friendly(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text.len() >= 248 {
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if units.len() >= 248 {
         return path.to_path_buf();
     }
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
+    let text = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    if let Some(rest) = units.strip_prefix(&text(r"\\?\UNC\")[..]) {
+        let mut out = text(r"\\");
+        out.extend_from_slice(rest);
+        return OsString::from_wide(&out).into();
     }
-    text.strip_prefix(r"\\?\")
-        .map_or_else(|| path.to_path_buf(), PathBuf::from)
+    match units.strip_prefix(&text(r"\\?\")[..]) {
+        Some(rest) => OsString::from_wide(rest).into(),
+        None => path.to_path_buf(),
+    }
 }
 
 /// What a leftover's name records about its target: a hash of the target's name.
@@ -174,7 +182,7 @@ struct RealEnv;
 impl SaveEnv for RealEnv {}
 
 /// How to tell whether a file is still the file it was.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct FileState {
     volume: u32,
     index: u64,
@@ -569,6 +577,18 @@ fn resolve_dangling_link(link: &Path) -> Result<Resolved, CodecError> {
 /// The checks that come before any byte is written. Returns the state to compare
 /// against later, and the rules a temp file must have.
 fn preflight_existing(target: &Path) -> Result<(FileState, Option<AccessRules>), CodecError> {
+    check_access(target)?;
+    let state = match file_state(target) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Err(save_error(ERROR_FILE_NOT_FOUND.0, target, true, None)),
+        Err(code) => return Err(save_error(code, target, true, None)),
+    };
+    let rules = read_access_rules(target).map_err(|code| save_error(code, target, true, None))?;
+    Ok((state, rules))
+}
+/// Whether this account may save over `target` now. A prepared copy can wait a long
+/// time, so a commit asks again.
+fn check_access(target: &Path) -> Result<(), CodecError> {
     let meta = fs::metadata(target).map_err(|e| save_error(io_code(&e), target, true, None))?;
     if meta.is_dir() {
         return Err(save_error(ERROR_DIRECTORY.0, target, true, None));
@@ -600,13 +620,7 @@ fn preflight_existing(target: &Path) -> Result<(FileState, Option<AccessRules>),
             save_error(code, target, true, None)
         });
     }
-    let state = match file_state(target) {
-        Ok(Some(state)) => state,
-        Ok(None) => return Err(save_error(ERROR_FILE_NOT_FOUND.0, target, true, None)),
-        Err(code) => return Err(save_error(code, target, true, None)),
-    };
-    let rules = read_access_rules(target).map_err(|code| save_error(code, target, true, None))?;
-    Ok((state, rules))
+    Ok(())
 }
 fn sibling_with_new_name(
     target: &Path,
@@ -678,26 +692,72 @@ fn real_cause(code: u32, target: &Path) -> u32 {
     }
     code
 }
+/// What a failed swap does with a finished temp file that is not needed for safety.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TempOnFailure {
+    /// The caller still has the text, as `atomic_write`'s caller does.
+    Delete,
+    /// The temp file may be the only copy, as with a prepared copy whose source is gone.
+    /// The error names it, or `PreparedCopy` gives it back.
+    Keep,
+}
+impl TempOnFailure {
+    /// What the error must add about `temp`.
+    fn apply(self, temp: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Delete => delete_ours(temp),
+            Self::Keep => None,
+        }
+    }
+}
+/// What a swap needs to know about the finished temp file.
+#[derive(Clone, Copy)]
+struct Commit<'a> {
+    target: &'a Path,
+    temp: &'a Path,
+    temp_state: FileState,
+    on_failure: TempOnFailure,
+}
+impl Commit<'_> {
+    fn temp_changed(&self) -> CodecError {
+        CodecError::TempChanged {
+            path: friendly(self.target),
+            temp: if_on_disk(self.temp),
+        }
+    }
+    fn temp_is_as_written(&self) -> bool {
+        matches!(file_state(self.temp), Ok(Some(state)) if state == self.temp_state)
+    }
+}
 /// Puts a finished temp file over an existing target, with the original kept
 /// aside under a reserved name until the swap has worked.
 fn commit_replace(
-    target: &Path,
-    temp: &Path,
+    commit: Commit<'_>,
     before: FileState,
     env: &mut impl SaveEnv,
 ) -> Result<AtomicWriteResult, CodecError> {
+    let Commit {
+        target,
+        temp,
+        on_failure,
+        ..
+    } = commit;
+    // A rule or mark added since the save began counts. If the file itself changed,
+    // `retry_replace` reports that, which says more.
+    if matches!(file_state(target), Ok(Some(state)) if state == before)
+        && let Err(error) = check_access(target)
+    {
+        return Err(with_leftover(error, on_failure.apply(temp)));
+    }
     let backup = sibling_with_new_name(target, "bak", env, |candidate| {
         create_new_with_rules(candidate, None).map(drop)
     });
     let backup = match backup {
         Ok(backup) => backup,
-        Err(error) => {
-            let leftover = delete_ours(temp);
-            return Err(with_leftover(error, leftover));
-        }
+        Err(error) => return Err(with_leftover(error, on_failure.apply(temp))),
     };
     let placeholder = file_state(&backup).ok().flatten();
-    match retry_replace(target, temp, &backup, before, env) {
+    match retry_replace(commit, &backup, before, env) {
         Swap::Done => after_good_replace(target, &backup, before),
         Swap::TargetChanged => {
             let error = CodecError::TargetChanged {
@@ -707,9 +767,9 @@ fn commit_replace(
             };
             Err(with_leftover(error, delete_ours(&backup)))
         }
+        Swap::TempChanged => Err(with_leftover(commit.temp_changed(), delete_ours(&backup))),
         Swap::Failed(code) => Err(after_failed_replace(
-            target,
-            temp,
+            commit,
             &backup,
             placeholder,
             before,
@@ -752,25 +812,30 @@ enum Swap {
     Done,
     /// The target was not what this save started from, and no swap was tried.
     TargetChanged,
+    /// The temp file was not what this save wrote, and no swap was tried.
+    TempChanged,
     Failed(u32),
 }
 fn retry_replace(
-    target: &Path,
-    temp: &Path,
+    commit: Commit<'_>,
     backup: &Path,
     before: FileState,
     env: &mut impl SaveEnv,
 ) -> Swap {
+    let Commit { target, temp, .. } = commit;
     let mut tries = 0;
     let mut last_code = None;
     loop {
         // Checked before every try: a retry waits long enough for another program to
-        // finish its own save. A failed try may itself have changed the target, and
+        // finish its own save. A failed try may itself have changed these files, and
         // only `after_failed_replace` can tell, so after a try the code is what counts.
         match file_state(target) {
             Ok(Some(state)) if state == before => {}
             Ok(_) => return last_code.map_or(Swap::TargetChanged, Swap::Failed),
             Err(code) => return Swap::Failed(last_code.unwrap_or(code)),
+        }
+        if !commit.temp_is_as_written() {
+            return last_code.map_or(Swap::TempChanged, Swap::Failed);
         }
         match env.replace(target, temp, backup) {
             Ok(()) => return Swap::Done,
@@ -791,38 +856,55 @@ fn is_passing(code: u32) -> bool {
         || code == ERROR_UNABLE_TO_REMOVE_REPLACED.0
         || code == ERROR_ACCESS_DENIED.0
 }
-/// Adds a file that could not be deleted to an error. An error with no place for it
-/// is wrapped, so the file is never left unsaid.
+/// Adds a file of ours that stayed on disk to an error. An error with no free place
+/// for it is wrapped, so a second file or an error with no such field loses nothing.
 pub(crate) fn with_leftover(error: CodecError, found: Option<PathBuf>) -> CodecError {
     let Some(found) = found else {
         return error;
     };
-    let found_slot = Some(found.clone());
     match error {
-        CodecError::AccessDenied { path, code, .. } => CodecError::AccessDenied {
+        CodecError::AccessDenied {
             path,
             code,
-            leftover: found_slot,
+            leftover: None,
+        } => CodecError::AccessDenied {
+            path,
+            code,
+            leftover: Some(found),
         },
-        CodecError::SharingViolation { path, code, .. } => CodecError::SharingViolation {
+        CodecError::SharingViolation {
             path,
             code,
-            leftover: found_slot,
+            leftover: None,
+        } => CodecError::SharingViolation {
+            path,
+            code,
+            leftover: Some(found),
         },
         CodecError::SaveFailed {
             path,
             code,
             original_intact,
-            ..
+            leftover: None,
         } => CodecError::SaveFailed {
             path,
             code,
             original_intact,
-            leftover: found_slot,
+            leftover: Some(found),
         },
-        CodecError::SourceChanged { path, .. } => CodecError::SourceChanged {
+        CodecError::SourceChanged {
             path,
-            leftover: found_slot,
+            leftover: None,
+        } => CodecError::SourceChanged {
+            path,
+            leftover: Some(found),
+        },
+        CodecError::TargetExists {
+            path,
+            leftover: None,
+        } => CodecError::TargetExists {
+            path,
+            leftover: Some(found),
         },
         other => CodecError::CleanupFailed {
             cause: Box::new(other),
@@ -838,14 +920,19 @@ pub(crate) fn with_leftover(error: CodecError, found: Option<PathBuf>) -> CodecE
 /// on FAT and exFAT a number may come from a folder slot. So a backup is deleted only
 /// when it is empty and is still the reservation.
 fn after_failed_replace(
-    target: &Path,
-    temp: &Path,
+    commit: Commit<'_>,
     backup: &Path,
     placeholder: Option<FileState>,
     before: FileState,
     code: u32,
     env: &mut impl SaveEnv,
 ) -> CodecError {
+    let Commit {
+        target,
+        temp,
+        on_failure,
+        ..
+    } = commit;
     let now = file_state(target);
     let aside = file_state(backup);
     let original_is_aside = matches!(
@@ -863,23 +950,24 @@ fn after_failed_replace(
         }
     };
     if matches!(now, Ok(Some(state)) if state == before) {
-        let temp_left = delete_ours(temp);
+        let temp_left = on_failure.apply(temp);
         let backup_left = drop_placeholder(&aside);
-        return save_error(
-            real_cause(code, target),
-            target,
-            true,
-            backup_left.or(temp_left),
-        );
+        let error = save_error(real_cause(code, target), target, true, backup_left);
+        return with_leftover(error, temp_left);
     }
-    if original_is_aside && matches!(now, Ok(None)) {
-        // The original was moved aside and the new file did not take its name.
-        let restored = env.move_no_replace(backup, target).is_ok()
-            && matches!(file_state(target), Ok(Some(state)) if state.same_content_stamp(&before));
-        if restored {
-            let leftover = delete_ours(temp);
-            return save_error(code, target, true, leftover);
-        }
+    if original_is_aside && matches!(now, Ok(None)) && env.move_no_replace(backup, target).is_ok() {
+        // The file that was moved aside is back under its name, so no backup exists now.
+        return if matches!(file_state(target), Ok(Some(state)) if state.same_content_stamp(&before))
+        {
+            save_error(code, target, true, on_failure.apply(temp))
+        } else {
+            // It holds what another program wrote, and the temp file stays.
+            CodecError::TargetChanged {
+                path: friendly(target),
+                new_text: if_on_disk(temp),
+                other_version: None,
+            }
+        };
     }
     if original_is_aside {
         return CodecError::RecoveryRequired {
@@ -891,16 +979,25 @@ fn after_failed_replace(
     }
     // The original is neither where it was nor aside, or another program changed it.
     // The temp file stays: it may be the only copy of this text on disk.
-    let backup_left = drop_placeholder(&aside);
-    CodecError::SaveFailed {
+    let error = CodecError::SaveFailed {
         path: friendly(target),
         code,
         original_intact: false,
-        leftover: if_on_disk(temp).or(backup_left),
-    }
+        leftover: if_on_disk(temp),
+    };
+    with_leftover(error, drop_placeholder(&aside))
 }
 /// Puts a finished temp file at a name where nothing was. It never replaces.
-fn commit_new(target: &Path, temp: &Path, env: &mut impl SaveEnv) -> Result<(), CodecError> {
+fn commit_new(commit: Commit<'_>, env: &mut impl SaveEnv) -> Result<(), CodecError> {
+    let Commit {
+        target,
+        temp,
+        on_failure,
+        ..
+    } = commit;
+    if !commit.temp_is_as_written() {
+        return Err(commit.temp_changed());
+    }
     let mut tries = 0;
     let code = loop {
         match env.move_no_replace(temp, target) {
@@ -912,7 +1009,7 @@ fn commit_new(target: &Path, temp: &Path, env: &mut impl SaveEnv) -> Result<(), 
             Err(code) => break code,
         }
     };
-    let leftover = delete_ours(temp);
+    let leftover = on_failure.apply(temp);
     if code == ERROR_ALREADY_EXISTS.0 || code == ERROR_FILE_EXISTS.0 {
         return Err(CodecError::TargetExists {
             path: friendly(target),
@@ -1007,10 +1104,28 @@ fn atomic_write_expecting(
     if let Err(error) = written {
         return Err(after_failed_write(error, &target, &temp, before));
     }
+    // After the close, which can move the file's time.
+    let temp_state = match file_state(&temp) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            let missing = std::io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND.0 as i32);
+            return Err(after_failed_write(missing, &target, &temp, before));
+        }
+        Err(code) => {
+            let failed = std::io::Error::from_raw_os_error(code as i32);
+            return Err(after_failed_write(failed, &target, &temp, before));
+        }
+    };
     env.before_commit(&temp);
+    let commit = Commit {
+        target: &target,
+        temp: &temp,
+        temp_state,
+        on_failure: TempOnFailure::Delete,
+    };
     match before {
-        Some(before) => commit_replace(&target, &temp, before, env),
-        None => commit_new(&target, &temp, env).map(|()| AtomicWriteResult::Replaced),
+        Some(before) => commit_replace(commit, before, env),
+        None => commit_new(commit, env).map(|()| AtomicWriteResult::Replaced),
     }
 }
 /// What a file was at one moment: which file, its size and its last write time. Keep
@@ -1034,15 +1149,37 @@ pub fn file_stamp(path: &Path) -> Result<Option<FileStamp>, CodecError> {
         .map_err(|code| save_error(code, &target, true, None))
 }
 
+/// A failed `PreparedCopy::try_commit`.
+#[derive(Debug)]
+pub struct CommitFailure {
+    pub error: CodecError,
+    /// The copy, ready for another try, when its temp file is still as it was written.
+    /// Dropping this deletes the temp file, so keep it if the source may be gone.
+    pub copy: Option<PreparedCopy>,
+}
 /// A complete copy under a temp name in the target's folder. Nothing is at the
-/// final name until `commit`. Dropping it deletes the temp file.
+/// final name until `commit`. Dropping it deletes the temp file. While it waits, it
+/// holds the temp file so that no other program can write to it or rename it.
 #[derive(Debug)]
 pub struct PreparedCopy {
     temp: PathBuf,
     target: PathBuf,
     /// What the target was when the copy was prepared. `None` for a new name.
     before: Option<FileState>,
+    /// What the temp file was when the copy was finished.
+    temp_state: FileState,
+    holder: Option<File>,
     done: bool,
+}
+/// Opens the finished temp file for reading and refuses others the right to write,
+/// rename or delete it. If that open fails, for example while a scanner has the file,
+/// the copy goes on without it: the commit still compares the file's state.
+fn hold_temp(temp: &Path) -> Option<File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(temp)
+        .ok()
 }
 impl PreparedCopy {
     pub fn temp_path(&self) -> &Path {
@@ -1052,37 +1189,84 @@ impl PreparedCopy {
     /// `prepare_large_copy` is replaced, with the same guarantees as `atomic_write`.
     /// A new name stays new: a file that appeared meanwhile gives `TargetExists`.
     ///
+    /// The checks run again here: the target's state, the read-only mark, the rights to
+    /// write and replace, and the temp file's own state. A changed temp file gives
+    /// `TempChanged`, and the target is not touched.
+    ///
     /// A target that another program changed since `prepare_large_copy` gives
     /// `TargetChanged`. The target keeps that program's bytes, and the copy stays at
     /// `new_text`. The caller decides what to do with it.
-    pub fn commit(mut self) -> Result<AtomicWriteResult, CodecError> {
-        self.done = true;
-        let env = &mut RealEnv;
-        match self.before {
-            Some(before) => commit_replace(&self.target, &self.temp, before, env),
-            None => commit_new(&self.target, &self.temp, env).map(|()| AtomicWriteResult::Replaced),
-        }
+    ///
+    /// After any failure the temp file stays on disk, because the source may be gone and
+    /// this may be the only copy. `CodecError::left_on_disk` names it. To try again
+    /// without a new copy, use `try_commit`.
+    pub fn commit(self) -> Result<AtomicWriteResult, CodecError> {
+        self.try_commit().map_err(|failure| failure.keep_and_name())
+    }
+    /// `commit` that gives the copy back after a failure, so the caller can try again.
+    pub fn try_commit(self) -> Result<AtomicWriteResult, Box<CommitFailure>> {
+        self.attempt(None, &mut RealEnv)
     }
     /// `commit` that also refuses if the target is not what `expected` recorded, as
     /// in `atomic_write_if_unchanged`. The copy stays at `new_text` in that case.
-    pub fn commit_if_unchanged(
-        mut self,
+    pub fn commit_if_unchanged(self, expected: FileStamp) -> Result<AtomicWriteResult, CodecError> {
+        self.try_commit_if_unchanged(expected)
+            .map_err(|failure| failure.keep_and_name())
+    }
+    /// `commit_if_unchanged` that gives the copy back after a failure.
+    pub fn try_commit_if_unchanged(
+        self,
         expected: FileStamp,
-    ) -> Result<AtomicWriteResult, CodecError> {
-        if self.before != Some(expected.0) {
-            self.done = true;
-            return Err(CodecError::TargetChanged {
+    ) -> Result<AtomicWriteResult, Box<CommitFailure>> {
+        self.attempt(Some(expected), &mut RealEnv)
+    }
+    fn attempt(
+        mut self,
+        expected: Option<FileStamp>,
+        env: &mut impl SaveEnv,
+    ) -> Result<AtomicWriteResult, Box<CommitFailure>> {
+        // ReplaceFileW cannot work while anything, this included, holds the file.
+        self.holder = None;
+        env.before_commit(&self.temp);
+        let commit = Commit {
+            target: &self.target,
+            temp: &self.temp,
+            temp_state: self.temp_state,
+            on_failure: TempOnFailure::Keep,
+        };
+        let result = if expected.is_some_and(|stamp| self.before != Some(stamp.0)) {
+            Err(CodecError::TargetChanged {
                 path: friendly(&self.target),
                 new_text: if_on_disk(&self.temp),
                 other_version: None,
-            });
+            })
+        } else {
+            match self.before {
+                Some(before) => commit_replace(commit, before, env),
+                None => commit_new(commit, env).map(|()| AtomicWriteResult::Replaced),
+            }
+        };
+        match result {
+            Ok(result) => {
+                self.done = true;
+                Ok(result)
+            }
+            Err(error) => {
+                let usable = commit.temp_is_as_written();
+                self.done = !usable;
+                let copy = usable.then(|| {
+                    self.holder = hold_temp(&self.temp);
+                    self
+                });
+                Err(Box::new(CommitFailure { error, copy }))
+            }
         }
-        self.commit()
     }
     /// Throws the copy away and says if the temp file could not go. Dropping a
     /// `PreparedCopy` does the same, but a drop cannot report a failure.
     pub fn discard(mut self) -> Result<(), CodecError> {
         self.done = true;
+        self.holder = None;
         try_delete(&self.temp).map_err(|code| CodecError::SaveFailed {
             path: friendly(&self.temp),
             code,
@@ -1093,12 +1277,30 @@ impl PreparedCopy {
     /// Removes the temp file after a failed copy, and adds it to `error` if it stayed.
     fn fail_with(mut self, error: CodecError) -> CodecError {
         self.done = true;
+        self.holder = None;
         with_leftover(error, delete_ours(&self.temp))
+    }
+}
+impl CommitFailure {
+    /// The error alone, with the temp file left on disk and named in it.
+    fn keep_and_name(self) -> CodecError {
+        let Some(mut copy) = self.copy else {
+            return self.error;
+        };
+        copy.done = true;
+        copy.holder = None;
+        let temp = friendly(&copy.temp);
+        if self.error.left_on_disk().contains(&temp.as_path()) {
+            self.error
+        } else {
+            with_leftover(self.error, Some(temp))
+        }
     }
 }
 impl Drop for PreparedCopy {
     fn drop(&mut self) {
         if !self.done {
+            self.holder = None;
             // A drop cannot report. `find_leftovers` lists this file if it stayed, and
             // `discard` is the call for a caller that wants to know now.
             let _ = delete_ours(&self.temp);
@@ -1135,17 +1337,32 @@ fn prepare_copy(
         Resolved::New(target) => (target, None, None),
     };
     let (temp, file) = create_temp(&target, rules, env)?;
-    let prepared = PreparedCopy {
+    let mut prepared = PreparedCopy {
         temp,
         target,
         before,
+        temp_state: FileState::default(),
+        holder: None,
         done: false,
     };
     // `file` is closed when this call returns, so the temp file can then be deleted.
-    match copy_into(&mut source, file, &prepared, progress, cancel, env) {
-        Ok(()) => Ok(prepared),
-        Err(error) => Err(prepared.fail_with(error)),
+    if let Err(error) = copy_into(&mut source, file, &prepared, progress, cancel, env) {
+        return Err(prepared.fail_with(error));
     }
+    // After the close, which can move the file's time.
+    match file_state(&prepared.temp) {
+        Ok(Some(state)) => prepared.temp_state = state,
+        Ok(None) => {
+            let error = save_error(ERROR_FILE_NOT_FOUND.0, &prepared.temp, true, None);
+            return Err(prepared.fail_with(error));
+        }
+        Err(code) => {
+            let error = save_error(code, &prepared.temp, true, None);
+            return Err(prepared.fail_with(error));
+        }
+    }
+    prepared.holder = hold_temp(&prepared.temp);
+    Ok(prepared)
 }
 fn copy_into(
     source: &mut WatchedSource,
@@ -1317,6 +1534,19 @@ pub fn find_leftovers(folder_or_path: &Path) -> Result<Vec<Leftover>, CodecError
     Ok(leftovers)
 }
 
+/// True when the folder of `leftover` holds a file with that hash that is not one of ours.
+fn document_is_there(leftover: &Path, hash: u32) -> Result<bool, CodecError> {
+    let folder = leftover
+        .parent()
+        .ok_or_else(|| save_error(ERROR_PATH_NOT_FOUND.0, leftover, true, None))?;
+    for entry in fs::read_dir(folder)? {
+        let name = entry?.file_name();
+        if parse_leftover_name(&name.to_string_lossy()).is_none() && name_hash(&name) == hash {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 /// How far `delete_leftover` may go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeftoverDelete {
@@ -1351,9 +1581,10 @@ pub fn delete_leftover(leftover: &Leftover, how: LeftoverDelete) -> Result<(), C
     if parsed.pid != std::process::id() && process_is_running(parsed.pid) {
         return Err(kept("the program that made it is still running"));
     }
+    // Looked up now: the list may be old, and the document may have gone since.
     let recoverable = match parsed.kind {
         LeftoverKind::Backup => meta.len() > 0,
-        LeftoverKind::Temp => meta.len() > 0 && leftover.target_missing,
+        LeftoverKind::Temp => meta.len() > 0 && !document_is_there(&path, parsed.hash)?,
     };
     if recoverable && how == LeftoverDelete::KeepRecoverable {
         return Err(kept("it may hold text the user can still recover"));

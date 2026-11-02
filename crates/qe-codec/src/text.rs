@@ -897,11 +897,9 @@ fn write_lossy_stream<F: FnMut(u64, u64)>(
     let mut buffer = vec![0u8; CHUNK + 4];
     let mut lines = LineCounts::default();
     let (mut held, mut done) = (0, 0u64);
-    let mut emit = |bytes: &[u8], done: u64| -> Result<(), CodecError> {
-        out.put(bytes, done)?;
-        lines.add(bytes);
-        Ok(())
-    };
+    // One piece of text at a time, so that a file of bad bytes makes one write per 1 MiB
+    // and not one per byte. At most 3 bytes of text come from each byte of the file.
+    let mut text = Vec::with_capacity(CHUNK);
     loop {
         if cancel() {
             return Err(CodecError::Cancelled);
@@ -911,23 +909,24 @@ fn write_lossy_stream<F: FnMut(u64, u64)>(
         let end = held + n;
         let last = n == 0;
         let mut start = 0;
+        text.clear();
         while start < end {
             match std::str::from_utf8(&buffer[start..end]) {
                 Ok(_) => {
-                    emit(&buffer[start..end], done)?;
+                    text.extend_from_slice(&buffer[start..end]);
                     start = end;
                 }
                 Err(e) => {
                     let good = start + e.valid_up_to();
-                    emit(&buffer[start..good], done)?;
+                    text.extend_from_slice(&buffer[start..good]);
                     start = good;
                     match e.error_len() {
                         Some(bad) => {
-                            emit("\u{fffd}".as_bytes(), done)?;
+                            text.extend_from_slice("\u{fffd}".as_bytes());
                             start += bad;
                         }
                         None if last => {
-                            emit("\u{fffd}".as_bytes(), done)?;
+                            text.extend_from_slice("\u{fffd}".as_bytes());
                             start = end;
                         }
                         None => break,
@@ -935,6 +934,8 @@ fn write_lossy_stream<F: FnMut(u64, u64)>(
                 }
             }
         }
+        out.put(&text, done)?;
+        lines.add(&text);
         if last {
             break;
         }
@@ -1345,6 +1346,61 @@ fn decode_file_with_system_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CountingSink {
+        puts: u32,
+        text: Vec<u8>,
+    }
+    impl TextSink for CountingSink {
+        fn put(&mut self, text: &[u8], _input_done: u64) -> Result<(), CodecError> {
+            self.puts += 1;
+            self.text.extend_from_slice(text);
+            Ok(())
+        }
+    }
+
+    /// Round 3, item 8: bad bytes make one write per piece, not one per byte, and a
+    /// cancel is seen at each piece.
+    #[test]
+    fn lossy_stream_writes_once_per_piece_and_can_be_cancelled() {
+        let dir = std::env::temp_dir().join(format!("qe-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in");
+        let mut bytes = vec![0xff; 3 * CHUNK];
+        bytes.extend([b'a', 0xe6, 0xbc]);
+        std::fs::write(&input, &bytes).unwrap();
+        let mut progress = Progress {
+            report: |_, _| {},
+            total: bytes.len() as u64,
+            base: 0,
+            best: 0,
+        };
+        let mut source = WatchedSource::open(&input).unwrap();
+        let mut sink = CountingSink::default();
+        let mut asked = 0;
+        write_lossy_stream(&mut source, &mut sink, &mut progress, &mut || {
+            asked += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(sink.text, String::from_utf8_lossy(&bytes).as_bytes());
+        assert!(sink.puts <= 5, "{} writes", sink.puts);
+        assert!(asked >= 4, "{asked} asks");
+
+        // Cancelled after the first piece: at most one write was made.
+        let mut source = WatchedSource::open(&input).unwrap();
+        let mut sink = CountingSink::default();
+        let mut asked = 0;
+        let result = write_lossy_stream(&mut source, &mut sink, &mut progress, &mut || {
+            asked += 1;
+            asked == 2
+        });
+        assert!(matches!(result, Err(CodecError::Cancelled)), "{result:?}");
+        assert_eq!(sink.puts, 1);
+        assert_eq!(sink.text.len(), 3 * CHUNK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Item 7: nothing here can end the process by growing a block.
     #[test]

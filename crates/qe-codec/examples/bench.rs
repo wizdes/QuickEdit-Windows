@@ -138,6 +138,14 @@ const CASES: &[Case] = &[
         ..UNIFORM
     },
     Case {
+        label: "Thai 8 MiB, then a",
+        encoding: TextEncoding::Windows874,
+        pattern: &[0xA1, 0xA2, 0xA3, 0xA4, 0xA5],
+        shape: Shape::PatternThenAscii,
+        file_only: true,
+        ..UNIFORM
+    },
+    Case {
         label: "SJIS 8 MiB 漢, then a",
         encoding: TextEncoding::ShiftJis,
         pattern: &[0x8A, 0xBF],

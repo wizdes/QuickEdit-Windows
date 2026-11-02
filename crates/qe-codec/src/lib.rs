@@ -9,9 +9,9 @@ use qe_api::TextEncoding;
 use std::path::PathBuf;
 
 pub use save::{
-    AtomicWriteResult, FileStamp, Leftover, LeftoverDelete, LeftoverKind, PreparedCopy,
-    atomic_write, atomic_write_if_unchanged, copy_large_original, delete_leftover, file_stamp,
-    find_leftovers, prepare_large_copy,
+    AtomicWriteResult, CommitFailure, FileStamp, Leftover, LeftoverDelete, LeftoverKind,
+    PreparedCopy, atomic_write, atomic_write_if_unchanged, copy_large_original, delete_leftover,
+    file_stamp, find_leftovers, prepare_large_copy,
 };
 pub use text::{can_encode, decode, decode_file, encode, is_available, transcode_to_utf8_file};
 
@@ -109,8 +109,13 @@ pub struct Decoded {
 
 /// Every way a decode, an encode or a save can fail.
 ///
-/// In the save errors, `code` is the Windows error code. `leftover` names a file
-/// of ours that could not be deleted; `find_leftovers` also finds it later.
+/// In the save errors, `code` is the Windows error code. `leftover` names a file of
+/// ours that stayed on disk, because it could not be deleted or because a failed
+/// `PreparedCopy::commit` keeps its text; `find_leftovers` also finds it later. A second
+/// such file is added by `CleanupFailed`, and `left_on_disk` lists them all.
+///
+/// Paths in these errors are exact, even for a name that is not valid Unicode. The
+/// messages show such a name with a stand-in character.
 #[derive(Debug)]
 pub enum CodecError {
     InapplicableEncoding(TextEncoding),
@@ -190,10 +195,16 @@ pub enum CodecError {
     InvalidFormat {
         what: &'static str,
     },
-    /// `cause` is what went wrong. Then a file of ours could not be deleted.
+    /// `cause` is what went wrong, and a file of ours also stayed on disk.
     CleanupFailed {
         cause: Box<CodecError>,
         leftover: PathBuf,
+    },
+    /// Something changed the finished temp file before the swap, so this save refused
+    /// to use it. The target was not changed. `temp` is that file, if it is still there.
+    TempChanged {
+        path: PathBuf,
+        temp: Option<PathBuf>,
     },
     /// `delete_leftover` refused: the file may still be in use, it changed since it
     /// was listed, or it holds text the user could still recover.
@@ -283,8 +294,14 @@ impl std::fmt::Display for CodecError {
             Self::InvalidFormat { what } => write!(f, "invalid text format: {what}"),
             Self::CleanupFailed { cause, leftover } => write!(
                 f,
-                "{cause}; also, {} could not be deleted",
+                "{cause}; also, a file of ours stayed at {}",
                 leftover.display()
+            ),
+            Self::TempChanged { path, .. } => write!(
+                f,
+                "the new text for {} was changed before the save finished; \
+                 the file on disk was not changed",
+                path.display()
             ),
             Self::LeftoverKept { path, reason } => {
                 write!(f, "{} was not deleted: {reason}", path.display())
@@ -292,6 +309,40 @@ impl std::fmt::Display for CodecError {
             Self::Io(e) => e.fmt(f),
             Self::Cancelled => write!(f, "operation cancelled"),
         }
+    }
+}
+impl CodecError {
+    /// Every file of ours that this error says is still on disk.
+    pub fn left_on_disk(&self) -> Vec<&std::path::Path> {
+        let mut files: Vec<&std::path::Path> = Vec::new();
+        match self {
+            Self::AccessDenied { leftover, .. }
+            | Self::SharingViolation { leftover, .. }
+            | Self::TargetExists { leftover, .. }
+            | Self::SaveFailed { leftover, .. }
+            | Self::SourceChanged { leftover, .. } => files.extend(leftover.as_deref()),
+            Self::TargetChanged {
+                new_text,
+                other_version,
+                ..
+            } => {
+                files.extend(new_text.as_deref());
+                files.extend(other_version.as_deref());
+            }
+            Self::RecoveryRequired {
+                backup, new_text, ..
+            } => {
+                files.extend(new_text.as_deref());
+                files.push(backup.as_path());
+            }
+            Self::TempChanged { temp, .. } => files.extend(temp.as_deref()),
+            Self::CleanupFailed { cause, leftover } => {
+                files.extend(cause.left_on_disk());
+                files.push(leftover.as_path());
+            }
+            _ => {}
+        }
+        files
     }
 }
 impl std::error::Error for CodecError {}

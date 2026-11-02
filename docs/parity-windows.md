@@ -8,7 +8,7 @@ Each Mac parity row has one row below. Inventory rows add details from `docs/res
 | --- | --- | --- | --- | --- | --- |
 | P1 | New opens a plain-text window. | New opens a plain-text window with Ctrl+N. | M14 | changed (Ctrl replaces Cmd) | no |
 | P2 | Open accepts plain text and other text files. | Open the same text files. | M14 | same | no |
-| P3 | Typing and Save write UTF-8 bytes. | Save new files as UTF-8 without BOM; use Ctrl+S. | M3, M9, M14 | changed (Ctrl replaces Cmd) | no |
+| P3 | Typing and Save write UTF-8 bytes. | Save new files as UTF-8 without BOM; use Ctrl+S. | M3, M14 | changed (Ctrl replaces Cmd) | no |
 | P4 | Untitled Save offers a .txt checkbox. | Offer the .txt checkbox, on by default. | M7, M14 | same | no |
 | P5 | Dirty untitled close asks; quit keeps autosaved edits. | Keep both rules. | M14 | same | no |
 | P6 | New windows fit 90 characters by 30 lines. | Use 90 by 30. | M6, M14 | same | no |
@@ -28,7 +28,7 @@ Each Mac parity row has one row below. Inventory rows add details from `docs/res
 | P22 | Bad chosen encoding shows an open error. | Show an error naming the encoding. | M3, M7 | same | no |
 | P23 | Save disables encodings that cannot hold text. | Disable those encodings. | M3, M7 | same | no |
 | P24 | Save writes a Mac encoding file tag. | Omit the tag. | M3 | left out (Windows has no Mac file tag) | no |
-| P25 | An edit beyond file encoding offers Save As or undo. | Warn and offer Save As or undo. | M3, M9 | same | no |
+| P25 | An edit beyond file encoding offers Save As or undo. | Warn and offer Save As or undo. | M3, M14 | same | no |
 | P26 | Lossy reads warn on first edit and overwrite. | Warn; offer Duplicate, Cancel, or Overwrite. | M3, M14 | same | no |
 | P27 | Keep mixed endings; Return uses the common ending. | Keep both rules. | M3, M9 | same | no |
 | P28 | Keep UTF-8 BOM on save. | Keep the BOM. | M3 | same | no |
@@ -36,7 +36,7 @@ Each Mac parity row has one row below. Inventory rows add details from `docs/res
 | P30 | Find, Replace, Next, Previous, selection, and jump. | Keep actions with Ctrl-based keys and F3. | M12 | changed (Windows keys) | no |
 | P31 | Select Line accepts numbers and ranges. | Keep `N-M`, `+N`, and other Mac forms. | M12 | same | no |
 | P32 | Spelling and Grammar menu checks and corrects text. | Keep spelling; omit grammar. | M10 | changed (grammar omitted by decision) | no |
-| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M9, M12 | changed (Data Detectors and Text Replacement omitted by decision) | no |
+| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M12 | changed (Data Detectors and Text Replacement omitted by decision) | no |
 | P34 | Transform selection to upper, lower, or capitalized. | Keep all three. | M12 | same | no |
 | P35 | Speech reads selected text. | Omit Speech. | M15 | left out (user decision) | no |
 | P36 | Complete uses Option+Esc. | Use Ctrl+Space. | M12 | changed (Windows reserves Alt+Esc) | no |
@@ -65,12 +65,12 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | --- | --- | --- | --- | --- | --- |
 | I01 | QuickEdit menu has About, Settings, Hide, Show All, Quit. | Put About, Settings, Quit in caret list; omit Mac hide actions. | M7, M8 | changed (Windows menu and no Mac hide actions) | no |
 | I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in caret list; omit Share. | M7, M13, M14 | changed (caret menu; Share omitted) | no |
-| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in caret list with Windows keys. | M7, M9, M12 | changed (caret menu and Windows keys) | no |
+| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in caret list with Windows keys. | M7, M12, M14 | changed (caret menu and Windows keys) | no |
 | I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in caret list. | M7, M12 | changed (caret menu) | no |
 | I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10 | changed (grammar omitted) | no |
 | I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | no |
 | I07 | Transformations menu has upper, lower, capitalize. | Keep all three in caret list. | M7, M12 | changed (caret menu) | no |
-| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in caret list. | M7, M9, M13 | changed (caret menu) | no |
+| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in caret list. | M7, M13, M14 | changed (caret menu) | no |
 | I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and caret menu) | no |
 | I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in caret list. | M6, M7, M14 | changed (Windows controls and caret menu) | no |
 | I11 | Help menu is empty. | No Help group, because the Mac Help menu is empty. About stays in the caret list. | M7 | left out (nothing to show; choice to check) | no |

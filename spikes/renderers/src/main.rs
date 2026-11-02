@@ -1,513 +1,265 @@
-use std::{env, ffi::c_void, fs, mem, ptr};
+//! The renderer race: `spike-renderers --arm a|b|c|d`.
+//!
+//! The windows subsystem matters for timing: a console program would start a
+//! console host, which the real app does not do. Errors go to stderr when it is
+//! redirected, and to `<log file>.err` when a log file was asked for.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+// `vcall!` exists to make an unsafe call with its arguments. It is private to
+// this crate, so the warning about hiding unsafe inside a macro does not apply.
+#![allow(clippy::macro_metavars_in_unsafe)]
 
-type H = *mut c_void;
-type Hr = i32;
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Guid {
-    a: u32,
-    b: u16,
-    c: u16,
-    d: [u8; 8],
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-#[repr(C)]
-struct Point {
-    x: i32,
-    y: i32,
-}
-#[repr(C)]
-struct Msg {
-    hwnd: H,
-    message: u32,
-    wp: usize,
-    lp: isize,
-    time: u32,
-    pt: Point,
-    private: u32,
-}
-#[repr(C)]
-struct WndClass {
-    style: u32,
-    proc: Option<unsafe extern "system" fn(H, u32, usize, isize) -> isize>,
-    cls_extra: i32,
-    wnd_extra: i32,
-    instance: H,
-    icon: H,
-    cursor: H,
-    background: H,
-    menu: *const u16,
-    name: *const u16,
-}
-#[repr(C)]
-struct GlyphRun {
-    face: H,
-    size: f32,
-    count: u32,
-    indices: *const u16,
-    advances: *const f32,
-    offsets: H,
-    sideways: i32,
-    bidi: u32,
-}
-#[repr(C)]
-struct Size {
-    cx: i32,
-    cy: i32,
-}
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetProcessDpiAwarenessContext(v: isize) -> i32;
-    fn RegisterClassW(c: *const WndClass) -> u16;
-    fn CreateWindowExW(
-        ex: u32,
-        class: *const u16,
-        title: *const u16,
-        style: u32,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        parent: H,
-        menu: H,
-        inst: H,
-        param: H,
-    ) -> H;
-    fn DefWindowProcW(h: H, m: u32, w: usize, l: isize) -> isize;
-    fn ShowWindow(h: H, c: i32) -> i32;
-    fn UpdateWindow(h: H) -> i32;
-    fn GetMessageW(m: *mut Msg, h: H, min: u32, max: u32) -> i32;
-    fn TranslateMessage(m: *const Msg) -> i32;
-    fn DispatchMessageW(m: *const Msg) -> isize;
-    fn PostQuitMessage(c: i32);
-    fn ValidateRect(h: H, r: *const Rect) -> i32;
-    fn GetDC(h: H) -> H;
-    fn ReleaseDC(h: H, dc: H) -> i32;
-    fn GetDpiForWindow(h: H) -> u32;
-    fn AdjustWindowRectExForDpi(r: *mut Rect, s: u32, menu: i32, ex: u32, dpi: u32) -> i32;
-    fn SetWindowPos(h: H, after: H, x: i32, y: i32, w: i32, hgt: i32, flags: u32) -> i32;
-}
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn CreateCompatibleDC(dc: H) -> H;
-    fn DeleteDC(dc: H) -> i32;
-    fn CreateFontW(
-        height: i32,
-        width: i32,
-        esc: i32,
-        orient: i32,
-        weight: i32,
-        italic: u32,
-        under: u32,
-        strike: u32,
-        charset: u32,
-        out: u32,
-        clip: u32,
-        quality: u32,
-        pitch: u32,
-        name: *const u16,
-    ) -> H;
-    fn SelectObject(dc: H, obj: H) -> H;
-    fn DeleteObject(obj: H) -> i32;
-    fn GetTextExtentPoint32W(dc: H, text: *const u16, len: i32, size: *mut Size) -> i32;
-    fn PatBlt(dc: H, x: i32, y: i32, w: i32, h: i32, rop: u32) -> i32;
-    fn BitBlt(dst: H, x: i32, y: i32, w: i32, h: i32, src: H, sx: i32, sy: i32, rop: u32) -> i32;
-}
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn QueryPerformanceCounter(t: *mut i64) -> i32;
-    fn GetModuleHandleW(name: *const u16) -> H;
-}
-#[link(name = "dwrite")]
-unsafe extern "system" {
-    fn DWriteCreateFactory(ty: u32, iid: *const Guid, out: *mut H) -> Hr;
-}
-const IID_FACTORY: Guid = Guid {
-    a: 0xb859ee5a,
-    b: 0xd838,
-    c: 0x4b5b,
-    d: [0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48],
+mod arm_a;
+mod arm_b;
+mod arm_c;
+mod arm_d;
+mod atlas;
+mod dump;
+mod ffi;
+mod gpu;
+mod text;
+
+use arm_a::ArmA;
+use arm_b::ArmB;
+use arm_c::{ArmC, Output};
+use arm_d::ArmD;
+use ffi::{H, Msg, Rect, WndClass, qpc};
+use std::{
+    env,
+    fs::{self, File},
+    io::Write,
+    mem, ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicPtr, Ordering},
+    },
 };
-const SAMPLE: [&str; 30] = [
-    "QuickEdit renderer race - Cascadia Mono 10 pt",
-    "0123456789 abcdefghijklmnopqrstuvwxyz",
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ !@#$%^&*()",
-    "The quick brown fox jumps over the lazy dog.",
-    "A: DirectWrite bitmap and BitBlt",
-    "B: Direct2D and hardware swap chain",
-    "C: Direct3D glyph atlas and waitable swap chain",
-    "D: software first, then hardware",
-    "",
-    "fn main() { println!(\"Hello, world!\"); }",
-    "let latency = after_present - key_received;",
-    "if latency < budget { show_frame(); }",
-    "Window size: 90 columns by 30 rows",
-    "DPI aware per monitor, version 2",
-    "White background. Black text.",
-    "This same text appears in each renderer.",
-    "Key presses append to the first line.",
-    "The new character appears after this marker:",
-    "A screen capture can watch that spot.",
-    "The launcher records the first frame.",
-    "The typing tool records screen changes.",
-    "One window remains open for the whole run.",
-    "Measure cold and warm starts separately.",
-    "Percentiles use nearest rank.",
-    "The GPU paths require a desktop session.",
-    "No animation runs while idle.",
-    "Test line 27: 11111111111111111111",
-    "Test line 28: 22222222222222222222",
-    "Test line 29: 33333333333333333333",
-    "Test line 30: END OF SAMPLE TEXT",
-];
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
-}
-unsafe fn method(p: H, index: usize) -> H {
-    unsafe { *(*(p as *const *const H)).add(index) }
-}
-unsafe fn release(p: H) {
-    if !p.is_null() {
-        let f: unsafe extern "system" fn(H) -> u32 = unsafe { mem::transmute(method(p, 2)) };
-        unsafe { f(p) };
-    }
-}
-fn check(hr: Hr, what: &str) -> Result<(), String> {
-    if hr < 0 {
-        Err(format!("{what} failed: HRESULT {hr:#010x}"))
-    } else {
-        Ok(())
-    }
-}
-fn qpc() -> i64 {
-    let mut v = 0;
-    unsafe { QueryPerformanceCounter(&mut v) };
-    v
-}
-struct State {
-    first: bool,
-    start: i64,
+use text::{Font, Layout};
+
+const WM_DESTROY: u32 = 0x0002;
+const WM_PAINT: u32 = 0x000f;
+const WM_CHAR: u32 = 0x0102;
+const WM_DPICHANGED: u32 = 0x02e0;
+const WINDOW_STYLE: u32 = 0x00cf0000;
+
+#[derive(Default)]
+struct Options {
+    arm: char,
     launch_log: Option<String>,
     type_log: Option<String>,
     exit_first: bool,
-    typed: String,
-    face: H,
-    target: H,
-    render_params: H,
-    dc: H,
-    font: H,
-    old_font: H,
-    width: i32,
-    height: i32,
-    cell: i32,
-    line: i32,
-    font_size: f32,
+    dump_frame: Option<String>,
+    /// Proof tool: feeds these characters to the WM_CHAR code after the first
+    /// frame. It uses no system input, so it can run while the user works.
+    self_type: Option<String>,
 }
-impl State {
-    fn new(
-        start: i64,
-        launch_log: Option<String>,
-        type_log: Option<String>,
-        exit_first: bool,
-    ) -> Self {
-        Self {
-            first: true,
-            start,
-            launch_log,
-            type_log,
-            exit_first,
-            typed: String::new(),
-            face: ptr::null_mut(),
-            target: ptr::null_mut(),
-            render_params: ptr::null_mut(),
-            dc: ptr::null_mut(),
-            font: ptr::null_mut(),
-            old_font: ptr::null_mut(),
-            width: 0,
-            height: 0,
-            cell: 0,
-            line: 0,
-            font_size: 0.0,
-        }
-    }
-    unsafe fn init(&mut self, hwnd: H) -> Result<(), String> {
-        let dpi = unsafe { GetDpiForWindow(hwnd) } as i32;
-        let screen = unsafe { GetDC(hwnd) };
-        self.dc = unsafe { CreateCompatibleDC(screen) };
-        unsafe { ReleaseDC(hwnd, screen) };
-        let font = unsafe {
-            CreateFontW(
-                -(10 * dpi / 72),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-                5,
-                49,
-                wide("Cascadia Mono").as_ptr(),
-            )
-        };
-        if font.is_null() {
-            return Err("CreateFontW failed".into());
-        }
-        self.font = font;
-        self.old_font = unsafe { SelectObject(self.dc, font) };
-        let mut size = Size { cx: 0, cy: 0 };
-        let one = wide("M");
-        if unsafe { GetTextExtentPoint32W(self.dc, one.as_ptr(), 1, &mut size) } == 0 {
-            return Err("GetTextExtentPoint32W failed".into());
-        }
-        self.cell = size.cx;
-        self.line = size.cy + 2 * dpi / 96;
-        self.width = self.cell * 90;
-        self.height = self.line * 30;
-        self.font_size = 10.0 * dpi as f32 / 72.0;
-        let mut factory = ptr::null_mut();
-        check(
-            unsafe { DWriteCreateFactory(0, &IID_FACTORY, &mut factory) },
-            "DWriteCreateFactory",
-        )?;
-        let mut interop = ptr::null_mut();
-        let get: unsafe extern "system" fn(H, *mut H) -> Hr =
-            unsafe { mem::transmute(method(factory, 17)) };
-        check(unsafe { get(factory, &mut interop) }, "GetGdiInterop")?;
-        let params_fn: unsafe extern "system" fn(H, *mut H) -> Hr =
-            unsafe { mem::transmute(method(factory, 10)) };
-        check(
-            unsafe { params_fn(factory, &mut self.render_params) },
-            "CreateRenderingParams",
-        )?;
-        let face_fn: unsafe extern "system" fn(H, H, *mut H) -> Hr =
-            unsafe { mem::transmute(method(interop, 6)) };
-        check(
-            unsafe { face_fn(interop, self.dc, &mut self.face) },
-            "CreateFontFaceFromHdc",
-        )?;
-        let target_fn: unsafe extern "system" fn(H, H, u32, u32, *mut H) -> Hr =
-            unsafe { mem::transmute(method(interop, 7)) };
-        let screen = unsafe { GetDC(hwnd) };
-        let result = check(
-            unsafe {
-                target_fn(
-                    interop,
-                    screen,
-                    self.width as u32,
-                    self.height as u32,
-                    &mut self.target,
-                )
-            },
-            "CreateBitmapRenderTarget",
-        );
-        unsafe {
-            ReleaseDC(hwnd, screen);
-            release(interop);
-            release(factory)
-        };
-        result
-    }
-    unsafe fn draw(&mut self, hwnd: H) -> Result<i64, String> {
-        let memdc_fn: unsafe extern "system" fn(H) -> H =
-            unsafe { mem::transmute(method(self.target, 4)) };
-        let memdc = unsafe { memdc_fn(self.target) };
-        if unsafe { PatBlt(memdc, 0, 0, self.width, self.height, 0x00ff0062) } == 0 {
-            return Err("PatBlt failed".into());
-        }
-        for (row, sample) in SAMPLE.iter().enumerate() {
-            let line = if row == 0 {
-                format!("{} {}", sample, self.typed)
-            } else {
-                (*sample).to_owned()
-            };
-            let line: Vec<u16> = line.encode_utf16().collect();
-            let count = line.len();
-            let mut glyphs = vec![0u16; count];
-            let indices: unsafe extern "system" fn(H, *const u32, u32, *mut u16) -> Hr =
-                unsafe { mem::transmute(method(self.face, 11)) };
-            let codepoints: Vec<u32> = line.iter().map(|c| *c as u32).collect();
-            check(
-                unsafe {
-                    indices(
-                        self.face,
-                        codepoints.as_ptr(),
-                        count as u32,
-                        glyphs.as_mut_ptr(),
-                    )
-                },
-                "GetGlyphIndices",
-            )?;
-            let advances = vec![self.cell as f32; count];
-            let run = GlyphRun {
-                face: self.face,
-                size: self.font_size,
-                count: count as u32,
-                indices: glyphs.as_ptr(),
-                advances: advances.as_ptr(),
-                offsets: ptr::null_mut(),
-                sideways: 0,
-                bidi: 0,
-            };
-            let draw: unsafe extern "system" fn(
-                H,
-                f32,
-                f32,
-                u32,
-                *const GlyphRun,
-                H,
-                u32,
-                *mut Rect,
-            ) -> Hr = unsafe { mem::transmute(method(self.target, 3)) };
-            let mut dirty = Rect::default();
-            check(
-                unsafe {
-                    draw(
-                        self.target,
-                        2.0,
-                        (row as i32 * self.line + self.line - 3) as f32,
-                        0,
-                        &run,
-                        self.render_params,
-                        0,
-                        &mut dirty,
-                    )
-                },
-                "DrawGlyphRun",
-            )?;
-        }
-        let dc = unsafe { GetDC(hwnd) };
-        let copied = unsafe { BitBlt(dc, 0, 0, self.width, self.height, memdc, 0, 0, 0x00cc0020) };
-        unsafe { ReleaseDC(hwnd, dc) };
-        if copied == 0 {
-            return Err("BitBlt failed".into());
-        }
-        Ok(qpc())
-    }
-}
-impl Drop for State {
-    fn drop(&mut self) {
-        unsafe {
-            release(self.target);
-            release(self.face);
-            release(self.render_params);
-            if !self.dc.is_null() {
-                SelectObject(self.dc, self.old_font);
-                DeleteDC(self.dc);
-            }
-            if !self.font.is_null() {
-                DeleteObject(self.font);
-            }
-        }
-    }
-}
-static mut STATE: *mut State = ptr::null_mut();
-unsafe extern "system" fn wndproc(hwnd: H, msg: u32, wp: usize, lp: isize) -> isize {
-    match msg {
-        0x000f => {
-            let state = unsafe { &mut *STATE };
-            match unsafe { state.draw(hwnd) } {
-                Ok(after) => {
-                    if state.first {
-                        state.first = false;
-                        if let Some(path) = &state.launch_log {
-                            if let Err(e) = fs::write(path, format!("{},{}\n", state.start, after))
-                            {
-                                eprintln!("launch log: {e}");
-                                unsafe { PostQuitMessage(1) };
-                            }
-                        }
-                        if state.exit_first {
-                            unsafe { PostQuitMessage(0) }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("draw: {e}");
-                    unsafe { PostQuitMessage(1) }
-                }
-            }
-            unsafe { ValidateRect(hwnd, ptr::null()) };
-            0
-        }
-        0x0102 => {
-            let state = unsafe { &mut *STATE };
-            let received = qpc();
-            if let Some(c) = char::from_u32(wp as u32) {
-                if !c.is_control() {
-                    state.typed.push(c);
-                    match unsafe { state.draw(hwnd) } {
-                        Ok(after) => {
-                            if let Some(path) = &state.type_log {
-                                use std::io::Write;
-                                match fs::OpenOptions::new().create(true).append(true).open(path) {
-                                    Ok(mut f) => {
-                                        if let Err(e) = writeln!(f, "{received},{after},{wp}") {
-                                            eprintln!("type log: {e}");
-                                            unsafe { PostQuitMessage(1) };
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("type log: {e}");
-                                        unsafe { PostQuitMessage(1) };
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("draw: {e}");
-                            unsafe { PostQuitMessage(1) };
-                        }
-                    }
-                }
-            }
-            0
-        }
-        0x0002 => {
-            unsafe { PostQuitMessage(0) };
-            0
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
-    }
-}
-fn run(start: i64) -> Result<(), String> {
-    let mut arm = None;
-    let mut launch_log = None;
-    let mut type_log = None;
-    let mut exit_first = false;
-    let mut args = env::args().skip(1);
+
+fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let mut options = Options::default();
     while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
-            "--arm" => arm = args.next().and_then(|s| s.chars().next()),
-            "--launch-log" => launch_log = args.next(),
-            "--type-log" => type_log = args.next(),
-            "--exit-after-first-frame" => exit_first = true,
+            "--arm" => options.arm = value()?.chars().next().unwrap_or('?'),
+            "--launch-log" => options.launch_log = Some(value()?),
+            "--type-log" => options.type_log = Some(value()?),
+            "--dump-frame" => options.dump_frame = Some(value()?),
+            "--self-type" => options.self_type = Some(value()?),
+            "--exit-after-first-frame" => options.exit_first = true,
             _ => return Err(format!("unknown option {arg}")),
         }
     }
-    let arm = arm.ok_or("--arm a|b|c|d is required")?;
-    if !"abcd".contains(arm) {
-        return Err("--arm must be a, b, c, or d".into());
+    if !"abcd".contains(options.arm) {
+        return Err("--arm a|b|c|d is required".into());
     }
-    if arm != 'a' {
-        return Err(format!("arm {arm} is not implemented yet"));
+    Ok(options)
+}
+
+enum Path {
+    A(ArmA),
+    B(ArmB),
+    C(ArmC),
+    D(ArmD),
+}
+
+/// The launch log's one line: main, first frame, DWM flush, arm d's takeover.
+/// Every value is a QueryPerformanceCounter reading. The last is empty except
+/// for arm d.
+fn launch_line(start: i64, first: i64, flushed: i64, takeover: Option<i64>) -> String {
+    let takeover = takeover.map(|t| t.to_string()).unwrap_or_default();
+    format!("{start},{first},{flushed},{takeover}\n")
+}
+
+struct State {
+    options: Options,
+    hwnd: H,
+    start: i64,
+    first_frame: Option<i64>,
+    flushed: i64,
+    font: Arc<Font>,
+    layout: Layout,
+    path: Path,
+    typed: Vec<char>,
+    type_file: Option<File>,
+    error: Option<String>,
+}
+
+impl State {
+    fn fail(&mut self, message: String) {
+        if self.error.is_none() {
+            self.error = Some(message);
+        }
+        unsafe { ffi::PostQuitMessage(1) };
     }
-    if let Some(path) = &type_log {
-        fs::write(path, "").map_err(|e| format!("type log: {e}"))?;
+
+    fn draw(&mut self, dump_path: Option<&str>) -> Result<(), String> {
+        match &mut self.path {
+            Path::A(arm) => {
+                arm.draw(&self.typed)?;
+                if let Some(path) = dump_path {
+                    arm.dump(path)?;
+                }
+                Ok(())
+            }
+            Path::B(arm) => arm.draw(&self.typed, dump_path),
+            Path::C(arm) => arm.draw(&self.typed, dump_path),
+            Path::D(arm) => arm.draw(&self.typed, dump_path),
+        }
     }
-    unsafe { SetProcessDpiAwarenessContext(-4) };
-    let class = wide("QeRendererSpike");
-    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+
+    fn on_paint(&mut self) -> Result<(), String> {
+        // After the takeover the visual covers the window, so GDI has nothing to do.
+        if matches!(&self.path, Path::D(arm) if arm.has_taken_over()) {
+            return Ok(());
+        }
+        if self.first_frame.is_some() {
+            return self.draw(None);
+        }
+        let dump_path = self.options.dump_frame.clone();
+        self.draw(dump_path.as_deref())?;
+        let after = qpc();
+        self.first_frame = Some(after);
+        if let Some(path) = &dump_path {
+            dump::write_modules(&format!("{path}.modules.txt"))?;
+        }
+        if let Path::D(_) = self.path {
+            arm_d::start(self.hwnd, self.font.clone(), self.layout)?;
+        }
+        if self.options.launch_log.is_some() {
+            // DwmFlush returns after the next desktop composition pass, so this
+            // later stamp is a little closer to "on screen" than the return of
+            // Present or BitBlt. It runs after the first stamp and cannot change it.
+            dump::dwm_flush()?;
+            self.flushed = qpc();
+        }
+        if !matches!(self.path, Path::D(_)) {
+            self.finish_launch(None)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the launch log and leaves if asked. Arm d waits for its takeover.
+    fn finish_launch(&mut self, takeover: Option<i64>) -> Result<(), String> {
+        if let Some(text) = self.options.self_type.take() {
+            for c in text.chars() {
+                self.on_char(c as usize)?;
+            }
+            if let Some(path) = self.options.dump_frame.clone() {
+                self.draw(Some(&format!("{path}.typed.bmp")))?;
+            }
+        }
+        let first = self.first_frame.ok_or("the launch ended with no frame")?;
+        if let Some(path) = &self.options.launch_log {
+            fs::write(path, launch_line(self.start, first, self.flushed, takeover))
+                .map_err(|e| format!("launch log {path}: {e}"))?;
+        }
+        if self.options.exit_first {
+            unsafe { ffi::PostQuitMessage(0) };
+        }
+        Ok(())
+    }
+
+    fn on_char(&mut self, wp: usize) -> Result<(), String> {
+        let received = qpc();
+        let Some(c) = char::from_u32(wp as u32) else {
+            return Ok(());
+        };
+        if c.is_control() {
+            return Ok(());
+        }
+        self.typed.push(c);
+        self.draw(None)?;
+        let after = qpc();
+        if let Some(file) = &mut self.type_file {
+            writeln!(file, "{received},{after},{wp}").map_err(|e| format!("type log: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn on_gpu_ready(&mut self, pointer: usize) -> Result<(), String> {
+        let gpu = arm_d::gpu_ready(pointer);
+        let dump_path = self
+            .options
+            .dump_frame
+            .as_ref()
+            .map(|p| format!("{p}.gpu.bmp"));
+        let Path::D(arm) = &mut self.path else {
+            return Err("a background result reached an arm with no background".into());
+        };
+        arm.take_over(gpu, &self.typed, dump_path.as_deref())?;
+        let takeover = qpc();
+        if let Some(path) = &dump_path {
+            dump::write_modules(&format!("{path}.modules.txt"))?;
+        }
+        self.finish_launch(Some(takeover))
+    }
+}
+
+static STATE: AtomicPtr<State> = AtomicPtr::new(ptr::null_mut());
+
+unsafe extern "system" fn wndproc(hwnd: H, msg: u32, wp: usize, lp: isize) -> isize {
+    let pointer = STATE.load(Ordering::Relaxed);
+    if pointer.is_null() {
+        return unsafe { ffi::DefWindowProcW(hwnd, msg, wp, lp) };
+    }
+    let state = unsafe { &mut *pointer };
+    let result = match msg {
+        WM_PAINT => {
+            let result = state.on_paint();
+            unsafe { ffi::ValidateRect(hwnd, ptr::null()) };
+            result
+        }
+        WM_CHAR => state.on_char(wp),
+        arm_d::WM_GPU_READY => state.on_gpu_ready(wp),
+        arm_d::WM_GPU_FAILED => Err(format!("arm d background: {}", arm_d::gpu_failed(wp))),
+        // The layout is built once for one DPI. Timings after a change would
+        // be for a blurry or wrong-size window, so the spike stops and says so.
+        WM_DPICHANGED => Err("the window moved to a monitor with another DPI; run it again".into()),
+        WM_DESTROY => {
+            unsafe { ffi::PostQuitMessage(0) };
+            Ok(())
+        }
+        _ => return unsafe { ffi::DefWindowProcW(hwnd, msg, wp, lp) },
+    };
+    if let Err(e) = result {
+        state.fail(e);
+    }
+    0
+}
+
+fn run(start: i64, options: Options) -> Result<(), String> {
+    let type_file = match &options.type_log {
+        Some(path) => Some(File::create(path).map_err(|e| format!("type log {path}: {e}"))?),
+        None => None,
+    };
+    // Per-monitor awareness, version 2. This call must come before any window.
+    if unsafe { ffi::SetProcessDpiAwarenessContext(-4) } == 0 {
+        return Err(format!(
+            "SetProcessDpiAwarenessContext failed: error {}",
+            unsafe { ffi::GetLastError() }
+        ));
+    }
+    let class = ffi::wide("QeRendererSpike");
+    let title = ffi::wide("QuickEdit renderer spike");
+    let instance = unsafe { ffi::GetModuleHandleW(ptr::null()) };
     let wc = WndClass {
         style: 0,
         proc: Some(wndproc),
@@ -520,17 +272,15 @@ fn run(start: i64) -> Result<(), String> {
         menu: ptr::null(),
         name: class.as_ptr(),
     };
-    if unsafe { RegisterClassW(&wc) } == 0 {
+    if unsafe { ffi::RegisterClassW(&wc) } == 0 {
         return Err("RegisterClassW failed".into());
     }
-    let mut state = Box::new(State::new(start, launch_log, type_log, exit_first));
-    unsafe { STATE = &mut *state };
     let hwnd = unsafe {
-        CreateWindowExW(
+        ffi::CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("QuickEdit renderer spike").as_ptr(),
-            0x10cf0000,
+            title.as_ptr(),
+            WINDOW_STYLE,
             100,
             100,
             900,
@@ -542,19 +292,25 @@ fn run(start: i64) -> Result<(), String> {
         )
     };
     if hwnd.is_null() {
-        return Err("CreateWindowExW failed".into());
+        return Err(format!("CreateWindowExW failed: error {}", unsafe {
+            ffi::GetLastError()
+        }));
     }
-    unsafe { state.init(hwnd) }?;
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = unsafe { ffi::GetDpiForWindow(hwnd) };
+    let font = Arc::new(Font::open()?);
+    let layout = font.layout(dpi)?;
     let mut rect = Rect {
         left: 0,
         top: 0,
-        right: state.width,
-        bottom: state.height,
+        right: layout.width,
+        bottom: layout.height,
     };
-    unsafe { AdjustWindowRectExForDpi(&mut rect, 0x10cf0000, 0, 0, dpi) };
-    unsafe {
-        SetWindowPos(
+    if unsafe { ffi::AdjustWindowRectExForDpi(&mut rect, WINDOW_STYLE, 0, 0, dpi) } == 0 {
+        return Err("AdjustWindowRectExForDpi failed".into());
+    }
+    // SWP_NOMOVE | SWP_NOZORDER
+    let sized = unsafe {
+        ffi::SetWindowPos(
             hwnd,
             ptr::null_mut(),
             0,
@@ -562,13 +318,38 @@ fn run(start: i64) -> Result<(), String> {
             rect.right - rect.left,
             rect.bottom - rect.top,
             0x0006,
-        );
-        ShowWindow(hwnd, 5);
-        UpdateWindow(hwnd)
+        )
     };
+    if sized == 0 {
+        return Err("SetWindowPos failed".into());
+    }
+    let path = match options.arm {
+        'a' => Path::A(ArmA::new(hwnd, font.clone(), layout)?),
+        'b' => Path::B(ArmB::new(hwnd, font.clone(), layout)?),
+        'c' => Path::C(ArmC::new(Output::Window(hwnd), font.clone(), layout)?),
+        _ => Path::D(ArmD::new(hwnd, font.clone(), layout)?),
+    };
+    let mut state = Box::new(State {
+        options,
+        hwnd,
+        start,
+        first_frame: None,
+        flushed: 0,
+        font,
+        layout,
+        path,
+        typed: Vec::new(),
+        type_file,
+        error: None,
+    });
+    STATE.store(&mut *state, Ordering::Relaxed);
+    unsafe {
+        ffi::ShowWindow(hwnd, 5);
+        ffi::UpdateWindow(hwnd);
+    }
     let mut msg = unsafe { mem::zeroed::<Msg>() };
     loop {
-        let result = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
+        let result = unsafe { ffi::GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
         if result == 0 {
             break;
         }
@@ -576,20 +357,75 @@ fn run(start: i64) -> Result<(), String> {
             return Err("GetMessageW failed".into());
         }
         unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            ffi::TranslateMessage(&msg);
+            ffi::DispatchMessageW(&msg);
         }
     }
-    if msg.wp == 0 {
-        Ok(())
-    } else {
-        Err(format!("window exited with code {}", msg.wp))
+    STATE.store(ptr::null_mut(), Ordering::Relaxed);
+    if let Some(e) = state.error.take() {
+        return Err(e);
+    }
+    if msg.wp != 0 {
+        return Err(format!("the window ended with code {}", msg.wp));
+    }
+    // Ends now, with no slow and pointless release of GPU objects at exit.
+    std::process::exit(0);
+}
+
+fn report(error: &str, logs: &[Option<String>]) {
+    eprintln!("spike-renderers: {error}");
+    for path in logs.iter().flatten() {
+        if let Err(e) = fs::write(format!("{path}.err"), error) {
+            eprintln!("spike-renderers: writing {path}.err: {e}");
+        }
     }
 }
+
 fn main() {
     let start = qpc();
-    if let Err(e) = run(start) {
-        eprintln!("{e}");
-        std::process::exit(1)
+    let options = match parse_options(env::args().skip(1)) {
+        Ok(options) => options,
+        Err(e) => {
+            report(&e, &[]);
+            std::process::exit(2);
+        }
+    };
+    let logs = [options.launch_log.clone(), options.type_log.clone()];
+    if let Err(e) = run(start, options) {
+        report(&e, &logs);
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(items: &[&str]) -> Result<Options, String> {
+        parse_options(items.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn options_need_a_known_arm() {
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--arm", "e"]).is_err());
+        assert!(parse(&["--arm"]).is_err());
+        assert!(parse(&["--arm", "c", "--nope"]).is_err());
+        let options = parse(&[
+            "--arm",
+            "d",
+            "--launch-log",
+            "x",
+            "--exit-after-first-frame",
+        ])
+        .unwrap();
+        assert_eq!(options.arm, 'd');
+        assert!(options.exit_first);
+    }
+
+    #[test]
+    fn the_launch_line_leaves_takeover_empty_when_there_is_none() {
+        assert_eq!(launch_line(1, 2, 3, None), "1,2,3,\n");
+        assert_eq!(launch_line(1, 2, 3, Some(4)), "1,2,3,4\n");
     }
 }

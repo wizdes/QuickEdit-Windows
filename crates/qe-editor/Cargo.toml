@@ -13,3 +13,8 @@ qe-api.workspace = true
 qe-buffer.workspace = true
 qe-layout.workspace = true
 windows.workspace = true
+
+[dev-dependencies]
+qe-render.workspace = true
+qe-shell.workspace = true
+qe-ui.workspace = true

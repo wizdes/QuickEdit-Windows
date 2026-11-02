@@ -79,6 +79,9 @@ dependencies = [
  "qe-api",
  "qe-buffer",
  "qe-layout",
+ "qe-render",
+ "qe-shell",
+ "qe-ui",
  "windows",
 ]
 
@@ -164,8 +167,8 @@ version = "0.1.0"
 dependencies = [
  "qe-api",
  "qe-render",
- "windows",
  "unicode-segmentation",
+ "windows",
 ]
 
 [[package]]

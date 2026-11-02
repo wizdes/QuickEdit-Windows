@@ -76,6 +76,10 @@ fn main() -> Result<(), String> {
         )
     }
     .map_err(error)?;
+    // SAFETY: `owner` is the window created above. A list opens over an active window.
+    unsafe {
+        let _ = SetForegroundWindow(owner);
+    }
     let model = caret_menu();
     let (width, height) = model.preferred_size(&Measure);
     let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", model);
@@ -98,6 +102,7 @@ fn main() -> Result<(), String> {
         // SAFETY: `msg` is a valid out pointer.
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if got.0 <= 0 || msg.message == POPUP_DISMISSED_MESSAGE {
+            eprintln!("list closed: message {:#x}, wparam {}", msg.message, msg.wParam.0);
             break;
         }
         // SAFETY: `msg` came from GetMessageW. It runs for every message, handled or not.

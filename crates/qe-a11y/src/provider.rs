@@ -1,482 +1,523 @@
-//! COM providers used by UI Automation. Construct them only for WM_GETOBJECT's
-//! `UiaRootObjectId`. The host updates selection after each editor action.
+//! The text side of the tree: documents, and the range objects a client holds.
+//!
+//! A range holds UTF-16 positions, the view and document it belongs to, and the revision it
+//! last saw. Each call first brings the range up to date through the editor's change log. A
+//! range from another view or document, or one the log can no longer describe, is stale, and
+//! its calls say UIA_E_ELEMENTNOTAVAILABLE.
 #![allow(non_snake_case, non_upper_case_globals)]
-use crate::{EventFlags, EventTracker, ReadError, TextModel, TextRange};
-use qe_editor::EditorView;
+use crate::{
+    com::{gone, interface_array, invalid, none, not_enabled, not_supported, not_supported_value, not_yet, read_error, rectangle_array, to_screen, to_window},
+    host::{UiaHost, WidgetAction},
+    marshal::OnWindowThread,
+    search::{FindError, FindRequest, SearchSlot},
+    text::{Answer, Mover, TextDoc, TextRange, Unit, byte_of, read_text, utf16_of},
+    widgets::find_widget,
+};
+use qe_api::{ByteOffset, Dip, Point, Rect, TextSnapshot, ViewContext, Widget, WidgetId, testing::StringStore};
+use qe_editor::{ChangesSince, EditorView, GeometryError, HostCommand};
 use std::{
-    ffi::c_void,
-    mem::ManuallyDrop,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::Range,
+    sync::{Arc, Mutex},
 };
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::{
-            Com::SAFEARRAY,
-            Variant::{VARENUM, VARIANT},
-        },
+        System::{Com::SAFEARRAY, Variant::VARIANT},
         UI::Accessibility::*,
     },
-    core::{
-        BOOL, BSTR, ComObject, Error, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result,
-        implement,
-    },
+    core::{BOOL, BSTR, ComObject, Interface, Ref, Result, implement},
 };
 
-const E_NOTIMPL: HRESULT = HRESULT(0x80004001u32 as i32);
-const E_INVALIDARG: HRESULT = HRESULT(0x80070057u32 as i32);
-
-fn unavailable() -> Error {
-    Error::new(
-        HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32),
-        "This text or layout is not available yet.",
-    )
-}
-fn unsupported() -> Error {
-    Error::new(E_NOTIMPL, "This text operation is not supported.")
-}
-fn read_error(error: ReadError) -> Error {
-    match error {
-        ReadError::OutOfRange => {
-            Error::new(E_INVALIDARG, "The text range is outside this document.")
-        }
-        ReadError::TooLong => Error::new(
-            HRESULT(UIA_E_TIMEOUT as i32),
-            "The requested search is over the 65,536 UTF-16 unit limit.",
-        ),
-        ReadError::NotYetKnown => Error::new(
-            HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32),
-            "The mapped text is still being indexed.",
-        ),
-        ReadError::Failed(message) => {
-            Error::new(HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), message)
-        }
-    }
+/// What every COM object shares. After `close`, the host is gone, and each call fails.
+pub(crate) struct Shared {
+    pub(crate) window: isize,
+    pub(crate) host: Mutex<Option<Arc<OnWindowThread>>>,
+    pub(crate) search: SearchSlot,
+    pub(crate) nodes: Mutex<Option<crate::widgets::CachedNodes>>,
 }
 
-fn variant_int(n: i32) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt = VARENUM(3);
-        (*v.Anonymous.Anonymous).Anonymous.lVal = n;
-    }
-    v
-}
-fn variant_bool(b: bool) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt = VARENUM(11);
-        (*v.Anonymous.Anonymous).Anonymous.boolVal.0 = if b { -1 } else { 0 };
-    }
-    v
-}
-fn variant_string(s: &str) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt = VARENUM(8);
-        (*v.Anonymous.Anonymous).Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(s));
-    }
-    v
-}
-fn variant_double(n: f64) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt = VARENUM(5);
-        (*v.Anonymous.Anonymous).Anonymous.dblVal = n;
-    }
-    v
-}
-
-#[link(name = "oleaut32")]
-unsafe extern "system" {
-    fn SafeArrayCreateVector(vt: u16, lower: i32, count: u32) -> *mut SAFEARRAY;
-    fn SafeArrayPutElement(array: *mut SAFEARRAY, index: *const i32, value: *const c_void) -> i32;
-    fn SafeArrayDestroy(array: *mut SAFEARRAY) -> i32;
-}
-fn range_array(ranges: &[ITextRangeProvider]) -> Result<*mut SAFEARRAY> {
-    let count = u32::try_from(ranges.len()).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-    let array = unsafe { SafeArrayCreateVector(13, 0, count) };
-    if array.is_null() {
-        return Err(unavailable());
-    }
-    for (index, range) in ranges.iter().enumerate() {
-        let at = i32::try_from(index).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-        let status = unsafe { SafeArrayPutElement(array, &at, range.as_raw()) };
-        if status < 0 {
-            unsafe {
-                SafeArrayDestroy(array);
-            }
-            return Err(Error::from_hresult(HRESULT(status)));
-        }
-    }
-    Ok(array)
-}
-fn rectangle_array(rectangles: &[[f64; 4]]) -> Result<*mut SAFEARRAY> {
-    let count = rectangles
-        .len()
-        .checked_mul(4)
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
-    let array = unsafe { SafeArrayCreateVector(5, 0, count) };
-    if array.is_null() {
-        return Err(unavailable());
-    }
-    for (index, value) in rectangles.iter().flatten().enumerate() {
-        let at = i32::try_from(index).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
-        let status = unsafe { SafeArrayPutElement(array, &at, (value as *const f64).cast()) };
-        if status < 0 {
-            unsafe {
-                SafeArrayDestroy(array);
-            }
-            return Err(Error::from_hresult(HRESULT(status)));
-        }
-    }
-    Ok(array)
-}
-
-/// The shell implements this with a UI-thread marshal. Its methods use only
-/// `EditorView`'s nonblocking hooks and convert UTF-16 with the public helpers.
-pub trait EditorHost: Send + Sync {
-    fn visible_range(&self) -> Result<TextRange>;
-    fn range_from_point(&self, point: UiaPoint) -> Result<TextRange>;
-    fn rectangles(&self, range: TextRange) -> Result<Vec<[f64; 4]>>;
-    fn select(&self, range: TextRange) -> Result<()>;
-    fn scroll_into_view(&self, range: TextRange, align_top: bool) -> Result<()>;
-    fn expand_to_unit(&self, _: TextRange, _: TextUnit) -> Result<TextRange> {
-        Err(unsupported())
-    }
-    fn move_range(&self, _: TextRange, _: TextUnit, _: i32) -> Result<(TextRange, i32)> {
-        Err(unsupported())
-    }
-    fn move_endpoint(
-        &self,
-        _: TextRange,
-        _: TextPatternRangeEndpoint,
-        _: TextUnit,
-        _: i32,
-    ) -> Result<(TextRange, i32)> {
-        Err(unsupported())
-    }
-}
-
-#[derive(Clone)]
-struct Shared {
-    model: Arc<Mutex<TextModel>>,
-    selection: Arc<Mutex<TextRange>>,
-    select: Option<Arc<dyn Fn(TextRange) -> Result<()> + Send + Sync>>,
-    editor_host: Option<Arc<dyn EditorHost>>,
-    read_only: Arc<AtomicBool>,
-    font: Arc<Mutex<Option<(String, f64)>>>,
-}
 impl Shared {
-    fn model(&self) -> Result<TextModel> {
-        Ok(self.model.lock().map_err(|_| unavailable())?.clone())
+    pub(crate) fn host(&self) -> Result<Arc<OnWindowThread>> {
+        self.host
+            .lock()
+            .map_err(|_| gone())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(gone)
     }
-    fn check_range(&self, range: TextRange) -> Result<TextRange> {
-        let end = self.model()?.len_utf16().map_err(read_error)?;
-        if range.start > range.end || range.end > end {
-            Err(Error::from_hresult(E_INVALIDARG))
-        } else {
-            Ok(range)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The editor's document.
+    Editor,
+    /// A painted text field's value.
+    Field(WidgetId),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tracked {
+    pub(crate) range: TextRange,
+    /// Which view, and which document in it.
+    pub(crate) owner: (u64, u64),
+    pub(crate) revision: u64,
+}
+
+/// One position through one change. Text before stays, text after shifts, and a position in
+/// the replaced text goes to where that text began.
+pub fn shift(position: usize, start: usize, old_end: usize, new_end: usize) -> usize {
+    if position <= start {
+        position
+    } else if position >= old_end {
+        position - old_end + new_end
+    } else {
+        start
+    }
+}
+
+/// A document as COM calls see it, for the length of one call.
+pub(crate) trait Doc: TextDoc {
+    fn stamp(&self) -> ((u64, u64), u64);
+    fn catch_up(&mut self, state: &mut Tracked) -> Result<()>;
+    fn shared_snapshot(&self) -> Arc<dyn TextSnapshot>;
+    fn selection(&self) -> Answer<TextRange>;
+    fn caret(&self) -> Answer<usize>;
+    fn read_only(&self) -> bool;
+    fn select(&mut self, range: TextRange) -> Result<()>;
+    fn scroll(&mut self, range: TextRange, top: bool) -> Result<()>;
+    fn rects(&mut self, range: TextRange) -> Result<Vec<[f64; 4]>>;
+    fn visible(&mut self) -> Result<Option<TextRange>>;
+    fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange>;
+}
+
+struct EditorDoc<'a> {
+    view: &'a mut EditorView,
+    ctx: &'a mut ViewContext,
+    view_id: u64,
+    window: isize,
+    text: Arc<dyn TextSnapshot>,
+    rows: Option<Vec<qe_editor::VisibleRow>>,
+}
+
+impl TextDoc for EditorDoc<'_> {
+    fn snapshot(&self) -> &dyn TextSnapshot {
+        self.text.as_ref()
+    }
+    fn word_at(&mut self, byte: usize) -> Answer<Range<usize>> {
+        let found = self.view.word_range_at(ByteOffset(byte))?;
+        Ok(found.start.0..found.end.0)
+    }
+    fn row_stops(&mut self, line: usize) -> Vec<usize> {
+        let view = &*self.view;
+        let rows = self.rows.get_or_insert_with(|| view.visible_rows().rows);
+        rows.iter()
+            .filter(|row| row.line.0 == line)
+            .map(|row| row.first_byte.0)
+            .collect()
+    }
+    fn line_of(&self, byte: usize) -> Answer<usize> {
+        Ok(self.view.line_of_byte(ByteOffset(byte))?.0)
+    }
+}
+
+impl Doc for EditorDoc<'_> {
+    fn stamp(&self) -> ((u64, u64), u64) {
+        ((self.view_id, self.view.document_number()), self.view.revision())
+    }
+    fn catch_up(&mut self, state: &mut Tracked) -> Result<()> {
+        let (owner, revision) = self.stamp();
+        if state.owner != owner {
+            return Err(gone());
         }
+        match self.view.changes_since(state.revision) {
+            ChangesSince::Current => {}
+            // A mapped file cannot be edited, so its positions stay good when its index grows.
+            ChangesSince::Rescan if self.text.is_read_only() => {}
+            ChangesSince::Rescan => return Err(gone()),
+            ChangesSince::Changes(changes) => {
+                for change in changes {
+                    let (from, to, new_end) =
+                        (change.utf16.start.0, change.utf16.old_end.0, change.utf16.new_end.0);
+                    state.range.start = shift(state.range.start, from, to, new_end);
+                    state.range.end = shift(state.range.end, from, to, new_end);
+                }
+            }
+        }
+        state.revision = revision;
+        Ok(())
     }
-}
-
-/// A document provider holds an immutable snapshot. Replace it after an edit.
-/// The caller must create the snapshot on the UI thread; all COM reads are bounded.
-pub struct DocumentProvider {
-    simple: IRawElementProviderSimple,
-    shared: Shared,
-}
-
-// SAFETY: `simple` is this crate's COM object, whose reference count is atomic.
-// Its methods touch only `Shared` data behind Mutex/AtomicBool and Send+Sync
-// callbacks. No apartment-bound Windows object is stored in the provider.
-unsafe impl Send for DocumentProvider {}
-unsafe impl Sync for DocumentProvider {}
-
-impl DocumentProvider {
-    /// `read_only` must come from `EditorView::can_edit` on the UI thread.
-    /// Reading that state from a mapped snapshot could wait for disk.
-    pub fn new(model: TextModel, selection: TextRange, read_only: bool) -> Self {
-        let shared = Shared {
-            model: Arc::new(Mutex::new(model)),
-            selection: Arc::new(Mutex::new(selection)),
-            select: None,
-            editor_host: None,
-            read_only: Arc::new(AtomicBool::new(read_only)),
-            font: Arc::new(Mutex::new(None)),
+    fn shared_snapshot(&self) -> Arc<dyn TextSnapshot> {
+        self.text.clone()
+    }
+    fn selection(&self) -> Answer<TextRange> {
+        let selection = self.view.selection();
+        Ok(TextRange::new(
+            self.view.byte_to_utf16(selection.start)?.0,
+            self.view.byte_to_utf16(selection.end)?.0,
+        ))
+    }
+    fn caret(&self) -> Answer<usize> {
+        Ok(self.view.byte_to_utf16(self.view.caret())?.0)
+    }
+    fn read_only(&self) -> bool {
+        !self.view.can_edit()
+    }
+    fn select(&mut self, range: TextRange) -> Result<()> {
+        let start = byte_of(self.text.as_ref(), range.start).map_err(read_error)?;
+        let end = byte_of(self.text.as_ref(), range.end).map_err(read_error)?;
+        self.view.run_host(
+            HostCommand::Select {
+                range: ByteOffset(start)..ByteOffset(end),
+                reveal: true,
+            },
+            self.ctx,
+        );
+        Ok(())
+    }
+    /// The editor has no hook that scrolls to a byte and keeps the selection, so this uses
+    /// the same estimate the scroll bar does: lines with no layout count at their estimate.
+    fn scroll(&mut self, range: TextRange, top: bool) -> Result<()> {
+        let start = byte_of(self.text.as_ref(), range.start).map_err(read_error)?;
+        if let Ok(visible) = self.view.visible_range()
+            && (visible.start.0..visible.end.0).contains(&start)
+        {
+            return Ok(());
+        }
+        let line = self.view.line_of_byte(ByteOffset(start)).map_err(|e| read_error(e.into()))?;
+        let lines = self.view.store_status().known_lines.max(1);
+        let along = self.view.total_height() * line.0 as f64 / lines as f64;
+        let height = f64::from(self.view.text_area().height.0);
+        let y = if top { along } else { (along - height / 2.0).max(0.0) };
+        self.view.run_host(HostCommand::ScrollTo(y), self.ctx);
+        Ok(())
+    }
+    /// Only text on screen has rectangles. A range off screen, or on screen with no layout
+    /// yet, gives none, which is how UIA says "not visible".
+    fn rects(&mut self, range: TextRange) -> Result<Vec<[f64; 4]>> {
+        let text = self.text.clone();
+        let start = byte_of(text.as_ref(), range.start).map_err(read_error)?;
+        let end = byte_of(text.as_ref(), range.end).map_err(read_error)?;
+        let Ok(visible) = self.view.visible_range() else {
+            return Ok(Vec::new());
         };
-        let simple = ComObject::new(Document {
-            shared: shared.clone(),
-        })
-        .to_interface();
-        Self { simple, shared }
-    }
-    /// Call on the UI thread. The snapshot may then answer later COM calls on
-    /// the calling UIA thread, without touching the editor or waiting on disk.
-    pub fn from_editor(view: &EditorView) -> std::result::Result<Self, ReadError> {
-        let selection = view.selection();
-        let start = view.byte_to_utf16(selection.start)?.0;
-        let end = view.byte_to_utf16(selection.end)?.0;
-        Ok(Self::new(
-            TextModel::new(view.worker_snapshot()),
-            TextRange::new(start, end),
-            !view.can_edit(),
-        ))
-    }
-    pub fn simple(&self) -> &IRawElementProviderSimple {
-        &self.simple
-    }
-    /// The callback must marshal to the UI thread and use `HostCommand::Select`.
-    pub fn with_select(
-        mut self,
-        callback: Arc<dyn Fn(TextRange) -> Result<()> + Send + Sync>,
-    ) -> Self {
-        self.shared.select = Some(callback);
-        self.simple = ComObject::new(Document {
-            shared: self.shared.clone(),
-        })
-        .to_interface();
-        self
-    }
-    pub fn with_editor_host(mut self, host: Arc<dyn EditorHost>) -> Self {
-        self.shared.editor_host = Some(host);
-        self.simple = ComObject::new(Document {
-            shared: self.shared.clone(),
-        })
-        .to_interface();
-        self
-    }
-    pub fn set_selection(&self, selection: TextRange) -> Result<()> {
-        *self.shared.selection.lock().map_err(|_| unavailable())? = selection;
-        Ok(())
-    }
-    /// The shell supplies the actual font after a font or zoom change.
-    pub fn set_font(&self, family: impl Into<String>, points: f64) -> Result<()> {
-        if !points.is_finite() || points <= 0.0 {
-            return Err(Error::from_hresult(E_INVALIDARG));
+        let from = start.max(visible.start.0);
+        let to = end.min(visible.end.0);
+        if from > to || (from == to && start != end) {
+            return Ok(Vec::new());
         }
-        *self.shared.font.lock().map_err(|_| unavailable())? = Some((family.into(), points));
-        Ok(())
-    }
-    /// Refresh after every edit or document replacement. Old range objects then
-    /// see the current document and reject positions that are past its end.
-    pub fn refresh_from_editor(&self, view: &EditorView) -> std::result::Result<(), ReadError> {
-        let selection = view.selection();
-        let start = view.byte_to_utf16(selection.start)?.0;
-        let end = view.byte_to_utf16(selection.end)?.0;
-        *self
-            .shared
-            .model
-            .lock()
-            .map_err(|_| ReadError::Failed("UIA document lock failed".into()))? =
-            TextModel::new(view.worker_snapshot());
-        *self
-            .shared
-            .selection
-            .lock()
-            .map_err(|_| ReadError::Failed("UIA selection lock failed".into()))? =
-            TextRange::new(start, end);
-        self.shared
-            .read_only
-            .store(!view.can_edit(), Ordering::Release);
-        Ok(())
-    }
-    /// Call after one UI input batch. This checks for clients before reading
-    /// the editor's change log or raising any event.
-    pub fn raise_editor_events(
-        &self,
-        tracker: &mut EventTracker,
-        view: &EditorView,
-    ) -> Result<EventFlags> {
-        let listening = unsafe { UiaClientsAreListening().as_bool() };
-        let flags = tracker.poll(view, listening);
-        if flags.text_changed {
-            unsafe {
-                UiaRaiseAutomationEvent(&self.simple, UIA_Text_TextChangedEventId)?;
+        let found = match self.view.range_rects(ByteOffset(from)..ByteOffset(to)) {
+            Ok(found) => found,
+            Err(GeometryError::NotLaidOut | GeometryError::TooManyLines { .. }) => return Ok(Vec::new()),
+            Err(GeometryError::Lookup(error)) => return Err(read_error(error.into())),
+        };
+        let area = self.view.text_area();
+        let mut answer = Vec::with_capacity(found.len());
+        for part in found {
+            if let Some(rect) = clip(part.rect, area) {
+                answer.push(to_screen(self.window, rect)?);
             }
         }
-        if flags.selection_changed {
-            unsafe {
-                UiaRaiseAutomationEvent(&self.simple, UIA_Text_TextSelectionChangedEventId)?;
-            }
-        }
-        if flags.caret_moved {
-            let selection = view.selection();
-            let at = view
-                .byte_to_utf16(selection.end)
-                .map_err(|e| read_error(e.into()))?
-                .0;
-            let caret = make_range(&self.shared, TextRange::new(at, at), &self.simple);
-            unsafe {
-                UiaRaiseActiveTextPositionChangedEvent(&self.simple, &caret)?;
-            }
-        }
-        Ok(flags)
+        Ok(answer)
     }
-}
-
-#[implement(IRawElementProviderSimple, ITextProvider2, IValueProvider)]
-struct Document {
-    shared: Shared,
-}
-
-impl IRawElementProviderSimple_Impl for Document_Impl {
-    fn ProviderOptions(&self) -> Result<ProviderOptions> {
-        Ok(ProviderOptions_ServerSideProvider)
-    }
-    fn GetPatternProvider(&self, id: UIA_PATTERN_ID) -> Result<IUnknown> {
-        if id == UIA_TextPatternId || id == UIA_TextPattern2Id {
-            let provider: ITextProvider2 = self.to_object().to_interface();
-            provider.cast()
-        } else if id == UIA_ValuePatternId && self.shared.read_only.load(Ordering::Acquire) {
-            self.to_object().to_interface::<IValueProvider>().cast()
-        } else {
-            Err(unsupported())
-        }
-    }
-    fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
-        Ok(match id {
-            UIA_ControlTypePropertyId => variant_int(UIA_DocumentControlTypeId.0),
-            UIA_NamePropertyId => variant_string("Document"),
-            UIA_IsEnabledPropertyId => variant_bool(true),
-            UIA_IsKeyboardFocusablePropertyId => variant_bool(true),
-            _ => VARIANT::default(),
-        })
-    }
-    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
-        Err(unsupported())
-    }
-}
-
-impl ITextProvider_Impl for Document_Impl {
-    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        let selection = *self.shared.selection.lock().map_err(|_| unavailable())?;
-        range_array(&[make_range(
-            &self.shared,
-            selection,
-            &self.to_object().to_interface(),
-        )])
-    }
-    fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
-        let host = self.shared.editor_host.as_ref().ok_or_else(unavailable)?;
-        range_array(&[make_range(
-            &self.shared,
-            host.visible_range()?,
-            &self.to_object().to_interface(),
-        )])
-    }
-    fn RangeFromChild(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
-        Err(unsupported())
-    }
-    fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
-        let host = self.shared.editor_host.as_ref().ok_or_else(unavailable)?;
-        Ok(make_range(
-            &self.shared,
-            host.range_from_point(*point)?,
-            &self.to_object().to_interface(),
-        ))
-    }
-    fn DocumentRange(&self) -> Result<ITextRangeProvider> {
-        let end = self.shared.model()?.len_utf16().map_err(read_error)?;
-        Ok(make_range(
-            &self.shared,
-            TextRange::new(0, end),
-            &self.to_object().to_interface(),
-        ))
-    }
-    fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
-        Ok(SupportedTextSelection_Single)
-    }
-}
-impl ITextProvider2_Impl for Document_Impl {
-    fn RangeFromAnnotation(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
-        Err(unsupported())
-    }
-    fn GetCaretRange(&self, active: *mut BOOL) -> Result<ITextRangeProvider> {
-        if active.is_null() {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        unsafe {
-            *active = BOOL(1);
-        }
-        let position = self.shared.selection.lock().map_err(|_| unavailable())?.end;
-        Ok(make_range(
-            &self.shared,
-            TextRange::new(position, position),
-            &self.to_object().to_interface(),
-        ))
-    }
-}
-
-impl IValueProvider_Impl for Document_Impl {
-    fn SetValue(&self, _: &windows::core::PCWSTR) -> Result<()> {
-        Err(Error::new(
-            HRESULT(UIA_E_ELEMENTNOTENABLED as i32),
-            "This document is read only.",
-        ))
-    }
-    fn Value(&self) -> Result<BSTR> {
-        let model = self.shared.model()?;
-        let end = model.len_utf16().map_err(read_error)?;
-        if end > crate::GET_TEXT_CAP {
-            return Err(Error::new(
-                HRESULT(UIA_E_TIMEOUT as i32),
-                "The document is too large for a Value answer.",
-            ));
-        }
-        model
-            .read(TextRange::new(0, end), -1)
-            .map(|s| BSTR::from(s.as_str()))
-            .map_err(read_error)
-    }
-    fn IsReadOnly(&self) -> Result<BOOL> {
-        Ok(BOOL(i32::from(
-            self.shared.read_only.load(Ordering::Acquire),
+    fn visible(&mut self) -> Result<Option<TextRange>> {
+        let Ok(found) = self.view.visible_range() else {
+            return Ok(None);
+        };
+        let text = self.text.as_ref();
+        Ok(Some(TextRange::new(
+            utf16_of(text, found.start.0).map_err(read_error)?,
+            utf16_of(text, found.end.0).map_err(read_error)?,
         )))
     }
+    fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange> {
+        let (x, y) = to_window(self.window, x, y)?;
+        let area = self.view.text_area();
+        let inside = x >= area.x.0
+            && y >= area.y.0
+            && x < area.x.0 + area.width.0
+            && y < area.y.0 + area.height.0;
+        if !inside {
+            return Err(invalid("This point is outside the text."));
+        }
+        let hit = self
+            .view
+            .byte_at_point(Point { x: Dip(x), y: Dip(y) })
+            .map_err(|error| match error {
+                GeometryError::Lookup(error) => read_error(error.into()),
+                _ => not_yet("The text here has no layout yet. Ask again soon."),
+            })?;
+        let at = utf16_of(self.text.as_ref(), hit.byte.0).map_err(read_error)?;
+        Ok(TextRange::new(at, at))
+    }
 }
 
-fn make_range(
+fn clip(rect: Rect, area: Rect) -> Option<Rect> {
+    let left = rect.x.0.max(area.x.0);
+    let top = rect.y.0.max(area.y.0);
+    let right = (rect.x.0 + rect.width.0).min(area.x.0 + area.width.0);
+    let bottom = (rect.y.0 + rect.height.0).min(area.y.0 + area.height.0);
+    (right >= left && bottom > top).then_some(Rect {
+        x: Dip(left),
+        y: Dip(top),
+        width: Dip(right - left),
+        height: Dip(bottom - top),
+    })
+}
+
+/// A painted text field. It has one line, so its rows and words need no editor.
+struct FieldDoc {
+    widget: Widget,
+    host: Arc<dyn UiaHost>,
+    window: isize,
+    text: Arc<dyn TextSnapshot>,
+    value: String,
+}
+
+fn word_class(c: char) -> u8 {
+    if c.is_alphanumeric() || c == '_' {
+        0
+    } else if crate::text::is_space(c) {
+        1
+    } else {
+        2
+    }
+}
+
+impl TextDoc for FieldDoc {
+    fn snapshot(&self) -> &dyn TextSnapshot {
+        self.text.as_ref()
+    }
+    fn word_at(&mut self, byte: usize) -> Answer<Range<usize>> {
+        let chars: Vec<(usize, char)> = self.value.char_indices().collect();
+        if chars.is_empty() {
+            return Ok(0..0);
+        }
+        let index = chars
+            .partition_point(|(at, _)| *at < byte)
+            .min(chars.len() - 1);
+        let class = word_class(chars[index].1);
+        let (mut first, mut last) = (index, index + 1);
+        if class != 2 {
+            while first > 0 && word_class(chars[first - 1].1) == class {
+                first -= 1;
+            }
+            while last < chars.len() && word_class(chars[last].1) == class {
+                last += 1;
+            }
+        }
+        let end = chars.get(last).map_or(self.value.len(), |(at, _)| *at);
+        Ok(chars[first].0..end)
+    }
+    fn row_stops(&mut self, _: usize) -> Vec<usize> {
+        Vec::new()
+    }
+}
+
+impl Doc for FieldDoc {
+    fn stamp(&self) -> ((u64, u64), u64) {
+        let mut hasher = DefaultHasher::new();
+        self.value.hash(&mut hasher);
+        ((self.widget.id.0, 0), hasher.finish())
+    }
+    /// A field has no change log, so after a change a range keeps its numbers, inside the
+    /// new text.
+    fn catch_up(&mut self, state: &mut Tracked) -> Result<()> {
+        let (owner, revision) = self.stamp();
+        if state.owner != owner {
+            return Err(gone());
+        }
+        let len = crate::text::known_len(self.text.as_ref()).map_err(read_error)?.0;
+        state.range.start = state.range.start.min(len);
+        state.range.end = state.range.end.min(len);
+        state.revision = revision;
+        Ok(())
+    }
+    fn shared_snapshot(&self) -> Arc<dyn TextSnapshot> {
+        self.text.clone()
+    }
+    fn selection(&self) -> Answer<TextRange> {
+        let len = crate::text::known_len(self.text.as_ref())?.0;
+        let selection = self.widget.selection.clone().unwrap_or(len..len);
+        Ok(TextRange::new(selection.start.min(len), selection.end.min(len)))
+    }
+    fn caret(&self) -> Answer<usize> {
+        Ok(self.selection()?.end)
+    }
+    fn read_only(&self) -> bool {
+        self.widget.states.read_only
+    }
+    fn select(&mut self, range: TextRange) -> Result<()> {
+        if !self.widget.states.enabled {
+            return Err(not_enabled("This field is turned off."));
+        }
+        self.host
+            .action(self.widget.id, WidgetAction::SelectText(range))
+    }
+    fn scroll(&mut self, _: TextRange, _: bool) -> Result<()> {
+        Ok(())
+    }
+    /// The field does not report where its characters are, so any text in it answers with
+    /// the field's whole box.
+    fn rects(&mut self, _: TextRange) -> Result<Vec<[f64; 4]>> {
+        Ok(vec![to_screen(self.window, self.widget.bounds)?])
+    }
+    fn visible(&mut self) -> Result<Option<TextRange>> {
+        let len = crate::text::known_len(self.text.as_ref()).map_err(read_error)?.0;
+        Ok(Some(TextRange::new(0, len)))
+    }
+    fn at_point(&mut self, _: f64, _: f64) -> Result<TextRange> {
+        Err(not_supported("A field does not report where its characters are."))
+    }
+}
+
+/// Runs `body` with this source's document, on the UI thread, with the host's permission.
+pub(crate) fn with_doc<T>(
     shared: &Shared,
-    value: TextRange,
-    enclosing: &IRawElementProviderSimple,
+    source: Source,
+    body: impl FnOnce(&mut dyn Doc) -> Result<T>,
+) -> Result<T> {
+    let host = shared.host()?;
+    match source {
+        Source::Editor => {
+            let view_id = host.call_now(|h| h.view_id().ok_or_else(gone))?;
+            let mut body = Some(body);
+            let mut out = None;
+            let window = shared.window;
+            let reached = host.with_editor(&mut |view, ctx| {
+                let text = view.worker_snapshot();
+                let mut doc = EditorDoc {
+                    view,
+                    ctx,
+                    view_id,
+                    window,
+                    text,
+                    rows: None,
+                };
+                if let Some(body) = body.take() {
+                    out = Some(body(&mut doc));
+                }
+            });
+            if !reached {
+                return Err(not_yet("The editor is busy. Ask again soon."));
+            }
+            out.unwrap_or_else(|| Err(not_yet("The editor is busy. Ask again soon.")))
+        }
+        Source::Field(id) => {
+            let root = host.widgets_now()?;
+            let widget = find_widget(&root, id).ok_or_else(gone)?.clone();
+            let value = widget.value.clone().unwrap_or_default();
+            let mut doc = FieldDoc {
+                widget,
+                host,
+                window: shared.window,
+                text: Arc::new(StringStore::new(value.clone())),
+                value,
+            };
+            body(&mut doc)
+        }
+    }
+}
+
+pub(crate) fn make_range(
+    shared: &Arc<Shared>,
+    source: Source,
+    doc: &dyn Doc,
+    range: TextRange,
+    enclosing: IRawElementProviderSimple,
 ) -> ITextRangeProvider {
-    ComObject::new(RangeProvider {
+    let (owner, revision) = doc.stamp();
+    ComObject::new(TextRangeObject {
         shared: shared.clone(),
-        value: Mutex::new(value),
-        enclosing: enclosing.clone(),
+        source,
+        enclosing,
+        state: Mutex::new(Tracked {
+            range,
+            owner,
+            revision,
+        }),
     })
     .to_interface()
 }
 
-#[implement(ITextRangeProvider)]
-struct RangeProvider {
-    shared: Shared,
-    value: Mutex<TextRange>,
-    enclosing: IRawElementProviderSimple,
+fn unit_of(unit: TextUnit) -> Result<Unit> {
+    match unit {
+        TextUnit_Character => Ok(Unit::Character),
+        TextUnit_Word => Ok(Unit::Word),
+        TextUnit_Line => Ok(Unit::Line),
+        TextUnit_Paragraph => Ok(Unit::Paragraph),
+        TextUnit_Format | TextUnit_Page | TextUnit_Document => Ok(Unit::Document),
+        _ => Err(invalid("This text unit does not exist.")),
+    }
 }
 
-impl ITextRangeProvider_Impl for RangeProvider_Impl {
+fn moves_start(endpoint: TextPatternRangeEndpoint) -> Result<bool> {
+    match endpoint {
+        TextPatternRangeEndpoint_Start => Ok(true),
+        TextPatternRangeEndpoint_End => Ok(false),
+        _ => Err(invalid("This range end does not exist.")),
+    }
+}
+
+#[implement(ITextRangeProvider)]
+struct TextRangeObject {
+    shared: Arc<Shared>,
+    source: Source,
+    enclosing: IRawElementProviderSimple,
+    state: Mutex<Tracked>,
+}
+
+impl TextRangeObject {
+    fn tracked(&self) -> Result<Tracked> {
+        self.state.lock().map(|state| *state).map_err(|_| gone())
+    }
+    /// Brings the range up to date, runs `body`, and keeps what `body` left in the range.
+    fn run<T>(&self, body: impl FnOnce(&mut dyn Doc, &mut TextRange) -> Result<T>) -> Result<T> {
+        with_doc(&self.shared, self.source, |doc| {
+            let mut state = self.tracked()?;
+            doc.catch_up(&mut state)?;
+            let answer = body(doc, &mut state.range)?;
+            *self.state.lock().map_err(|_| gone())? = state;
+            Ok(answer)
+        })
+    }
+    /// The other range's text range, up to date. It must belong to this same document.
+    fn other_range(&self, doc: &mut dyn Doc, other: Ref<ITextRangeProvider>) -> Result<TextRange> {
+        let other = other
+            .ok()
+            .map_err(|_| invalid("No range was given."))?
+            .cast_object_ref::<TextRangeObject>()
+            .map_err(|_| invalid("This range is from another provider."))?;
+        if !Arc::ptr_eq(&self.shared, &other.shared) || self.source != other.source {
+            return Err(invalid("This range is from another document."));
+        }
+        let mut state = other.tracked()?;
+        doc.catch_up(&mut state)?;
+        *other.state.lock().map_err(|_| gone())? = state;
+        Ok(state.range)
+    }
+}
+
+fn endpoint_of(range: TextRange, start: bool) -> usize {
+    if start { range.start } else { range.end }
+}
+
+impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     fn Clone(&self) -> Result<ITextRangeProvider> {
-        Ok(make_range(
-            &self.shared,
-            *self.value.lock().map_err(|_| unavailable())?,
-            &self.enclosing,
-        ))
+        self.run(|doc, range| {
+            Ok(make_range(
+                &self.shared,
+                self.source,
+                &*doc,
+                *range,
+                self.enclosing.clone(),
+            ))
+        })
     }
     fn Compare(&self, other: Ref<ITextRangeProvider>) -> Result<BOOL> {
-        let target = other.ok()?.cast_object_ref::<RangeProvider>()?;
-        if !Arc::ptr_eq(&self.shared.selection, &target.shared.selection) {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let a = *self.value.lock().map_err(|_| unavailable())?;
-        let b = *target.value.lock().map_err(|_| unavailable())?;
-        Ok(BOOL(i32::from(a == b)))
+        self.run(|doc, range| {
+            let other = self.other_range(doc, other)?;
+            Ok(BOOL::from(*range == other))
+        })
     }
     fn CompareEndpoints(
         &self,
@@ -484,38 +525,59 @@ impl ITextRangeProvider_Impl for RangeProvider_Impl {
         other: Ref<ITextRangeProvider>,
         other_endpoint: TextPatternRangeEndpoint,
     ) -> Result<i32> {
-        let target = other.ok()?.cast_object_ref::<RangeProvider>()?;
-        if !Arc::ptr_eq(&self.shared.selection, &target.shared.selection) {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let a = *self.value.lock().map_err(|_| unavailable())?;
-        let b = *target.value.lock().map_err(|_| unavailable())?;
-        let left = endpoint_value(a, endpoint)?;
-        let right = endpoint_value(b, other_endpoint)?;
-        let distance = left.abs_diff(right).min(i32::MAX as usize) as i32;
-        Ok(if left < right { -distance } else { distance })
+        let mine = moves_start(endpoint)?;
+        let theirs = moves_start(other_endpoint)?;
+        self.run(|doc, range| {
+            let other = self.other_range(doc, other)?;
+            let left = endpoint_of(*range, mine);
+            let right = endpoint_of(other, theirs);
+            let distance = i32::try_from(left.abs_diff(right)).unwrap_or(i32::MAX);
+            Ok(if left < right { -distance } else { distance })
+        })
     }
     fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> Result<()> {
-        if unit != TextUnit_Document {
-            let host = self.shared.editor_host.as_ref().ok_or_else(unsupported)?;
-            let current = *self.value.lock().map_err(|_| unavailable())?;
-            let next = self
-                .shared
-                .check_range(host.expand_to_unit(current, unit)?)?;
-            *self.value.lock().map_err(|_| unavailable())? = next;
-            return Ok(());
-        }
-        let end = self.shared.model()?.len_utf16().map_err(read_error)?;
-        *self.value.lock().map_err(|_| unavailable())? = TextRange::new(0, end);
-        Ok(())
+        let unit = unit_of(unit)?;
+        self.run(|doc, range| {
+            *range = Mover { doc: &mut *doc }
+                .unit_at(unit, range.start)
+                .map_err(read_error)?;
+            Ok(())
+        })
     }
+    /// Plain text has one format, so the answer is this whole range or nothing.
     fn FindAttribute(
         &self,
-        _: UIA_TEXTATTRIBUTE_ID,
-        _: &VARIANT,
-        _: BOOL,
+        id: UIA_TEXTATTRIBUTE_ID,
+        value: &VARIANT,
+        _backward: BOOL,
     ) -> Result<ITextRangeProvider> {
-        Err(unsupported())
+        let wanted = self.attribute(id)?;
+        let same = match (bool::try_from(&wanted), bool::try_from(value)) {
+            (Ok(a), Ok(b)) if id == UIA_IsReadOnlyAttributeId => a == b,
+            _ => match id {
+                UIA_FontNameAttributeId => matches!(
+                    (BSTR::try_from(&wanted), BSTR::try_from(value)),
+                    (Ok(a), Ok(b)) if a == b
+                ),
+                UIA_FontSizeAttributeId => matches!(
+                    (f64::try_from(&wanted), f64::try_from(value)),
+                    (Ok(a), Ok(b)) if a == b
+                ),
+                _ => false,
+            },
+        };
+        if !same {
+            return Err(none());
+        }
+        self.run(|doc, range| {
+            Ok(make_range(
+                &self.shared,
+                self.source,
+                &*doc,
+                *range,
+                self.enclosing.clone(),
+            ))
+        })
     }
     fn FindText(
         &self,
@@ -523,85 +585,73 @@ impl ITextRangeProvider_Impl for RangeProvider_Impl {
         backward: BOOL,
         ignore_case: BOOL,
     ) -> Result<ITextRangeProvider> {
-        let range = *self.value.lock().map_err(|_| unavailable())?;
-        let found = self
-            .shared
-            .model()?
-            .find_text(
-                range,
-                &query.to_string(),
-                backward.as_bool(),
-                ignore_case.as_bool(),
-            )
-            .map_err(read_error)?;
-        found
-            .map(|value| make_range(&self.shared, value, &self.enclosing))
-            .ok_or_else(unavailable)
-    }
-    fn GetAttributeValue(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
-        Ok(match id {
-            UIA_IsReadOnlyAttributeId => {
-                variant_bool(self.shared.read_only.load(Ordering::Acquire))
+        if query.is_empty() {
+            return Err(invalid("The text to find is empty."));
+        }
+        // Text with a lone surrogate cannot be in a document, which is all valid text.
+        let Ok(query) = String::from_utf16(query) else {
+            return Err(none());
+        };
+        self.run(|doc, range| {
+            let ((view, document), revision) = doc.stamp();
+            let request = FindRequest {
+                identity: (view, document, revision),
+                range: *range,
+                query,
+                backward: backward.as_bool(),
+                ignore_case: ignore_case.as_bool(),
+            };
+            let found = self
+                .shared
+                .search
+                .find(&doc.shared_snapshot(), request)
+                .map_err(|error| match error {
+                    FindError::Searching => {
+                        not_yet("The search is still running. Ask again soon.")
+                    }
+                    FindError::Read(error) => read_error(error),
+                })?;
+            match found {
+                Some(found) => Ok(make_range(
+                    &self.shared,
+                    self.source,
+                    &*doc,
+                    found,
+                    self.enclosing.clone(),
+                )),
+                None => Err(none()),
             }
-            UIA_FontNameAttributeId => self
-                .shared
-                .font
-                .lock()
-                .map_err(|_| unavailable())?
-                .as_ref()
-                .map_or_else(VARIANT::default, |f| variant_string(&f.0)),
-            UIA_FontSizeAttributeId => self
-                .shared
-                .font
-                .lock()
-                .map_err(|_| unavailable())?
-                .as_ref()
-                .map_or_else(VARIANT::default, |f| variant_double(f.1)),
-            _ => VARIANT::default(),
         })
     }
+    fn GetAttributeValue(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+        self.attribute(id)
+    }
     fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
-        let host = self.shared.editor_host.as_ref().ok_or_else(unavailable)?;
-        let range = *self.value.lock().map_err(|_| unavailable())?;
-        rectangle_array(&host.rectangles(range)?)
+        self.run(|doc, range| rectangle_array(&doc.rects(*range)?))
     }
     fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
+        // A closed provider has no element to give.
+        self.shared.host()?;
         Ok(self.enclosing.clone())
     }
-    fn GetText(&self, max: i32) -> Result<BSTR> {
-        let range = *self.value.lock().map_err(|_| unavailable())?;
-        self.shared
-            .model()?
-            .read(range, max)
-            .map(|s| BSTR::from(s.as_str()))
-            .map_err(read_error)
+    fn GetText(&self, limit: i32) -> Result<BSTR> {
+        if limit < -1 {
+            return Err(invalid("The limit must be -1 or more."));
+        }
+        self.run(|doc, range| {
+            let text = read_text(doc.snapshot(), *range, limit).map_err(read_error)?;
+            Ok(BSTR::from(text.as_str()))
+        })
     }
     fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
-        if unit != TextUnit_Document {
-            let host = self.shared.editor_host.as_ref().ok_or_else(unsupported)?;
-            let current = *self.value.lock().map_err(|_| unavailable())?;
-            let (next, moved) = host.move_range(current, unit, count)?;
-            *self.value.lock().map_err(|_| unavailable())? = self.shared.check_range(next)?;
-            return Ok(moved);
-        }
-        let end = self.shared.model()?.len_utf16().map_err(read_error)?;
-        let mut range = self.value.lock().map_err(|_| unavailable())?;
-        let next = if count < 0 {
-            0
-        } else if count > 0 {
-            end
-        } else {
-            range.start
-        };
-        let moved = if next == range.start {
-            0
-        } else if count < 0 {
-            -1
-        } else {
-            1
-        };
-        *range = TextRange::new(next, next);
-        Ok(moved)
+        let unit = unit_of(unit)?;
+        self.run(|doc, range| {
+            let (next, moved) = Mover { doc: &mut *doc }
+                .move_range(*range, unit, count)
+                .map_err(read_error)?;
+            *range = next;
+            Ok(moved)
+        })
     }
     fn MoveEndpointByUnit(
         &self,
@@ -609,11 +659,15 @@ impl ITextRangeProvider_Impl for RangeProvider_Impl {
         unit: TextUnit,
         count: i32,
     ) -> Result<i32> {
-        let host = self.shared.editor_host.as_ref().ok_or_else(unsupported)?;
-        let current = *self.value.lock().map_err(|_| unavailable())?;
-        let (next, moved) = host.move_endpoint(current, endpoint, unit, count)?;
-        *self.value.lock().map_err(|_| unavailable())? = self.shared.check_range(next)?;
-        Ok(moved)
+        let unit = unit_of(unit)?;
+        let start = moves_start(endpoint)?;
+        self.run(|doc, range| {
+            let (next, moved) = Mover { doc: &mut *doc }
+                .move_endpoint(*range, start, unit, count)
+                .map_err(read_error)?;
+            *range = next;
+            Ok(moved)
+        })
     }
     fn MoveEndpointByRange(
         &self,
@@ -621,79 +675,57 @@ impl ITextRangeProvider_Impl for RangeProvider_Impl {
         other: Ref<ITextRangeProvider>,
         other_endpoint: TextPatternRangeEndpoint,
     ) -> Result<()> {
-        let target = other.ok()?.cast_object_ref::<RangeProvider>()?;
-        if !Arc::ptr_eq(&self.shared.selection, &target.shared.selection) {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let value = endpoint_value(
-            *target.value.lock().map_err(|_| unavailable())?,
-            other_endpoint,
-        )?;
-        let mut range = self.value.lock().map_err(|_| unavailable())?;
-        if endpoint == TextPatternRangeEndpoint_Start {
-            range.start = value;
-            if range.start > range.end {
-                range.end = range.start;
+        let start = moves_start(endpoint)?;
+        let theirs = moves_start(other_endpoint)?;
+        self.run(|doc, range| {
+            let at = endpoint_of(self.other_range(doc, other)?, theirs);
+            if start {
+                range.start = at;
+                range.end = range.end.max(at);
+            } else {
+                range.end = at;
+                range.start = range.start.min(at);
             }
-        } else if endpoint == TextPatternRangeEndpoint_End {
-            range.end = value;
-            if range.end < range.start {
-                range.start = range.end;
-            }
-        } else {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        Ok(())
+            Ok(())
+        })
     }
     fn Select(&self) -> Result<()> {
-        let value = *self.value.lock().map_err(|_| unavailable())?;
-        if let Some(host) = &self.shared.editor_host {
-            host.select(value)?;
-        } else {
-            self.shared.select.as_ref().ok_or_else(unsupported)?(value)?;
-        }
-        *self.shared.selection.lock().map_err(|_| unavailable())? = value;
-        Ok(())
+        self.run(|doc, range| doc.select(*range))
     }
     fn AddToSelection(&self) -> Result<()> {
-        Err(unsupported())
+        Err(not_supported("This text has one selection only."))
     }
     fn RemoveFromSelection(&self) -> Result<()> {
-        Err(unsupported())
+        Err(not_supported("This text has one selection only."))
     }
     fn ScrollIntoView(&self, align_top: BOOL) -> Result<()> {
-        let host = self.shared.editor_host.as_ref().ok_or_else(unavailable)?;
-        host.scroll_into_view(
-            *self.value.lock().map_err(|_| unavailable())?,
-            align_top.as_bool(),
-        )
+        self.run(|doc, range| doc.scroll(*range, align_top.as_bool()))
     }
     fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
-        range_array(&[])
+        self.shared.host()?;
+        interface_array::<IRawElementProviderSimple>(&[])
     }
 }
 
-fn endpoint_value(range: TextRange, endpoint: TextPatternRangeEndpoint) -> Result<usize> {
-    if endpoint == TextPatternRangeEndpoint_Start {
-        Ok(range.start)
-    } else if endpoint == TextPatternRangeEndpoint_End {
-        Ok(range.end)
-    } else {
-        Err(Error::from_hresult(E_INVALIDARG))
+impl TextRangeObject {
+    fn attribute(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+        match id {
+            UIA_IsReadOnlyAttributeId => self.run(|doc, _| Ok(VARIANT::from(doc.read_only()))),
+            UIA_FontNameAttributeId | UIA_FontSizeAttributeId if self.source == Source::Editor => {
+                let host = self.shared.host()?;
+                self.run(|_, _| Ok(()))?;
+                match host.font() {
+                    Some((family, _)) if id == UIA_FontNameAttributeId => {
+                        Ok(VARIANT::from(family.as_str()))
+                    }
+                    Some((_, points)) => Ok(VARIANT::from(points)),
+                    None => not_supported_value(),
+                }
+            }
+            _ => {
+                self.shared.host()?;
+                not_supported_value()
+            }
+        }
     }
-}
-
-/// Call from WM_GETOBJECT. The factory runs only for a UIA root request.
-/// Keep all window state on the UI thread; create a new snapshot in `factory`.
-pub fn wm_getobject(
-    hwnd: HWND,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    factory: impl FnOnce() -> DocumentProvider,
-) -> Option<LRESULT> {
-    if lparam.0 != UiaRootObjectId as isize {
-        return None;
-    }
-    let provider = factory();
-    Some(unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, provider.simple()) })
 }

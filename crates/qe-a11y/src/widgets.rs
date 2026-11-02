@@ -1,514 +1,518 @@
-//! UIA fragment tree for the painted `Widget` nodes.
+//! The UIA tree: the window's root, the painted widgets, and the document, plus the object
+//! the shell keeps for one window.
 #![allow(non_snake_case, non_upper_case_globals)]
-use crate::provider::DocumentProvider;
-use qe_api::{Widget, WidgetId, WidgetRole};
-use std::{ffi::c_void, sync::Arc};
+use crate::{
+    com::{gone, int_array, interface_array, invalid, none, not_enabled, not_supported, read_error, to_screen, to_window},
+    events::{EventFlags, EventTracker},
+    host::{UiaHost, WidgetAction},
+    marshal::OnWindowThread,
+    provider::{Doc, Shared, Source, make_range, with_doc},
+    search::SearchSlot,
+    text::known_len,
+};
+use qe_api::{Rect, Widget, WidgetId, WidgetRole};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    sync::{Arc, Mutex},
+};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::{Com::SAFEARRAY, Variant::VARIANT},
-        UI::Accessibility::*,
+        UI::{Accessibility::*, WindowsAndMessaging::WM_GETOBJECT},
     },
-    core::{
-        BOOL, BSTR, ComObject, Error, HRESULT, IUnknown, IUnknownImpl, Interface, PCWSTR, Result,
-        implement,
-    },
+    core::{BOOL, BSTR, ComObject, IUnknown, IUnknownImpl, Interface, PCWSTR, Ref, Result, implement},
 };
 
-const E_INVALIDARG: HRESULT = HRESULT(0x80070057u32 as i32);
-fn unavailable() -> Error {
-    Error::new(
-        HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32),
-        "This widget is not available in the current tree.",
-    )
+/// The window's root and the one document object, so a client always sees the same COM object
+/// for each. `Accessibility::shutdown` clears this, and that ends the reference cycle.
+pub(crate) struct CachedNodes {
+    root: IRawElementProviderSimple,
+    document: Option<IRawElementProviderSimple>,
 }
-fn unsupported() -> Error {
-    Error::new(
-        HRESULT(UIA_E_NOTSUPPORTED as i32),
-        "This widget does not support that action.",
-    )
+// SAFETY: these are this crate's own COM objects, with atomic reference counts. The objects
+// keep their state behind `Arc` and `Mutex`.
+unsafe impl Send for CachedNodes {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Root,
+    Document,
+    Widget(WidgetId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum WidgetAction {
-    Invoke,
-    Toggle,
-    SetValue(String),
-    Select,
-    Expand,
-    Collapse,
-    SetRange(f64),
-    Focus,
+pub(crate) fn find_widget(node: &Widget, id: WidgetId) -> Option<&Widget> {
+    if node.id == id {
+        return Some(node);
+    }
+    node.children.iter().find_map(|child| find_widget(child, id))
 }
 
-/// Each call must return the latest painted tree. Implementations marshal to
-/// the UI thread; they must never shape text or wait for disk there.
-pub trait WidgetHost: Send + Sync {
-    fn widgets(&self) -> Widget;
-    fn action(&self, id: WidgetId, action: WidgetAction) -> Result<()>;
-    /// A stable process-wide number for this window, distinct across windows.
-    fn window_id(&self) -> u64;
-    fn window_origin(&self) -> (f64, f64) {
-        (0.0, 0.0)
-    }
-    /// Pixels per device-independent pixel for this window.
-    fn window_scale(&self) -> f64;
-    /// When present, this appears as the last child of the window root.
-    /// `document_widget` gives its bounds, name, focus and stable ID.
-    fn document_provider(&self) -> Option<Arc<DocumentProvider>> {
-        None
-    }
-    fn document_widget(&self) -> Option<Widget> {
-        None
-    }
-}
-
-const DOCUMENT_PATH: usize = usize::MAX;
-
-pub struct WidgetProvider {
-    simple: IRawElementProviderSimple,
-}
-impl WidgetProvider {
-    pub fn new(host: Arc<dyn WidgetHost>) -> Self {
-        let simple = make_node(host, Vec::new()).to_interface();
-        Self { simple }
-    }
-    pub fn simple(&self) -> &IRawElementProviderSimple {
-        &self.simple
-    }
-    /// Call after the widget focus changes. The host tree must already show
-    /// the new focused node. With no UIA client, this reads nothing.
-    pub fn raise_focus_changed(&self, host: &Arc<dyn WidgetHost>) -> Result<()> {
-        if !unsafe { UiaClientsAreListening().as_bool() } {
-            return Ok(());
-        }
-        let root = host.widgets();
-        let mut path = Vec::new();
-        if !focus_path(&root, &mut path) {
-            if host.document_widget().is_some_and(|w| w.states.focused) {
-                path.push(DOCUMENT_PATH);
-            } else {
-                return Err(unavailable());
-            }
-        }
-        let focused: IRawElementProviderSimple = make_node(host.clone(), path).to_interface();
-        unsafe { UiaRaiseAutomationEvent(&focused, UIA_AutomationFocusChangedEventId) }
-    }
-}
-
-/// The shell calls this from WM_GETOBJECT and uses DefWindowProcW for `None`.
-/// `factory` is not called for other object IDs.
-pub fn wm_getobject(
-    hwnd: HWND,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    factory: impl FnOnce() -> WidgetProvider,
-) -> Option<LRESULT> {
-    if lparam.0 != UiaRootObjectId as isize {
-        return None;
-    }
-    let provider = factory();
-    Some(unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, provider.simple()) })
-}
-
-fn make_node(host: Arc<dyn WidgetHost>, path: Vec<usize>) -> ComObject<WidgetNode> {
-    ComObject::new(WidgetNode { host, path })
-}
-
-#[implement(
-    IRawElementProviderSimple,
-    IRawElementProviderFragment,
-    IRawElementProviderFragmentRoot,
-    IInvokeProvider,
-    IToggleProvider,
-    IValueProvider,
-    ISelectionItemProvider,
-    IExpandCollapseProvider,
-    IRangeValueProvider
-)]
-struct WidgetNode {
-    host: Arc<dyn WidgetHost>,
-    path: Vec<usize>,
-}
-
-impl WidgetNode_Impl {
-    fn node(&self) -> Result<Widget> {
-        if self.path.as_slice() == [DOCUMENT_PATH] {
-            return self.host.document_widget().ok_or_else(unavailable);
-        }
-        let mut node = self.host.widgets();
-        for &index in &self.path {
-            node = node.children.get(index).cloned().ok_or_else(unavailable)?;
-        }
-        Ok(node)
-    }
-    fn at(&self, path: Vec<usize>) -> IRawElementProviderFragment {
-        make_node(self.host.clone(), path).to_interface()
-    }
-    fn send(&self, action: WidgetAction) -> Result<()> {
-        let node = self.node()?;
-        if !node.states.enabled {
-            return Err(Error::from_hresult(HRESULT(UIA_E_ELEMENTNOTENABLED as i32)));
-        }
-        self.host.action(node.id, action)
-    }
-}
-
-fn variant_int(n: i32) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt.0 = 3;
-        (*v.Anonymous.Anonymous).Anonymous.lVal = n;
-    }
-    v
-}
-fn variant_bool(b: bool) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt.0 = 11;
-        (*v.Anonymous.Anonymous).Anonymous.boolVal.0 = if b { -1 } else { 0 };
-    }
-    v
-}
-fn variant_string(s: &str) -> VARIANT {
-    let mut v = VARIANT::default();
-    unsafe {
-        (*v.Anonymous.Anonymous).vt.0 = 8;
-        (*v.Anonymous.Anonymous).Anonymous.bstrVal = std::mem::ManuallyDrop::new(BSTR::from(s));
-    }
-    v
-}
-fn control_type(role: WidgetRole) -> i32 {
-    match role {
-        WidgetRole::Button => 50000,
-        WidgetRole::Checkbox => 50002,
-        WidgetRole::Tab => 50019,
-        WidgetRole::TabList => 50018,
-        WidgetRole::Menu => 50009,
-        WidgetRole::MenuItem => 50011,
-        WidgetRole::TextField => 50004,
-        WidgetRole::Table => 50036,
-        WidgetRole::Row => 50029,
-        WidgetRole::Cell => 50029,
-        WidgetRole::Dialog => 50032,
-        WidgetRole::Group => 50026,
-        WidgetRole::Label => 50020,
-        WidgetRole::ComboBox => 50003,
-        WidgetRole::ScrollBar => 50014,
-        WidgetRole::List => 50008,
-        WidgetRole::ListItem => 50007,
-    }
-}
-
-impl IRawElementProviderSimple_Impl for WidgetNode_Impl {
-    fn ProviderOptions(&self) -> Result<ProviderOptions> {
-        Ok(ProviderOptions_ServerSideProvider)
-    }
-    fn GetPatternProvider(&self, id: UIA_PATTERN_ID) -> Result<IUnknown> {
-        if self.path.as_slice() == [DOCUMENT_PATH] {
-            let document = self.host.document_provider().ok_or_else(unavailable)?;
-            return unsafe { document.simple().GetPatternProvider(id) };
-        }
-        let node = self.node()?;
-        let object = self.to_object();
-        match (id, node.role) {
-            (UIA_InvokePatternId, WidgetRole::Button | WidgetRole::MenuItem) => {
-                object.to_interface::<IInvokeProvider>().cast()
-            }
-            (UIA_TogglePatternId, WidgetRole::Checkbox) => {
-                object.to_interface::<IToggleProvider>().cast()
-            }
-            (UIA_ValuePatternId, WidgetRole::TextField | WidgetRole::ComboBox) => {
-                object.to_interface::<IValueProvider>().cast()
-            }
-            (
-                UIA_SelectionItemPatternId,
-                WidgetRole::Tab | WidgetRole::ListItem | WidgetRole::Row,
-            ) => object.to_interface::<ISelectionItemProvider>().cast(),
-            (UIA_ExpandCollapsePatternId, WidgetRole::ComboBox | WidgetRole::Menu) => {
-                object.to_interface::<IExpandCollapseProvider>().cast()
-            }
-            (UIA_RangeValuePatternId, WidgetRole::ScrollBar) if node.range_value.is_some() => {
-                object.to_interface::<IRangeValueProvider>().cast()
-            }
-            _ => Err(unsupported()),
-        }
-    }
-    fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
-        let node = self.node()?;
-        Ok(match id {
-            UIA_ControlTypePropertyId => variant_int(if self.path.as_slice() == [DOCUMENT_PATH] {
-                UIA_DocumentControlTypeId.0
-            } else {
-                control_type(node.role)
-            }),
-            UIA_NamePropertyId => variant_string(&node.name),
-            UIA_HelpTextPropertyId => node
-                .description
-                .as_deref()
-                .map_or_else(VARIANT::default, variant_string),
-            UIA_IsEnabledPropertyId => variant_bool(node.states.enabled),
-            UIA_HasKeyboardFocusPropertyId => variant_bool(node.states.focused),
-            UIA_IsKeyboardFocusablePropertyId => {
-                variant_bool(!matches!(node.role, WidgetRole::Label | WidgetRole::Group))
-            }
-            UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => variant_bool(true),
-            _ => VARIANT::default(),
-        })
-    }
-    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
-        Err(unsupported())
-    }
-}
-
-#[link(name = "oleaut32")]
-unsafe extern "system" {
-    fn SafeArrayCreateVector(vt: u16, lower: i32, count: u32) -> *mut SAFEARRAY;
-    fn SafeArrayPutElement(array: *mut SAFEARRAY, index: *const i32, value: *const c_void) -> i32;
-    fn SafeArrayDestroy(array: *mut SAFEARRAY) -> i32;
-}
-fn runtime_id(window: u64, id: WidgetId) -> Result<*mut SAFEARRAY> {
-    let array = unsafe { SafeArrayCreateVector(3, 0, 5) };
-    if array.is_null() {
-        return Err(unavailable());
-    }
-    let parts = [
-        UiaAppendRuntimeId as i32,
-        window as i32,
-        (window >> 32) as i32,
-        id.0 as i32,
-        (id.0 >> 32) as i32,
-    ];
-    for (i, part) in parts.iter().enumerate() {
-        let hr = unsafe { SafeArrayPutElement(array, &(i as i32), (part as *const i32).cast()) };
-        if hr < 0 {
-            unsafe {
-                SafeArrayDestroy(array);
-            }
-            return Err(Error::from_hresult(HRESULT(hr)));
-        }
-    }
-    Ok(array)
-}
-
-impl IRawElementProviderFragment_Impl for WidgetNode_Impl {
-    fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        let mut path = self.path.clone();
-        let node = self.node()?;
-        let document = self.host.document_widget().is_some();
-        if path.as_slice() == [DOCUMENT_PATH] {
-            match direction {
-                NavigateDirection_Parent => return Ok(self.at(Vec::new())),
-                NavigateDirection_PreviousSibling => {
-                    let root = self.host.widgets();
-                    if root.children.is_empty() {
-                        return Err(unavailable());
-                    }
-                    return Ok(self.at(vec![root.children.len() - 1]));
-                }
-                _ => return Err(unavailable()),
-            }
-        }
-        match direction {
-            NavigateDirection_FirstChild if !node.children.is_empty() => path.push(0),
-            NavigateDirection_FirstChild if path.is_empty() && document => path.push(DOCUMENT_PATH),
-            NavigateDirection_LastChild if path.is_empty() && document => path.push(DOCUMENT_PATH),
-            NavigateDirection_LastChild if !node.children.is_empty() => {
-                path.push(node.children.len() - 1)
-            }
-            NavigateDirection_Parent if !path.is_empty() => {
-                path.pop();
-            }
-            NavigateDirection_NextSibling | NavigateDirection_PreviousSibling
-                if !path.is_empty() =>
-            {
-                let index = path.pop().ok_or_else(unavailable)?;
-                let mut parent = self.host.widgets();
-                for &part in &path {
-                    parent = parent.children.get(part).cloned().ok_or_else(unavailable)?;
-                }
-                let next = if direction == NavigateDirection_NextSibling {
-                    index.checked_add(1)
-                } else {
-                    index.checked_sub(1)
-                };
-                if direction == NavigateDirection_NextSibling
-                    && path.is_empty()
-                    && next == Some(parent.children.len())
-                    && document
-                {
-                    path.push(DOCUMENT_PATH);
-                } else {
-                    path.push(
-                        next.filter(|n| *n < parent.children.len())
-                            .ok_or_else(unavailable)?,
-                    );
-                }
-            }
-            _ => return Err(unavailable()),
-        }
-        Ok(self.at(path))
-    }
-    fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
-        runtime_id(self.host.window_id(), self.node()?.id)
-    }
-    fn BoundingRectangle(&self) -> Result<UiaRect> {
-        let b = self.node()?.bounds;
-        let (x, y) = self.host.window_origin();
-        let scale = self.host.window_scale();
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        Ok(UiaRect {
-            left: x + f64::from(b.x.0) * scale,
-            top: y + f64::from(b.y.0) * scale,
-            width: f64::from(b.width.0) * scale,
-            height: f64::from(b.height.0) * scale,
-        })
-    }
-    fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
-        let array = unsafe { SafeArrayCreateVector(13, 0, 0) };
-        if array.is_null() {
-            Err(unavailable())
-        } else {
-            Ok(array)
-        }
-    }
-    fn SetFocus(&self) -> Result<()> {
-        self.send(WidgetAction::Focus)
-    }
-    fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
-        Ok(make_node(self.host.clone(), Vec::new()).to_interface())
-    }
-}
-
-fn focus_path(node: &Widget, path: &mut Vec<usize>) -> bool {
-    if node.states.focused {
+fn path_to(node: &Widget, id: WidgetId, path: &mut Vec<usize>) -> bool {
+    if node.id == id {
         return true;
     }
     for (index, child) in node.children.iter().enumerate() {
         path.push(index);
-        if focus_path(child, path) {
+        if path_to(child, id, path) {
             return true;
         }
         path.pop();
     }
     false
 }
-fn point_path(node: &Widget, x: f64, y: f64, path: &mut Vec<usize>) -> bool {
-    let b = node.bounds;
-    let inside = x >= f64::from(b.x.0)
-        && y >= f64::from(b.y.0)
-        && x < f64::from(b.x.0 + b.width.0)
-        && y < f64::from(b.y.0 + b.height.0);
-    if !inside {
-        return false;
+
+fn at_path<'a>(root: &'a Widget, path: &[usize]) -> Option<&'a Widget> {
+    let mut node = root;
+    for &index in path {
+        node = node.children.get(index)?;
     }
-    for (index, child) in node.children.iter().enumerate().rev() {
-        path.push(index);
-        if point_path(child, x, y, path) {
-            return true;
-        }
-        path.pop();
-    }
-    true
+    Some(node)
 }
-impl IRawElementProviderFragmentRoot_Impl for WidgetNode_Impl {
-    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
-        let (ox, oy) = self.host.window_origin();
-        let scale = self.host.window_scale();
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
-        let x = (x - ox) / scale;
-        let y = (y - oy) / scale;
-        if let Some(document) = self.host.document_widget() {
-            let b = document.bounds;
-            if x >= f64::from(b.x.0)
-                && y >= f64::from(b.y.0)
-                && x < f64::from(b.x.0 + b.width.0)
-                && y < f64::from(b.y.0 + b.height.0)
-            {
-                return Ok(self.at(vec![DOCUMENT_PATH]));
-            }
-        }
-        let mut path = Vec::new();
-        if point_path(&self.host.widgets(), x, y, &mut path) {
-            Ok(self.at(path))
-        } else {
-            Err(unavailable())
-        }
-    }
-    fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
-        let mut path = Vec::new();
-        if focus_path(&self.host.widgets(), &mut path) {
-            return Ok(self.at(path));
-        }
-        if self
-            .host
-            .document_widget()
-            .is_some_and(|w| w.states.focused)
-        {
-            return Ok(self.at(vec![DOCUMENT_PATH]));
-        }
-        Err(unavailable())
+
+fn focused_child(node: &Widget) -> Option<WidgetId> {
+    node.children.iter().find_map(|child| {
+        focused_child(child).or_else(|| child.states.focused.then_some(child.id))
+    })
+}
+
+fn contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x.0 && y >= rect.y.0 && x < rect.x.0 + rect.width.0 && y < rect.y.0 + rect.height.0
+}
+
+/// The deepest widget under a point. A later child paints over an earlier one.
+fn hit(node: &Widget, x: f32, y: f32) -> Option<WidgetId> {
+    node.children.iter().rev().find_map(|child| {
+        hit(child, x, y).or_else(|| contains(child.bounds, x, y).then_some(child.id))
+    })
+}
+
+/// UIA's control type for a role. A table here has no Grid pattern, so it shows as a list
+/// of items, which is what UIA's rules ask of a control with no grid.
+fn control_type(role: WidgetRole) -> UIA_CONTROLTYPE_ID {
+    match role {
+        WidgetRole::Button => UIA_ButtonControlTypeId,
+        WidgetRole::Checkbox => UIA_CheckBoxControlTypeId,
+        WidgetRole::Tab => UIA_TabItemControlTypeId,
+        WidgetRole::TabList => UIA_TabControlTypeId,
+        WidgetRole::Menu => UIA_MenuControlTypeId,
+        WidgetRole::MenuItem => UIA_MenuItemControlTypeId,
+        WidgetRole::TextField => UIA_EditControlTypeId,
+        WidgetRole::Table | WidgetRole::List => UIA_ListControlTypeId,
+        WidgetRole::Row | WidgetRole::ListItem => UIA_ListItemControlTypeId,
+        WidgetRole::Cell | WidgetRole::Label => UIA_TextControlTypeId,
+        WidgetRole::Dialog => UIA_WindowControlTypeId,
+        WidgetRole::Group => UIA_GroupControlTypeId,
+        WidgetRole::ComboBox => UIA_ComboBoxControlTypeId,
+        WidgetRole::ScrollBar => UIA_ScrollBarControlTypeId,
     }
 }
 
-impl IInvokeProvider_Impl for WidgetNode_Impl {
+fn focusable(role: WidgetRole) -> bool {
+    !matches!(
+        role,
+        WidgetRole::Label | WidgetRole::Group | WidgetRole::Cell | WidgetRole::Menu | WidgetRole::Dialog
+    )
+}
+
+fn make_node(shared: &Arc<Shared>, target: Target) -> Result<IRawElementProviderFragment> {
+    match target {
+        Target::Root => root_simple(shared)?.cast(),
+        Target::Document => document_simple(shared)?.cast(),
+        Target::Widget(_) => Ok(ComObject::new(Node {
+            shared: shared.clone(),
+            target,
+        })
+        .to_interface()),
+    }
+}
+
+fn root_simple(shared: &Arc<Shared>) -> Result<IRawElementProviderSimple> {
+    shared
+        .nodes
+        .lock()
+        .map_err(|_| gone())?
+        .as_ref()
+        .map(|nodes| nodes.root.clone())
+        .ok_or_else(gone)
+}
+
+fn document_simple(shared: &Arc<Shared>) -> Result<IRawElementProviderSimple> {
+    let mut nodes = shared.nodes.lock().map_err(|_| gone())?;
+    let nodes = nodes.as_mut().ok_or_else(gone)?;
+    if let Some(found) = &nodes.document {
+        return Ok(found.clone());
+    }
+    let made: IRawElementProviderSimple = ComObject::new(Node {
+        shared: shared.clone(),
+        target: Target::Document,
+    })
+    .to_interface();
+    nodes.document = Some(made.clone());
+    Ok(made)
+}
+
+#[implement(
+    IRawElementProviderSimple,
+    IRawElementProviderFragment,
+    IInvokeProvider,
+    IToggleProvider,
+    IValueProvider,
+    ISelectionItemProvider,
+    ISelectionProvider,
+    IExpandCollapseProvider,
+    IRangeValueProvider,
+    ITextProvider2
+)]
+struct Node {
+    shared: Arc<Shared>,
+    target: Target,
+}
+
+impl Node {
+    fn host(&self) -> Result<Arc<OnWindowThread>> {
+        self.shared.host()
+    }
+    fn widget(&self) -> Result<Widget> {
+        let host = self.host()?;
+        match self.target {
+            Target::Root => host.widgets_now(),
+            Target::Document => host.call_now(|h| h.document_widget().ok_or_else(gone)),
+            Target::Widget(id) => {
+                let root = host.widgets_now()?;
+                find_widget(&root, id).cloned().ok_or_else(gone)
+            }
+        }
+    }
+    fn send(&self, action: WidgetAction) -> Result<()> {
+        let widget = self.widget()?;
+        if !widget.states.enabled {
+            return Err(not_enabled("This control is turned off."));
+        }
+        self.host()?.action(widget.id, action)
+    }
+    fn text_source(&self) -> Result<Source> {
+        match self.target {
+            Target::Document => Ok(Source::Editor),
+            Target::Widget(id) => {
+                if self.widget()?.role == WidgetRole::TextField {
+                    Ok(Source::Field(id))
+                } else {
+                    Err(not_supported("This control has no text."))
+                }
+            }
+            Target::Root => Err(not_supported("The window has no text of its own.")),
+        }
+    }
+    /// Value is offered on a document only when it is read-only: there, it reports that. An
+    /// editable document is changed through its keys and commands, not by a whole new value.
+    fn offers_value(&self, widget: &Widget) -> bool {
+        match self.target {
+            Target::Document => with_doc(&self.shared, Source::Editor, |doc| Ok(doc.read_only()))
+                .unwrap_or(false),
+            _ => matches!(widget.role, WidgetRole::TextField | WidgetRole::ComboBox),
+        }
+    }
+    fn is_read_only(&self) -> Result<bool> {
+        match self.target {
+            Target::Document => with_doc(&self.shared, Source::Editor, |doc| Ok(doc.read_only())),
+            _ => Ok(self.widget()?.states.read_only),
+        }
+    }
+    fn property(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
+        let widget = self.widget()?;
+        let is_root = self.target == Target::Root;
+        Ok(match id {
+            // The window's own provider gives the root its type.
+            UIA_ControlTypePropertyId if is_root => VARIANT::default(),
+            UIA_ControlTypePropertyId if self.target == Target::Document => {
+                VARIANT::from(UIA_DocumentControlTypeId.0)
+            }
+            UIA_ControlTypePropertyId => VARIANT::from(control_type(widget.role).0),
+            UIA_NamePropertyId if is_root && widget.name.is_empty() => VARIANT::default(),
+            UIA_NamePropertyId => VARIANT::from(widget.name.as_str()),
+            UIA_AutomationIdPropertyId if !is_root => {
+                VARIANT::from(format!("qe-{}", widget.id.0).as_str())
+            }
+            UIA_HelpTextPropertyId => widget
+                .description
+                .as_deref()
+                .map_or_else(VARIANT::default, VARIANT::from),
+            UIA_IsEnabledPropertyId => VARIANT::from(widget.states.enabled),
+            UIA_HasKeyboardFocusPropertyId => VARIANT::from(widget.states.focused),
+            UIA_IsKeyboardFocusablePropertyId => {
+                VARIANT::from(self.target == Target::Document || focusable(widget.role))
+            }
+            UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => VARIANT::from(true),
+            UIA_IsOffscreenPropertyId => VARIANT::from(false),
+            UIA_IsDialogPropertyId => VARIANT::from(widget.role == WidgetRole::Dialog),
+            UIA_HeadingLevelPropertyId if widget.states.section => {
+                VARIANT::from(HeadingLevel2.0)
+            }
+            _ => VARIANT::default(),
+        })
+    }
+    fn navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+        let host = self.host()?;
+        let root = host.widgets_now()?;
+        let has_document = host.document_widget().is_some();
+        let child = |index: usize| {
+            root.children
+                .get(index)
+                .map_or_else(|| Err(none()), |w| make_node(&self.shared, Target::Widget(w.id)))
+        };
+        match self.target {
+            Target::Root => match direction {
+                NavigateDirection_FirstChild if !root.children.is_empty() => child(0),
+                NavigateDirection_FirstChild | NavigateDirection_LastChild if has_document => {
+                    make_node(&self.shared, Target::Document)
+                }
+                NavigateDirection_LastChild if !root.children.is_empty() => {
+                    child(root.children.len() - 1)
+                }
+                _ => Err(none()),
+            },
+            Target::Document => match direction {
+                NavigateDirection_Parent => make_node(&self.shared, Target::Root),
+                NavigateDirection_PreviousSibling if !root.children.is_empty() => {
+                    child(root.children.len() - 1)
+                }
+                _ => Err(none()),
+            },
+            Target::Widget(id) => {
+                let mut path = Vec::new();
+                if !path_to(&root, id, &mut path) {
+                    return Err(gone());
+                }
+                let node = at_path(&root, &path).ok_or_else(gone)?;
+                let index = path.pop().ok_or_else(gone)?;
+                let parent = at_path(&root, &path).ok_or_else(gone)?;
+                let of = |w: Option<&Widget>| {
+                    w.map_or_else(|| Err(none()), |w| make_node(&self.shared, Target::Widget(w.id)))
+                };
+                match direction {
+                    NavigateDirection_Parent if path.is_empty() => {
+                        make_node(&self.shared, Target::Root)
+                    }
+                    NavigateDirection_Parent => make_node(&self.shared, Target::Widget(parent.id)),
+                    NavigateDirection_FirstChild => of(node.children.first()),
+                    NavigateDirection_LastChild => of(node.children.last()),
+                    NavigateDirection_NextSibling => {
+                        if path.is_empty() && index + 1 == parent.children.len() && has_document {
+                            make_node(&self.shared, Target::Document)
+                        } else {
+                            of(parent.children.get(index + 1))
+                        }
+                    }
+                    NavigateDirection_PreviousSibling => {
+                        of(index.checked_sub(1).and_then(|i| parent.children.get(i)))
+                    }
+                    _ => Err(none()),
+                }
+            }
+        }
+    }
+    fn runtime_id(&self) -> Result<*mut SAFEARRAY> {
+        if self.target == Target::Root {
+            // The window's own provider gives the root its ID.
+            self.host()?;
+            return Ok(std::ptr::null_mut());
+        }
+        let id = self.widget()?.id.0;
+        int_array(&[UiaAppendRuntimeId as i32, id as i32, (id >> 32) as i32])
+    }
+    fn rect(&self) -> Result<UiaRect> {
+        let [left, top, width, height] = to_screen(self.shared.window, self.widget()?.bounds)?;
+        Ok(UiaRect {
+            left,
+            top,
+            width,
+            height,
+        })
+    }
+    fn set_focus(&self) -> Result<()> {
+        self.send(WidgetAction::Focus)
+    }
+}
+
+impl IRawElementProviderSimple_Impl for Node_Impl {
+    fn ProviderOptions(&self) -> Result<ProviderOptions> {
+        Ok(ProviderOptions_ServerSideProvider)
+    }
+    fn GetPatternProvider(&self, id: UIA_PATTERN_ID) -> Result<IUnknown> {
+        let widget = self.widget()?;
+        let role = widget.role;
+        let states = widget.states;
+        let is_document = self.target == Target::Document;
+        let is_field = !is_document && role == WidgetRole::TextField;
+        let offered = match id {
+            UIA_TextPatternId | UIA_TextPattern2Id => is_document || is_field,
+            UIA_ValuePatternId => self.offers_value(&widget),
+            UIA_InvokePatternId => {
+                !is_document
+                    && (role == WidgetRole::Button
+                        || (role == WidgetRole::MenuItem && !states.has_popup))
+            }
+            UIA_TogglePatternId => {
+                !is_document
+                    && (role == WidgetRole::Checkbox
+                        || (role == WidgetRole::MenuItem && states.checked))
+            }
+            UIA_SelectionItemPatternId => {
+                !is_document
+                    && matches!(role, WidgetRole::Tab | WidgetRole::ListItem | WidgetRole::Row)
+            }
+            UIA_SelectionPatternId => {
+                !is_document
+                    && matches!(role, WidgetRole::TabList | WidgetRole::List | WidgetRole::Table)
+            }
+            UIA_ExpandCollapsePatternId => {
+                !is_document && (role == WidgetRole::ComboBox || states.has_popup)
+            }
+            UIA_RangeValuePatternId => !is_document && widget.range_value.is_some(),
+            _ => false,
+        };
+        if !offered {
+            return Err(none());
+        }
+        let this = self.to_object();
+        match id {
+            UIA_TextPatternId | UIA_TextPattern2Id => this.to_interface::<ITextProvider2>().cast(),
+            UIA_ValuePatternId => this.to_interface::<IValueProvider>().cast(),
+            UIA_InvokePatternId => this.to_interface::<IInvokeProvider>().cast(),
+            UIA_TogglePatternId => this.to_interface::<IToggleProvider>().cast(),
+            UIA_SelectionItemPatternId => this.to_interface::<ISelectionItemProvider>().cast(),
+            UIA_SelectionPatternId => this.to_interface::<ISelectionProvider>().cast(),
+            UIA_ExpandCollapsePatternId => this.to_interface::<IExpandCollapseProvider>().cast(),
+            UIA_RangeValuePatternId => this.to_interface::<IRangeValueProvider>().cast(),
+            _ => Err(none()),
+        }
+    }
+    fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
+        self.property(id)
+    }
+    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+        self.host()?;
+        Err(none())
+    }
+}
+
+impl IRawElementProviderFragment_Impl for Node_Impl {
+    fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+        self.navigate(direction)
+    }
+    fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+        self.runtime_id()
+    }
+    fn BoundingRectangle(&self) -> Result<UiaRect> {
+        self.rect()
+    }
+    fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
+        self.host()?;
+        Ok(std::ptr::null_mut())
+    }
+    fn SetFocus(&self) -> Result<()> {
+        self.set_focus()
+    }
+    fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+        root_simple(&self.shared)?.cast()
+    }
+}
+
+impl IInvokeProvider_Impl for Node_Impl {
     fn Invoke(&self) -> Result<()> {
         self.send(WidgetAction::Invoke)
     }
 }
-impl IToggleProvider_Impl for WidgetNode_Impl {
+impl IToggleProvider_Impl for Node_Impl {
     fn Toggle(&self) -> Result<()> {
         self.send(WidgetAction::Toggle)
     }
     fn ToggleState(&self) -> Result<ToggleState> {
-        Ok(if self.node()?.states.checked {
+        Ok(if self.widget()?.states.checked {
             ToggleState_On
         } else {
             ToggleState_Off
         })
     }
 }
-impl IValueProvider_Impl for WidgetNode_Impl {
-    fn SetValue(&self, val: &PCWSTR) -> Result<()> {
-        if self.node()?.states.read_only {
-            return Err(unsupported());
+impl IValueProvider_Impl for Node_Impl {
+    fn SetValue(&self, value: &PCWSTR) -> Result<()> {
+        if self.is_read_only()? {
+            return Err(not_enabled("This text is read only."));
         }
-        let value = unsafe { val.to_string()? };
+        let value = unsafe { value.to_string() }.map_err(|_| invalid("This text is not valid."))?;
         self.send(WidgetAction::SetValue(value))
     }
+    /// A document's value stops at the same cap as GetText, because tools ask for this
+    /// property with no limit.
     fn Value(&self) -> Result<BSTR> {
-        Ok(BSTR::from(self.node()?.value.as_deref().unwrap_or("")))
+        if self.target == Target::Document {
+            return with_doc(&self.shared, Source::Editor, |doc| {
+                let text = doc.snapshot();
+                let (len, _) = known_len(text).map_err(read_error)?;
+                let read = crate::text::read_text(text, crate::text::TextRange::new(0, len), -1)
+                    .map_err(read_error)?;
+                Ok(BSTR::from(read.as_str()))
+            });
+        }
+        Ok(BSTR::from(self.widget()?.value.as_deref().unwrap_or("")))
     }
     fn IsReadOnly(&self) -> Result<BOOL> {
-        Ok(BOOL(i32::from(self.node()?.states.read_only)))
+        Ok(BOOL::from(self.is_read_only()?))
     }
 }
-impl ISelectionItemProvider_Impl for WidgetNode_Impl {
+impl ISelectionItemProvider_Impl for Node_Impl {
     fn Select(&self) -> Result<()> {
         self.send(WidgetAction::Select)
     }
     fn AddToSelection(&self) -> Result<()> {
-        Err(unsupported())
+        Err(not_supported("Only one item can be selected here."))
     }
     fn RemoveFromSelection(&self) -> Result<()> {
-        Err(unsupported())
+        Err(not_supported("Only one item can be selected here."))
     }
     fn IsSelected(&self) -> Result<BOOL> {
-        Ok(BOOL(i32::from(self.node()?.states.selected)))
+        Ok(BOOL::from(self.widget()?.states.selected))
     }
     fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
-        let mut path = self.path.clone();
-        if path.pop().is_none() {
-            return Err(unavailable());
+        let Target::Widget(id) = self.target else {
+            return Err(none());
+        };
+        let root = self.host()?.widgets_now()?;
+        let mut path = Vec::new();
+        if !path_to(&root, id, &mut path) {
+            return Err(gone());
         }
-        Ok(make_node(self.host.clone(), path).to_interface())
+        path.pop();
+        if path.is_empty() {
+            return root_simple(&self.shared);
+        }
+        let parent = at_path(&root, &path).ok_or_else(gone)?;
+        make_node(&self.shared, Target::Widget(parent.id))?.cast()
     }
 }
-impl IExpandCollapseProvider_Impl for WidgetNode_Impl {
+impl ISelectionProvider_Impl for Node_Impl {
+    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+        let widget = self.widget()?;
+        let mut selected = Vec::new();
+        for child in widget.children.iter().filter(|c| c.states.selected) {
+            let node: IRawElementProviderSimple =
+                make_node(&self.shared, Target::Widget(child.id))?.cast()?;
+            selected.push(node);
+        }
+        interface_array(&selected)
+    }
+    fn CanSelectMultiple(&self) -> Result<BOOL> {
+        self.host()?;
+        Ok(BOOL::from(false))
+    }
+    fn IsSelectionRequired(&self) -> Result<BOOL> {
+        Ok(BOOL::from(self.widget()?.role == WidgetRole::TabList))
+    }
+}
+impl IExpandCollapseProvider_Impl for Node_Impl {
     fn Expand(&self) -> Result<()> {
         self.send(WidgetAction::Expand)
     }
@@ -516,41 +520,412 @@ impl IExpandCollapseProvider_Impl for WidgetNode_Impl {
         self.send(WidgetAction::Collapse)
     }
     fn ExpandCollapseState(&self) -> Result<ExpandCollapseState> {
-        Ok(if self.node()?.states.expanded {
+        Ok(if self.widget()?.states.expanded {
             ExpandCollapseState_Expanded
         } else {
             ExpandCollapseState_Collapsed
         })
     }
 }
-impl IRangeValueProvider_Impl for WidgetNode_Impl {
+impl IRangeValueProvider_Impl for Node_Impl {
     fn SetValue(&self, value: f64) -> Result<()> {
-        let node = self.node()?;
-        if node.states.read_only {
-            return Err(unsupported());
+        let widget = self.widget()?;
+        if widget.states.read_only {
+            return Err(not_enabled("This control is read only."));
         }
-        let range = node.range_value.ok_or_else(unavailable)?;
+        let range = widget.range_value.ok_or_else(gone)?;
         if !value.is_finite() || value < range.minimum || value > range.maximum {
-            return Err(Error::from_hresult(E_INVALIDARG));
+            return Err(invalid("This value is outside the control's range."));
         }
         self.send(WidgetAction::SetRange(value))
     }
     fn Value(&self) -> Result<f64> {
-        Ok(self.node()?.range_value.ok_or_else(unavailable)?.value)
+        Ok(self.widget()?.range_value.ok_or_else(gone)?.value)
     }
     fn IsReadOnly(&self) -> Result<BOOL> {
-        Ok(BOOL(i32::from(self.node()?.states.read_only)))
+        Ok(BOOL::from(self.widget()?.states.read_only))
     }
     fn Maximum(&self) -> Result<f64> {
-        Ok(self.node()?.range_value.ok_or_else(unavailable)?.maximum)
+        Ok(self.widget()?.range_value.ok_or_else(gone)?.maximum)
     }
     fn Minimum(&self) -> Result<f64> {
-        Ok(self.node()?.range_value.ok_or_else(unavailable)?.minimum)
+        Ok(self.widget()?.range_value.ok_or_else(gone)?.minimum)
     }
     fn LargeChange(&self) -> Result<f64> {
+        self.widget()?.range_value.ok_or_else(gone)?;
         Ok(1.0)
     }
     fn SmallChange(&self) -> Result<f64> {
+        self.widget()?.range_value.ok_or_else(gone)?;
         Ok(1.0)
     }
 }
+
+impl Node_Impl {
+    fn enclosing(&self) -> IRawElementProviderSimple {
+        self.to_object().to_interface()
+    }
+    fn make(&self, source: Source, doc: &dyn Doc, range: crate::text::TextRange) -> ITextRangeProvider {
+        make_range(&self.shared, source, doc, range, self.enclosing())
+    }
+}
+
+impl ITextProvider_Impl for Node_Impl {
+    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+        let source = self.text_source()?;
+        with_doc(&self.shared, source, |doc| {
+            let selection = doc.selection().map_err(read_error)?;
+            interface_array(&[self.make(source, &*doc, selection)])
+        })
+    }
+    fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
+        let source = self.text_source()?;
+        with_doc(&self.shared, source, |doc| match doc.visible()? {
+            Some(range) => interface_array(&[self.make(source, &*doc, range)]),
+            None => interface_array::<ITextRangeProvider>(&[]),
+        })
+    }
+    fn RangeFromChild(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
+        self.text_source()?;
+        Err(invalid("This text has no child elements."))
+    }
+    fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
+        let source = self.text_source()?;
+        with_doc(&self.shared, source, |doc| {
+            let range = doc.at_point(point.x, point.y)?;
+            Ok(self.make(source, &*doc, range))
+        })
+    }
+    fn DocumentRange(&self) -> Result<ITextRangeProvider> {
+        let source = self.text_source()?;
+        with_doc(&self.shared, source, |doc| {
+            let (len, _) = known_len(doc.snapshot()).map_err(read_error)?;
+            Ok(self.make(source, &*doc, crate::text::TextRange::new(0, len)))
+        })
+    }
+    fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
+        self.text_source()?;
+        Ok(SupportedTextSelection_Single)
+    }
+}
+impl ITextProvider2_Impl for Node_Impl {
+    fn RangeFromAnnotation(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
+        self.text_source()?;
+        Err(invalid("This text has no annotations."))
+    }
+    fn GetCaretRange(&self, active: *mut BOOL) -> Result<ITextRangeProvider> {
+        if active.is_null() {
+            return Err(invalid("No place was given for the answer."));
+        }
+        let source = self.text_source()?;
+        let focused = self.widget()?.states.focused;
+        with_doc(&self.shared, source, |doc| {
+            let at = doc.caret().map_err(read_error)?;
+            // SAFETY: the caller gave this pointer for the answer, and it is not null.
+            unsafe { *active = BOOL::from(focused) };
+            Ok(self.make(source, &*doc, crate::text::TextRange::new(at, at)))
+        })
+    }
+}
+
+/// The window's root. It is a separate type because UIA treats anything that answers
+/// `IRawElementProviderFragmentRoot` as a root.
+#[implement(IRawElementProviderSimple, IRawElementProviderFragment, IRawElementProviderFragmentRoot)]
+struct Root {
+    node: Node,
+}
+
+impl IRawElementProviderSimple_Impl for Root_Impl {
+    fn ProviderOptions(&self) -> Result<ProviderOptions> {
+        Ok(ProviderOptions_ServerSideProvider)
+    }
+    fn GetPatternProvider(&self, _: UIA_PATTERN_ID) -> Result<IUnknown> {
+        self.node.host()?;
+        Err(none())
+    }
+    fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
+        self.node.property(id)
+    }
+    /// This joins the root to the window, so UIA finds the tree under the window's element.
+    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+        self.node.host()?;
+        unsafe { UiaHostProviderFromHwnd(HWND(self.node.shared.window as *mut c_void)) }
+    }
+}
+impl IRawElementProviderFragment_Impl for Root_Impl {
+    fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+        self.node.navigate(direction)
+    }
+    fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+        self.node.runtime_id()
+    }
+    /// The window's own provider gives the root its rectangle.
+    fn BoundingRectangle(&self) -> Result<UiaRect> {
+        self.node.host()?;
+        Ok(UiaRect::default())
+    }
+    fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
+        self.node.host()?;
+        Ok(std::ptr::null_mut())
+    }
+    fn SetFocus(&self) -> Result<()> {
+        self.node.host()?;
+        Ok(())
+    }
+    fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+        self.node.host()?;
+        Ok(self.to_object().to_interface())
+    }
+}
+impl IRawElementProviderFragmentRoot_Impl for Root_Impl {
+    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
+        let shared = &self.node.shared;
+        let host = shared.host()?;
+        let (x, y) = to_window(shared.window, x, y)?;
+        let root = host.widgets_now()?;
+        if let Some(id) = hit(&root, x, y) {
+            return make_node(shared, Target::Widget(id));
+        }
+        if host.document_widget().is_some_and(|d| contains(d.bounds, x, y)) {
+            return make_node(shared, Target::Document);
+        }
+        Ok(self.to_object().to_interface())
+    }
+    fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
+        let shared = &self.node.shared;
+        let host = shared.host()?;
+        let root = host.widgets_now()?;
+        if let Some(id) = focused_child(&root) {
+            return make_node(shared, Target::Widget(id));
+        }
+        if host.document_widget().is_some_and(|d| d.states.focused) {
+            return make_node(shared, Target::Document);
+        }
+        Err(none())
+    }
+}
+
+/// True when WM_GETOBJECT asks for UIA's tree. Windows may send the ID sign-extended or not,
+/// and its docs say to read it as 32 bits.
+pub fn is_uia_request(lparam: LPARAM) -> bool {
+    lparam.0 as i32 == UiaRootObjectId
+}
+
+/// The shell's WM_GETOBJECT handler. Nothing is made until a client asks for UIA's tree. It
+/// answers `None` for other IDs, and the shell then calls DefWindowProcW.
+pub fn wm_getobject(
+    slot: &mut Option<Accessibility>,
+    hwnd: HWND,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    host: impl FnOnce() -> Arc<dyn UiaHost>,
+) -> Option<LRESULT> {
+    if !is_uia_request(lparam) {
+        return None;
+    }
+    let accessibility = slot.get_or_insert_with(|| Accessibility::new(hwnd, host()));
+    Some(accessibility.respond(hwnd, wparam, lparam))
+}
+
+/// The one line the shell's window procedure needs, before anything else. `Some` means this
+/// message was for UIA, and the procedure returns that answer. It costs one comparison for
+/// other messages, and it makes nothing until a client asks.
+pub fn on_window_message(
+    slot: &mut Option<Accessibility>,
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    host: impl FnOnce() -> Arc<dyn UiaHost>,
+) -> Option<LRESULT> {
+    if message == WM_GETOBJECT {
+        return wm_getobject(slot, hwnd, wparam, lparam, host);
+    }
+    crate::marshal::dispatch(message, wparam)
+}
+
+/// All of one window's UIA state. The shell keeps this in an `Option`, which stays `None`
+/// until the first client asks.
+pub struct Accessibility {
+    shared: Arc<Shared>,
+    root: IRawElementProviderSimple,
+    tracker: RefCell<EventTracker>,
+    last_focus: RefCell<Option<Option<WidgetId>>>,
+    last_shape: RefCell<Option<u64>>,
+    closed: RefCell<bool>,
+}
+
+fn shape_of(node: &Widget, into: &mut std::collections::hash_map::DefaultHasher) {
+    use std::hash::Hash;
+    node.id.0.hash(into);
+    node.children.len().hash(into);
+    for child in &node.children {
+        shape_of(child, into);
+    }
+}
+
+impl Accessibility {
+    pub fn new(hwnd: HWND, host: Arc<dyn UiaHost>) -> Self {
+        let shared = Arc::new(Shared {
+            window: hwnd.0 as isize,
+            host: Mutex::new(Some(Arc::new(crate::marshal::OnWindowThread {
+                inner: host,
+                thread: std::thread::current().id(),
+                window: hwnd.0 as isize,
+            }))),
+            search: SearchSlot::default(),
+            nodes: Mutex::new(None),
+        });
+        let root: IRawElementProviderSimple = ComObject::new(Root {
+            node: Node {
+                shared: shared.clone(),
+                target: Target::Root,
+            },
+        })
+        .to_interface();
+        if let Ok(mut nodes) = shared.nodes.lock() {
+            *nodes = Some(CachedNodes {
+                root: root.clone(),
+                document: None,
+            });
+        }
+        Self {
+            shared,
+            root,
+            tracker: RefCell::default(),
+            last_focus: RefCell::new(None),
+            last_shape: RefCell::new(None),
+            closed: RefCell::new(false),
+        }
+    }
+    /// The answer to WM_GETOBJECT for UIA's tree.
+    pub fn respond(&self, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, &self.root) }
+    }
+    pub fn root(&self) -> IRawElementProviderSimple {
+        self.root.clone()
+    }
+    /// The one document object. An error when the window has closed.
+    pub fn document(&self) -> Result<IRawElementProviderSimple> {
+        document_simple(&self.shared)
+    }
+    /// Call once after each input batch, and after `poll_layout` changes the text. With no
+    /// client listening, this makes one system call and does nothing else.
+    pub fn after_input(&self) -> Result<EventFlags> {
+        let listening = unsafe { UiaClientsAreListening() }.as_bool();
+        self.after_input_when(listening)
+    }
+    /// `after_input` with the answer to "is a client listening" given by the caller.
+    pub fn after_input_when(&self, listening: bool) -> Result<EventFlags> {
+        if !listening {
+            self.tracker.borrow_mut().no_client();
+            return Ok(EventFlags::default());
+        }
+        let host = self.shared.host()?;
+        let Some(view_id) = host.view_id() else {
+            return Ok(EventFlags::default());
+        };
+        let mut flags = EventFlags::default();
+        let reached = host.with_editor(&mut |view, _| {
+            flags = self.tracker.borrow_mut().poll(view_id, view);
+        });
+        if !reached {
+            return Ok(EventFlags::default());
+        }
+        if flags == EventFlags::default() {
+            return Ok(flags);
+        }
+        let document = self.document()?;
+        if flags.text_changed {
+            unsafe { UiaRaiseAutomationEvent(&document, UIA_Text_TextChangedEventId) }?;
+        }
+        // UIA has no event for the caret alone. A caret move is a selection change.
+        if flags.selection_changed || flags.caret_moved {
+            unsafe { UiaRaiseAutomationEvent(&document, UIA_Text_TextSelectionChangedEventId) }?;
+        }
+        Ok(flags)
+    }
+    /// Call after widgets change: focus moved, a dialog or menu opened or closed. It raises
+    /// a focus event if focus moved, and a structure event if the tree's shape changed.
+    pub fn widgets_changed(&self) -> Result<()> {
+        let listening = unsafe { UiaClientsAreListening() }.as_bool();
+        self.widgets_changed_when(listening)
+    }
+    /// `widgets_changed` with the answer to "is a client listening" given by the caller.
+    pub fn widgets_changed_when(&self, listening: bool) -> Result<()> {
+        if !listening {
+            *self.last_focus.borrow_mut() = None;
+            *self.last_shape.borrow_mut() = None;
+            return Ok(());
+        }
+        let host = self.shared.host()?;
+        let root = host.widgets_now()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        shape_of(&root, &mut hasher);
+        let shape = std::hash::Hasher::finish(&hasher);
+        let shape_moved = self.last_shape.borrow_mut().replace(shape) != Some(shape);
+        if shape_moved {
+            unsafe {
+                UiaRaiseStructureChangedEvent(
+                    &self.root,
+                    StructureChangeType_ChildrenInvalidated,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }?;
+        }
+        let focus = focused_child(&root);
+        let in_document = focus.is_none() && host.document_widget().is_some_and(|d| d.states.focused);
+        let now = if in_document { None } else { focus };
+        let before = self.last_focus.borrow_mut().replace(now);
+        if before != Some(now) {
+            if let Some(id) = now {
+                let node: IRawElementProviderSimple =
+                    make_node(&self.shared, Target::Widget(id))?.cast()?;
+                unsafe { UiaRaiseAutomationEvent(&node, UIA_AutomationFocusChangedEventId) }?;
+            } else if in_document {
+                let document = self.document()?;
+                unsafe { UiaRaiseAutomationEvent(&document, UIA_AutomationFocusChangedEventId) }?;
+            }
+        }
+        Ok(())
+    }
+    /// Call from WM_DESTROY, or when the shell ends this window's UI. After this, every
+    /// object a client still holds says UIA_E_ELEMENTNOTAVAILABLE. A second call does nothing.
+    pub fn shutdown(&self) -> Result<()> {
+        if self.closed.replace(true) {
+            return Ok(());
+        }
+        self.shared.search.cancel();
+        let document = self
+            .shared
+            .nodes
+            .lock()
+            .map_err(|_| gone())?
+            .as_ref()
+            .and_then(|nodes| nodes.document.clone());
+        // UIA asks these objects for their IDs while it disconnects them, so they must still
+        // answer here. This also tells UIA the window has no tree now, as its docs ask at
+        // WM_DESTROY.
+        let window = HWND(self.shared.window as *mut c_void);
+        unsafe {
+            UiaReturnRawElementProvider(window, WPARAM(0), LPARAM(0), None::<&IRawElementProviderSimple>)
+        };
+        let document_gone = document.map_or(Ok(()), |document| unsafe {
+            UiaDisconnectProvider(&document)
+        });
+        self.shared.nodes.lock().map_err(|_| gone())?.take();
+        let host = self.shared.host.lock().map_err(|_| gone())?.take();
+        drop(host);
+        document_gone
+    }
+}
+
+impl Drop for Accessibility {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            eprintln!("UI Automation did not close cleanly: {error}");
+        }
+    }
+}
+

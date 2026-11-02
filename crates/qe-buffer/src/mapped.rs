@@ -3,6 +3,7 @@ use qe_api::{
     ByteOffset, EditError, LineIndex, TextChange, TextPosition, TextSnapshot, TextStore,
     Utf16Offset,
 };
+use std::collections::VecDeque;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::ops::Range;
@@ -10,8 +11,11 @@ use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 const PAGE: usize = 64 * 1024;
+const SCAN_BLOCK: usize = 4 * 1024 * 1024;
+const CACHED_PAGES: usize = 4;
 struct Block {
     end: usize,
     cumulative: Sum,
@@ -28,6 +32,10 @@ struct Inner {
     index: RwLock<Index>,
     indexed: AtomicU64,
     error: Mutex<Option<String>>,
+    scan_lock: Mutex<()>,
+    pages: Mutex<VecDeque<(usize, Vec<u8>)>>,
+    read_ns: AtomicU64,
+    scan_ns: AtomicU64,
 }
 impl Inner {
     fn fail(&self, message: impl Into<String>) {
@@ -53,54 +61,102 @@ impl Inner {
             self.fail(format!("mapped file changed: {e}"));
             return None;
         }
-        match self.file.seek_read(buf, offset as u64) {
-            Ok(n) if n == buf.len() => Some(n),
-            Ok(_) => {
-                self.fail("mapped file shrank during read");
-                None
-            }
-            Err(e) => {
-                self.fail(format!("mapped file read failed: {e}"));
-                None
-            }
+        if buf.len() > PAGE {
+            return match self.file.seek_read(buf, offset as u64) {
+                Ok(n) if n == buf.len() => Some(n),
+                Ok(_) => {
+                    self.fail("mapped file shrank during read");
+                    None
+                }
+                Err(e) => {
+                    self.fail(format!("mapped file read failed: {e}"));
+                    None
+                }
+            };
         }
+        let mut copied = 0;
+        let mut pages = self.pages.lock().unwrap();
+        while copied < buf.len() {
+            let at = offset + copied;
+            let page_at = at / PAGE * PAGE;
+            let position = if let Some(i) = pages.iter().position(|(start, _)| *start == page_at) {
+                i
+            } else {
+                let mut bytes = vec![0; PAGE.min(self.size - page_at)];
+                match self.file.seek_read(&mut bytes, page_at as u64) {
+                    Ok(n) if n == bytes.len() => {}
+                    Ok(_) => {
+                        self.fail("mapped file shrank during read");
+                        return None;
+                    }
+                    Err(e) => {
+                        self.fail(format!("mapped file read failed: {e}"));
+                        return None;
+                    }
+                }
+                if pages.len() == CACHED_PAGES {
+                    pages.pop_front();
+                }
+                pages.push_back((page_at, bytes));
+                pages.len() - 1
+            };
+            let bytes = &pages[position].1;
+            let within = at - page_at;
+            let take = (buf.len() - copied).min(bytes.len() - within);
+            buf[copied..copied + take].copy_from_slice(&bytes[within..within + take]);
+            copied += take;
+        }
+        Some(copied)
     }
-    fn index_one(&self) -> Option<()> {
+    fn index_one(&self, max_bytes: usize) -> Option<()> {
+        let _scan = self.scan_lock.lock().unwrap();
         let start = self.indexed.load(Ordering::Acquire) as usize;
         if start >= self.size {
             return Some(());
         }
-        let want = (self.size - start).min(PAGE);
-        let mut bytes = vec![0; want + 3.min(self.size - start - want)];
+        let want = (self.size - start).min(max_bytes);
+        let mut bytes = vec![0; want];
+        let read_start = Instant::now();
         self.read(start, &mut bytes)?;
-        let mut end = want;
-        while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
-            end -= 1;
-        }
+        self.read_ns
+            .fetch_add(read_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let end = match std::str::from_utf8(&bytes) {
+            Ok(_) => want,
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => {
+                self.fail("invalid UTF-8 in mapped file");
+                return None;
+            }
+        };
         if end == 0 {
             self.fail("invalid UTF-8 in mapped file");
             return None;
         }
-        let Ok(text) = std::str::from_utf8(&bytes[..end]) else {
-            self.fail("invalid UTF-8 in mapped file");
-            return None;
-        };
-        let part = measure(text);
+        let text = std::str::from_utf8(&bytes[..end]).unwrap();
         let mut index = self.index.write().unwrap();
-        if index.total.bytes == start {
-            index.total = index.total.add(part);
+        let scan_start = Instant::now();
+        let mut part_start = 0;
+        while part_start < end {
+            let mut part_end = (part_start + PAGE).min(end);
+            while !text.is_char_boundary(part_end) {
+                part_end -= 1;
+            }
+            index.total = index.total.add(measure(&text[part_start..part_end]));
             let total = index.total;
             index.blocks.push(Block {
-                end: start + end,
+                end: start + part_end,
                 cumulative: total,
             });
-            self.indexed.store((start + end) as u64, Ordering::Release);
+            part_start = part_end;
         }
+        self.indexed.store((start + end) as u64, Ordering::Release);
+        self.scan_ns
+            .fetch_add(scan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Some(())
     }
     fn ensure(&self, at: usize) -> Option<()> {
         while (self.indexed.load(Ordering::Acquire) as usize) < at {
-            self.index_one()?;
+            self.index_one(SCAN_BLOCK)?;
         }
         Some(())
     }
@@ -142,12 +198,12 @@ impl Inner {
             let breaks = self.index.read().unwrap().total.breaks;
             if breaks >= line || indexed == self.size {
                 if indexed < self.size && self.break_count(indexed)? < line {
-                    self.index_one()?;
+                    self.index_one(SCAN_BLOCK)?;
                     continue;
                 }
                 break;
             }
-            self.index_one()?;
+            self.index_one(SCAN_BLOCK)?;
         }
         let indexed = self.indexed.load(Ordering::Acquire) as usize;
         if line > self.index.read().unwrap().total.breaks {
@@ -173,8 +229,8 @@ impl Inner {
 
 /// A read-only UTF-8 file. `line_count` reports indexed lines so far; use
 /// `indexed_up_to` to see the known byte prefix. Other lookups may index ahead.
-/// Reads use ReadFile through FileExt. A live Windows mapping prevents another
-/// handle from truncating the file, so this store holds no mapping object.
+/// Reads use ReadFile through FileExt and a bounded 256 KiB page cache. A live
+/// Windows mapping prevents another handle from truncating the file.
 #[derive(Clone)]
 pub struct MappedStore {
     inner: Arc<Inner>,
@@ -203,11 +259,25 @@ impl MappedStore {
             }),
             indexed: AtomicU64::new(0),
             error: Mutex::new(None),
+            scan_lock: Mutex::new(()),
+            pages: Mutex::new(VecDeque::new()),
+            read_ns: AtomicU64::new(0),
+            scan_ns: AtomicU64::new(0),
         });
+        inner.index_one(PAGE).ok_or_else(|| {
+            io::Error::other(
+                inner
+                    .error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "index failed".into()),
+            )
+        })?;
         let worker = inner.clone();
         std::thread::spawn(move || {
             while worker.indexed.load(Ordering::Acquire) < worker.size as u64 {
-                if worker.index_one().is_none() {
+                if worker.index_one(SCAN_BLOCK).is_none() {
                     break;
                 }
             }
@@ -222,6 +292,16 @@ impl MappedStore {
     }
     pub fn is_index_complete(&self) -> bool {
         self.indexed_up_to().0 == self.inner.size
+    }
+    /// Bytes reserved for sparse checkpoints, excluding the bounded scan buffer.
+    pub fn index_memory_bytes(&self) -> usize {
+        self.inner.index.read().unwrap().blocks.capacity() * std::mem::size_of::<Block>()
+    }
+    pub fn index_timing_ns(&self) -> (u64, u64) {
+        (
+            self.inner.read_ns.load(Ordering::Relaxed),
+            self.inner.scan_ns.load(Ordering::Relaxed),
+        )
     }
 }
 impl TextSnapshot for MappedStore {

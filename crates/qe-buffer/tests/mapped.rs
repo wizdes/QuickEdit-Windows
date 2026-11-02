@@ -21,6 +21,14 @@ fn gib_open_first_screen_and_index() {
     file.set_len(1024 * 1024 * 1024).unwrap();
     file.seek(SeekFrom::Start(0)).unwrap();
     file.write_all(b"first screen\n").unwrap();
+    for (at, bytes) in [
+        (65_535_u64, b"\r\n".as_slice()),
+        ((512 << 20) - 1, "\u{2028}".as_bytes()),
+        ((768 << 20) - 1, b"\r\n".as_slice()),
+    ] {
+        file.seek(SeekFrom::Start(at)).unwrap();
+        file.write_all(bytes).unwrap();
+    }
     drop(file);
     let start = Instant::now();
     let store = MappedStore::open(&path).unwrap();
@@ -37,14 +45,41 @@ fn gib_open_first_screen_and_index() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let done = store.is_index_complete();
+    let index_time = start.elapsed();
     let error = store.error_state();
+    let timing = store.index_timing_ns();
+    let memory = store.index_memory_bytes();
+    if done {
+        let middle = (512 << 20) + 2;
+        let mut slow_bytes = vec![0; middle];
+        let mut slow_file = fs::File::open(&path).unwrap();
+        use std::io::Read;
+        slow_file.read_exact(&mut slow_bytes).unwrap();
+        let slow = StringStore::new(std::str::from_utf8(&slow_bytes).unwrap());
+        assert_eq!(
+            store.byte_to_position(ByteOffset(middle)),
+            slow.byte_to_position(ByteOffset(middle))
+        );
+        assert_eq!(
+            store
+                .byte_to_position(ByteOffset((768 << 20) + 1))
+                .unwrap()
+                .line,
+            LineIndex(4)
+        );
+        assert!(memory < 16 * 1024 * 1024);
+    }
     drop(store);
     fs::remove_file(&path).unwrap();
     eprintln!(
-        "1 GiB open {:?}, first screen {:?}, index {:?}",
+        "1 GiB open {:?}, first screen {:?}, index {:?}, read {:.3} s, scan {:.3} s, index memory {} bytes, page cache <= {} bytes",
         open_time,
         first_time,
-        start.elapsed()
+        index_time,
+        timing.0 as f64 / 1e9,
+        timing.1 as f64 / 1e9,
+        memory,
+        4 * 64 * 1024
     );
     assert!(done, "index did not finish within 60 s: {error:?}");
 }

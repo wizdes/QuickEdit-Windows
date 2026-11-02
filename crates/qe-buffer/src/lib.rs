@@ -1,4 +1,8 @@
 //! UTF-8 text storage with immutable tree nodes.
+//!
+//! `MappedStore` is a read-only ReadFile store, not a live memory mapping.
+//! Windows blocks file truncation while a live mapping exists. Lookups use a
+//! 256 KiB page cache; background indexing reads at most 4 MiB per scan.
 use qe_api::{
     ByteOffset, EditError, LineIndex, TextChange, TextPosition, TextSnapshot, TextStore,
     Utf16Offset,
@@ -33,16 +37,111 @@ impl Sum {
     }
 }
 fn measure(s: &str) -> Sum {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime feature check above guards every AVX2 instruction.
+        return unsafe { measure_avx2(s) };
+    }
+    measure_plain(s)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn measure_avx2(s: &str) -> Sum {
+    use std::arch::x86_64::*;
+    let bytes = s.as_bytes();
+    let cr = _mm256_set1_epi8(b'\r' as i8);
+    let lf = _mm256_set1_epi8(b'\n' as i8);
+    let mut at = 0;
+    let mut breaks = 0;
+    let mut previous_cr = false;
+    while at + 32 <= bytes.len() {
+        // SAFETY: the loop checks that 32 bytes remain.
+        let block = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(at).cast()) };
+        if _mm256_movemask_epi8(block) != 0 {
+            return measure_plain(s);
+        }
+        let cr_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, cr)) as u32;
+        let lf_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, lf)) as u32;
+        breaks += cr_mask.count_ones() as usize + lf_mask.count_ones() as usize;
+        breaks -= (cr_mask & (lf_mask >> 1)).count_ones() as usize;
+        breaks -= usize::from(previous_cr && (lf_mask & 1) != 0);
+        previous_cr = cr_mask & (1 << 31) != 0;
+        at += 32;
+    }
+    for &b in &bytes[at..] {
+        if b >= 128 {
+            return measure_plain(s);
+        }
+        if b == b'\r' || (b == b'\n' && !previous_cr) {
+            breaks += 1;
+        }
+        previous_cr = b == b'\r';
+    }
     Sum {
         bytes: s.len(),
-        units: s.encode_utf16().count(),
-        breaks: s
-            .chars()
-            .filter(|c| matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}'))
-            .count()
-            - s.as_bytes().windows(2).filter(|w| *w == b"\r\n").count(),
+        units: s.len(),
+        breaks,
         first_lf: s.starts_with('\n'),
-        last_cr: s.ends_with('\r'),
+        last_cr: previous_cr,
+    }
+}
+
+fn measure_plain(s: &str) -> Sum {
+    if s.is_ascii() {
+        let mut breaks = 0;
+        let mut previous_cr = false;
+        let bytes = s.as_bytes();
+        let mut at = 0;
+        while at + 8 <= bytes.len() {
+            let word = u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+            let cr = word ^ u64::from_ne_bytes([b'\r'; 8]);
+            let lf = word ^ u64::from_ne_bytes([b'\n'; 8]);
+            let has_zero =
+                |x: u64| (x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080) != 0;
+            if !has_zero(cr) && !has_zero(lf) {
+                previous_cr = false;
+                at += 8;
+                continue;
+            }
+            for &b in &bytes[at..at + 8] {
+                if b == b'\r' || (b == b'\n' && !previous_cr) {
+                    breaks += 1;
+                }
+                previous_cr = b == b'\r';
+            }
+            at += 8;
+        }
+        for &b in &bytes[at..] {
+            if b == b'\r' || (b == b'\n' && !previous_cr) {
+                breaks += 1;
+            }
+            previous_cr = b == b'\r';
+        }
+        return Sum {
+            bytes: s.len(),
+            units: s.len(),
+            breaks,
+            first_lf: s.starts_with('\n'),
+            last_cr: previous_cr,
+        };
+    }
+    let mut units = 0;
+    let mut breaks = 0;
+    let mut previous_cr = false;
+    for c in s.chars() {
+        units += c.len_utf16();
+        if matches!(c, '\r' | '\u{85}' | '\u{2028}' | '\u{2029}') || (c == '\n' && !previous_cr) {
+            breaks += 1;
+        }
+        previous_cr = c == '\r';
+    }
+    Sum {
+        bytes: s.len(),
+        units,
+        breaks,
+        first_lf: s.starts_with('\n'),
+        last_cr: previous_cr,
     }
 }
 #[derive(Clone)]

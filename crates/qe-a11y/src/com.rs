@@ -2,7 +2,7 @@
 use std::ffi::c_void;
 use windows::{
     Win32::{
-        Foundation::{E_INVALIDARG, HWND, POINT},
+        Foundation::{E_INVALIDARG, E_OUTOFMEMORY, HWND, POINT, SysAllocStringLen},
         Graphics::Gdi::ClientToScreen,
         System::{
             Com::SAFEARRAY,
@@ -11,7 +11,7 @@ use windows::{
         },
         UI::{Accessibility::*, HiDpi::GetDpiForWindow},
     },
-    core::{Error, HRESULT, Interface, Result},
+    core::{BSTR, Error, HRESULT, Interface, Result},
 };
 
 use crate::text::ReadError;
@@ -46,7 +46,9 @@ pub(crate) fn read_error(error: ReadError) -> Error {
     match error {
         ReadError::NotYetKnown => not_yet("This text is not in memory yet. Ask again soon."),
         ReadError::OutOfRange => invalid("The text range is outside this document."),
-        ReadError::Failed(message) => Error::new(HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), message),
+        ReadError::Failed(message) => {
+            Error::new(HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), message)
+        }
     }
 }
 
@@ -116,21 +118,27 @@ fn hwnd_of(window: isize) -> HWND {
     HWND(window as *mut c_void)
 }
 
-fn scale_of(window: isize) -> Result<f64> {
-    let dpi = unsafe { GetDpiForWindow(hwnd_of(window)) };
+/// Screen pixels per device-independent pixel. The host's answer comes first, because the
+/// shell tracks its window's DPI.
+pub(crate) fn scale_of(window: isize, host_dpi: Option<u32>) -> Result<f64> {
+    let dpi = host_dpi.unwrap_or_else(|| unsafe { GetDpiForWindow(hwnd_of(window)) });
     if dpi == 0 {
         return Err(gone());
     }
     Ok(f64::from(dpi) / 96.0)
 }
 
-/// Window coordinates in device-independent pixels to screen pixels.
-pub(crate) fn to_screen(window: isize, rect: qe_api::Rect) -> Result<[f64; 4]> {
-    let scale = scale_of(window)?;
+fn client_origin(window: isize) -> Result<POINT> {
     let mut origin = POINT::default();
     if !unsafe { ClientToScreen(hwnd_of(window), &mut origin) }.as_bool() {
         return Err(gone());
     }
+    Ok(origin)
+}
+
+/// Window coordinates in device-independent pixels to screen pixels.
+pub(crate) fn to_screen(window: isize, scale: f64, rect: qe_api::Rect) -> Result<[f64; 4]> {
+    let origin = client_origin(window)?;
     Ok([
         f64::from(origin.x) + f64::from(rect.x.0) * scale,
         f64::from(origin.y) + f64::from(rect.y.0) * scale,
@@ -140,14 +148,24 @@ pub(crate) fn to_screen(window: isize, rect: qe_api::Rect) -> Result<[f64; 4]> {
 }
 
 /// Screen pixels to window coordinates in device-independent pixels.
-pub(crate) fn to_window(window: isize, x: f64, y: f64) -> Result<(f32, f32)> {
-    let scale = scale_of(window)?;
-    let mut origin = POINT::default();
-    if !unsafe { ClientToScreen(hwnd_of(window), &mut origin) }.as_bool() {
-        return Err(gone());
-    }
+pub(crate) fn to_window(window: isize, scale: f64, x: f64, y: f64) -> Result<(f32, f32)> {
+    let origin = client_origin(window)?;
     Ok((
         ((x - f64::from(origin.x)) / scale) as f32,
         ((y - f64::from(origin.y)) / scale) as f32,
     ))
+}
+
+/// A BSTR, or an error when Windows has no memory for it. `BSTR::from` would panic there, and
+/// a panic ends the app with the user's text.
+pub(crate) fn bstr(text: &str) -> Result<BSTR> {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    if wide.is_empty() {
+        return Ok(BSTR::new());
+    }
+    let answer = unsafe { SysAllocStringLen(Some(&wide)) };
+    if answer.is_empty() {
+        return Err(Error::from_hresult(E_OUTOFMEMORY));
+    }
+    Ok(answer)
 }

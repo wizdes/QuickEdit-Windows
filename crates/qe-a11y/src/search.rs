@@ -1,26 +1,26 @@
-//! FindText. A short range is searched in the call. A long range, or text not in memory,
-//! is searched by a worker on a snapshot, and the call waits at most `FIND_WAIT`. If the
-//! worker is not done, the call says `Searching`, and the same call later gets the answer.
-//! The worker stops when it is done, when another search starts, or when the window closes.
-use crate::text::{ReadError, TextRange, byte_of, read_units, utf16_of};
-use qe_api::{ByteOffset, TextSnapshot};
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
-};
+//! FindText. The search runs on the thread that called, not on the window's thread.
+//!
+//! UIA calls a provider on its own worker thread, so that thread waits for the answer. A
+//! client's normal patience is about 20 seconds (from memory of UIA's default transaction
+//! timeout), so a search stops at `FIND_PATIENCE` and fails once, honestly, instead of
+//! returning "not found" for text it did not reach.
+//!
+//! The cost is linear in the text plus the query. Only a direct caller on the window's own
+//! thread stays inside `FIND_ON_WINDOW` units, and it never waits for disk.
+use crate::text::{ReadError, TextRange, byte_of, known_len, read_units, utf16_of};
+use qe_api::{ByteOffset, TextSnapshot, Utf16Offset};
+use std::time::{Duration, Instant};
 
-/// The most text searched inside the call, in UTF-16 units.
-pub const FIND_INLINE: usize = 64 * 1024;
-/// The longest a call waits for a worker. It leaves room inside a 16 ms frame.
-pub const FIND_WAIT: Duration = Duration::from_millis(6);
+/// The longest one search runs before it gives up.
+pub const FIND_PATIENCE: Duration = Duration::from_secs(15);
+/// The most text searched by a direct call on the window's thread, in UTF-16 units.
+pub const FIND_ON_WINDOW: usize = 64 * 1024;
+/// A query this long or shorter uses the standard library's search, which is fastest. It
+/// keeps this much of each chunk for the next one, so a longer query uses the search below.
+const SHORT_QUERY_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FindRequest {
-    /// Which view, which document in it, and which revision.
-    pub identity: (u64, u64, u64),
     pub range: TextRange,
     pub query: String,
     pub backward: bool,
@@ -29,8 +29,8 @@ pub struct FindRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindError {
-    /// A worker is still searching. The same call later gets the answer.
-    Searching,
+    /// The search hit its limit, so the answer is not known.
+    TooLong,
     Read(ReadError),
 }
 impl From<ReadError> for FindError {
@@ -39,106 +39,77 @@ impl From<ReadError> for FindError {
     }
 }
 
-type Outcome = Result<Option<TextRange>, ReadError>;
-
-struct Job {
-    request: FindRequest,
-    done: Arc<Mutex<Option<Outcome>>>,
-    cancel: Arc<AtomicBool>,
-}
-
-/// One search per window. A new search stops the one before it.
-#[derive(Default)]
-pub struct SearchSlot {
-    job: Mutex<Option<Job>>,
-}
-
-impl SearchSlot {
-    pub fn cancel(&self) {
-        if let Ok(mut job) = self.job.lock()
-            && let Some(job) = job.take()
-        {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
+/// Searches on this thread. It may wait for disk, so it must not run on the window's thread.
+pub fn find_waiting(
+    text: &dyn TextSnapshot,
+    request: &FindRequest,
+    patience: Duration,
+) -> Result<Option<TextRange>, FindError> {
+    if nothing_to_find(request) {
+        return Ok(None);
     }
-    pub fn find(
-        &self,
-        text: &Arc<dyn TextSnapshot>,
-        request: FindRequest,
-    ) -> Result<Option<TextRange>, FindError> {
-        if request.query.is_empty() || request.range.start >= request.range.end {
-            return Ok(None);
-        }
-        if request.range.end - request.range.start <= FIND_INLINE {
-            match search_inline(text.as_ref(), &request) {
-                Err(ReadError::NotYetKnown) => {}
-                answer => return answer.map_err(Into::into),
-            }
-        }
-        let poisoned = || ReadError::Failed("The search lock failed.".into());
-        let mut slot = self.job.lock().map_err(|_| poisoned())?;
-        if slot.as_ref().is_none_or(|job| job.request != request) {
-            if let Some(old) = slot.take() {
-                old.cancel.store(true, Ordering::Relaxed);
-            }
-            *slot = Some(start_worker(text, request).map_err(FindError::Read)?);
-        }
-        let Some(job) = slot.as_ref() else {
-            return Err(poisoned().into());
-        };
-        let done = job.done.clone();
-        drop(slot);
-        // This yields rather than sleeps, because a timed sleep on Windows can last 16 ms,
-        // which is a whole frame.
-        let began = Instant::now();
-        let answer = loop {
-            if let Some(answer) = done.lock().map_err(|_| poisoned())?.take() {
-                break answer;
-            }
-            if began.elapsed() >= FIND_WAIT {
-                return Err(FindError::Searching);
-            }
-            std::thread::yield_now();
-        };
-        self.cancel();
-        answer.map_err(Into::into)
-    }
-}
-
-fn start_worker(text: &Arc<dyn TextSnapshot>, request: FindRequest) -> Result<Job, ReadError> {
-    let from = byte_of(text.as_ref(), request.range.start)?;
-    let to = byte_of(text.as_ref(), request.range.end)?;
-    let done = Arc::new(Mutex::new(None));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let job = Job {
-        request: request.clone(),
-        done: done.clone(),
-        cancel: cancel.clone(),
+    let byte = |unit: usize| -> Result<usize, FindError> {
+        text.utf16_to_byte(Utf16Offset(unit))
+            .or_else(|| text.utf16_to_byte(Utf16Offset(unit.saturating_sub(1))))
+            .map(|b| b.0)
+            .ok_or(FindError::Read(ReadError::OutOfRange))
     };
-    let text = text.clone();
-    std::thread::Builder::new()
-        .name("qe-a11y-find".into())
-        .spawn(move || {
-            let answer = search_worker(text.as_ref(), &request, from, to, &cancel);
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            if let Ok(mut slot) = done.lock() {
-                *slot = Some(answer);
-            }
-        })
-        .map_err(|e| ReadError::Failed(format!("The search could not start: {e}")))?;
-    Ok(job)
+    let from = byte(request.range.start)?;
+    let to = byte(request.range.end)?;
+    let began = Instant::now();
+    let mut scanner = Scanner::new(request);
+    let mut at = from;
+    let mut timed_out = false;
+    let good = text.visit_chunks_while(ByteOffset(from)..ByteOffset(to), &mut |part| {
+        if began.elapsed() > patience {
+            timed_out = true;
+            return false;
+        }
+        let going = scanner.feed(at, part);
+        at += part.len();
+        going
+    });
+    if timed_out {
+        return Err(FindError::TooLong);
+    }
+    if !good {
+        return Err(FindError::Read(ReadError::Failed(
+            "The text could not be read for the search.".into(),
+        )));
+    }
+    let Some((start, end)) = scanner.found else {
+        return Ok(None);
+    };
+    let unit = |b: usize| {
+        text.byte_to_utf16(ByteOffset(b))
+            .map(|u| u.0)
+            .ok_or(FindError::Read(ReadError::OutOfRange))
+    };
+    Ok(Some(TextRange::new(unit(start)?, unit(end)?)))
 }
 
-fn search_inline(text: &dyn TextSnapshot, request: &FindRequest) -> Outcome {
+/// For a direct call on the window's thread: only text in memory, and only so much of it.
+pub fn find_on_window(
+    text: &dyn TextSnapshot,
+    request: &FindRequest,
+) -> Result<Option<TextRange>, FindError> {
+    if nothing_to_find(request) {
+        return Ok(None);
+    }
+    if request.range.end - request.range.start > FIND_ON_WINDOW {
+        return Err(FindError::TooLong);
+    }
+    let (len, _) = known_len(text)?;
+    if request.range.end > len {
+        return Err(FindError::Read(ReadError::OutOfRange));
+    }
     let body = read_units(text, request.range.start, request.range.end)?;
     let from = byte_of(text, request.range.start)?;
     let to = byte_of(text, request.range.end)?;
     if body.len() != to.saturating_sub(from) {
-        return Err(ReadError::NotYetKnown);
+        return Err(FindError::Read(ReadError::NotYetKnown));
     }
-    let mut scanner = Scanner::new(&request.query, request.backward, request.ignore_case);
+    let mut scanner = Scanner::new(request);
     scanner.feed(from, &body);
     match scanner.found {
         Some((start, end)) => Ok(Some(TextRange::new(
@@ -149,145 +120,164 @@ fn search_inline(text: &dyn TextSnapshot, request: &FindRequest) -> Outcome {
     }
 }
 
-fn search_worker(
-    text: &dyn TextSnapshot,
-    request: &FindRequest,
-    from: usize,
-    to: usize,
-    cancel: &AtomicBool,
-) -> Outcome {
-    let mut scanner = Scanner::new(&request.query, request.backward, request.ignore_case);
-    let mut at = from;
-    let good = text.visit_chunks_while(ByteOffset(from)..ByteOffset(to), &mut |part| {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
-        }
-        let going = scanner.feed(at, part);
-        at += part.len();
-        going
-    });
-    if !good {
-        return Err(ReadError::Failed(
-            "The text could not be read for the search.".into(),
-        ));
+fn nothing_to_find(request: &FindRequest) -> bool {
+    request.query.is_empty()
+        || request.range.start >= request.range.end
+        // Each query character needs at least one unit of text, in any case.
+        || request.query.chars().count() > request.range.end - request.range.start
+}
+
+/// What makes two characters match. Equal keys mean equal text, or equal text after
+/// `to_lowercase` when the case does not count. A character that folds to several still
+/// matches only itself, and a match stays on character edges.
+fn key(c: char, ignore_case: bool) -> [char; 3] {
+    if !ignore_case {
+        return [c, '\0', '\0'];
     }
-    // A worker may wait for disk, so it uses the plain queries here.
-    match scanner.found {
-        Some((start, end)) => {
-            let unit = |byte| {
-                text.byte_to_utf16(ByteOffset(byte))
-                    .map(|u| u.0)
-                    .ok_or(ReadError::OutOfRange)
-            };
-            Ok(Some(TextRange::new(unit(start)?, unit(end)?)))
+    if c.is_ascii() {
+        return [c.to_ascii_lowercase(), '\0', '\0'];
+    }
+    let mut lower = c.to_lowercase();
+    [
+        lower.next().unwrap_or(c),
+        lower.next().unwrap_or('\0'),
+        lower.next().unwrap_or('\0'),
+    ]
+}
+
+/// The prefix-table search (Knuth, Morris and Pratt). Each character of text costs a constant
+/// amount on average, whatever the query, and a chunk edge needs no special care.
+struct Prefix {
+    keys: Vec<[char; 3]>,
+    fail: Vec<u32>,
+    ignore_case: bool,
+    matched: usize,
+    /// The byte of each of the last `keys.len()` characters.
+    bytes: Vec<usize>,
+    seen: usize,
+}
+
+impl Prefix {
+    fn new(query: &str, ignore_case: bool) -> Self {
+        let keys: Vec<[char; 3]> = query.chars().map(|c| key(c, ignore_case)).collect();
+        let mut fail = vec![0u32; keys.len()];
+        let mut length = 0usize;
+        for i in 1..keys.len() {
+            while length > 0 && keys[i] != keys[length] {
+                length = fail[length - 1] as usize;
+            }
+            if keys[i] == keys[length] {
+                length += 1;
+            }
+            fail[i] = length as u32;
         }
-        None => Ok(None),
+        let bytes = vec![0; keys.len()];
+        Self {
+            keys,
+            fail,
+            ignore_case,
+            matched: 0,
+            bytes,
+            seen: 0,
+        }
+    }
+    /// Takes one chunk. Each match goes to `found`, and returning false stops the scan.
+    fn feed(&mut self, at: usize, part: &str, found: &mut dyn FnMut(usize, usize) -> bool) -> bool {
+        let count = self.keys.len();
+        for (offset, c) in part.char_indices() {
+            let k = key(c, self.ignore_case);
+            while self.matched > 0 && self.keys[self.matched] != k {
+                self.matched = self.fail[self.matched - 1] as usize;
+            }
+            if self.keys[self.matched] == k {
+                self.matched += 1;
+            }
+            self.bytes[self.seen % count] = at + offset;
+            self.seen += 1;
+            if self.matched == count {
+                let start = self.bytes[(self.seen - count) % count];
+                if !found(start, at + offset + c.len_utf8()) {
+                    return false;
+                }
+                self.matched = self.fail[count - 1] as usize;
+            }
+        }
+        true
     }
 }
 
-/// Compares a character at a time, so a match stays on character edges. Folding is by
-/// `to_lowercase`, and a character that folds to several still matches only itself.
-fn same(a: char, b: char) -> bool {
-    a == b
-        || if a.is_ascii() && b.is_ascii() {
-            a.eq_ignore_ascii_case(&b)
-        } else {
-            a.to_lowercase().eq(b.to_lowercase())
-        }
+enum Method {
+    /// A short exact query. It keeps the end of each chunk for the next one.
+    Short {
+        buffer: String,
+        base: usize,
+    },
+    Prefix(Box<Prefix>),
 }
 
-/// Scans chunks in order and keeps the end of each one, so a match across two chunks counts.
+/// Scans chunks in order. A backward search keeps the last match it sees.
 struct Scanner<'a> {
     query: &'a str,
-    chars: Vec<char>,
     backward: bool,
-    ignore_case: bool,
-    most_bytes: usize,
-    buffer: String,
-    /// The document byte of `buffer`'s first byte.
-    base: usize,
+    method: Method,
     found: Option<(usize, usize)>,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(query: &'a str, backward: bool, ignore_case: bool) -> Self {
-        let chars: Vec<char> = query.chars().collect();
+    fn new(request: &'a FindRequest) -> Self {
+        let method = if !request.ignore_case && request.query.len() <= SHORT_QUERY_BYTES {
+            Method::Short {
+                buffer: String::new(),
+                base: 0,
+            }
+        } else {
+            Method::Prefix(Box::new(Prefix::new(&request.query, request.ignore_case)))
+        };
         Self {
-            query,
-            most_bytes: if ignore_case {
-                chars.len().saturating_mul(4)
-            } else {
-                query.len()
-            },
-            chars,
-            backward,
-            ignore_case,
-            buffer: String::new(),
-            base: 0,
+            query: &request.query,
+            backward: request.backward,
+            method,
             found: None,
         }
     }
     /// Returns false once the answer is known.
     fn feed(&mut self, at: usize, part: &str) -> bool {
-        if self.buffer.is_empty() {
-            self.base = at;
-        }
-        self.buffer.push_str(part);
-        let hit = if self.ignore_case {
-            self.scan_folded()
-        } else if self.backward {
-            self.buffer
-                .rfind(self.query)
-                .map(|s| (s, s + self.query.len()))
-        } else {
-            self.buffer
-                .find(self.query)
-                .map(|s| (s, s + self.query.len()))
-        };
-        if let Some((start, end)) = hit {
-            self.found = Some((self.base + start, self.base + end));
-            if !self.backward {
-                return false;
+        let backward = self.backward;
+        match &mut self.method {
+            Method::Prefix(prefix) => {
+                let found = &mut self.found;
+                prefix.feed(at, part, &mut |start, end| {
+                    *found = Some((start, end));
+                    backward
+                })
             }
-        }
-        // Keep what could start a match that the next chunk finishes.
-        let mut keep = self.buffer.len().saturating_sub(self.most_bytes.saturating_sub(1));
-        while !self.buffer.is_char_boundary(keep) {
-            keep += 1;
-        }
-        self.buffer.drain(..keep);
-        self.base += keep;
-        true
-    }
-    fn scan_folded(&self) -> Option<(usize, usize)> {
-        let first = *self.chars.first()?;
-        let mut hit = None;
-        for (start, c) in self.buffer.char_indices() {
-            if !same(c, first) {
-                continue;
-            }
-            let Some(tail) = self.buffer.get(start..) else {
-                continue;
-            };
-            let mut end = start;
-            let mut letters = tail.chars();
-            let mut good = true;
-            for wanted in &self.chars {
-                match letters.next() {
-                    Some(actual) if same(actual, *wanted) => end += actual.len_utf8(),
-                    _ => {
-                        good = false;
-                        break;
+            Method::Short { buffer, base } => {
+                if buffer.is_empty() {
+                    *base = at;
+                }
+                buffer.push_str(part);
+                let hit = if backward {
+                    buffer.rfind(self.query)
+                } else {
+                    buffer.find(self.query)
+                };
+                if let Some(start) = hit {
+                    self.found = Some((*base + start, *base + start + self.query.len()));
+                    if !backward {
+                        return false;
                     }
                 }
-            }
-            if good {
-                hit = Some((start, end));
-                if !self.backward {
-                    break;
+                // Keep what could start a match that the next chunk finishes.
+                let mut keep = buffer
+                    .len()
+                    .saturating_sub(self.query.len().saturating_sub(1));
+                while !buffer.is_char_boundary(keep) {
+                    keep += 1;
                 }
+                buffer.drain(..keep);
+                *base += keep;
+                true
             }
         }
-        hit
     }
 }

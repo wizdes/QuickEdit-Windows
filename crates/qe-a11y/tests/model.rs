@@ -153,7 +153,12 @@ fn previous_stop(stops: &[usize], at: usize) -> Option<usize> {
     stops.iter().copied().rev().find(|s| *s < at)
 }
 
-fn model_move(m: &Model, range: (usize, usize), unit: TextUnit, count: i32) -> ((usize, usize), i32) {
+fn model_move(
+    m: &Model,
+    range: (usize, usize),
+    unit: TextUnit,
+    count: i32,
+) -> ((usize, usize), i32) {
     if count == 0 {
         return (range, 0);
     }
@@ -164,9 +169,15 @@ fn model_move(m: &Model, range: (usize, usize), unit: TextUnit, count: i32) -> (
     let mut moved = 0;
     let whole = matches!(unit, TextUnit_Document | TextUnit_Page | TextUnit_Format);
     while moved != count {
-        let step = if count > 0 { next_stop(&stops, at) } else { previous_stop(&stops, at) };
+        let step = if count > 0 {
+            next_stop(&stops, at)
+        } else {
+            previous_stop(&stops, at)
+        };
         let Some(step) = step else { break };
-        if !empty && count > 0 && step >= len {
+        let final_line =
+            matches!(unit, TextUnit_Line | TextUnit_Paragraph) && len > 0 && m.ends_with_line();
+        if !empty && count > 0 && step >= len && !final_line {
             break;
         }
         at = step;
@@ -196,7 +207,11 @@ fn model_endpoint(
     let mut at = if start { range.0 } else { range.1 };
     let mut moved = 0;
     while moved != count {
-        let step = if count > 0 { next_stop(&stops, at) } else { previous_stop(&stops, at) };
+        let step = if count > 0 {
+            next_stop(&stops, at)
+        } else {
+            previous_stop(&stops, at)
+        };
         let Some(step) = step else { break };
         at = step;
         moved += count.signum();
@@ -204,7 +219,11 @@ fn model_endpoint(
             break;
         }
     }
-    let answer = if start { (at, range.1.max(at)) } else { (range.0.min(at), at) };
+    let answer = if start {
+        (at, range.1.max(at))
+    } else {
+        (range.0.min(at), at)
+    };
     (answer, moved)
 }
 
@@ -216,7 +235,12 @@ fn model_expand(m: &Model, at: usize, unit: TextUnit) -> (usize, usize) {
     let stops = m.stops(unit);
     if at >= len {
         let start = if matches!(unit, TextUnit_Line | TextUnit_Paragraph) {
-            stops.iter().copied().rev().find(|s| *s < len && !m.ends_with_line()).unwrap_or(len)
+            stops
+                .iter()
+                .copied()
+                .rev()
+                .find(|s| *s < len && !m.ends_with_line())
+                .unwrap_or(len)
         } else {
             len
         };
@@ -261,7 +285,10 @@ fn check(
 /// Every range holds one model position, and the model moves it by the same rule.
 fn run_moves(seed: u64, atoms: Vec<usize>, steps: usize) {
     let mut rng = Rng(seed);
-    let model = Model { atoms, rows: Vec::new() };
+    let model = Model {
+        atoms,
+        rows: Vec::new(),
+    };
     let window = TestWindow::from_text(&model.text());
     let ui = window.accessibility();
     let document = ui.document().unwrap();
@@ -276,17 +303,26 @@ fn run_moves(seed: u64, atoms: Vec<usize>, steps: usize) {
         for inner in 0..4 {
             let unit = UNITS[rng.below(UNITS.len())];
             let count = rng.count();
-            let what = format!("seed {seed} step {step}.{inner} {unit:?} {count} from {position:?}");
+            let what =
+                format!("seed {seed} step {step}.{inner} {unit:?} {count} from {position:?}");
             match rng.below(4) {
                 0 => {
                     let (want, moved) = model_move(&model, position, unit, count);
-                    assert_eq!(unsafe { range.Move(unit, count) }.unwrap(), moved, "Move {what}");
+                    assert_eq!(
+                        unsafe { range.Move(unit, count) }.unwrap(),
+                        moved,
+                        "Move {what}"
+                    );
                     position = want;
                 }
                 1 => {
                     let start = rng.below(2) == 0;
                     let (want, moved) = model_endpoint(&model, position, start, unit, count);
-                    let end = if start { TextPatternRangeEndpoint_Start } else { TextPatternRangeEndpoint_End };
+                    let end = if start {
+                        TextPatternRangeEndpoint_Start
+                    } else {
+                        TextPatternRangeEndpoint_End
+                    };
                     assert_eq!(
                         unsafe { range.MoveEndpointByUnit(end, unit, count) }.unwrap(),
                         moved,
@@ -356,7 +392,10 @@ fn random_line_moves_match_wrapped_rows() {
             }
             atoms.push(14 + rng.below(2));
         }
-        let mut model = Model { atoms, rows: Vec::new() };
+        let mut model = Model {
+            atoms,
+            rows: Vec::new(),
+        };
         let mut view = EditorView::from_text(&model.text()).unwrap();
         view.set_wrap(true).unwrap();
         let window = TestWindow::new(view);
@@ -380,7 +419,10 @@ fn random_line_moves_match_wrapped_rows() {
         // Rows break between clusters, so a row stop is a character stop.
         let chars = model.char_stops();
         for row in &model.rows {
-            assert!(chars.contains(row), "a row starts inside a cluster at {row}");
+            assert!(
+                chars.contains(row),
+                "a row starts inside a cluster at {row}"
+            );
         }
         let stops = model.line_stops();
         for step in 0..120 {
@@ -389,14 +431,22 @@ fn random_line_moves_match_wrapped_rows() {
             let count = rng.count();
             let what = format!("round {round} step {step} from {at} count {count}");
             let (want, moved) = model_move(&model, (at, at), TextUnit_Line, count);
-            assert_eq!(unsafe { range.Move(TextUnit_Line, count) }.unwrap(), moved, "{what}");
+            assert_eq!(
+                unsafe { range.Move(TextUnit_Line, count) }.unwrap(),
+                moved,
+                "{what}"
+            );
             check(&range, &doc, &wide, want, &what);
             if want.0 < model.len() {
                 unsafe { range.ExpandToEnclosingUnit(TextUnit_Line) }.unwrap();
                 let end = next_stop(&stops, want.0).unwrap_or(model.len());
                 check(&range, &doc, &wide, (want.0, end), &what);
                 let (want, moved) = model_move(&model, (want.0, end), TextUnit_Line, count);
-                assert_eq!(unsafe { range.Move(TextUnit_Line, count) }.unwrap(), moved, "{what}");
+                assert_eq!(
+                    unsafe { range.Move(TextUnit_Line, count) }.unwrap(),
+                    moved,
+                    "{what}"
+                );
                 check(&range, &doc, &wide, want, &what);
             }
         }
@@ -419,7 +469,10 @@ fn ranges_kept_across_edits_and_undo_match_the_model() {
     for seed in [5u64, 6, 7, 8] {
         let mut rng = Rng(seed * 104_729 + 3);
         let count = 20 + rng.below(30);
-        let mut model = Model { atoms: random_atoms(&mut rng, count), rows: Vec::new() };
+        let mut model = Model {
+            atoms: random_atoms(&mut rng, count),
+            rows: Vec::new(),
+        };
         let window = TestWindow::from_text(&model.text());
         let ui = window.accessibility();
         let document = ui.document().unwrap();
@@ -442,10 +495,14 @@ fn ranges_kept_across_edits_and_undo_match_the_model() {
                     // Replace some atoms with some others.
                     let at = rng.below(model.atoms.len() + 1);
                     let gone = rng.below(4).min(model.atoms.len() - at);
-                    let fresh: Vec<usize> = random_atoms(&mut rng, rng_small(&mut Rng(seed + step as u64)));
+                    let fresh: Vec<usize> =
+                        random_atoms(&mut rng, rng_small(&mut Rng(seed + step as u64)));
                     let before = model.atoms.clone();
                     let prefix: String = model.atoms[..at].iter().map(|a| ATOMS[*a].0).collect();
-                    let old: String = model.atoms[at..at + gone].iter().map(|a| ATOMS[*a].0).collect();
+                    let old: String = model.atoms[at..at + gone]
+                        .iter()
+                        .map(|a| ATOMS[*a].0)
+                        .collect();
                     let new: String = fresh.iter().map(|a| ATOMS[*a].0).collect();
                     if old.is_empty() && new.is_empty() {
                         continue;
@@ -456,33 +513,56 @@ fn ranges_kept_across_edits_and_undo_match_the_model() {
                         &mut ctx,
                     );
                     model.atoms.splice(at..at + gone, fresh);
-                    let change = (units(&prefix), units(&prefix) + units(&old), units(&prefix) + units(&new));
+                    let change = (
+                        units(&prefix),
+                        units(&prefix) + units(&old),
+                        units(&prefix) + units(&new),
+                    );
                     undo.push((before, change));
                     redo.clear();
                     change
                 }
                 3 if !undo.is_empty() => {
-                    window.ui.view.borrow_mut().run(EditorCommand::Undo, &mut ctx);
-                    let Some((before, change)) = undo.pop() else { continue };
+                    window
+                        .ui
+                        .view
+                        .borrow_mut()
+                        .run(EditorCommand::Undo, &mut ctx);
+                    let Some((before, change)) = undo.pop() else {
+                        continue;
+                    };
                     redo.push((model.atoms.clone(), change));
                     model.atoms = before;
                     // An undo swaps the new text back for the old.
                     (change.0, change.2, change.1)
                 }
                 4 if !redo.is_empty() => {
-                    window.ui.view.borrow_mut().run(EditorCommand::Redo, &mut ctx);
-                    let Some((before, change)) = redo.pop() else { continue };
+                    window
+                        .ui
+                        .view
+                        .borrow_mut()
+                        .run(EditorCommand::Redo, &mut ctx);
+                    let Some((before, change)) = redo.pop() else {
+                        continue;
+                    };
                     undo.push((model.atoms.clone(), change));
                     model.atoms = before;
                     change
                 }
                 _ => continue,
             };
-            assert_eq!(window.ui.view.borrow().text().unwrap(), model.text(), "{what}");
+            assert_eq!(
+                window.ui.view.borrow().text().unwrap(),
+                model.text(),
+                "{what}"
+            );
             let wide = model.wide();
             let doc = document_range(&document);
             for (range, spot) in &mut kept {
-                *spot = (shift(spot.0, start, old_end, new_end), shift(spot.1, start, old_end, new_end));
+                *spot = (
+                    shift(spot.0, start, old_end, new_end),
+                    shift(spot.1, start, old_end, new_end),
+                );
                 if spot.0 > spot.1 {
                     spot.1 = spot.0;
                 }

@@ -36,7 +36,8 @@ fn rectangles(range: &ITextRangeProvider) -> Vec<f64> {
     (0..count)
         .map(|index| {
             let mut value = 0f64;
-            unsafe { SafeArrayGetElement(array, &index, (&raw mut value).cast()) }.expect("element");
+            unsafe { SafeArrayGetElement(array, &index, (&raw mut value).cast()) }
+                .expect("element");
             value
         })
         .collect()
@@ -65,7 +66,10 @@ fn get_text_with_no_limit_stops_at_the_cap() {
     let ui = window.accessibility();
     let doc = document_range(&ui.document().unwrap());
     assert_eq!(unsafe { doc.GetText(-1) }.unwrap().len(), GET_TEXT_CAP);
-    assert_eq!(unsafe { doc.GetText(i32::MAX) }.unwrap().len(), GET_TEXT_CAP);
+    assert_eq!(
+        unsafe { doc.GetText(i32::MAX) }.unwrap().len(),
+        GET_TEXT_CAP
+    );
     assert_eq!(unsafe { doc.GetText(3) }.unwrap().to_string(), "xxx");
     // A client reads on from where the first answer stopped.
     let later = unsafe { doc.Clone() }.unwrap();
@@ -110,7 +114,8 @@ fn empty_document_answers_every_unit_with_an_empty_range() {
 #[test]
 fn character_moves_stop_only_between_clusters() {
     // a | emoji | e + mark | flag | family | CRLF | b
-    let body = "a\u{1f600}e\u{301}\u{1f1eb}\u{1f1f7}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\r\nb";
+    let body =
+        "a\u{1f600}e\u{301}\u{1f1eb}\u{1f1f7}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\r\nb";
     let window = TestWindow::from_text(body);
     let ui = window.accessibility();
     let doc = document_range(&ui.document().unwrap());
@@ -177,7 +182,7 @@ fn lines_and_paragraphs_include_their_endings_and_stop_at_the_last() {
     assert_eq!(text(&line), "two\n");
     assert_eq!(unsafe { line.Move(TextUnit_Paragraph, 5) }.unwrap(), 1);
     assert_eq!(text(&line), "three");
-    // A range with text stays put at the last line: no line starts at the very end.
+    // A range with text stays put at a last line with no ending: no line starts at the end.
     assert_eq!(unsafe { line.Move(TextUnit_Line, 1) }.unwrap(), 0);
     assert_eq!(text(&line), "three");
     assert_eq!(unsafe { line.Move(TextUnit_Line, -100) }.unwrap(), -2);
@@ -212,15 +217,30 @@ fn move_endpoint_past_the_other_end_brings_it_along() {
     let document = ui.document().unwrap();
     let doc = document_range(&document);
     let range = range_at(&document, 2, 4);
-    assert_eq!(unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, 3) }.unwrap(), 3);
+    assert_eq!(
+        unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, 3) }.unwrap(),
+        3
+    );
     assert_eq!(ends(&range, &doc), (5, 5));
-    assert_eq!(unsafe { range.MoveEndpointByUnit(END, TextUnit_Character, -4) }.unwrap(), -4);
+    assert_eq!(
+        unsafe { range.MoveEndpointByUnit(END, TextUnit_Character, -4) }.unwrap(),
+        -4
+    );
     assert_eq!(ends(&range, &doc), (1, 1));
     // Out of range stops at the end and reports how far it went.
-    assert_eq!(unsafe { range.MoveEndpointByUnit(END, TextUnit_Character, 100) }.unwrap(), 5);
-    assert_eq!(unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, -100) }.unwrap(), -1);
+    assert_eq!(
+        unsafe { range.MoveEndpointByUnit(END, TextUnit_Character, 100) }.unwrap(),
+        5
+    );
+    assert_eq!(
+        unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, -100) }.unwrap(),
+        -1
+    );
     assert_eq!(ends(&range, &doc), (0, 6));
-    assert_eq!(unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, i32::MIN) }.unwrap(), 0);
+    assert_eq!(
+        unsafe { range.MoveEndpointByUnit(START, TextUnit_Character, i32::MIN) }.unwrap(),
+        0
+    );
     assert_code(
         unsafe { range.MoveEndpointByUnit(TextPatternRangeEndpoint(9), TextUnit_Character, 1) },
         -2147024809,
@@ -253,7 +273,11 @@ fn compare_and_endpoints_and_move_by_range() {
     let other_window = TestWindow::from_text("abcdef");
     let other_ui = other_window.accessibility();
     let foreign = document_range(&other_ui.document().unwrap());
-    assert_code(unsafe { a.Compare(&foreign) }, -2147024809, "another document's range");
+    assert_code(
+        unsafe { a.Compare(&foreign) },
+        -2147024809,
+        "another document's range",
+    );
     assert_code(
         unsafe { a.CompareEndpoints(START, &foreign, START) },
         -2147024809,
@@ -277,11 +301,14 @@ fn find_text_gives_real_null_and_utf16_ranges() {
     assert_eq!(ends(&found, &doc), (8, 11));
     assert_eq!(text(&found), "\u{1f600}B");
     assert_null(
-        unsafe { doc.FindText(&BSTR::from("\u{1f600}b"), true, false).and_then(|f| {
-            // Case-sensitive and backward finds the first one, not null.
-            assert_eq!(ends(&f, &doc), (1, 4));
-            doc.FindText(&BSTR::from("zzz"), false, false)
-        }) },
+        unsafe {
+            doc.FindText(&BSTR::from("\u{1f600}b"), true, false)
+                .and_then(|f| {
+                    // Case-sensitive and backward finds the first one, not null.
+                    assert_eq!(ends(&f, &doc), (1, 4));
+                    doc.FindText(&BSTR::from("zzz"), false, false)
+                })
+        },
         "no match",
     );
     // The Kelvin sign folds to k, and the answer covers it in its real units.
@@ -289,7 +316,10 @@ fn find_text_gives_real_null_and_utf16_ranges() {
     assert_eq!(text(&found), "K");
     // An empty range holds nothing. An empty query is the caller's mistake.
     let caret = range_at(&ui.document().unwrap(), 1, 1);
-    assert_null(unsafe { caret.FindText(&BSTR::from("b"), false, false) }, "an empty range");
+    assert_null(
+        unsafe { caret.FindText(&BSTR::from("b"), false, false) },
+        "an empty range",
+    );
     assert_code(
         unsafe { doc.FindText(&BSTR::from(""), false, false) },
         -2147024809,
@@ -297,42 +327,89 @@ fn find_text_gives_real_null_and_utf16_ranges() {
     );
     // A lone surrogate cannot match valid text.
     let lone = BSTR::from_wide(&[0xd83d]);
-    assert_null(unsafe { doc.FindText(&lone, false, false) }, "a lone surrogate");
+    assert_null(
+        unsafe { doc.FindText(&lone, false, false) },
+        "a lone surrogate",
+    );
     // The search stays inside the range.
     let part = range_at(&ui.document().unwrap(), 3, 5);
-    assert_null(unsafe { part.FindText(&BSTR::from("\u{1f600}"), false, false) }, "outside the range");
+    assert_null(
+        unsafe { part.FindText(&BSTR::from("\u{1f600}"), false, false) },
+        "outside the range",
+    );
 }
 
 #[test]
-fn find_text_over_the_old_cap_finds_text_far_in() {
-    let mut body = "x".repeat(70_000);
+fn find_text_over_any_old_cap_finds_text_far_in_on_the_first_try() {
+    let mut body = "x".repeat(200_000);
     body.push_str("needle");
     let window = TestWindow::from_text(&body);
     let ui = window.accessibility();
     let doc = document_range(&ui.document().unwrap());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let found = loop {
-        match unsafe { doc.FindText(&BSTR::from("NEEDLE"), false, true) } {
-            Ok(found) => break found,
-            Err(error) if error.code().0 == NOT_YET => {
-                assert!(std::time::Instant::now() < deadline, "the search never ended");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(error) => panic!("{error}"),
-        }
-    };
-    assert_eq!(ends(&found, &doc), (70_000, 70_006));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        match unsafe { doc.FindText(&BSTR::from("missing"), false, false) } {
-            Ok(_) => panic!("found text that is not there"),
-            Err(error) if error.code().0 == 0 => break,
-            Err(error) if error.code().0 == NOT_YET => {
-                assert!(std::time::Instant::now() < deadline, "the search never ended");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(error) => panic!("{error}"),
-        }
+    let found = window
+        .find_off_thread(&doc, "NEEDLE", false, true)
+        .expect("one call is enough")
+        .expect("it is there");
+    assert_eq!(ends(&found, &doc), (200_000, 200_006));
+    assert!(
+        window
+            .find_off_thread(&doc, "missing", false, false)
+            .expect("one call is enough")
+            .is_none()
+    );
+    // The same long search again gets the same answer, not a stale state.
+    let again = window
+        .find_off_thread(&doc, "NEEDLE", false, true)
+        .expect("one call is enough")
+        .expect("it is there");
+    assert_eq!(ends(&again, &doc), (200_000, 200_006));
+}
+
+#[test]
+fn find_on_the_window_thread_refuses_a_long_range_rather_than_block() {
+    let body = "x".repeat(70_000);
+    let window = TestWindow::from_text(&body);
+    let ui = window.accessibility();
+    let doc = document_range(&ui.document().unwrap());
+    assert_code(
+        unsafe { doc.FindText(&BSTR::from("y"), false, false) },
+        NOT_YET,
+        "a long search on the window's own thread",
+    );
+}
+
+#[test]
+fn exact_case_backward_takes_the_last_match_in_any_chunk() {
+    // Long enough to cross the store's chunks, with matches in several of them.
+    let mut body = String::new();
+    for i in 0..4000 {
+        body.push_str(&format!("line {i} marker\n"));
+    }
+    let window = TestWindow::from_text(&body);
+    let ui = window.accessibility();
+    let doc = document_range(&ui.document().unwrap());
+    let last = body.rfind("marker").unwrap();
+    let first = body.find("marker").unwrap();
+    for (ignore_case, query) in [(false, "marker"), (true, "MARKER")] {
+        let found = window
+            .find_off_thread(&doc, query, true, ignore_case)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ends(&found, &doc).0, last, "backward, {query}");
+        let found = window
+            .find_off_thread(&doc, query, false, ignore_case)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ends(&found, &doc).0, first, "forward, {query}");
+    }
+    // A query across chunks, and one too long for the short method, in both cases.
+    let long: String = body[..9000].to_owned();
+    for ignore_case in [false, true] {
+        let found = window
+            .find_off_thread(&doc, &long, false, ignore_case)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ends(&found, &doc).0, 0);
     }
 }
 
@@ -343,8 +420,14 @@ fn attributes_report_read_only_font_and_not_supported() {
     let doc = document_range(&ui.document().unwrap());
     let value = |id| unsafe { doc.GetAttributeValue(id) }.unwrap();
     assert!(!bool::try_from(&value(UIA_IsReadOnlyAttributeId)).unwrap());
-    assert_eq!(BSTR::try_from(&value(UIA_FontNameAttributeId)).unwrap(), "Cascadia Mono");
-    assert_eq!(f64::try_from(&value(UIA_FontSizeAttributeId)).unwrap(), 10.0);
+    assert_eq!(
+        BSTR::try_from(&value(UIA_FontNameAttributeId)).unwrap(),
+        "Cascadia Mono"
+    );
+    assert_eq!(
+        f64::try_from(&value(UIA_FontSizeAttributeId)).unwrap(),
+        10.0
+    );
     let unknown = IUnknown::try_from(&value(UIA_BackgroundColorAttributeId)).unwrap();
     assert!(unknown_is_not_supported(&unknown));
     // With no font reported, the font attributes say so rather than guess.
@@ -391,7 +474,10 @@ fn read_only_view_reports_it_and_refuses_value_changes() {
     // A selection does not edit, so it still works.
     let range = range_at(&document, 1, 2);
     unsafe { range.Select() }.unwrap();
-    assert_eq!(window.ui.view.borrow().selection(), ByteOffset(1)..ByteOffset(2));
+    assert_eq!(
+        window.ui.view.borrow().selection(),
+        ByteOffset(1)..ByteOffset(2)
+    );
 }
 
 #[test]
@@ -416,8 +502,14 @@ fn selection_and_caret_follow_the_editor() {
     let document = ui.document().unwrap();
     let text_pattern = text_of(&document);
     let doc = document_range(&document);
-    window.ui.view.borrow_mut().select(ByteOffset(1)..ByteOffset(6), &mut ViewContext::default());
-    let array = unsafe { ITextProvider::GetSelection(&text_pattern.cast::<ITextProvider>().unwrap()) }.unwrap();
+    window
+        .ui
+        .view
+        .borrow_mut()
+        .select(ByteOffset(1)..ByteOffset(6), &mut ViewContext::default());
+    let array =
+        unsafe { ITextProvider::GetSelection(&text_pattern.cast::<ITextProvider>().unwrap()) }
+            .unwrap();
     let selection = first_range(array).unwrap();
     assert_eq!(ends(&selection, &doc), (1, 4));
     assert_eq!(text(&selection), "\u{1f600}b");
@@ -428,9 +520,20 @@ fn selection_and_caret_follow_the_editor() {
     // Selecting from a range moves the editor's real selection.
     let range = range_at(&document, 3, 5);
     unsafe { range.Select() }.unwrap();
-    assert_eq!(window.ui.view.borrow().selection(), ByteOffset(5)..ByteOffset(7));
-    assert_code(unsafe { range.AddToSelection() }, UIA_E_NOTSUPPORTED as i32, "a second selection");
-    assert_code(unsafe { range.RemoveFromSelection() }, UIA_E_NOTSUPPORTED as i32, "a second selection");
+    assert_eq!(
+        window.ui.view.borrow().selection(),
+        ByteOffset(5)..ByteOffset(7)
+    );
+    assert_code(
+        unsafe { range.AddToSelection() },
+        UIA_E_NOTSUPPORTED as i32,
+        "a second selection",
+    );
+    assert_code(
+        unsafe { range.RemoveFromSelection() },
+        UIA_E_NOTSUPPORTED as i32,
+        "a second selection",
+    );
     assert_eq!(
         unsafe { text_pattern.SupportedTextSelection() }.unwrap(),
         SupportedTextSelection_Single
@@ -460,9 +563,12 @@ fn bounding_rectangles_cover_only_what_shows() {
     let all = rectangles(&doc);
     assert!(!all.is_empty() && all.len().is_multiple_of(4));
     assert!(all.len() / 4 < 20, "only rows on screen: {}", all.len() / 4);
-    let visible = first_range(unsafe {
-        ITextProvider::GetVisibleRanges(&text_of(&document).cast::<ITextProvider>().unwrap())
-    }.unwrap())
+    let visible = first_range(
+        unsafe {
+            ITextProvider::GetVisibleRanges(&text_of(&document).cast::<ITextProvider>().unwrap())
+        }
+        .unwrap(),
+    )
     .unwrap();
     assert!(text(&visible).starts_with("line 0\n"));
     assert!(!text(&visible).contains("line 400"));
@@ -498,7 +604,12 @@ fn range_from_point_finds_text_and_refuses_points_outside() {
     .unwrap();
     assert_eq!(ends(&hit, &doc), (0, 0));
     assert_code(
-        unsafe { text_of(&document).RangeFromPoint(UiaPoint { x: -5000.0, y: -5000.0 }) },
+        unsafe {
+            text_of(&document).RangeFromPoint(UiaPoint {
+                x: -5000.0,
+                y: -5000.0,
+            })
+        },
         -2147024809,
         "a point outside",
     );
@@ -562,14 +673,26 @@ fn a_kept_range_follows_edits_and_undo() {
     let range = range_at(&document, 6, 9);
     assert_eq!(text(&range), "big");
     let edit = |range, new: &str| {
-        window.ui.view.borrow_mut().replace_range(range, new, &mut ViewContext::default());
+        window
+            .ui
+            .view
+            .borrow_mut()
+            .replace_range(range, new, &mut ViewContext::default());
     };
     edit(ByteOffset(0)..ByteOffset(0), "\u{1f600}");
     assert_eq!(text(&range), "big", "text before moved it by 2 units");
     edit(ByteOffset(15)..ByteOffset(15), "xx");
     assert_eq!(text(&range), "big", "text after does not touch it");
-    window.ui.view.borrow_mut().run(EditorCommand::Undo, &mut ViewContext::default());
-    window.ui.view.borrow_mut().run(EditorCommand::Undo, &mut ViewContext::default());
+    window
+        .ui
+        .view
+        .borrow_mut()
+        .run(EditorCommand::Undo, &mut ViewContext::default());
+    window
+        .ui
+        .view
+        .borrow_mut()
+        .run(EditorCommand::Undo, &mut ViewContext::default());
     assert_eq!(window.ui.view.borrow().text().unwrap(), "hello big world");
     assert_eq!(text(&range), "big", "undo moved it back");
     // Replacing all of it leaves an empty range where the text began.
@@ -586,7 +709,11 @@ fn a_range_from_another_document_or_tab_is_stale() {
     // Another tab comes forward: another view number.
     window.ui.view_id.set(Some(8));
     assert_code(unsafe { doc.GetText(-1) }, GONE, "a range from another tab");
-    assert_code(unsafe { doc.Move(TextUnit_Character, 1) }, GONE, "a range from another tab");
+    assert_code(
+        unsafe { doc.Move(TextUnit_Character, 1) },
+        GONE,
+        "a range from another tab",
+    );
     window.ui.view_id.set(None);
     assert_code(unsafe { doc.GetText(-1) }, GONE, "no view at all");
     window.ui.view_id.set(Some(7));
@@ -600,9 +727,17 @@ fn a_change_log_that_ran_out_makes_a_range_stale_not_wrong() {
     let doc = document_range(&ui.document().unwrap());
     let mut ctx = ViewContext::default();
     for _ in 0..4100 {
-        window.ui.view.borrow_mut().replace_range(ByteOffset(0)..ByteOffset(0), "x", &mut ctx);
+        window
+            .ui
+            .view
+            .borrow_mut()
+            .replace_range(ByteOffset(0)..ByteOffset(0), "x", &mut ctx);
     }
-    assert_code(unsafe { doc.GetText(-1) }, GONE, "a range older than the log");
+    assert_code(
+        unsafe { doc.GetText(-1) },
+        GONE,
+        "a range older than the log",
+    );
     let fresh = document_range(&ui.document().unwrap());
     assert_eq!(text(&fresh).len(), 4101);
 }
@@ -626,27 +761,103 @@ fn every_held_object_reports_gone_after_the_window_closes() {
     assert_code(unsafe { doc.GetText(-1) }, GONE, "GetText");
     assert_code(unsafe { doc.Clone() }, GONE, "Clone");
     assert_code(unsafe { doc.Compare(&other) }, GONE, "Compare");
-    assert_code(unsafe { doc.CompareEndpoints(TextPatternRangeEndpoint_Start, &other, TextPatternRangeEndpoint_Start) }, GONE, "CompareEndpoints");
-    assert_code(unsafe { doc.ExpandToEnclosingUnit(TextUnit_Word) }, GONE, "Expand");
-    assert_code(unsafe { doc.FindText(&BSTR::from("a"), false, false) }, GONE, "FindText");
-    assert_code(unsafe { doc.FindAttribute(UIA_IsReadOnlyAttributeId, &VARIANT::from(true), false) }, GONE, "FindAttribute");
-    assert_code(unsafe { doc.GetAttributeValue(UIA_FontNameAttributeId) }, GONE, "GetAttributeValue");
-    assert_code(unsafe { doc.GetBoundingRectangles() }, GONE, "GetBoundingRectangles");
-    assert_code(unsafe { doc.GetEnclosingElement() }, GONE, "GetEnclosingElement");
+    assert_code(
+        unsafe {
+            doc.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                &other,
+                TextPatternRangeEndpoint_Start,
+            )
+        },
+        GONE,
+        "CompareEndpoints",
+    );
+    assert_code(
+        unsafe { doc.ExpandToEnclosingUnit(TextUnit_Word) },
+        GONE,
+        "Expand",
+    );
+    assert_code(
+        unsafe { doc.FindText(&BSTR::from("a"), false, false) },
+        GONE,
+        "FindText",
+    );
+    assert_code(
+        unsafe { doc.FindAttribute(UIA_IsReadOnlyAttributeId, &VARIANT::from(true), false) },
+        GONE,
+        "FindAttribute",
+    );
+    assert_code(
+        unsafe { doc.GetAttributeValue(UIA_FontNameAttributeId) },
+        GONE,
+        "GetAttributeValue",
+    );
+    assert_code(
+        unsafe { doc.GetBoundingRectangles() },
+        GONE,
+        "GetBoundingRectangles",
+    );
+    assert_code(
+        unsafe { doc.GetEnclosingElement() },
+        GONE,
+        "GetEnclosingElement",
+    );
     assert_code(unsafe { doc.Move(TextUnit_Word, 1) }, GONE, "Move");
-    assert_code(unsafe { doc.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Word, 1) }, GONE, "MoveEndpointByUnit");
-    assert_code(unsafe { doc.MoveEndpointByRange(TextPatternRangeEndpoint_End, &other, TextPatternRangeEndpoint_End) }, GONE, "MoveEndpointByRange");
+    assert_code(
+        unsafe { doc.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Word, 1) },
+        GONE,
+        "MoveEndpointByUnit",
+    );
+    assert_code(
+        unsafe {
+            doc.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &other,
+                TextPatternRangeEndpoint_End,
+            )
+        },
+        GONE,
+        "MoveEndpointByRange",
+    );
     assert_code(unsafe { doc.Select() }, GONE, "Select");
     assert_code(unsafe { doc.ScrollIntoView(true) }, GONE, "ScrollIntoView");
     assert_code(unsafe { doc.GetChildren() }, GONE, "GetChildren");
-    assert_code(unsafe { text_pattern.DocumentRange() }, GONE, "DocumentRange");
+    assert_code(
+        unsafe { text_pattern.DocumentRange() },
+        GONE,
+        "DocumentRange",
+    );
     let mut active = BOOL(0);
-    assert_code(unsafe { text_pattern.GetCaretRange(&mut active) }, GONE, "GetCaretRange");
-    assert_code(unsafe { document.GetPatternProvider(UIA_TextPatternId) }, GONE, "GetPatternProvider");
-    assert_code(unsafe { document.GetPropertyValue(UIA_NamePropertyId) }, GONE, "GetPropertyValue");
-    assert_code(unsafe { fragment.Navigate(NavigateDirection_Parent) }, GONE, "Navigate");
-    assert_code(unsafe { fragment.BoundingRectangle() }, GONE, "BoundingRectangle");
+    assert_code(
+        unsafe { text_pattern.GetCaretRange(&mut active) },
+        GONE,
+        "GetCaretRange",
+    );
+    assert_code(
+        unsafe { document.GetPatternProvider(UIA_TextPatternId) },
+        GONE,
+        "GetPatternProvider",
+    );
+    assert_code(
+        unsafe { document.GetPropertyValue(UIA_NamePropertyId) },
+        GONE,
+        "GetPropertyValue",
+    );
+    assert_code(
+        unsafe { fragment.Navigate(NavigateDirection_Parent) },
+        GONE,
+        "Navigate",
+    );
+    assert_code(
+        unsafe { fragment.BoundingRectangle() },
+        GONE,
+        "BoundingRectangle",
+    );
     assert_code(unsafe { fragment.GetRuntimeId() }, GONE, "GetRuntimeId");
     assert_code(unsafe { fragment.FragmentRoot() }, GONE, "FragmentRoot");
-    assert_code(unsafe { root.HostRawElementProvider() }, GONE, "the root's host");
+    assert_code(
+        unsafe { root.HostRawElementProvider() },
+        GONE,
+        "the root's host",
+    );
 }

@@ -1,6 +1,6 @@
 //! Text units over a snapshot: reads, stops, moves. No COM here. Every read uses a `try_`
 //! query, so nothing here waits for disk or shapes text.
-use crate::clusters::is_stop;
+use crate::clusters::{is_regional, is_stop};
 use qe_api::{ByteOffset, LineIndex, LookupError, TextSnapshot, Utf16Offset};
 use std::{
     ops::Range,
@@ -19,6 +19,9 @@ const FIRST_WINDOW: usize = 64;
 const WIDE_WINDOW: usize = 2048;
 /// Runs of blank text a word move crosses before it counts the run's end as a stop.
 const WORD_STEPS: usize = 8;
+/// How far back a character move looks for the start of a run of flags, in UTF-16 units. A run
+/// of up to 16,384 flags stays paired in both directions. In a longer run the pairs can differ.
+pub const FLAG_RUN_LIMIT: usize = 64 * 1024;
 /// A move always makes this many steps, however slow the machine, so the budget cannot change
 /// the answer to an ordinary call.
 const SURE_STEPS: i32 = 64;
@@ -122,7 +125,11 @@ pub fn read_text(text: &dyn TextSnapshot, range: TextRange, limit: i32) -> Answe
         return Err(ReadError::OutOfRange);
     }
     let most = usize::try_from(limit).map_or(GET_TEXT_CAP, |n| n.min(GET_TEXT_CAP));
-    read_units(text, range.start, range.start.saturating_add(most).min(range.end))
+    read_units(
+        text,
+        range.start,
+        range.start.saturating_add(most).min(range.end),
+    )
 }
 
 /// Reads the units in `start..stop`, with no cap, in slices a mapped store accepts.
@@ -165,12 +172,31 @@ fn window(
     Ok((out, middle.saturating_sub(start), start))
 }
 
+/// `window`, widened while it starts inside a run of flags, so the pairs count from the
+/// run's start.
+fn paired_window(
+    text: &dyn TextSnapshot,
+    at: usize,
+    reach: usize,
+    len: usize,
+) -> Answer<(String, usize, usize)> {
+    let mut reach = reach;
+    loop {
+        let found = window(text, at, reach, len)?;
+        let starts_in_run = found.2 > 0 && found.0.chars().next().is_some_and(is_regional);
+        if !starts_in_run || reach >= FLAG_RUN_LIMIT {
+            return Ok(found);
+        }
+        reach = reach.saturating_mul(4).min(FLAG_RUN_LIMIT);
+    }
+}
+
 fn char_next(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<Option<usize>> {
     if at >= len {
         return Ok(None);
     }
     for reach in [FIRST_WINDOW, WIDE_WINDOW] {
-        let (body, local, base) = window(text, at, reach, len)?;
+        let (body, local, base) = paired_window(text, at, reach, len)?;
         let Some(tail) = body.get(local..) else {
             return Err(ReadError::OutOfRange);
         };
@@ -196,7 +222,7 @@ fn char_at_or_before(text: &dyn TextSnapshot, at: usize, len: usize) -> Answer<u
         return Ok(0);
     }
     for reach in [FIRST_WINDOW, WIDE_WINDOW] {
-        let (body, local, base) = window(text, at, reach, len)?;
+        let (body, local, base) = paired_window(text, at, reach, len)?;
         let Some(head) = body.get(..local) else {
             return Err(ReadError::OutOfRange);
         };
@@ -448,8 +474,12 @@ impl Mover<'_> {
             }
         }
     }
+    fn last_line_is_empty(&self, len: usize) -> Answer<bool> {
+        let byte = byte_of(self.doc.snapshot(), len)?;
+        Ok(line_span(&*self.doc, byte)?.start == byte)
+    }
     /// UIA's Move: a range with text stays one unit long, and an empty range stays empty.
-    /// A range with text does not move to the very end, because no unit starts there.
+    /// A range with text moves to the very end only onto a final empty line.
     pub fn move_range(
         &mut self,
         range: TextRange,
@@ -461,6 +491,11 @@ impl Mover<'_> {
         }
         let len = self.len()?;
         let empty = range.start == range.end;
+        // From memory of Edit and RichEdit: a final line ending makes a last, empty line that a
+        // caret can stand on, so a line move can land there. No character or word starts there.
+        let ends_on_empty_line = matches!(unit, Unit::Line | Unit::Paragraph)
+            && len > 0
+            && self.last_line_is_empty(len)?;
         let began = Instant::now();
         let mut at = range.start;
         let mut moved = 0i32;
@@ -471,7 +506,7 @@ impl Mover<'_> {
                 self.previous(unit, at)?
             };
             let Some(step) = step else { break };
-            if !empty && count > 0 && step >= len {
+            if !empty && count > 0 && step >= len && !ends_on_empty_line {
                 break;
             }
             at = step;

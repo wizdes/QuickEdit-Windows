@@ -6,14 +6,19 @@
 //! its calls say UIA_E_ELEMENTNOTAVAILABLE.
 #![allow(non_snake_case, non_upper_case_globals)]
 use crate::{
-    com::{gone, interface_array, invalid, none, not_enabled, not_supported, not_supported_value, not_yet, read_error, rectangle_array, to_screen, to_window},
+    com::{
+        bstr, gone, interface_array, invalid, none, not_enabled, not_supported,
+        not_supported_value, not_yet, read_error, rectangle_array, scale_of, to_screen, to_window,
+    },
     host::{UiaHost, WidgetAction},
-    marshal::OnWindowThread,
-    search::{FindError, FindRequest, SearchSlot},
-    text::{Answer, Mover, TextDoc, TextRange, Unit, byte_of, read_text, utf16_of},
-    widgets::find_widget,
+    marshal::WindowThread,
+    search::{FIND_PATIENCE, FindError, FindRequest, find_on_window, find_waiting},
+    text::{Answer, Mover, TextDoc, TextRange, Unit, byte_of, known_len, read_text, utf16_of},
+    widgets::{CachedNodes, find_widget},
 };
-use qe_api::{ByteOffset, Dip, Point, Rect, TextSnapshot, ViewContext, Widget, WidgetId, testing::StringStore};
+use qe_api::{
+    ByteOffset, Dip, Point, Rect, TextSnapshot, ViewContext, Widget, WidgetId, testing::StringStore,
+};
 use qe_editor::{ChangesSince, EditorView, GeometryError, HostCommand};
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
@@ -25,26 +30,14 @@ use windows::{
         System::{Com::SAFEARRAY, Variant::VARIANT},
         UI::Accessibility::*,
     },
-    core::{BOOL, BSTR, ComObject, Interface, Ref, Result, implement},
+    core::{BOOL, BSTR, ComObject, IUnknownImpl, Interface, Ref, Result, implement},
 };
 
-/// What every COM object shares. After `close`, the host is gone, and each call fails.
+/// What every COM object shares. After `Accessibility::shutdown`, each call fails.
 pub(crate) struct Shared {
     pub(crate) window: isize,
-    pub(crate) host: Mutex<Option<Arc<OnWindowThread>>>,
-    pub(crate) search: SearchSlot,
-    pub(crate) nodes: Mutex<Option<crate::widgets::CachedNodes>>,
-}
-
-impl Shared {
-    pub(crate) fn host(&self) -> Result<Arc<OnWindowThread>> {
-        self.host
-            .lock()
-            .map_err(|_| gone())?
-            .as_ref()
-            .cloned()
-            .ok_or_else(gone)
-    }
+    pub(crate) ui: Arc<WindowThread>,
+    pub(crate) nodes: Mutex<Option<CachedNodes>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,10 +48,12 @@ pub(crate) enum Source {
     Field(WidgetId),
 }
 
+/// Which view and document, and which revision.
+pub(crate) type Stamp = ((u64, u64), u64);
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tracked {
     pub(crate) range: TextRange,
-    /// Which view, and which document in it.
     pub(crate) owner: (u64, u64),
     pub(crate) revision: u64,
 }
@@ -75,9 +70,9 @@ pub fn shift(position: usize, start: usize, old_end: usize, new_end: usize) -> u
     }
 }
 
-/// A document as COM calls see it, for the length of one call.
+/// A document as COM calls see it, for the length of one call on the window's thread.
 pub(crate) trait Doc: TextDoc {
-    fn stamp(&self) -> ((u64, u64), u64);
+    fn stamp(&self) -> Stamp;
     fn catch_up(&mut self, state: &mut Tracked) -> Result<()>;
     fn shared_snapshot(&self) -> Arc<dyn TextSnapshot>;
     fn selection(&self) -> Answer<TextRange>;
@@ -95,6 +90,9 @@ struct EditorDoc<'a> {
     ctx: &'a mut ViewContext,
     view_id: u64,
     window: isize,
+    scale: f64,
+    /// The document's box in the tree, in window coordinates.
+    element: Option<Rect>,
     text: Arc<dyn TextSnapshot>,
     rows: Option<Vec<qe_editor::VisibleRow>>,
 }
@@ -121,8 +119,11 @@ impl TextDoc for EditorDoc<'_> {
 }
 
 impl Doc for EditorDoc<'_> {
-    fn stamp(&self) -> ((u64, u64), u64) {
-        ((self.view_id, self.view.document_number()), self.view.revision())
+    fn stamp(&self) -> Stamp {
+        (
+            (self.view_id, self.view.document_number()),
+            self.view.revision(),
+        )
     }
     fn catch_up(&mut self, state: &mut Tracked) -> Result<()> {
         let (owner, revision) = self.stamp();
@@ -131,13 +132,14 @@ impl Doc for EditorDoc<'_> {
         }
         match self.view.changes_since(state.revision) {
             ChangesSince::Current => {}
-            // A mapped file cannot be edited, so its positions stay good when its index grows.
-            ChangesSince::Rescan if self.text.is_read_only() => {}
             ChangesSince::Rescan => return Err(gone()),
             ChangesSince::Changes(changes) => {
                 for change in changes {
-                    let (from, to, new_end) =
-                        (change.utf16.start.0, change.utf16.old_end.0, change.utf16.new_end.0);
+                    let (from, to, new_end) = (
+                        change.utf16.start.0,
+                        change.utf16.old_end.0,
+                        change.utf16.new_end.0,
+                    );
                     state.range.start = shift(state.range.start, from, to, new_end);
                     state.range.end = shift(state.range.end, from, to, new_end);
                 }
@@ -183,11 +185,18 @@ impl Doc for EditorDoc<'_> {
         {
             return Ok(());
         }
-        let line = self.view.line_of_byte(ByteOffset(start)).map_err(|e| read_error(e.into()))?;
+        let line = self
+            .view
+            .line_of_byte(ByteOffset(start))
+            .map_err(|e| read_error(e.into()))?;
         let lines = self.view.store_status().known_lines.max(1);
         let along = self.view.total_height() * line.0 as f64 / lines as f64;
         let height = f64::from(self.view.text_area().height.0);
-        let y = if top { along } else { (along - height / 2.0).max(0.0) };
+        let y = if top {
+            along
+        } else {
+            (along - height / 2.0).max(0.0)
+        };
         self.view.run_host(HostCommand::ScrollTo(y), self.ctx);
         Ok(())
     }
@@ -207,14 +216,16 @@ impl Doc for EditorDoc<'_> {
         }
         let found = match self.view.range_rects(ByteOffset(from)..ByteOffset(to)) {
             Ok(found) => found,
-            Err(GeometryError::NotLaidOut | GeometryError::TooManyLines { .. }) => return Ok(Vec::new()),
+            Err(GeometryError::NotLaidOut | GeometryError::TooManyLines { .. }) => {
+                return Ok(Vec::new());
+            }
             Err(GeometryError::Lookup(error)) => return Err(read_error(error.into())),
         };
         let area = self.view.text_area();
         let mut answer = Vec::with_capacity(found.len());
         for part in found {
             if let Some(rect) = clip(part.rect, area) {
-                answer.push(to_screen(self.window, rect)?);
+                answer.push(to_screen(self.window, self.scale, rect)?);
             }
         }
         Ok(answer)
@@ -229,19 +240,28 @@ impl Doc for EditorDoc<'_> {
             utf16_of(text, found.end.0).map_err(read_error)?,
         )))
     }
+    /// A point inside the document's box gets the nearest text. A point outside it is the
+    /// caller's mistake.
     fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange> {
-        let (x, y) = to_window(self.window, x, y)?;
+        let (x, y) = to_window(self.window, self.scale, x, y)?;
         let area = self.view.text_area();
-        let inside = x >= area.x.0
-            && y >= area.y.0
-            && x < area.x.0 + area.width.0
-            && y < area.y.0 + area.height.0;
-        if !inside {
-            return Err(invalid("This point is outside the text."));
+        let element = self.element.unwrap_or(area);
+        if !inside(element, x, y) {
+            return Err(invalid("This point is outside the document."));
         }
+        // Just inside the far edges, because those edges belong to whatever is next.
+        let x = x
+            .max(area.x.0)
+            .min((area.x.0 + area.width.0 - 1.0).max(area.x.0));
+        let y = y
+            .max(area.y.0)
+            .min((area.y.0 + area.height.0 - 1.0).max(area.y.0));
         let hit = self
             .view
-            .byte_at_point(Point { x: Dip(x), y: Dip(y) })
+            .byte_at_point(Point {
+                x: Dip(x),
+                y: Dip(y),
+            })
             .map_err(|error| match error {
                 GeometryError::Lookup(error) => read_error(error.into()),
                 _ => not_yet("The text here has no layout yet. Ask again soon."),
@@ -249,6 +269,10 @@ impl Doc for EditorDoc<'_> {
         let at = utf16_of(self.text.as_ref(), hit.byte.0).map_err(read_error)?;
         Ok(TextRange::new(at, at))
     }
+}
+
+fn inside(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x.0 && y >= rect.y.0 && x < rect.x.0 + rect.width.0 && y < rect.y.0 + rect.height.0
 }
 
 fn clip(rect: Rect, area: Rect) -> Option<Rect> {
@@ -269,6 +293,7 @@ struct FieldDoc {
     widget: Widget,
     host: Arc<dyn UiaHost>,
     window: isize,
+    scale: f64,
     text: Arc<dyn TextSnapshot>,
     value: String,
 }
@@ -314,7 +339,7 @@ impl TextDoc for FieldDoc {
 }
 
 impl Doc for FieldDoc {
-    fn stamp(&self) -> ((u64, u64), u64) {
+    fn stamp(&self) -> Stamp {
         let mut hasher = DefaultHasher::new();
         self.value.hash(&mut hasher);
         ((self.widget.id.0, 0), hasher.finish())
@@ -326,7 +351,7 @@ impl Doc for FieldDoc {
         if state.owner != owner {
             return Err(gone());
         }
-        let len = crate::text::known_len(self.text.as_ref()).map_err(read_error)?.0;
+        let len = known_len(self.text.as_ref()).map_err(read_error)?.0;
         state.range.start = state.range.start.min(len);
         state.range.end = state.range.end.min(len);
         state.revision = revision;
@@ -336,9 +361,12 @@ impl Doc for FieldDoc {
         self.text.clone()
     }
     fn selection(&self) -> Answer<TextRange> {
-        let len = crate::text::known_len(self.text.as_ref())?.0;
+        let len = known_len(self.text.as_ref())?.0;
         let selection = self.widget.selection.clone().unwrap_or(len..len);
-        Ok(TextRange::new(selection.start.min(len), selection.end.min(len)))
+        Ok(TextRange::new(
+            selection.start.min(len),
+            selection.end.min(len),
+        ))
     }
     fn caret(&self) -> Answer<usize> {
         Ok(self.selection()?.end)
@@ -359,73 +387,85 @@ impl Doc for FieldDoc {
     /// The field does not report where its characters are, so any text in it answers with
     /// the field's whole box.
     fn rects(&mut self, _: TextRange) -> Result<Vec<[f64; 4]>> {
-        Ok(vec![to_screen(self.window, self.widget.bounds)?])
+        Ok(vec![to_screen(
+            self.window,
+            self.scale,
+            self.widget.bounds,
+        )?])
     }
     fn visible(&mut self) -> Result<Option<TextRange>> {
-        let len = crate::text::known_len(self.text.as_ref()).map_err(read_error)?.0;
+        let len = known_len(self.text.as_ref()).map_err(read_error)?.0;
         Ok(Some(TextRange::new(0, len)))
     }
     fn at_point(&mut self, _: f64, _: f64) -> Result<TextRange> {
-        Err(not_supported("A field does not report where its characters are."))
+        Err(not_supported(
+            "A field does not report where its characters are.",
+        ))
     }
 }
 
-/// Runs `body` with this source's document, on the UI thread, with the host's permission.
-pub(crate) fn with_doc<T>(
-    shared: &Shared,
+/// Runs `body` with this source's document, on the window's thread.
+pub(crate) fn with_doc<T: 'static>(
+    shared: &Arc<Shared>,
     source: Source,
-    body: impl FnOnce(&mut dyn Doc) -> Result<T>,
+    body: impl FnOnce(&mut dyn Doc) -> Result<T> + 'static,
 ) -> Result<T> {
-    let host = shared.host()?;
-    match source {
-        Source::Editor => {
-            let view_id = host.call_now(|h| h.view_id().ok_or_else(gone))?;
-            let mut body = Some(body);
-            let mut out = None;
-            let window = shared.window;
-            let reached = host.with_editor(&mut |view, ctx| {
-                let text = view.worker_snapshot();
-                let mut doc = EditorDoc {
-                    view,
-                    ctx,
-                    view_id,
-                    window,
-                    text,
-                    rows: None,
-                };
-                if let Some(body) = body.take() {
-                    out = Some(body(&mut doc));
+    let window = shared.window;
+    shared.ui.on_ui(move |host| {
+        let scale = scale_of(window, host.dpi())?;
+        match source {
+            Source::Editor => {
+                let view_id = host.view_id().ok_or_else(gone)?;
+                let element = host.document_widget().map(|w| w.bounds);
+                let mut body = Some(body);
+                let mut out = None;
+                let reached = host.with_editor(&mut |view, ctx| {
+                    let text = view.worker_snapshot();
+                    let mut doc = EditorDoc {
+                        view,
+                        ctx,
+                        view_id,
+                        window,
+                        scale,
+                        element,
+                        text,
+                        rows: None,
+                    };
+                    if let Some(body) = body.take() {
+                        out = Some(body(&mut doc));
+                    }
+                });
+                if !reached {
+                    return Err(not_yet("The editor is busy. Ask again soon."));
                 }
-            });
-            if !reached {
-                return Err(not_yet("The editor is busy. Ask again soon."));
+                out.unwrap_or_else(|| Err(not_yet("The editor is busy. Ask again soon.")))
             }
-            out.unwrap_or_else(|| Err(not_yet("The editor is busy. Ask again soon.")))
+            Source::Field(id) => {
+                let root = host.widgets().ok_or_else(gone)?;
+                let widget = find_widget(&root, id).ok_or_else(gone)?.clone();
+                let value = widget.value.clone().unwrap_or_default();
+                let mut doc = FieldDoc {
+                    widget,
+                    host: host.clone(),
+                    window,
+                    scale,
+                    text: Arc::new(StringStore::new(value.clone())),
+                    value,
+                };
+                body(&mut doc)
+            }
         }
-        Source::Field(id) => {
-            let root = host.widgets_now()?;
-            let widget = find_widget(&root, id).ok_or_else(gone)?.clone();
-            let value = widget.value.clone().unwrap_or_default();
-            let mut doc = FieldDoc {
-                widget,
-                host,
-                window: shared.window,
-                text: Arc::new(StringStore::new(value.clone())),
-                value,
-            };
-            body(&mut doc)
-        }
-    }
+    })
 }
 
 pub(crate) fn make_range(
     shared: &Arc<Shared>,
     source: Source,
-    doc: &dyn Doc,
+    stamp: Stamp,
     range: TextRange,
     enclosing: IRawElementProviderSimple,
 ) -> ITextRangeProvider {
-    let (owner, revision) = doc.stamp();
+    let (owner, revision) = stamp;
     ComObject::new(TextRangeObject {
         shared: shared.clone(),
         source,
@@ -470,30 +510,78 @@ impl TextRangeObject {
     fn tracked(&self) -> Result<Tracked> {
         self.state.lock().map(|state| *state).map_err(|_| gone())
     }
-    /// Brings the range up to date, runs `body`, and keeps what `body` left in the range.
-    fn run<T>(&self, body: impl FnOnce(&mut dyn Doc, &mut TextRange) -> Result<T>) -> Result<T> {
-        with_doc(&self.shared, self.source, |doc| {
-            let mut state = self.tracked()?;
+    fn fresh(&self, stamp: Stamp, range: TextRange) -> ITextRangeProvider {
+        make_range(
+            &self.shared,
+            self.source,
+            stamp,
+            range,
+            self.enclosing.clone(),
+        )
+    }
+}
+
+impl TextRangeObject_Impl {
+    /// Brings the range up to date on the window's thread, runs `body`, and keeps what `body`
+    /// left in the range. Everything `body` uses travels with it, so a caller that gives up
+    /// on a busy window leaves nothing behind.
+    fn run<T: 'static>(
+        &self,
+        body: impl FnOnce(&TextRangeObject, &mut dyn Doc, &mut TextRange) -> Result<T> + 'static,
+    ) -> Result<T> {
+        let this = self.to_object();
+        let shared = self.shared.clone();
+        with_doc(&shared, self.source, move |doc| {
+            let mut state = this.tracked()?;
             doc.catch_up(&mut state)?;
-            let answer = body(doc, &mut state.range)?;
-            *self.state.lock().map_err(|_| gone())? = state;
+            let answer = body(&this, doc, &mut state.range)?;
+            *this.state.lock().map_err(|_| gone())? = state;
             Ok(answer)
         })
     }
-    /// The other range's text range, up to date. It must belong to this same document.
-    fn other_range(&self, doc: &mut dyn Doc, other: Ref<ITextRangeProvider>) -> Result<TextRange> {
+    /// This range's value in a call that also needs another range of the same document.
+    fn with_other<T: 'static>(
+        &self,
+        other: Ref<ITextRangeProvider>,
+        body: impl FnOnce(&mut dyn Doc, &mut TextRange, TextRange) -> Result<T> + 'static,
+    ) -> Result<T> {
         let other = other
-            .ok()
-            .map_err(|_| invalid("No range was given."))?
-            .cast_object_ref::<TextRangeObject>()
-            .map_err(|_| invalid("This range is from another provider."))?;
-        if !Arc::ptr_eq(&self.shared, &other.shared) || self.source != other.source {
-            return Err(invalid("This range is from another document."));
+            .cloned()
+            .ok_or_else(|| invalid("No range was given."))?;
+        self.run(move |this, doc, range| {
+            let other = other
+                .cast_object_ref::<TextRangeObject>()
+                .map_err(|_| invalid("This range is from another provider."))?;
+            if !Arc::ptr_eq(&this.shared, &other.shared) || this.source != other.source {
+                return Err(invalid("This range is from another document."));
+            }
+            let mut state = other.tracked()?;
+            doc.catch_up(&mut state)?;
+            *other.state.lock().map_err(|_| gone())? = state;
+            body(doc, range, state.range)
+        })
+    }
+    fn attribute(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+        match id {
+            UIA_IsReadOnlyAttributeId => {
+                let read_only = self.run(|_, doc, _| Ok(doc.read_only()))?;
+                Ok(VARIANT::from(read_only))
+            }
+            UIA_FontNameAttributeId | UIA_FontSizeAttributeId if self.source == Source::Editor => {
+                self.run(|_, _, _| Ok(()))?;
+                match self.shared.ui.on_ui(|host| Ok(host.font()))? {
+                    Some((family, _)) if id == UIA_FontNameAttributeId => {
+                        Ok(VARIANT::from(family.as_str()))
+                    }
+                    Some((_, points)) => Ok(VARIANT::from(points)),
+                    None => not_supported_value(),
+                }
+            }
+            _ => {
+                self.shared.ui.check_open()?;
+                not_supported_value()
+            }
         }
-        let mut state = other.tracked()?;
-        doc.catch_up(&mut state)?;
-        *other.state.lock().map_err(|_| gone())? = state;
-        Ok(state.range)
     }
 }
 
@@ -503,21 +591,10 @@ fn endpoint_of(range: TextRange, start: bool) -> usize {
 
 impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     fn Clone(&self) -> Result<ITextRangeProvider> {
-        self.run(|doc, range| {
-            Ok(make_range(
-                &self.shared,
-                self.source,
-                &*doc,
-                *range,
-                self.enclosing.clone(),
-            ))
-        })
+        self.run(|this, doc, range| Ok(this.fresh(doc.stamp(), *range)))
     }
     fn Compare(&self, other: Ref<ITextRangeProvider>) -> Result<BOOL> {
-        self.run(|doc, range| {
-            let other = self.other_range(doc, other)?;
-            Ok(BOOL::from(*range == other))
-        })
+        self.with_other(other, |_, range, other| Ok(BOOL::from(*range == other)))
     }
     fn CompareEndpoints(
         &self,
@@ -527,8 +604,7 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     ) -> Result<i32> {
         let mine = moves_start(endpoint)?;
         let theirs = moves_start(other_endpoint)?;
-        self.run(|doc, range| {
-            let other = self.other_range(doc, other)?;
+        self.with_other(other, move |_, range, other| {
             let left = endpoint_of(*range, mine);
             let right = endpoint_of(other, theirs);
             let distance = i32::try_from(left.abs_diff(right)).unwrap_or(i32::MAX);
@@ -537,7 +613,7 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     }
     fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> Result<()> {
         let unit = unit_of(unit)?;
-        self.run(|doc, range| {
+        self.run(move |_, doc, range| {
             *range = Mover { doc: &mut *doc }
                 .unit_at(unit, range.start)
                 .map_err(read_error)?;
@@ -552,32 +628,24 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         _backward: BOOL,
     ) -> Result<ITextRangeProvider> {
         let wanted = self.attribute(id)?;
-        let same = match (bool::try_from(&wanted), bool::try_from(value)) {
-            (Ok(a), Ok(b)) if id == UIA_IsReadOnlyAttributeId => a == b,
-            _ => match id {
-                UIA_FontNameAttributeId => matches!(
-                    (BSTR::try_from(&wanted), BSTR::try_from(value)),
-                    (Ok(a), Ok(b)) if a == b
-                ),
-                UIA_FontSizeAttributeId => matches!(
-                    (f64::try_from(&wanted), f64::try_from(value)),
-                    (Ok(a), Ok(b)) if a == b
-                ),
-                _ => false,
-            },
+        let same = match id {
+            UIA_IsReadOnlyAttributeId => {
+                matches!((bool::try_from(&wanted), bool::try_from(value)), (Ok(a), Ok(b)) if a == b)
+            }
+            UIA_FontNameAttributeId => matches!(
+                (BSTR::try_from(&wanted), BSTR::try_from(value)),
+                (Ok(a), Ok(b)) if a == b
+            ),
+            UIA_FontSizeAttributeId => matches!(
+                (f64::try_from(&wanted), f64::try_from(value)),
+                (Ok(a), Ok(b)) if a == b
+            ),
+            _ => false,
         };
         if !same {
             return Err(none());
         }
-        self.run(|doc, range| {
-            Ok(make_range(
-                &self.shared,
-                self.source,
-                &*doc,
-                *range,
-                self.enclosing.clone(),
-            ))
-        })
+        self.run(|this, doc, range| Ok(this.fresh(doc.stamp(), *range)))
     }
     fn FindText(
         &self,
@@ -590,62 +658,62 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         }
         // Text with a lone surrogate cannot be in a document, which is all valid text.
         let Ok(query) = String::from_utf16(query) else {
+            self.shared.ui.check_open()?;
             return Err(none());
         };
-        self.run(|doc, range| {
-            let ((view, document), revision) = doc.stamp();
-            let request = FindRequest {
-                identity: (view, document, revision),
-                range: *range,
-                query,
-                backward: backward.as_bool(),
-                ignore_case: ignore_case.as_bool(),
-            };
-            let found = self
-                .shared
-                .search
-                .find(&doc.shared_snapshot(), request)
-                .map_err(|error| match error {
-                    FindError::Searching => {
-                        not_yet("The search is still running. Ask again soon.")
-                    }
-                    FindError::Read(error) => read_error(error),
-                })?;
-            match found {
-                Some(found) => Ok(make_range(
-                    &self.shared,
-                    self.source,
-                    &*doc,
-                    found,
-                    self.enclosing.clone(),
-                )),
-                None => Err(none()),
-            }
-        })
+        // The window's thread only hands over a snapshot. The search then runs on this thread.
+        let (text, stamp, range) =
+            self.run(|_, doc, range| Ok((doc.shared_snapshot(), doc.stamp(), *range)))?;
+        let request = FindRequest {
+            range,
+            query,
+            backward: backward.as_bool(),
+            ignore_case: ignore_case.as_bool(),
+        };
+        let answer = if self.shared.ui.is_window_thread() {
+            find_on_window(text.as_ref(), &request)
+        } else {
+            find_waiting(text.as_ref(), &request, FIND_PATIENCE)
+        };
+        match answer {
+            Ok(Some(found)) => Ok(make_range(
+                &self.shared,
+                self.source,
+                stamp,
+                found,
+                self.enclosing.clone(),
+            )),
+            Ok(None) => Err(none()),
+            Err(FindError::TooLong) => Err(not_yet(
+                "The search hit its limit, so the answer is not known.",
+            )),
+            Err(FindError::Read(error)) => Err(read_error(error)),
+        }
     }
     fn GetAttributeValue(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
         self.attribute(id)
     }
     fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
-        self.run(|doc, range| rectangle_array(&doc.rects(*range)?))
+        let rectangles = self.run(|_, doc, range| doc.rects(*range))?;
+        rectangle_array(&rectangles)
     }
     fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
         // A closed provider has no element to give.
-        self.shared.host()?;
+        self.shared.ui.check_open()?;
         Ok(self.enclosing.clone())
     }
     fn GetText(&self, limit: i32) -> Result<BSTR> {
         if limit < -1 {
             return Err(invalid("The limit must be -1 or more."));
         }
-        self.run(|doc, range| {
+        self.run(move |_, doc, range| {
             let text = read_text(doc.snapshot(), *range, limit).map_err(read_error)?;
-            Ok(BSTR::from(text.as_str()))
+            bstr(&text)
         })
     }
     fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
         let unit = unit_of(unit)?;
-        self.run(|doc, range| {
+        self.run(move |_, doc, range| {
             let (next, moved) = Mover { doc: &mut *doc }
                 .move_range(*range, unit, count)
                 .map_err(read_error)?;
@@ -661,7 +729,7 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     ) -> Result<i32> {
         let unit = unit_of(unit)?;
         let start = moves_start(endpoint)?;
-        self.run(|doc, range| {
+        self.run(move |_, doc, range| {
             let (next, moved) = Mover { doc: &mut *doc }
                 .move_endpoint(*range, start, unit, count)
                 .map_err(read_error)?;
@@ -677,8 +745,8 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
     ) -> Result<()> {
         let start = moves_start(endpoint)?;
         let theirs = moves_start(other_endpoint)?;
-        self.run(|doc, range| {
-            let at = endpoint_of(self.other_range(doc, other)?, theirs);
+        self.with_other(other, move |_, range, other| {
+            let at = endpoint_of(other, theirs);
             if start {
                 range.start = at;
                 range.end = range.end.max(at);
@@ -690,42 +758,22 @@ impl ITextRangeProvider_Impl for TextRangeObject_Impl {
         })
     }
     fn Select(&self) -> Result<()> {
-        self.run(|doc, range| doc.select(*range))
+        self.run(|_, doc, range| doc.select(*range))
     }
     fn AddToSelection(&self) -> Result<()> {
+        self.shared.ui.check_open()?;
         Err(not_supported("This text has one selection only."))
     }
     fn RemoveFromSelection(&self) -> Result<()> {
+        self.shared.ui.check_open()?;
         Err(not_supported("This text has one selection only."))
     }
     fn ScrollIntoView(&self, align_top: BOOL) -> Result<()> {
-        self.run(|doc, range| doc.scroll(*range, align_top.as_bool()))
+        let top = align_top.as_bool();
+        self.run(move |_, doc, range| doc.scroll(*range, top))
     }
     fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
-        self.shared.host()?;
+        self.shared.ui.check_open()?;
         interface_array::<IRawElementProviderSimple>(&[])
-    }
-}
-
-impl TextRangeObject {
-    fn attribute(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
-        match id {
-            UIA_IsReadOnlyAttributeId => self.run(|doc, _| Ok(VARIANT::from(doc.read_only()))),
-            UIA_FontNameAttributeId | UIA_FontSizeAttributeId if self.source == Source::Editor => {
-                let host = self.shared.host()?;
-                self.run(|_, _| Ok(()))?;
-                match host.font() {
-                    Some((family, _)) if id == UIA_FontNameAttributeId => {
-                        Ok(VARIANT::from(family.as_str()))
-                    }
-                    Some((_, points)) => Ok(VARIANT::from(points)),
-                    None => not_supported_value(),
-                }
-            }
-            _ => {
-                self.shared.host()?;
-                not_supported_value()
-            }
-        }
     }
 }

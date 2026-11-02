@@ -19,13 +19,15 @@ pub enum WidgetAction {
     SelectText(TextRange),
 }
 
-/// Calls arrive on the window's thread. UIA moves them there for a provider that a window
-/// returned from WM_GETOBJECT. None of them may wait for disk or shape text.
+/// Every call runs on the window's thread. None of them may wait for disk or shape text, and only
+/// `action` for a posted action may open a dialog. See the README.
 pub trait UiaHost: Send + Sync {
     /// The painted tree as it stands. Its root is the window, and its bounds and every
     /// child's are in window coordinates, in device-independent pixels.
     fn widgets(&self) -> Option<Widget>;
-    /// Runs one widget action.
+    /// Runs one widget action. Invoke, Toggle, Expand, Collapse and Select run from a posted
+    /// message after the client's call has returned, so they may open a modal dialog or close
+    /// the window. SetValue, SetRange, SelectText and Focus run inside the call, and must not.
     fn action(&self, id: WidgetId, action: WidgetAction) -> Result<()>;
     /// The editor's place in the tree: its bounds, name, focus and a stable ID. `None` when
     /// this window shows no editor.
@@ -47,6 +49,19 @@ pub trait UiaHost: Send + Sync {
     /// font is not reported.
     fn font(&self) -> Option<(String, f64)> {
         None
+    }
+    /// The window's DPI, if the shell tracks it. `None` asks Windows.
+    fn dpi(&self) -> Option<u32> {
+        None
+    }
+    /// True for a menu item that can be checked, checked or not. `qe_api::WidgetStates` has no
+    /// field for this yet, so this asks the host. See the README's list for root.
+    fn is_checkable(&self, _id: WidgetId) -> bool {
+        false
+    }
+    /// A posted action failed after its call had already said yes. Show the reason at once.
+    fn action_failed(&self, id: WidgetId, action: &WidgetAction, error: &windows::core::Error) {
+        eprintln!("The action {action:?} on widget {} failed: {error}", id.0);
     }
 }
 

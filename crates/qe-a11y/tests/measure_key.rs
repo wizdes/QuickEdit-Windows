@@ -67,8 +67,14 @@ fn a_key_with_no_client_costs_no_more_than_the_check() {
         "with no client, the check must not open the view"
     );
     assert_eq!(window.counts.widget_calls.load(Ordering::SeqCst), 0);
-    println!("  a key, no check:                 median {:.2} microseconds", median(&mut plain));
-    println!("  a key, with the no-client check: median {:.2} microseconds", median(&mut no_client));
+    println!(
+        "  a key, no check:                 median {:.2} microseconds",
+        median(&mut plain)
+    );
+    println!(
+        "  a key, with the no-client check: median {:.2} microseconds",
+        median(&mut no_client)
+    );
 
     let runs = 1_000_000;
     let began = Instant::now();
@@ -90,6 +96,28 @@ fn a_key_with_no_client_costs_no_more_than_the_check() {
     );
     drop(ui);
     window.close();
+}
+
+/// The review's worst case: a query half as long as the text, nearly matching everywhere.
+#[test]
+#[ignore = "A timing. Run by name, in release."]
+fn a_long_query_on_a_short_range() {
+    let text = qe_api::testing::StringStore::new("a".repeat(60_000));
+    let query = format!("{}b", "a".repeat(30_000));
+    for ignore_case in [true, false] {
+        let request = qe_a11y::search::FindRequest {
+            range: qe_a11y::TextRange::new(0, 60_000),
+            query: query.clone(),
+            backward: false,
+            ignore_case,
+        };
+        let began = Instant::now();
+        let answer = qe_a11y::search::find_on_window(&text, &request);
+        let took = began.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(answer, Ok(None));
+        println!("\n  60,000 units, 30,001-unit query, ignore_case {ignore_case}: {took:.3} ms");
+        assert!(took < 16.0, "{took} ms is over a frame");
+    }
 }
 
 /// Through UIA, with its thread hop and the move to the window's thread.

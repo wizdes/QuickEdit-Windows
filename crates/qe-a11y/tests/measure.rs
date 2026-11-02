@@ -38,8 +38,10 @@ impl Drop for TempFile {
 /// Lines of plain text with an emoji and a mark now and then, and one needle near the end.
 fn write_file(name: &str, bytes: u64) -> TempFile {
     let path = std::env::temp_dir().join(format!("qe-a11y-{}-{name}.txt", std::process::id()));
-    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path).expect("create"));
-    let line = "The quick brown fox jumps over the lazy dog, a\u{1f600}e\u{301} and 0123456789 words\r\n";
+    let mut out =
+        std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path).expect("create"));
+    let line =
+        "The quick brown fox jumps over the lazy dog, a\u{1f600}e\u{301} and 0123456789 words\r\n";
     let tail = format!("{NEEDLE}\r\n");
     let mut written = 0u64;
     while written + (line.len() + tail.len()) as u64 <= bytes {
@@ -136,45 +138,52 @@ fn first_range(array: *mut SAFEARRAY) -> ITextRangeProvider {
 }
 
 /// A caret range at this byte, placed the way a client finds one: through the selection.
-fn caret_at(window: &TestWindow, document: &IRawElementProviderSimple, byte: usize) -> ITextRangeProvider {
-    window
-        .ui
-        .view
-        .borrow_mut()
-        .select(ByteOffset(byte)..ByteOffset(byte), &mut ViewContext::default());
-    let text = text_of(document).cast::<ITextProvider>().expect("the text provider");
+fn caret_at(
+    window: &TestWindow,
+    document: &IRawElementProviderSimple,
+    byte: usize,
+) -> ITextRangeProvider {
+    window.ui.view.borrow_mut().select(
+        ByteOffset(byte)..ByteOffset(byte),
+        &mut ViewContext::default(),
+    );
+    let text = text_of(document)
+        .cast::<ITextProvider>()
+        .expect("the text provider");
     first_range(unsafe { text.GetSelection() }.expect("GetSelection"))
 }
 
-/// Time for one FindText, in calls on the UI thread and in total until it answers.
-fn find(
-    range: &ITextRangeProvider,
-    query: &str,
-    ignore_case: bool,
-) -> (bool, usize, f64, f64, f64) {
-    let query = BSTR::from(query);
+/// One FindText, as UIA calls it. Gives whether it found the text, how long the answer took,
+/// and the longest the window's message loop was held up meanwhile.
+fn find(range: &ITextRangeProvider, query: &str, ignore_case: bool) -> (bool, f64, f64) {
+    let moved = SendIt(range.clone());
+    let query = query.to_owned();
+    let (say, heard) = std::sync::mpsc::channel();
     let began = Instant::now();
-    let deadline = began + Duration::from_secs(300);
-    let mut calls = 0;
-    let mut worst = 0f64;
-    let mut samples = Vec::new();
+    std::thread::spawn(move || {
+        let moved = moved;
+        let answer = unsafe {
+            moved
+                .0
+                .FindText(&BSTR::from(query.as_str()), false, ignore_case)
+        };
+        let summary = match answer {
+            Ok(_) => Ok(true),
+            Err(error) if error.code().0 == 0 => Ok(false),
+            Err(error) => Err(error.to_string()),
+        };
+        say.send(summary).expect("report");
+    });
+    let mut stall = 0f64;
     loop {
-        let call = Instant::now();
-        let answer = unsafe { range.FindText(&query, false, ignore_case) };
-        worst = worst.max(call.elapsed().as_secs_f64() * 1000.0);
-        samples.push(call.elapsed().as_secs_f64() * 1000.0);
-        calls += 1;
-        match answer {
-            Ok(_) => return (true, calls, worst, middle_of(&mut samples), began.elapsed().as_secs_f64() * 1000.0),
-            Err(error) if error.code().0 == 0 => {
-                return (false, calls, worst, middle_of(&mut samples), began.elapsed().as_secs_f64() * 1000.0);
-            }
-            Err(error) if error.code().0 == NOT_YET => {
-                assert!(Instant::now() < deadline, "the search never ended");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("FindText failed: {error}"),
+        let turn = Instant::now();
+        pump();
+        stall = stall.max(turn.elapsed().as_secs_f64() * 1000.0);
+        if let Ok(answer) = heard.try_recv() {
+            let found = answer.expect("FindText failed");
+            return (found, began.elapsed().as_secs_f64() * 1000.0, stall);
         }
+        std::thread::yield_now();
     }
 }
 
@@ -236,19 +245,34 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
     let mut rows = Vec::new();
     let runs = 200;
     time(&mut rows, "DocumentRange", runs, || {
-        unsafe { text.DocumentRange() }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { text.DocumentRange() }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "GetSelection", runs, || {
-        unsafe { basic.GetSelection() }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { basic.GetSelection() }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "GetVisibleRanges", runs, || {
-        unsafe { basic.GetVisibleRanges() }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { basic.GetVisibleRanges() }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "GetText(200) at the start", runs, || {
-        unsafe { doc.GetText(200) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { doc.GetText(200) }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "GetText(200) in the middle", runs, || {
-        unsafe { word.GetText(200) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { word.GetText(200) }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "GetText(-1) on the whole document", 20, || {
         let Ok(answer) = (unsafe { doc.GetText(-1) }) else {
@@ -265,18 +289,37 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
     ] {
         let moving = unsafe { middle.Clone() }.expect("Clone");
         let mut way = 1;
-        time(&mut rows, &format!("Move({name}) in the middle"), runs, || {
-            unsafe { moving.Move(unit, way) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
-            way = -way;
-        });
+        time(
+            &mut rows,
+            &format!("Move({name}) in the middle"),
+            runs,
+            || {
+                unsafe { moving.Move(unit, way) }
+                    .map(drop)
+                    .or_else(not_yet_is_fine)
+                    .expect("a provider call");
+                way = -way;
+            },
+        );
         let expanding = unsafe { middle.Clone() }.expect("Clone");
-        time(&mut rows, &format!("Expand({name}) in the middle"), runs, || {
-            unsafe { expanding.ExpandToEnclosingUnit(unit) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
-        });
+        time(
+            &mut rows,
+            &format!("Expand({name}) in the middle"),
+            runs,
+            || {
+                unsafe { expanding.ExpandToEnclosingUnit(unit) }
+                    .map(drop)
+                    .or_else(not_yet_is_fine)
+                    .expect("a provider call");
+            },
+        );
     }
     let moving = unsafe { middle.Clone() }.expect("Clone");
     time(&mut rows, "Move(character, huge count)", 5, || {
-        unsafe { moving.Move(TextUnit_Character, 1_000_000_000) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { moving.Move(TextUnit_Character, 1_000_000_000) }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
     time(&mut rows, "CompareEndpoints", runs, || {
         unsafe {
@@ -286,17 +329,32 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
                 TextPatternRangeEndpoint_Start,
             )
         }
-        .map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        .map(drop)
+        .or_else(not_yet_is_fine)
+        .expect("a provider call");
     });
-    time(&mut rows, "GetBoundingRectangles on the whole document", runs, || {
-        unsafe { doc.GetBoundingRectangles() }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
-    });
+    time(
+        &mut rows,
+        "GetBoundingRectangles on the whole document",
+        runs,
+        || {
+            unsafe { doc.GetBoundingRectangles() }
+                .map(drop)
+                .or_else(not_yet_is_fine)
+                .expect("a provider call");
+        },
+    );
     time(&mut rows, "GetAttributeValue(FontName)", runs, || {
-        unsafe { doc.GetAttributeValue(UIA_FontNameAttributeId) }.map(drop).or_else(not_yet_is_fine).expect("a provider call");
+        unsafe { doc.GetAttributeValue(UIA_FontNameAttributeId) }
+            .map(drop)
+            .or_else(not_yet_is_fine)
+            .expect("a provider call");
     });
 
     println!("\n{label}: {bytes} bytes");
-    println!("  first GetText(200) in the middle: {first_read_units} units after {first_read_calls} calls");
+    println!(
+        "  first GetText(200) in the middle: {first_read_units} units after {first_read_calls} calls"
+    );
     println!(
         "  'not yet' answers so far in this process: {}",
         NOT_YET_ANSWERS.load(Ordering::Relaxed)
@@ -320,16 +378,18 @@ fn measure(label: &str, window: &TestWindow, bytes: usize) {
         ("far, exact case", NEEDLE, false, true),
         ("far, ignoring case", "ZQ-NEEDLE-AT-THE-END", true, true),
         ("absent, exact case", "this text is not there", false, false),
-        ("absent, ignoring case", "THIS TEXT IS NOT THERE", true, false),
+        (
+            "absent, ignoring case",
+            "THIS TEXT IS NOT THERE",
+            true,
+            false,
+        ),
     ] {
-        let (found, calls, worst, typical, total) = find(&doc, query, ignore_case);
+        let (found, total, stall) = find(&doc, query, ignore_case);
         println!(
-            "  FindText {name:24} found {found}, {calls} calls, median call {typical:.3} ms, worst call {worst:.3} ms, answer after {total:.1} ms"
+            "  FindText {name:24} found {found}, one call, answer after {total:.1} ms, window held up {stall:.3} ms at most"
         );
         assert_eq!(found, should_find, "{label}: {name}");
-        // Other work on this PC can stall one call, so this checks the typical call. The worst
-        // one is printed above for a person to read.
-        assert!(typical < FRAME_MS, "{label}: a typical FindText call took {typical} ms");
     }
     drop(ui);
 }
@@ -374,7 +434,7 @@ fn measure_1_gib_mapped_file() {
     let mut during = 0;
     let first_revision = window.ui.view.borrow().revision();
     let mut worst = 0f64;
-    let mut samples = Vec::new();
+
     let mut partial = 0;
     let began = Instant::now();
     while !window.ui.view.borrow().store_status().complete && began.elapsed().as_secs() < 300 {
@@ -386,7 +446,6 @@ fn measure_1_gib_mapped_file() {
             Err(error) => assert_eq!(error.code().0, NOT_YET, "{error}"),
         }
         worst = worst.max(call.elapsed().as_secs_f64() * 1000.0);
-        samples.push(call.elapsed().as_secs_f64() * 1000.0);
         during += 1;
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -400,10 +459,4 @@ fn measure_1_gib_mapped_file() {
     window.lay_out(800.0, 600.0);
     measure("1 GiB, mapped, read-only", &window, bytes);
     window.close();
-}
-
-
-fn middle_of(samples: &mut [f64]) -> f64 {
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
 }

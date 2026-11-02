@@ -1,13 +1,13 @@
 //! Events are coalesced, and with no client nothing runs.
 mod support;
-use qe_a11y::{Accessibility, EventFlags, EventTracker, wm_getobject};
+use qe_a11y::{EventFlags, EventTracker, UiaSlot};
 use qe_api::{ByteOffset, ViewContext};
 use qe_editor::{EditorView, HostCommand};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
 use support::*;
 use windows::Win32::{
     Foundation::{LPARAM, WPARAM},
-    UI::Accessibility::UiaClientsAreListening,
+    UI::{Accessibility::UiaClientsAreListening, WindowsAndMessaging::WM_GETOBJECT},
 };
 
 #[test]
@@ -93,21 +93,39 @@ fn while_no_client_listens_the_tracker_keeps_nothing() {
     assert!(again.text_changed);
 }
 
+const GET_OBJECT: u32 = WM_GETOBJECT;
+
 #[test]
 fn wm_getobject_makes_nothing_for_other_ids() {
     let window = TestWindow::from_text("abc");
-    let mut slot: Option<Accessibility> = None;
+    let slot = UiaSlot::new();
     let mut made = 0;
     // OBJID_CLIENT, OBJID_WINDOW, and a plain zero.
     for id in [-4isize, 0, -1] {
-        let answer = wm_getobject(&mut slot, window.hwnd, WPARAM(0), LPARAM(id), || {
+        let answer = slot.on_window_message(window.hwnd, GET_OBJECT, WPARAM(0), LPARAM(id), || {
             made += 1;
             window.host.clone()
         });
         assert!(answer.is_none());
     }
     assert_eq!(made, 0);
-    assert!(slot.is_none());
+    assert!(slot.current().is_none());
+}
+
+#[test]
+fn other_messages_make_nothing_and_are_not_taken() {
+    let window = TestWindow::from_text("abc");
+    let slot = UiaSlot::new();
+    let answer = slot.on_window_message(window.hwnd, 0x0400, WPARAM(1), LPARAM(-25), || {
+        panic!("this message must not make a provider")
+    });
+    assert!(answer.is_none());
+    assert!(slot.current().is_none());
+    // With no provider, the reports read one Option and touch nothing.
+    assert_eq!(slot.after_input().unwrap(), EventFlags::default());
+    slot.widgets_changed().unwrap();
+    assert_eq!(window.counts.editor_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(window.counts.widget_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -115,34 +133,37 @@ fn wm_getobject_accepts_the_id_with_or_without_sign_extension() {
     let window = TestWindow::from_text("abc");
     let mut made = 0;
     for id in [-25isize, 0xFFFF_FFE7] {
-        let mut slot: Option<Accessibility> = None;
-        let answer = wm_getobject(&mut slot, window.hwnd, WPARAM(0), LPARAM(id), || {
+        let slot = UiaSlot::new();
+        let answer = slot.on_window_message(window.hwnd, GET_OBJECT, WPARAM(0), LPARAM(id), || {
             made += 1;
             window.host.clone()
         });
         assert!(answer.is_some(), "{id:#x}");
-        assert!(slot.is_some());
-        slot.as_ref().unwrap().shutdown().unwrap();
+        assert!(slot.current().is_some());
+        slot.shutdown().unwrap();
     }
     assert_eq!(made, 2);
 }
 
 #[test]
-fn wm_getobject_makes_one_provider_for_many_requests() {
+fn wm_getobject_makes_one_provider_for_many_requests_and_none_after_close() {
     let window = TestWindow::from_text("abc");
-    let mut slot: Option<Accessibility> = None;
+    let slot = UiaSlot::new();
     let mut made = 0;
     let mut roots = Vec::new();
     for _ in 0..3 {
-        wm_getobject(&mut slot, window.hwnd, WPARAM(0), LPARAM(-25), || {
+        slot.on_window_message(window.hwnd, GET_OBJECT, WPARAM(0), LPARAM(-25), || {
             made += 1;
             window.host.clone()
         });
-        roots.push(slot.as_ref().unwrap().root());
+        roots.push(slot.current().unwrap().root());
     }
     assert_eq!(made, 1);
     assert_eq!(roots[0], roots[2]);
-    slot.as_ref().unwrap().shutdown().unwrap();
-    // The cycle between the root and its document ends at shutdown.
-    assert!(Arc::strong_count(&window.counts) >= 1);
+    slot.shutdown().unwrap();
+    slot.shutdown().unwrap();
+    let late = slot.on_window_message(window.hwnd, GET_OBJECT, WPARAM(0), LPARAM(-25), || {
+        panic!("a closed window must not make a provider")
+    });
+    assert!(late.is_none());
 }

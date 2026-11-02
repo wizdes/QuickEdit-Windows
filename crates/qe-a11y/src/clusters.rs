@@ -81,7 +81,7 @@ fn is_joining(c: char) -> bool {
 fn is_pictographic(c: char) -> bool {
     in_table(PICTOGRAPHIC, c)
 }
-fn is_regional(c: char) -> bool {
+pub(crate) fn is_regional(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
 fn is_prepend(c: char) -> bool {

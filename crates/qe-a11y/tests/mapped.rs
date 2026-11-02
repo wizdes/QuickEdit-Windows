@@ -17,10 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::*;
-use windows::{
-    Win32::UI::Accessibility::*,
-    core::{BSTR, Interface},
-};
+use windows::{Win32::UI::Accessibility::*, core::Interface};
 
 struct Temp(std::path::PathBuf);
 impl Drop for Temp {
@@ -106,10 +103,16 @@ fn a_mapped_file_reads_moves_and_is_read_only() {
     assert!(unsafe { value.IsReadOnly() }.unwrap().as_bool());
     let line = unsafe { doc.Clone() }.unwrap();
     retry(|| unsafe { line.ExpandToEnclosingUnit(TextUnit_Line) });
-    assert_eq!(retry(|| unsafe { line.GetText(-1) }).0, "a\u{1f600}e\u{301}\r\n");
+    assert_eq!(
+        retry(|| unsafe { line.GetText(-1) }).0,
+        "a\u{1f600}e\u{301}\r\n"
+    );
     retry(|| unsafe { line.Move(TextUnit_Line, 1) });
     assert_eq!(retry(|| unsafe { line.GetText(-1) }).0, "second line\n");
-    let found = retry(|| unsafe { doc.FindText(&BSTR::from("THIRD"), false, true) }).0;
+    let found = window
+        .find_off_thread(&doc, "THIRD", false, true)
+        .unwrap()
+        .unwrap();
     assert_eq!(retry(|| unsafe { found.GetText(-1) }).0, "third");
 }
 
@@ -143,17 +146,13 @@ fn a_page_not_in_memory_says_ask_again_and_then_answers() {
     retry(|| unsafe { caret.ExpandToEnclosingUnit(TextUnit_Line) });
     let (text, _) = retry(|| unsafe { caret.GetText(-1) });
     assert_eq!(text, "line 400000\n");
-    // A search of the whole file gets there, and no call waits long on this thread.
+    // A search of the whole file waits on its own thread, so one call gets the answer.
     let doc = document_range(&document);
-    let mut worst = Duration::ZERO;
-    let (found, _) = retry(|| {
-        let began = Instant::now();
-        let answer = unsafe { doc.FindText(&BSTR::from("line 599999"), false, false) };
-        worst = worst.max(began.elapsed());
-        answer
-    });
+    let found = window
+        .find_off_thread(&doc, "line 599999", false, false)
+        .expect("one call is enough")
+        .expect("it is there");
     assert_eq!(retry(|| unsafe { found.GetText(-1) }).0, "line 599999");
-    assert!(worst < Duration::from_millis(250), "a call took {worst:?}");
 }
 
 /// Knows only the first part of its text, as a mapped file does while its index grows.

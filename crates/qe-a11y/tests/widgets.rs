@@ -88,23 +88,57 @@ fn navigation_walks_the_whole_tree_and_ends_in_real_null() {
     }
     assert_eq!(
         names,
-        ["Tabs", "Wrap", "Off", "Find", "Encoding", "Scroll", "Menu bar", "A label", "Untitled"]
+        [
+            "Tabs", "Wrap", "Off", "Find", "Encoding", "Scroll", "Menu bar", "A label", "Untitled"
+        ]
     );
     // The document is last, and it knows its way back.
-    assert_eq!(name(&unsafe { root.Navigate(NavigateDirection_LastChild) }.unwrap()), "Untitled");
+    assert_eq!(
+        name(&unsafe { root.Navigate(NavigateDirection_LastChild) }.unwrap()),
+        "Untitled"
+    );
     let document = unsafe { root.Navigate(NavigateDirection_LastChild) }.unwrap();
-    assert_eq!(name(&unsafe { document.Navigate(NavigateDirection_PreviousSibling) }.unwrap()), "A label");
-    assert_null(unsafe { document.Navigate(NavigateDirection_NextSibling) }, "after the document");
-    assert_null(unsafe { document.Navigate(NavigateDirection_FirstChild) }, "the document's children");
-    assert_null(unsafe { root.Navigate(NavigateDirection_Parent) }, "the root's parent");
-    assert_null(unsafe { root.Navigate(NavigateDirection_NextSibling) }, "the root's sibling");
+    assert_eq!(
+        name(&unsafe { document.Navigate(NavigateDirection_PreviousSibling) }.unwrap()),
+        "A label"
+    );
+    assert_null(
+        unsafe { document.Navigate(NavigateDirection_NextSibling) },
+        "after the document",
+    );
+    assert_null(
+        unsafe { document.Navigate(NavigateDirection_FirstChild) },
+        "the document's children",
+    );
+    assert_null(
+        unsafe { root.Navigate(NavigateDirection_Parent) },
+        "the root's parent",
+    );
+    assert_null(
+        unsafe { root.Navigate(NavigateDirection_NextSibling) },
+        "the root's sibling",
+    );
     let tabs = child(&root, "Tabs");
     let one = unsafe { tabs.Navigate(NavigateDirection_FirstChild) }.unwrap();
     assert_eq!(name(&one), "One");
-    assert_eq!(name(&unsafe { one.Navigate(NavigateDirection_Parent) }.unwrap()), "Tabs");
-    assert_null(unsafe { one.Navigate(NavigateDirection_PreviousSibling) }, "before the first");
-    assert_null(unsafe { one.Navigate(NavigateDirection_FirstChild) }, "a leaf's children");
-    assert_eq!(unsafe { tabs.FragmentRoot() }.unwrap().as_raw(), root.cast::<IRawElementProviderFragmentRoot>().unwrap().as_raw());
+    assert_eq!(
+        name(&unsafe { one.Navigate(NavigateDirection_Parent) }.unwrap()),
+        "Tabs"
+    );
+    assert_null(
+        unsafe { one.Navigate(NavigateDirection_PreviousSibling) },
+        "before the first",
+    );
+    assert_null(
+        unsafe { one.Navigate(NavigateDirection_FirstChild) },
+        "a leaf's children",
+    );
+    assert_eq!(
+        unsafe { tabs.FragmentRoot() }.unwrap().as_raw(),
+        root.cast::<IRawElementProviderFragmentRoot>()
+            .unwrap()
+            .as_raw()
+    );
 }
 
 #[test]
@@ -142,20 +176,30 @@ fn a_menu_item_with_a_popup_expands_and_a_plain_one_invokes() {
     let menu = child(&root, "Menu bar");
     let file = simple(&child(&menu, "File"));
     let save = simple(&child(&menu, "Save"));
-    let expand: IExpandCollapseProvider = unsafe { file.GetPatternProvider(UIA_ExpandCollapsePatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
-    assert_eq!(unsafe { expand.ExpandCollapseState() }.unwrap(), ExpandCollapseState_Collapsed);
+    let expand: IExpandCollapseProvider =
+        unsafe { file.GetPatternProvider(UIA_ExpandCollapsePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
+    assert_eq!(
+        unsafe { expand.ExpandCollapseState() }.unwrap(),
+        ExpandCollapseState_Collapsed
+    );
     unsafe { expand.Expand() }.unwrap();
-    assert_null(unsafe { file.GetPatternProvider(UIA_InvokePatternId) }, "Invoke with a popup");
+    assert_null(
+        unsafe { file.GetPatternProvider(UIA_InvokePatternId) },
+        "Invoke with a popup",
+    );
     let invoke: IInvokeProvider = unsafe { save.GetPatternProvider(UIA_InvokePatternId) }
         .unwrap()
         .cast()
         .unwrap();
     unsafe { invoke.Invoke() }.unwrap();
-    assert_null(unsafe { save.GetPatternProvider(UIA_ExpandCollapsePatternId) }, "ExpandCollapse with no popup");
-    let actions = window.counts.actions.lock().unwrap().clone();
+    assert_null(
+        unsafe { save.GetPatternProvider(UIA_ExpandCollapsePatternId) },
+        "ExpandCollapse with no popup",
+    );
+    let actions = window.actions_after_pump();
     assert_eq!(
         actions,
         vec![
@@ -169,39 +213,56 @@ fn a_menu_item_with_a_popup_expands_and_a_plain_one_invokes() {
 fn actions_reach_the_host_and_refuse_when_turned_off() {
     let window = window();
     let (_ui, root) = fragment_root(&window);
-    let toggle: IToggleProvider = unsafe { simple(&child(&root, "Wrap")).GetPatternProvider(UIA_TogglePatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
+    let toggle: IToggleProvider =
+        unsafe { simple(&child(&root, "Wrap")).GetPatternProvider(UIA_TogglePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
     assert_eq!(unsafe { toggle.ToggleState() }.unwrap(), ToggleState_On);
     unsafe { toggle.Toggle() }.unwrap();
-    let invoke: IInvokeProvider = unsafe { simple(&child(&root, "Off")).GetPatternProvider(UIA_InvokePatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
-    assert_code(unsafe { invoke.Invoke() }, UIA_E_ELEMENTNOTENABLED as i32, "a turned-off button");
-    let scroll: IRangeValueProvider = unsafe { simple(&child(&root, "Scroll")).GetPatternProvider(UIA_RangeValuePatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
+    let invoke: IInvokeProvider =
+        unsafe { simple(&child(&root, "Off")).GetPatternProvider(UIA_InvokePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
+    assert_code(
+        unsafe { invoke.Invoke() },
+        UIA_E_ELEMENTNOTENABLED as i32,
+        "a turned-off button",
+    );
+    let scroll: IRangeValueProvider =
+        unsafe { simple(&child(&root, "Scroll")).GetPatternProvider(UIA_RangeValuePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
     assert_eq!(unsafe { scroll.Value() }.unwrap(), 3.0);
     assert_eq!(unsafe { scroll.Maximum() }.unwrap(), 10.0);
     unsafe { scroll.SetValue(4.0) }.unwrap();
-    assert_code(unsafe { scroll.SetValue(11.0) }, -2147024809, "over the maximum");
-    assert_code(unsafe { scroll.SetValue(f64::NAN) }, -2147024809, "not a number");
-    let value: IValueProvider = unsafe { simple(&child(&root, "Find")).GetPatternProvider(UIA_ValuePatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
+    assert_code(
+        unsafe { scroll.SetValue(11.0) },
+        -2147024809,
+        "over the maximum",
+    );
+    assert_code(
+        unsafe { scroll.SetValue(f64::NAN) },
+        -2147024809,
+        "not a number",
+    );
+    let value: IValueProvider =
+        unsafe { simple(&child(&root, "Find")).GetPatternProvider(UIA_ValuePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
     assert_eq!(unsafe { value.Value() }.unwrap(), "a\u{1f600} word");
     unsafe { value.SetValue(w!("next")) }.unwrap();
-    let actions = window.counts.actions.lock().unwrap().clone();
+    let actions = window.actions_after_pump();
     assert_eq!(
         actions,
         vec![
-            (WidgetId(20), WidgetAction::Toggle),
             (WidgetId(40), WidgetAction::SetRange(4.0)),
             (WidgetId(30), WidgetAction::SetValue("next".into())),
+            // A posted action runs after the calls that run at once.
+            (WidgetId(20), WidgetAction::Toggle),
         ]
     );
 }
@@ -211,24 +272,29 @@ fn tabs_report_selection_both_ways() {
     let window = window();
     let (_ui, root) = fragment_root(&window);
     let tabs = child(&root, "Tabs");
-    let selection: ISelectionProvider = unsafe { simple(&tabs).GetPatternProvider(UIA_SelectionPatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
+    let selection: ISelectionProvider =
+        unsafe { simple(&tabs).GetPatternProvider(UIA_SelectionPatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
     let array = unsafe { selection.GetSelection() }.unwrap();
     assert_eq!(unsafe { (*array).rgsabound[0].cElements }, 1);
     assert!(!unsafe { selection.CanSelectMultiple() }.unwrap().as_bool());
     let two = child(&tabs, "Two");
-    let item: ISelectionItemProvider = unsafe { simple(&two).GetPatternProvider(UIA_SelectionItemPatternId) }
-        .unwrap()
-        .cast()
-        .unwrap();
+    let item: ISelectionItemProvider =
+        unsafe { simple(&two).GetPatternProvider(UIA_SelectionItemPatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
     assert!(!unsafe { item.IsSelected() }.unwrap().as_bool());
     unsafe { item.Select() }.unwrap();
     let container = unsafe { item.SelectionContainer() }.unwrap();
     let value = unsafe { container.GetPropertyValue(UIA_NamePropertyId) }.unwrap();
     assert_eq!(BSTR::try_from(&value).unwrap(), "Tabs");
-    assert_eq!(window.counts.actions.lock().unwrap()[0], (WidgetId(12), WidgetAction::Select));
+    assert_eq!(
+        window.actions_after_pump()[0],
+        (WidgetId(12), WidgetAction::Select)
+    );
 }
 
 #[test]
@@ -243,8 +309,13 @@ fn a_text_field_exposes_its_text_and_selection_in_utf16() {
     assert_eq!(unsafe { (*array).rgsabound[0].cElements }, 1);
     let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
     let index = 0i32;
-    unsafe { windows::Win32::System::Ole::SafeArrayGetElement(array, &index, (&raw mut raw).cast()) }.unwrap();
-    let selection: ITextRangeProvider = unsafe { windows::core::IUnknown::from_raw(raw) }.cast().unwrap();
+    unsafe {
+        windows::Win32::System::Ole::SafeArrayGetElement(array, &index, (&raw mut raw).cast())
+    }
+    .unwrap();
+    let selection: ITextRangeProvider = unsafe { windows::core::IUnknown::from_raw(raw) }
+        .cast()
+        .unwrap();
     assert_eq!(unsafe { selection.GetText(-1) }.unwrap(), "\u{1f600}");
     // A word move and a character move work in a field too.
     let word = unsafe { doc.Clone() }.unwrap();
@@ -274,8 +345,16 @@ fn a_held_widget_that_left_the_tree_reports_gone() {
     let text = text_of(&simple(&find));
     let range = unsafe { text.DocumentRange() }.unwrap();
     window.ui.tree.borrow_mut().children.remove(3);
-    assert_code(unsafe { find.Navigate(NavigateDirection_Parent) }, GONE, "Navigate");
-    assert_code(unsafe { simple(&find).GetPropertyValue(UIA_NamePropertyId) }, GONE, "a property");
+    assert_code(
+        unsafe { find.Navigate(NavigateDirection_Parent) },
+        GONE,
+        "Navigate",
+    );
+    assert_code(
+        unsafe { simple(&find).GetPropertyValue(UIA_NamePropertyId) },
+        GONE,
+        "a property",
+    );
     assert_code(unsafe { range.GetText(-1) }, GONE, "a range in the field");
 }
 
@@ -287,14 +366,24 @@ fn focus_and_hit_tests_find_the_right_element() {
     assert_eq!(name(&unsafe { root_face.GetFocus() }.unwrap()), "Find");
     window.ui.tree.borrow_mut().children[3].states.focused = false;
     assert_eq!(name(&unsafe { root_face.GetFocus() }.unwrap()), "Untitled");
-    window.ui.document.borrow_mut().as_mut().unwrap().states.focused = false;
+    window
+        .ui
+        .document
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .states
+        .focused = false;
     assert_null(unsafe { root_face.GetFocus() }, "nothing has focus");
 
     let wrap = unsafe { child(&root, "Wrap").BoundingRectangle() }.unwrap();
-    let found = unsafe { root_face.ElementProviderFromPoint(wrap.left + 1.0, wrap.top + 1.0) }.unwrap();
+    let found =
+        unsafe { root_face.ElementProviderFromPoint(wrap.left + 1.0, wrap.top + 1.0) }.unwrap();
     assert_eq!(name(&found), "Wrap");
     let document = unsafe { child(&root, "Untitled").BoundingRectangle() }.unwrap();
-    let found = unsafe { root_face.ElementProviderFromPoint(document.left + 5.0, document.top + 5.0) }.unwrap();
+    let found =
+        unsafe { root_face.ElementProviderFromPoint(document.left + 5.0, document.top + 5.0) }
+            .unwrap();
     assert_eq!(name(&found), "Untitled");
 }
 
@@ -302,7 +391,8 @@ fn focus_and_hit_tests_find_the_right_element() {
 fn properties_say_what_a_client_needs() {
     let window = window();
     let (_ui, root) = fragment_root(&window);
-    let property = |name: &str, id| unsafe { simple(&child(&root, name)).GetPropertyValue(id) }.unwrap();
+    let property =
+        |name: &str, id| unsafe { simple(&child(&root, name)).GetPropertyValue(id) }.unwrap();
     let kind = |name: &str| i32::try_from(&property(name, UIA_ControlTypePropertyId)).unwrap();
     assert_eq!(kind("Untitled"), UIA_DocumentControlTypeId.0);
     assert_eq!(kind("Wrap"), UIA_CheckBoxControlTypeId.0);
@@ -316,9 +406,18 @@ fn properties_say_what_a_client_needs() {
     assert!(empty.is_empty());
     let ids = unsafe { child(&root, "Wrap").GetRuntimeId() }.unwrap();
     assert_eq!(unsafe { (*ids).rgsabound[0].cElements }, 3);
-    assert!(unsafe { root.GetRuntimeId() }.unwrap().is_null(), "the window gives the root's ID");
+    assert!(
+        unsafe { root.GetRuntimeId() }.unwrap().is_null(),
+        "the window gives the root's ID"
+    );
     let simple_root = simple(&root);
-    assert_eq!(unsafe { simple_root.ProviderOptions() }.unwrap(), ProviderOptions_ServerSideProvider);
+    assert_eq!(
+        unsafe { simple_root.ProviderOptions() }.unwrap(),
+        ProviderOptions_ServerSideProvider
+    );
     assert!(unsafe { simple_root.HostRawElementProvider() }.is_ok());
-    assert_null(unsafe { simple(&child(&root, "Wrap")).HostRawElementProvider() }, "a child's host");
+    assert_null(
+        unsafe { simple(&child(&root, "Wrap")).HostRawElementProvider() },
+        "a child's host",
+    );
 }

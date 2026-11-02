@@ -5,9 +5,9 @@
 //! unless a client calls or the host reports input.
 pub mod clusters;
 mod com;
-pub mod marshal;
 pub mod events;
 pub mod host;
+pub mod marshal;
 pub mod provider;
 pub mod search;
 pub mod text;
@@ -16,7 +16,7 @@ pub mod widgets;
 pub use events::{EventFlags, EventTracker};
 pub use host::{UiThreadOnly, UiaHost, WidgetAction};
 pub use text::{GET_TEXT_CAP, ReadError, TextRange};
-pub use widgets::{Accessibility, on_window_message, wm_getobject};
+pub use widgets::{Accessibility, UiaSlot, WidgetEvents};
 
 // The `implement` macro names `windows_core` directly. This re-exports the exact version
 // that `windows` bundles, so this crate needs no lock-file edit.

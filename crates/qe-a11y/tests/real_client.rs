@@ -23,7 +23,10 @@ use windows::{
     Win32::{
         Foundation::HWND,
         System::{
-            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY},
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+                SAFEARRAY,
+            },
             Ole::{SafeArrayDestroy, SafeArrayGetElement},
             Variant::VARIANT,
         },
@@ -73,7 +76,10 @@ fn null<T>(what: &str, answer: WinResult<T>) -> Result<(), String> {
     match answer {
         Ok(_) => Err(format!("{what}: expected null, got an object")),
         Err(e) if e.code().0 == 0 => Ok(()),
-        Err(e) => Err(format!("{what}: expected null, got error {e} (0x{:08x})", e.code().0 as u32)),
+        Err(e) => Err(format!(
+            "{what}: expected null, got error {e} (0x{:08x})",
+            e.code().0 as u32
+        )),
     }
 }
 fn read(range: &IUIAutomationTextRange) -> Result<String, String> {
@@ -96,7 +102,10 @@ fn doubles(array: *mut SAFEARRAY) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 fn automation() -> Result<IUIAutomation, String> {
-    call("CoInitializeEx", unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok())?;
+    call(
+        "CoInitializeEx",
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok(),
+    )?;
     call("CoCreateInstance(CUIAutomation)", unsafe {
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
     })
@@ -109,7 +118,9 @@ fn find_by_type(
     let condition = call("CreatePropertyCondition", unsafe {
         client.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(kind.0))
     })?;
-    call("FindFirst", unsafe { from.FindFirst(TreeScope_Descendants, &condition) })
+    call("FindFirst", unsafe {
+        from.FindFirst(TreeScope_Descendants, &condition)
+    })
 }
 
 /// The whole client script. `close_window` asks for the window to close, and returns when
@@ -117,7 +128,9 @@ fn find_by_type(
 fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
     let client = automation()?;
     let hwnd = HWND(window as *mut c_void);
-    let element = call("ElementFromHandle", unsafe { client.ElementFromHandle(hwnd) })?;
+    let element = call("ElementFromHandle", unsafe {
+        client.ElementFromHandle(hwnd)
+    })?;
     let document = find_by_type(&client, &element, UIA_DocumentControlTypeId)?;
     let name = call("the document's name", unsafe { document.CurrentName() })?;
     ensure!(name == "Untitled", "the document's name was {name}");
@@ -128,29 +141,44 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
     })?;
     let doc = call("DocumentRange", unsafe { pattern.DocumentRange() })?;
     let whole = body();
-    ensure!(read(&doc)? == whole, "the document text was wrong: {:?}", read(&doc)?);
+    ensure!(
+        read(&doc)? == whole,
+        "the document text was wrong: {:?}",
+        read(&doc)?
+    );
     let some = call("GetText(5)", unsafe { doc.GetText(5) })?;
     ensure!(some == "Hello", "GetText(5) gave {some}");
 
     // Selection and caret.
     let selection = call("GetSelection", unsafe { pattern.GetSelection() })?;
-    ensure!(call("Length", unsafe { selection.Length() })? == 1, "one selection expected");
+    ensure!(
+        call("Length", unsafe { selection.Length() })? == 1,
+        "one selection expected"
+    );
     let first = call("GetElement", unsafe { selection.GetElement(0) })?;
     ensure!(read(&first)?.is_empty(), "the selection starts empty");
 
     // Move by character across the emoji and the combining mark.
     let caret = call("Clone", unsafe { doc.Clone() })?;
     call("collapse", unsafe {
-        caret.MoveEndpointByRange(TextPatternRangeEndpoint_End, &doc, TextPatternRangeEndpoint_Start)
+        caret.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            &doc,
+            TextPatternRangeEndpoint_Start,
+        )
     })?;
     let moved = call("Move line", unsafe { caret.Move(TextUnit_Line, 1) })?;
     ensure!(moved == 1, "Move(Line, 1) gave {moved}");
     let mut seen = Vec::new();
     for _ in 0..3 {
         let one = call("Clone", unsafe { caret.Clone() })?;
-        call("Expand character", unsafe { one.ExpandToEnclosingUnit(TextUnit_Character) })?;
+        call("Expand character", unsafe {
+            one.ExpandToEnclosingUnit(TextUnit_Character)
+        })?;
         seen.push(read(&one)?);
-        let moved = call("Move character", unsafe { caret.Move(TextUnit_Character, 1) })?;
+        let moved = call("Move character", unsafe {
+            caret.Move(TextUnit_Character, 1)
+        })?;
         ensure!(moved == 1, "Move(Character, 1) gave {moved}");
     }
     ensure!(
@@ -160,16 +188,32 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
 
     // Move by word.
     let word = call("Clone", unsafe { doc.Clone() })?;
-    call("Expand word", unsafe { word.ExpandToEnclosingUnit(TextUnit_Word) })?;
-    ensure!(read(&word)? == "Hello ", "the first word was {:?}", read(&word)?);
+    call("Expand word", unsafe {
+        word.ExpandToEnclosingUnit(TextUnit_Word)
+    })?;
+    ensure!(
+        read(&word)? == "Hello ",
+        "the first word was {:?}",
+        read(&word)?
+    );
     let moved = call("Move word", unsafe { word.Move(TextUnit_Word, 2) })?;
     ensure!(moved == 2, "Move(Word, 2) gave {moved}");
-    ensure!(read(&word)? == "world\r\n", "the third word was {:?}", read(&word)?);
+    ensure!(
+        read(&word)? == "world\r\n",
+        "the third word was {:?}",
+        read(&word)?
+    );
 
     // Move by line: the wrapped line gives rows, and a paragraph gives the whole line.
     let line = call("Clone", unsafe { doc.Clone() })?;
-    call("Expand line", unsafe { line.ExpandToEnclosingUnit(TextUnit_Line) })?;
-    ensure!(read(&line)? == "Hello big world\r\n", "the first line was {:?}", read(&line)?);
+    call("Expand line", unsafe {
+        line.ExpandToEnclosingUnit(TextUnit_Line)
+    })?;
+    ensure!(
+        read(&line)? == "Hello big world\r\n",
+        "the first line was {:?}",
+        read(&line)?
+    );
     let moved = call("Move line", unsafe { line.Move(TextUnit_Line, 2) })?;
     ensure!(moved == 2, "Move(Line, 2) gave {moved}");
     let row = read(&line)?;
@@ -179,35 +223,68 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
     );
     let moved = call("Move line", unsafe { line.Move(TextUnit_Line, 1) })?;
     ensure!(moved == 1, "the next row gave {moved}");
-    ensure!(read(&line)?.starts_with("word"), "the next row was {:?}", read(&line)?);
-    call("Expand paragraph", unsafe { line.ExpandToEnclosingUnit(TextUnit_Paragraph) })?;
-    ensure!(read(&line)? == format!("{WRAPPED}\n"), "the paragraph was {:?}", read(&line)?);
+    ensure!(
+        read(&line)?.starts_with("word"),
+        "the next row was {:?}",
+        read(&line)?
+    );
+    call("Expand paragraph", unsafe {
+        line.ExpandToEnclosingUnit(TextUnit_Paragraph)
+    })?;
+    ensure!(
+        read(&line)? == format!("{WRAPPED}\n"),
+        "the paragraph was {:?}",
+        read(&line)?
+    );
 
     // Rectangles.
-    let rectangles = doubles(call("GetBoundingRectangles", unsafe { line.GetBoundingRectangles() })?)?;
+    let rectangles = doubles(call("GetBoundingRectangles", unsafe {
+        line.GetBoundingRectangles()
+    })?)?;
     ensure!(
         rectangles.len() >= 8 && rectangles.len() % 4 == 0,
         "a wrapped paragraph gave {} numbers",
         rectangles.len()
     );
-    ensure!(rectangles[2] > 0.0 && rectangles[3] > 0.0, "an empty rectangle: {rectangles:?}");
+    ensure!(
+        rectangles[2] > 0.0 && rectangles[3] > 0.0,
+        "an empty rectangle: {rectangles:?}"
+    );
 
     // Real null answers survive UIA's own layers.
-    null("FindText with no match", unsafe { doc.FindText(&BSTR::from("zzzz"), false, false) })?;
+    null("FindText with no match", unsafe {
+        doc.FindText(&BSTR::from("zzzz"), false, false)
+    })?;
     null("a pattern a document lacks", unsafe {
         document.GetCurrentPattern(UIA_InvokePatternId)
     })?;
-    let found = call("FindText", unsafe { doc.FindText(&BSTR::from("BIG"), false, true) })?;
+    let found = call("FindText", unsafe {
+        doc.FindText(&BSTR::from("BIG"), false, true)
+    })?;
     ensure!(read(&found)? == "big", "FindText gave {:?}", read(&found)?);
 
     // Attributes.
-    let reserved = call("the reserved value", unsafe { client.ReservedNotSupportedValue() })?;
-    let value = call("an attribute", unsafe { doc.GetAttributeValue(UIA_BackgroundColorAttributeId) })?;
+    let reserved = call("the reserved value", unsafe {
+        client.ReservedNotSupportedValue()
+    })?;
+    let value = call("an attribute", unsafe {
+        doc.GetAttributeValue(UIA_BackgroundColorAttributeId)
+    })?;
     let unknown = IUnknown::try_from(&value).map_err(|e| format!("not an object: {e}"))?;
-    ensure!(unknown.as_raw() == reserved.as_raw(), "not the 'not supported' value");
-    let value = call("IsReadOnly", unsafe { doc.GetAttributeValue(UIA_IsReadOnlyAttributeId) })?;
-    ensure!(bool::try_from(&value) == Ok(false), "IsReadOnly was not false");
-    let value = call("FontName", unsafe { doc.GetAttributeValue(UIA_FontNameAttributeId) })?;
+    ensure!(
+        unknown.as_raw() == reserved.as_raw(),
+        "not the 'not supported' value"
+    );
+    let value = call("IsReadOnly", unsafe {
+        doc.GetAttributeValue(UIA_IsReadOnlyAttributeId)
+    })?;
+    ensure!(
+        bool::try_from(&value) == Ok(false),
+        "IsReadOnly was not false"
+    );
+    let value = call("FontName", unsafe {
+        doc.GetAttributeValue(UIA_FontNameAttributeId)
+    })?;
     ensure!(
         BSTR::try_from(&value).is_ok_and(|n| n == "Cascadia Mono"),
         "FontName was wrong"
@@ -215,7 +292,9 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
 
     // The range and the tree name the same element.
     let enclosing = call("GetEnclosingElement", unsafe { doc.GetEnclosingElement() })?;
-    let same = call("CompareElements", unsafe { client.CompareElements(&enclosing, &document) })?;
+    let same = call("CompareElements", unsafe {
+        client.CompareElements(&enclosing, &document)
+    })?;
     ensure!(same.as_bool(), "the enclosing element is not the document");
 
     // Compare, and a selection made by the client.
@@ -226,7 +305,11 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
     call("Select", unsafe { found.Select() })?;
     let selection = call("GetSelection", unsafe { pattern.GetSelection() })?;
     let first = call("GetElement", unsafe { selection.GetElement(0) })?;
-    ensure!(read(&first)? == "big", "the selection was {:?}", read(&first)?);
+    ensure!(
+        read(&first)? == "big",
+        "the selection was {:?}",
+        read(&first)?
+    );
 
     // Widgets, through the same tree.
     let button = find_named(&client, &element, UIA_ButtonControlTypeId, "Save")?;
@@ -243,9 +326,15 @@ fn client_script(window: isize, close_window: &dyn Fn()) -> Result<(), String> {
     let field_text: IUIAutomationTextPattern = call("the field's text", unsafe {
         field.GetCurrentPatternAs(UIA_TextPatternId)
     })?;
-    let selection = call("the field's selection", unsafe { field_text.GetSelection() })?;
+    let selection = call("the field's selection", unsafe {
+        field_text.GetSelection()
+    })?;
     let first = call("GetElement", unsafe { selection.GetElement(0) })?;
-    ensure!(read(&first)? == "nee", "the field's selection was {:?}", read(&first)?);
+    ensure!(
+        read(&first)? == "nee",
+        "the field's selection was {:?}",
+        read(&first)?
+    );
 
     // The window closes while this client holds a range and an element. A crash here would
     // end this process, and a wrong answer fails the check.
@@ -267,7 +356,10 @@ fn check_after_script(window: &TestWindow) {
     // also sets focus on an element before it invokes one, so those actions are left out here.
     let actions = || -> Vec<(WidgetId, WidgetAction)> {
         let all = window.counts.actions.lock().expect("actions");
-        all.iter().filter(|a| a.1 != WidgetAction::Focus).cloned().collect()
+        all.iter()
+            .filter(|a| a.1 != WidgetAction::Focus)
+            .cloned()
+            .collect()
     };
     window.pump_until("the widget actions", 30, || actions().len() >= 2);
     assert_eq!(
@@ -301,7 +393,11 @@ fn a_real_client_on_another_thread_reads_everything() {
             closed_window = true;
             check_after_script(&window);
             let selection = window.ui.view.borrow().selection();
-            assert_eq!(selection.start.0..selection.end.0, 6..9, "the client's Select");
+            assert_eq!(
+                selection.start.0..selection.end.0,
+                6..9,
+                "the client's Select"
+            );
             window.close();
             say_closed.send(()).expect("say closed");
         }
@@ -329,7 +425,9 @@ fn child_process_entry() {
         println!("\nREADY-TO-CLOSE");
         std::io::stdout().flush().expect("flush");
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).expect("hear it closed");
+        std::io::stdin()
+            .read_line(&mut line)
+            .expect("hear it closed");
     });
     if let Err(problem) = answer {
         println!("\nCLIENT-FAILED: {problem}");
@@ -442,7 +540,9 @@ fn a_real_client_hears_one_event_for_a_batch_of_typing() {
             })?;
             say_ready.send(()).map_err(|e| e.to_string())?;
             stop.recv().map_err(|e| e.to_string())?;
-            call("remove the handlers", unsafe { client.RemoveAllEventHandlers() })
+            call("remove the handlers", unsafe {
+                client.RemoveAllEventHandlers()
+            })
         };
         say_done.send(run()).expect("report");
     });
@@ -460,7 +560,9 @@ fn a_real_client_hears_one_event_for_a_batch_of_typing() {
 
     // One batch to set the baseline.
     window.with_slot(|ui| ui.after_input().expect("after_input"));
-    window.pump_until("the first events", 30, || text_events.load(Ordering::SeqCst) >= 1);
+    window.pump_until("the first events", 30, || {
+        text_events.load(Ordering::SeqCst) >= 1
+    });
     let settle = |window: &TestWindow| {
         let until = Instant::now() + Duration::from_millis(400);
         window.pump_until("a quiet moment", 30, || Instant::now() >= until);
@@ -478,14 +580,20 @@ fn a_real_client_hears_one_event_for_a_batch_of_typing() {
         }
         view.select(qe_api::ByteOffset(1)..qe_api::ByteOffset(2), &mut ctx);
     }
-    let flags = window.with_slot(|ui| ui.after_input().expect("after_input")).expect("provider");
+    let flags = window
+        .with_slot(|ui| ui.after_input().expect("after_input"))
+        .expect("provider");
     assert!(flags.text_changed && flags.selection_changed);
     window.pump_until("the text event", 30, || {
         text_events.load(Ordering::SeqCst) > texts_before
             && selection_events.load(Ordering::SeqCst) > selections_before
     });
     settle(&window);
-    assert_eq!(text_events.load(Ordering::SeqCst), texts_before * 2, "the same deliveries as one batch");
+    assert_eq!(
+        text_events.load(Ordering::SeqCst),
+        texts_before * 2,
+        "the same deliveries as one batch"
+    );
     assert_eq!(
         selection_events.load(Ordering::SeqCst),
         selections_before * 2,
@@ -517,8 +625,12 @@ fn find_named(
     let named = call("CreatePropertyCondition", unsafe {
         client.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(name))
     })?;
-    let both = call("CreateAndCondition", unsafe { client.CreateAndCondition(&of_type, &named) })?;
-    call("FindFirst", unsafe { from.FindFirst(TreeScope_Descendants, &both) })
+    let both = call("CreateAndCondition", unsafe {
+        client.CreateAndCondition(&of_type, &named)
+    })?;
+    call("FindFirst", unsafe {
+        from.FindFirst(TreeScope_Descendants, &both)
+    })
 }
 
 const EVENTS_VARIABLE: &str = "QE_A11Y_EVENTS_HWND";
@@ -537,7 +649,10 @@ fn events_child_entry() {
         })?;
         let document = find_by_type(&client, &element, UIA_DocumentControlTypeId)?;
         let texts = Arc::new(AtomicUsize::new(0));
-        let text: IUIAutomationEventHandler = Counter { hits: texts.clone() }.into();
+        let text: IUIAutomationEventHandler = Counter {
+            hits: texts.clone(),
+        }
+        .into();
         call("add a handler", unsafe {
             client.AddAutomationEventHandler(
                 UIA_Text_TextChangedEventId,
@@ -550,7 +665,11 @@ fn events_child_entry() {
         println!("\nHANDLERS-READY");
         std::io::stdout().flush().map_err(|e| e.to_string())?;
         let mut line = String::new();
-        while std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())? > 0 {
+        while std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?
+            > 0
+        {
             println!("\nCOUNT {}", texts.load(Ordering::SeqCst));
             std::io::stdout().flush().map_err(|e| e.to_string())?;
             if line.contains("stop") {
@@ -558,7 +677,9 @@ fn events_child_entry() {
             }
             line.clear();
         }
-        call("remove the handlers", unsafe { client.RemoveAllEventHandlers() })
+        call("remove the handlers", unsafe {
+            client.RemoveAllEventHandlers()
+        })
     };
     if let Err(problem) = run() {
         println!("\nCLIENT-FAILED: {problem}");
@@ -613,9 +734,14 @@ fn a_client_in_another_process_hears_one_event_for_each_raise() {
         writeln!(stdin, "{word}").expect("ask");
         stdin.flush().expect("flush");
         let line = wait_for("COUNT");
-        line.trim().trim_start_matches("COUNT ").parse().expect("a count")
+        line.trim()
+            .trim_start_matches("COUNT ")
+            .parse()
+            .expect("a count")
     };
-    window.with_slot(|ui| ui.after_input().expect("after_input")).expect("provider");
+    window
+        .with_slot(|ui| ui.after_input().expect("after_input"))
+        .expect("provider");
     let first = ask(&window, "report");
     assert_eq!(first, 1, "the first batch raises one text event");
     {
@@ -625,9 +751,17 @@ fn a_client_in_another_process_hears_one_event_for_each_raise() {
             view.replace_range(qe_api::ByteOffset(i)..qe_api::ByteOffset(i), "x", &mut ctx);
         }
     }
-    window.with_slot(|ui| ui.after_input().expect("after_input")).expect("provider");
-    window.with_slot(|ui| ui.after_input().expect("after_input")).expect("provider");
-    assert_eq!(ask(&window, "stop"), 2, "500 edits in a batch raise one text event");
+    window
+        .with_slot(|ui| ui.after_input().expect("after_input"))
+        .expect("provider");
+    window
+        .with_slot(|ui| ui.after_input().expect("after_input"))
+        .expect("provider");
+    assert_eq!(
+        ask(&window, "stop"),
+        2,
+        "500 edits in a batch raise one text event"
+    );
     child.wait().expect("wait for the client");
     window.close();
 }
@@ -664,15 +798,27 @@ fn a_real_client_keeps_two_windows_apart_and_one_closing_leaves_the_other() {
             };
             let one = range_of(a)?;
             let two = range_of(b)?;
-            ensure!(read(&one)? == "first window", "the first window said {:?}", read(&one)?);
-            ensure!(read(&two)? == "second window", "the second window said {:?}", read(&two)?);
+            ensure!(
+                read(&one)? == "first window",
+                "the first window said {:?}",
+                read(&one)?
+            );
+            ensure!(
+                read(&two)? == "second window",
+                "the second window said {:?}",
+                read(&two)?
+            );
             ask_close.send(()).map_err(|e| e.to_string())?;
             closed.recv().map_err(|e| e.to_string())?;
             match unsafe { one.GetText(-1) } {
                 Err(e) if e.code().0 == UIA_E_ELEMENTNOTAVAILABLE as i32 => {}
                 other => return Err(format!("the closed window said {other:?}")),
             }
-            ensure!(read(&two)? == "second window", "the open window said {:?}", read(&two)?);
+            ensure!(
+                read(&two)? == "second window",
+                "the open window said {:?}",
+                read(&two)?
+            );
             Ok(())
         };
         say_done.send(run()).expect("report");
@@ -692,11 +838,4 @@ fn a_real_client_keeps_two_windows_apart_and_one_closing_leaves_the_other() {
     });
     result.expect("an answer").expect("the client");
     second.close();
-}
-
-/// The app has one UI thread. Several test threads with UIA windows at once in one process
-/// make UIA fail with E_FAIL or an empty tree, so these tests take turns.
-fn one_ui_thread() -> std::sync::MutexGuard<'static, ()> {
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

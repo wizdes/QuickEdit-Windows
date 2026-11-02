@@ -1,7 +1,7 @@
 //! A hidden window with a real `EditorView` and a host written the way the README tells
-//! the shell to write it. Each test runs on its own thread, so each has its own window.
+//! the shell to write it. Each test runs on its own thread, so each has its own windows.
 #![allow(dead_code)]
-use qe_a11y::{Accessibility, UiThreadOnly, UiaHost, WidgetAction, on_window_message};
+use qe_a11y::{Accessibility, UiThreadOnly, UiaHost, UiaSlot, WidgetAction};
 use qe_api::{
     Dip, Rect, View, ViewContext, Widget, WidgetId, WidgetRole, WidgetStates,
     testing::FixedTextMeasurer,
@@ -14,7 +14,9 @@ use std::{
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread::ThreadId,
     time::{Duration, Instant},
 };
 use windows::{
@@ -22,7 +24,7 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         UI::{Accessibility::*, WindowsAndMessaging::*},
     },
-    core::{IUnknown, Interface, PCWSTR, w},
+    core::{BSTR, IUnknown, Interface, PCWSTR, w},
 };
 
 #[derive(Default)]
@@ -31,7 +33,11 @@ pub struct Counts {
     pub widget_calls: AtomicUsize,
     pub made: AtomicUsize,
     pub actions: Mutex<Vec<(WidgetId, WidgetAction)>>,
+    /// The thread each `Ui` ended on. A leak leaves this empty.
+    pub ended_on: Mutex<Vec<ThreadId>>,
 }
+
+pub type OnAction = Box<dyn Fn(WidgetId, &WidgetAction)>;
 
 pub struct Ui {
     pub view: RefCell<EditorView>,
@@ -39,6 +45,21 @@ pub struct Ui {
     pub document: RefCell<Option<Widget>>,
     pub view_id: Cell<Option<u64>>,
     pub font: RefCell<Option<(String, f64)>>,
+    pub dpi: Cell<Option<u32>>,
+    pub checkable: RefCell<Vec<WidgetId>>,
+    /// What an action does, as the shell's action handler would.
+    pub on_action: RefCell<Option<Rc<OnAction>>>,
+    pub counts: Arc<Counts>,
+}
+
+impl Drop for Ui {
+    fn drop(&mut self) {
+        self.counts
+            .ended_on
+            .lock()
+            .expect("ended_on lock")
+            .push(std::thread::current().id());
+    }
 }
 
 pub struct TestHost {
@@ -56,7 +77,13 @@ impl UiaHost for TestHost {
             .actions
             .lock()
             .expect("actions lock")
-            .push((id, action));
+            .push((id, action.clone()));
+        if let Some(ui) = self.ui.get() {
+            let handler = ui.on_action.borrow().clone();
+            if let Some(handler) = handler {
+                handler(id, &action);
+            }
+        }
         Ok(())
     }
     fn document_widget(&self) -> Option<Widget> {
@@ -79,6 +106,14 @@ impl UiaHost for TestHost {
     }
     fn font(&self) -> Option<(String, f64)> {
         self.ui.get()?.font.borrow().clone()
+    }
+    fn dpi(&self) -> Option<u32> {
+        self.ui.get()?.dpi.get()
+    }
+    fn is_checkable(&self, id: WidgetId) -> bool {
+        self.ui
+            .get()
+            .is_some_and(|ui| ui.checkable.borrow().contains(&id))
     }
 }
 
@@ -129,28 +164,29 @@ pub fn root_with(children: Vec<Widget>) -> Widget {
 }
 
 type HostEntry = (Arc<dyn UiaHost>, Arc<Counts>);
-type SlotEntry = Rc<RefCell<Option<Accessibility>>>;
 
 thread_local! {
-    static SLOTS: RefCell<HashMap<isize, SlotEntry>> = RefCell::new(HashMap::new());
+    static SLOTS: RefCell<HashMap<isize, Rc<UiaSlot>>> = RefCell::new(HashMap::new());
     static HOSTS: RefCell<HashMap<isize, HostEntry>> = RefCell::new(HashMap::new());
 }
 
+/// The README's window procedure: the slot's call first, then the shell's own messages.
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let key = hwnd.0 as isize;
     let slot = SLOTS.with(|slots| slots.borrow_mut().entry(key).or_default().clone());
-    if let Ok(mut slot) = slot.try_borrow_mut() {
-        let answer = on_window_message(&mut slot, hwnd, msg, w, l, || {
-            HOSTS.with(|hosts| {
-                let hosts = hosts.borrow();
-                let (host, counts) = hosts.get(&key).expect("a host for this window");
-                counts.made.fetch_add(1, Ordering::SeqCst);
-                host.clone()
-            })
-        });
-        if let Some(answer) = answer {
-            return answer;
-        }
+    let answer = slot.on_window_message(hwnd, msg, w, l, || {
+        HOSTS.with(|hosts| {
+            let hosts = hosts.borrow();
+            let (host, counts) = hosts.get(&key).expect("a host for this window");
+            counts.made.fetch_add(1, Ordering::SeqCst);
+            host.clone()
+        })
+    });
+    if let Some(answer) = answer {
+        return answer;
+    }
+    if msg == WM_DESTROY {
+        slot.shutdown().expect("shutdown in WM_DESTROY");
     }
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
@@ -177,7 +213,11 @@ impl TestWindow {
                 lpszClassName: w!("QeA11yTestWindow"),
                 ..Default::default()
             };
-            assert_ne!(unsafe { RegisterClassW(&class) }, 0, "RegisterClassW failed");
+            assert_ne!(
+                unsafe { RegisterClassW(&class) },
+                0,
+                "RegisterClassW failed"
+            );
         });
         // No WS_VISIBLE and no ShowWindow, so this never appears on screen.
         let hwnd = unsafe {
@@ -198,20 +238,26 @@ impl TestWindow {
             )
         }
         .expect("CreateWindowExW failed");
+        let counts = Arc::new(Counts::default());
         let ui = Rc::new(Ui {
             view: RefCell::new(view),
             tree: RefCell::new(tree),
             document: RefCell::new(Some(document_widget())),
             view_id: Cell::new(Some(7)),
             font: RefCell::new(Some(("Cascadia Mono".into(), 10.0))),
+            dpi: Cell::new(None),
+            checkable: RefCell::new(Vec::new()),
+            on_action: RefCell::new(None),
+            counts: counts.clone(),
         });
-        let counts = Arc::new(Counts::default());
         let host: Arc<dyn UiaHost> = Arc::new(TestHost {
             ui: UiThreadOnly::new(ui.clone()),
             counts: counts.clone(),
         });
         HOSTS.with(|hosts| {
-            hosts.borrow_mut().insert(hwnd.0 as isize, (host.clone(), counts.clone()));
+            hosts
+                .borrow_mut()
+                .insert(hwnd.0 as isize, (host.clone(), counts.clone()));
         });
         Self {
             hwnd,
@@ -220,12 +266,16 @@ impl TestWindow {
             host,
         }
     }
-    /// Makes the provider as WM_GETOBJECT would, for tests that call COM directly.
+    /// Makes a provider apart from the window's slot, for tests that call COM directly.
     pub fn accessibility(&self) -> Accessibility {
         Accessibility::new(self.hwnd, self.host.clone())
     }
     pub fn lay_out(&self, width: f32, height: f32) {
-        let measure = FixedTextMeasurer { char_width: Dip(8.0), height: Dip(16.0), baseline: Dip(12.0) };
+        let measure = FixedTextMeasurer {
+            char_width: Dip(8.0),
+            height: Dip(16.0),
+            baseline: Dip(12.0),
+        };
         let bounds = Rect {
             x: Dip(0.0),
             y: Dip(40.0),
@@ -233,6 +283,10 @@ impl TestWindow {
             height: Dip(height),
         };
         self.ui.view.borrow_mut().layout(bounds, &measure);
+        self.settle();
+    }
+    /// Waits for the layout workers, without any new layout call.
+    pub fn settle(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let mut ctx = ViewContext::default();
@@ -246,20 +300,24 @@ impl TestWindow {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
-    pub fn with_slot<T>(&self, body: impl FnOnce(&Accessibility) -> T) -> Option<T> {
-        let slot = SLOTS.with(|slots| slots.borrow().get(&(self.hwnd.0 as isize)).cloned())?;
-        let slot = slot.borrow();
-        slot.as_ref().map(body)
+    pub fn slot(&self) -> Rc<UiaSlot> {
+        SLOTS.with(|slots| {
+            slots
+                .borrow_mut()
+                .entry(self.hwnd.0 as isize)
+                .or_default()
+                .clone()
+        })
     }
-    /// Shuts down UIA for this window and destroys it, as the shell's WM_DESTROY will.
+    pub fn with_slot<T>(&self, body: impl FnOnce(&Accessibility) -> T) -> Option<T> {
+        self.slot().current().map(|ui| body(&ui))
+    }
+    /// Destroys the window, so WM_DESTROY shuts down UIA for it, as in the shell.
     pub fn close(&self) {
         let key = self.hwnd.0 as isize;
-        let slot = SLOTS.with(|slots| slots.borrow_mut().remove(&key));
-        if let Some(accessibility) = slot.and_then(|slot| slot.borrow_mut().take()) {
-            accessibility.shutdown().expect("shutdown");
-        }
         HOSTS.with(|hosts| hosts.borrow_mut().remove(&key));
         unsafe { DestroyWindow(self.hwnd) }.expect("DestroyWindow failed");
+        SLOTS.with(|slots| slots.borrow_mut().remove(&key));
     }
     /// Runs the window's messages until `done` says stop.
     pub fn pump_until(&self, what: &str, seconds: u64, mut done: impl FnMut() -> bool) {
@@ -273,7 +331,52 @@ impl TestWindow {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    /// What the host's actions have been told so far, after posted actions have run.
+    pub fn actions_after_pump(&self) -> Vec<(WidgetId, WidgetAction)> {
+        pump();
+        self.counts.actions.lock().expect("actions").clone()
+    }
+    /// FindText as UIA calls it: from another thread, with this window's messages running.
+    /// `Ok(None)` is the real null.
+    pub fn find_off_thread(
+        &self,
+        range: &ITextRangeProvider,
+        query: &str,
+        backward: bool,
+        ignore_case: bool,
+    ) -> windows::core::Result<Option<ITextRangeProvider>> {
+        let range = SendIt(range.clone());
+        let query = query.to_owned();
+        let (say, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let range = range;
+            let answer = unsafe {
+                range
+                    .0
+                    .FindText(&BSTR::from(query.as_str()), backward, ignore_case)
+            };
+            say.send(SendIt(answer)).expect("report");
+        });
+        let mut got = None;
+        self.pump_until("FindText on another thread", 120, || {
+            if let Ok(answer) = heard.try_recv() {
+                got = Some(answer);
+            }
+            got.is_some()
+        });
+        match got.expect("an answer").0 {
+            Ok(found) => Ok(Some(found)),
+            Err(error) if error.code().0 == 0 => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
+
+/// Moves a value to another thread in a test.
+pub struct SendIt<T>(pub T);
+// SAFETY: tests move this crate's COM objects, whose counts are atomic and whose calls move to
+// the window's thread, and their answers.
+unsafe impl<T> Send for SendIt<T> {}
 
 pub fn pump() {
     let mut message = MSG::default();
@@ -339,7 +442,11 @@ pub fn ends(range: &ITextRangeProvider, doc: &ITextRangeProvider) -> (usize, usi
 }
 
 /// A range at these positions, moved there with the calls a client has.
-pub fn range_at(simple: &IRawElementProviderSimple, start: usize, end: usize) -> ITextRangeProvider {
+pub fn range_at(
+    simple: &IRawElementProviderSimple,
+    start: usize,
+    end: usize,
+) -> ITextRangeProvider {
     let doc = document_range(simple);
     let range = unsafe { doc.Clone() }.expect("Clone");
     unsafe {
@@ -375,10 +482,9 @@ pub fn range_at(simple: &IRawElementProviderSimple, start: usize, end: usize) ->
     .expect("collapse");
     let mut at = 0;
     while at < start {
-        let moved = unsafe {
-            walk.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 1)
-        }
-        .expect("move end");
+        let moved =
+            unsafe { walk.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 1) }
+                .expect("move end");
         assert_eq!(moved, 1, "ran out of text walking to {start}");
         at = ends(&walk, &doc).1;
     }
@@ -392,4 +498,12 @@ pub fn range_at(simple: &IRawElementProviderSimple, start: usize, end: usize) ->
     }
     .expect("set start");
     range
+}
+
+/// Several test threads with UIA clients at once in one process make UIA fail with E_FAIL or an
+/// empty tree. The app has one UI thread, so these tests take turns.
+pub fn one_ui_thread() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

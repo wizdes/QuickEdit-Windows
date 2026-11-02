@@ -46,7 +46,7 @@ An edit records its place, the length of its text in the document, and a tree sl
 
 The store reads with ReadFile and keeps at most 16 pages of 64 KiB. It does not use a live memory mapping, because Windows then stops other apps from truncating the file.
 
-Three threads share the store. Each file reader has its own handle, because reads on one handle wait for each other.
+Three threads share the store. Each file reader has its own handle, because reads on one handle wait for each other. Short plain chunk reads share a fourth handle on the caller's own thread, because they may wait for the disk anyway and a trip to another thread cost more than the read.
 
 | Thread | What it does |
 | --- | --- |
@@ -68,7 +68,7 @@ Three threads share the store. Each file reader has its own handle, because read
 
 **The UI thread must use only `try_*` and `status`. The plain queries wait for the disk and the worker, so they must not run on the UI thread.** After `NotYetKnown`, the UI waits for `Notify` and asks again. `len_utf16` and `line_count` cannot report anything, so use `status`, `try_len_utf16` or `try_line_count` when the difference matters.
 
-`try_visit_chunks` gives the whole range in one callback from memory, or no callback at all. A range over 448 KiB gives `TooLong`, so read it off the UI thread with `visit_chunks` or `visit_chunks_while`. Plain chunk reads always come fresh from the file.
+`try_visit_chunks` gives the whole range in one callback from memory, or no callback at all. A range over 448 KiB gives `TooLong`, so read it off the UI thread with `visit_chunks` or `visit_chunks_while`. Plain chunk reads always come fresh from the file: each byte that leaves matched its page's hash and then matched the file, on that read.
 
 ### A very long line
 
@@ -113,23 +113,38 @@ Two checks work together.
 
 - A `try_*` query asks for a check when 25 ms have passed since the last one, and does not wait. A query that comes before the answer can still give an answer from pages in memory.
 - A plain query waits for a check when one is due.
-- `visit_chunks` waits for a check at its start and at its end, every call.
+- `visit_chunks` of 64 KiB or more waits for a check on the reader at its start and at its end.
+- A shorter `visit_chunks` checks on its own thread, right before the text leaves. It always checks the file behind the store's handle, and it checks the path too when 1 ms has passed since the last check. See "Plain chunk reads" for what that leaves out.
 - The worker checks after each 4 MiB read.
 - `check_file` waits for a check at once. It returns any stored failure. `request_file_check` does not wait.
 - With no queries running, nothing runs, so an idle store does no work.
 
 **The page hash** catches changed bytes that the file check misses. Every page gets a 64-bit hash (`hash.rs`, not cryptographic) the first time anything reads it. Each later read of that page, by the worker or the reader, must match. A mismatch is a failure at once, so changed bytes never reach the index, the cache or a caller. The hash costs 8 bytes per page, 131 KiB for 1 GiB, plus the time to hash each page that is read.
 
+### Plain chunk reads
+
+PDF export makes about 3 reads per line, so this route has to be cheap per call. Each short read does this, with no trip to another thread:
+
+1. It takes the bytes from the page cache, loading the page once when it is not there. A loaded page always meets its hash.
+2. It reads the same bytes from the file and compares them. A mismatch is a failure, so no text leaves that differs from the file.
+3. It asks the OS about the file behind the handle. A shrink, a write, a delete or a replace shows there.
+4. It gives out the text.
+
+The path check opens the file by its name, which costs several times what the other steps cost together. A short read runs it when 1 ms has passed since the last check. `examples/visit_bench.rs` measures all this.
+
+A read of 64 KiB or more works as it always has: each page comes from the file and meets its hash on the reader thread, with a whole file check on the reader at the start and at the end.
+
 ### What this cannot detect
 
-A same-size rewrite that restores the modified and creation times is detected, because the change time moves. A rewrite that forges every time is caught by the hash as soon as a changed page is read. These limits remain:
-
-1. **A page already in memory.** `try_*` queries answer from pages in memory. If such a page changes on disk, the answers stay right for the old file until the file check notices, and for good if the writer forged every time. The test `a_forged_rewrite_of_a_page_in_memory_is_the_stated_limit` shows this. These answers are old, never mixed, because a page in memory matches the index. Plain chunk reads re-read the file, so they do not have this limit.
+1. **A page already in memory.** `try_*` queries answer from pages in memory. If such a page changes on disk, the answers stay right for the old file until the file check notices, and for good if the writer forged every time. The test `a_forged_rewrite_of_a_page_in_memory_is_the_stated_limit` shows this. These answers are old, never mixed, because a page in memory matches the index. Plain chunk reads compare their own bytes with the file, so they do not have this limit for the text they give. A forged change elsewhere in that page waits until something reads those bytes, or until the page leaves memory and meets its hash again.
 2. **A change the file check has not reached yet, to a page in memory.** Up to 25 ms after the last check, plus the check's own time.
 3. **Time steps.** File times move in steps of the system clock. A same-size rewrite in the same step as the last write can leave the times alone. Then the hash catches it only on a page that is not in memory, and the page that `open` keeps can give old answers. Plain chunk reads re-read the file, so they still catch it.
 4. **A writer that keeps its handle open,** on a file system that delays the time updates until the handle closes. The hash still catches its changes on read.
 5. **File systems with no change time,** such as FAT and some network shares. There, the check relies on the other fields and the hash.
 6. **A hash collision.** A change gives the same 64-bit hash with a chance of about 1 in 2^64.
+7. **A rename away or a replace, for under 1 ms, on a short read.** If the handle shows no change, a short read in that time gives text from the file as it was opened. That text is exact and matches the index, so it is old, not mixed. On NTFS a replace or a delete drops the old file's link count, so the handle does show those at once. A rename away, and a replace on a file system that keeps the link count, wait for the next path check.
+
+A same-size rewrite that restores the modified and creation times is detected, because the change time moves. A rewrite that forges every time is caught by the hash as soon as a changed page is read. These limits remain:
 
 Invalid UTF-8 from such a rewrite never reaches a caller as text, since every chunk is validated before it goes out.
 

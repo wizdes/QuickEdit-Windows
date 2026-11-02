@@ -3,7 +3,8 @@
 //! Three threads touch this store. The caller's thread only reads memory on the
 //! `try_` route. A worker thread indexes the file. A reader thread loads pages and
 //! checks the file on request. Each has its own file handle, because reads on one
-//! handle wait for each other.
+//! handle wait for each other. Short plain chunk reads, which may wait for the disk,
+//! share a fourth handle on the caller's own thread.
 use crate::hash::page_hash;
 use crate::{Sum, measure};
 use qe_api::{
@@ -23,8 +24,8 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_STANDARD_INFO, FileBasicInfo,
+    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 
 const PAGE: usize = 64 * 1024;
@@ -35,6 +36,11 @@ const CACHED_LINE_TABLES: usize = 4;
 const TRY_VISIT_PAGES: usize = CACHED_PAGES / 2;
 /// The file is checked at most this often while queries are running.
 const CHECK_INTERVAL: Duration = Duration::from_millis(25);
+/// How long a short plain chunk read may go without asking what the path now names.
+/// That question costs about 25 us, so at this interval it adds under 3% to a run of
+/// reads. The question about the file behind the store's own handle is asked on every
+/// read, and a long read uses the reader thread's whole check every time.
+const PLAIN_PATH_CHECK_US: u64 = 1000;
 /// How long another app's lock may last before the store gives up.
 const DEFAULT_LOCK_GIVE_UP: Duration = Duration::from_secs(30);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
@@ -98,6 +104,12 @@ fn is_lock_error(e: &io::Error) -> bool {
     )
 }
 
+/// `since` can be later than `now`, when another thread saw the same lock between
+/// this thread reading its clock and recording the time.
+fn lock_is_too_old(now: u64, since: u64, limit: u64) -> bool {
+    now.saturating_sub(since) > limit
+}
+
 /// What the file looked like at open. `change` is NTFS's ChangeTime, which also
 /// moves when an app restores the modified time with SetFileTime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +117,8 @@ struct FileStamp {
     volume: u32,
     id: u64,
     len: u64,
+    /// Goes to 0 when the file is deleted or replaced while a handle holds it open.
+    links: u32,
     created: i64,
     written: i64,
     change: i64,
@@ -134,10 +148,45 @@ fn file_stamp(file: &File) -> io::Result<FileStamp> {
         volume: whole.dwVolumeSerialNumber,
         id: u64::from(whole.nFileIndexHigh) << 32 | u64::from(whole.nFileIndexLow),
         len: u64::from(whole.nFileSizeHigh) << 32 | u64::from(whole.nFileSizeLow),
+        links: whole.nNumberOfLinks,
         created: basic.CreationTime,
         written: basic.LastWriteTime,
         change: basic.ChangeTime,
     })
+}
+
+/// Whether the file behind a handle still matches `original`. Its id and volume cannot
+/// change for an open handle, so this skips them and costs two short OS calls, where
+/// `file_stamp` makes several more. An error counts as no match.
+fn handle_still_matches(file: &File, original: &FileStamp) -> bool {
+    let handle = HANDLE(file.as_raw_handle());
+    let mut basic = FILE_BASIC_INFO::default();
+    let mut standard = FILE_STANDARD_INFO::default();
+    // SAFETY: `handle` stays open for this call because `file` is borrowed, and both
+    // out pointers refer to live values of the size each call expects.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+        .and_then(|()| {
+            GetFileInformationByHandleEx(
+                handle,
+                FileStandardInfo,
+                (&raw mut standard).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        })
+    };
+    read.is_ok()
+        && !standard.DeletePending
+        && standard.EndOfFile as u64 == original.len
+        && standard.NumberOfLinks == original.links
+        && basic.CreationTime == original.created
+        && basic.LastWriteTime == original.written
+        && basic.ChangeTime == original.change
 }
 
 fn stamp_at_path(path: &Path) -> io::Result<FileStamp> {
@@ -200,6 +249,8 @@ struct ReaderQueue {
 struct Inner {
     path: PathBuf,
     original: FileStamp,
+    /// For short plain chunk reads, on the caller's thread.
+    plain_file: File,
     size: usize,
     index: RwLock<Index>,
     indexed: AtomicUsize,
@@ -290,9 +341,77 @@ impl Inner {
                 Ok(_) => now,
                 Err(since) => since,
             };
-        if now - since > self.lock_give_up_us.load(Ordering::Relaxed) {
+        if lock_is_too_old(now, since, self.lock_give_up_us.load(Ordering::Relaxed)) {
             self.fail(format!("mapped file stayed locked: {e}"), 0);
         }
+    }
+    /// The file check for a short plain chunk read, on the caller's own thread, which
+    /// is free to wait. It looks at the file behind the handle each time, which finds a
+    /// file that shrank, was written to, was deleted or was replaced. What the path now
+    /// names takes much longer to ask, so it asks only when `PLAIN_PATH_CHECK_US` has
+    /// passed.
+    fn check_short_read(&self) -> Result<()> {
+        let due = self
+            .now_us()
+            .saturating_sub(self.last_check_us.load(Ordering::Relaxed))
+            >= PLAIN_PATH_CHECK_US;
+        if due || !handle_still_matches(&self.plain_file, &self.original) {
+            // This names the reason, and it knows a lock from a change.
+            self.run_file_check(&self.plain_file)?;
+        }
+        match self.current_failure() {
+            Some(failure) if failure.valid_up_to.0 == 0 => Err(LookupError::Failed(failure)),
+            _ => Ok(()),
+        }
+    }
+    /// Compares bytes from the cache with the file as it is now. Those bytes met their
+    /// page's hash, so a match means that this text is both fresh and the text the index
+    /// was built from. A short read costs much less than reading and hashing a whole
+    /// page. A change elsewhere in the page is not this text, and it is found when
+    /// something reads it.
+    fn matches_file(&self, start: usize, bytes: &[u8]) -> Result<()> {
+        self.note_disk_thread();
+        let delay = self.test_read_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        let mut now = vec![0; bytes.len()];
+        while let Err(e) = read_full(
+            |b, o| self.plain_file.seek_read(b, o),
+            &mut now,
+            start as u64,
+        ) {
+            if !is_lock_error(&e) {
+                return Err(LookupError::Failed(
+                    self.fail(format!("mapped file read failed: {e}"), 0),
+                ));
+            }
+            self.note_lock(&e);
+            if let Some(failure) = self.current_failure()
+                && failure.valid_up_to.0 == 0
+            {
+                return Err(LookupError::Failed(failure));
+            }
+            std::thread::sleep(LOCK_RETRY);
+        }
+        self.lock_passed();
+        if now != bytes {
+            return Err(LookupError::Failed(self.fail(
+                format!("the file changed outside QuickEdit: bytes at {start} differ"),
+                0,
+            )));
+        }
+        Ok(())
+    }
+    /// Takes pages out of the cache, so the next read of them comes from the file and
+    /// meets its hash. Only the long plain chunk read does this.
+    fn forget_pages(&self, start: usize, end: usize) {
+        let first = start / PAGE;
+        let last = end.saturating_sub(1).max(start) / PAGE;
+        self.pages
+            .lock()
+            .unwrap()
+            .retain(|(at, _)| at / PAGE < first || at / PAGE > last);
     }
     fn lock_passed(&self) {
         self.locked_since_us.store(0, Ordering::Release);
@@ -464,8 +583,13 @@ impl Inner {
     /// Copies a range from the cache, and never touches the disk. On a miss it asks
     /// the reader for every missing page.
     fn cached_range(&self, start: usize, end: usize) -> Query<Vec<u8>> {
+        // Empty needs no page. At the end of a file with a whole number of pages, the
+        // page this names does not exist.
+        if start >= end {
+            return Ok(Vec::new());
+        }
         let first = start / PAGE;
-        let last = end.saturating_sub(1).max(start) / PAGE;
+        let last = (end - 1) / PAGE;
         let mut found: Vec<Arc<[u8]>> = Vec::with_capacity(last - first + 1);
         let mut missing: Vec<usize> = Vec::new();
         {
@@ -508,16 +632,6 @@ impl Inner {
             at += take;
         }
         Ok(out)
-    }
-    /// Takes pages out of the cache, so the next read of them comes from the file and
-    /// meets its hash. Only the plain chunk read does this.
-    fn forget_pages(&self, start: usize, end: usize) {
-        let first = start / PAGE;
-        let last = end.saturating_sub(1).max(start) / PAGE;
-        self.pages
-            .lock()
-            .unwrap()
-            .retain(|(at, _)| at / PAGE < first || at / PAGE > last);
     }
     fn mismatch(&self) -> LookupError {
         LookupError::Failed(self.fail("the index does not match the file", 0))
@@ -806,8 +920,9 @@ impl MappedStore {
         };
         let reader_file = open_read()?;
         let worker_file = open_read()?;
+        let plain_file = open_read()?;
         let original = file_stamp(&reader_file)?;
-        if file_stamp(&worker_file)? != original {
+        if file_stamp(&worker_file)? != original || file_stamp(&plain_file)? != original {
             return Err(io::Error::other("the file changed during open"));
         }
         let size =
@@ -822,6 +937,7 @@ impl MappedStore {
         let inner = Arc::new(Inner {
             path,
             original,
+            plain_file,
             size,
             index: RwLock::new(Index {
                 blocks: Vec::with_capacity(block_room),
@@ -1219,6 +1335,48 @@ impl MappedStore {
     ) -> Result<()> {
         let (start, end) = (range.start.0, range.end.0);
         self.check_visit(start, end)?;
+        if end - start < PAGE {
+            self.visit_short(start, end, f)
+        } else {
+            self.visit_long(start, end, f)
+        }
+    }
+    /// PDF export comes here a few times per line, so this cost decides how long a large
+    /// file takes. It makes no trip to another thread, loads a page only when the cache
+    /// does not have it, and reads the file once.
+    fn visit_short(&self, start: usize, end: usize, f: &mut dyn FnMut(&str) -> bool) -> Result<()> {
+        // One byte past the end, to see that the end does not cut a character.
+        let bytes = self.fetch(start, (end + 1).min(self.inner.size))?;
+        self.inner.matches_file(start, &bytes)?;
+        let inside = |b: Option<&u8>| b.is_some_and(|b| b & 0xC0 == 0x80);
+        if (start != 0 && inside(bytes.first())) || inside(bytes.get(end - start)) {
+            return Err(LookupError::OutOfRange);
+        }
+        // After the read, so that it also covers a change during the read. The text then
+        // leaves at once, which is why a short read needs no second check.
+        self.inner.check_short_read()?;
+        let bytes = &bytes[..end - start];
+        let valid = match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    f(text);
+                }
+                return Ok(());
+            }
+            Err(e) => e.valid_up_to(),
+        };
+        let text = std::str::from_utf8(&bytes[..valid]).map_err(|_| self.inner.mismatch())?;
+        if !text.is_empty() && !f(text) {
+            return Ok(());
+        }
+        let at = start + valid;
+        Err(LookupError::Failed(
+            self.inner.fail(format!("invalid UTF-8 at byte {at}"), at),
+        ))
+    }
+    /// A read of a page or more. Every page comes from the file and meets its hash, on
+    /// the reader thread, with a whole file check at the start and at the end.
+    fn visit_long(&self, start: usize, end: usize, f: &mut dyn FnMut(&str) -> bool) -> Result<()> {
         self.inner.check_and_wait()?;
         let is_edge = |at: usize| -> Result<bool> {
             if at == 0 || at == self.inner.size {
@@ -1556,6 +1714,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_lock_another_thread_saw_just_now_is_not_an_old_lock() {
+        // Thread A reads its clock at 10. Thread B records the lock at 12. A must not
+        // subtract 12 from 10, which panics here and in a release build wraps to a huge
+        // age and calls the file locked for good.
+        assert!(!lock_is_too_old(10, 12, 50));
+        assert!(!lock_is_too_old(60, 10, 50));
+        assert!(lock_is_too_old(61, 10, 50));
     }
 
     #[test]

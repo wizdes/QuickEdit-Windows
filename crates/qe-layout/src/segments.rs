@@ -1,7 +1,7 @@
 //! Long lines are cut into segments on grapheme boundaries. Every read here is
 //! bounded, whatever the length of the line.
 use crate::{DirectWriteLayout, HeightMap, LayoutError, shaped};
-use qe_api::{Affinity, ByteOffset, Dip, LineIndex, LineLayout, TextSnapshot};
+use qe_api::{Affinity, ByteOffset, Dip, LineIndex, LineLayout, LookupError, TextSnapshot};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -92,21 +92,27 @@ pub(crate) fn stop_table(s: &str) -> Vec<bool> {
 
 /// When a window starts in a run of regional indicators, how many bytes of a flag
 /// lie before it. It finds the start of the run, reading a bounded amount and
-/// allocating nothing.
-fn flag_phase(text: &dyn TextSnapshot, line_start: usize, at: usize, window: &str) -> usize {
+/// allocating nothing. A look-back the store cannot read is an error, because a guess
+/// here would cut flags in two.
+fn flag_phase(
+    text: &dyn TextSnapshot,
+    line_start: usize,
+    at: usize,
+    window: &str,
+) -> Result<usize, LayoutError> {
     if at <= line_start || !window.chars().next().is_some_and(is_regional) {
-        return 0;
+        return Ok(0);
     }
     let limit = at.saturating_sub(FLAG_RUN_LOOK_BACK).max(line_start);
     let mut pos = at;
     let mut run_start = None;
     while pos > limit && run_start.is_none() {
-        let from = char_edge_forward(text, pos.saturating_sub(4096).max(limit), pos);
+        let from = char_edge_forward(text, pos.saturating_sub(4096).max(limit), pos)?;
         if from == pos {
             break;
         }
         let mut trailing = 0;
-        text.visit_chunks(ByteOffset(from)..ByteOffset(pos), &mut |part| {
+        let read_all = text.visit_chunks(ByteOffset(from)..ByteOffset(pos), &mut |part| {
             let tail: usize = part
                 .chars()
                 .rev()
@@ -119,13 +125,16 @@ fn flag_phase(text: &dyn TextSnapshot, line_start: usize, at: usize, window: &st
                 tail
             };
         });
+        if !read_all {
+            return Err(LayoutError::BadRange(ByteOffset(from)..ByteOffset(pos)));
+        }
         if trailing < pos - from {
             run_start = Some(pos - trailing);
         }
         pos = from;
     }
     let start = run_start.unwrap_or(line_start);
-    (at - start) % FLAG_BYTES
+    Ok((at - start) % FLAG_BYTES)
 }
 
 pub(crate) fn read(
@@ -140,19 +149,58 @@ pub(crate) fn read(
     }
 }
 
-fn char_edge_forward(text: &dyn TextSnapshot, at: usize, limit: usize) -> usize {
+/// Whether a character starts at `at`.
+///
+/// `byte_to_utf16` gives `None` for a byte inside a character, and also when the
+/// store has no answer: the page is not in memory, the bytes lie past a snapshot's
+/// pinned part, or the file failed. Only the `try_` form tells these apart, and only
+/// the first is a reason to look at the next byte. Taking the others for it moves a
+/// segment edge by however far a search got before a page arrived, or to the line's
+/// end if none did.
+fn is_char_edge(text: &dyn TextSnapshot, at: usize) -> Result<bool, LayoutError> {
+    if text.byte_to_utf16(ByteOffset(at)).is_some() {
+        return Ok(true);
+    }
+    match text.try_byte_to_utf16(ByteOffset(at)) {
+        Ok(_) => Ok(true),
+        Err(LookupError::OutOfRange) => Ok(false),
+        Err(_) => Err(LayoutError::BadRange(ByteOffset(at)..ByteOffset(at))),
+    }
+}
+
+/// UTF-8 has at most 3 bytes after a character's first byte, so a search for an edge
+/// looks at most at this many places. A store that denies them all is reporting
+/// trouble, and the error keeps this read bounded whatever the length of the line.
+const CHAR_EDGE_LOOKUPS: usize = 4;
+
+fn char_edge_forward(
+    text: &dyn TextSnapshot,
+    at: usize,
+    limit: usize,
+) -> Result<usize, LayoutError> {
     let mut at = at.min(limit);
-    while at < limit && text.byte_to_utf16(ByteOffset(at)).is_none() {
+    for _ in 0..CHAR_EDGE_LOOKUPS {
+        if at >= limit || is_char_edge(text, at)? {
+            return Ok(at);
+        }
         at += 1;
     }
-    at
+    Err(LayoutError::BadRange(ByteOffset(at)..ByteOffset(at)))
 }
-fn char_edge_backward(text: &dyn TextSnapshot, at: usize, limit: usize) -> usize {
+
+fn char_edge_backward(
+    text: &dyn TextSnapshot,
+    at: usize,
+    limit: usize,
+) -> Result<usize, LayoutError> {
     let mut at = at.max(limit);
-    while at > limit && text.byte_to_utf16(ByteOffset(at)).is_none() {
+    for _ in 0..CHAR_EDGE_LOOKUPS {
+        if at <= limit || is_char_edge(text, at)? {
+            return Ok(at);
+        }
         at -= 1;
     }
-    at
+    Err(LayoutError::BadRange(ByteOffset(at)..ByteOffset(at)))
 }
 
 /// The line's bytes without its line ending. Reads only the last few bytes.
@@ -166,7 +214,7 @@ pub(crate) fn content_range(
         text,
         range.end.0.saturating_sub(3).max(range.start.0),
         range.end.0,
-    );
+    )?;
     let part = read(text, ByteOffset(tail)..range.end)?;
     let kept = part.trim_end_matches(LINE_ENDINGS).len();
     Ok(range.start..ByteOffset(tail + kept))
@@ -187,10 +235,12 @@ fn snap(
     if nominal >= end {
         return Ok(end);
     }
-    let from = char_edge_forward(text, nominal.saturating_sub(SNAP_BEHIND).max(start), end);
-    let to = char_edge_backward(text, nominal.saturating_add(SNAP_AHEAD).min(end), from);
+    let from = char_edge_forward(text, nominal.saturating_sub(SNAP_BEHIND).max(start), end)?;
+    let to = char_edge_backward(text, nominal.saturating_add(SNAP_AHEAD).min(end), from)?;
     let window = read(text, ByteOffset(from)..ByteOffset(to))?;
-    let stops = grapheme_stops(&window, flag_phase(text, start, from, &window));
+    let stops = grapheme_stops(&window, flag_phase(text, start, from, &window)?);
+    // `from` cannot pass `nominal`. It is `start`, or it lies at most 3 bytes past a
+    // place 256 before `nominal`. An edge search that finds nothing returns an error.
     let target = nominal - from;
     let candidates = || {
         stops
@@ -206,7 +256,7 @@ fn snap(
     }
     // One cluster is longer than the window. Cut at a character edge, in a place
     // that depends on nothing else, and accept the wrong look at that one spot.
-    Ok(char_edge_forward(text, nominal, end))
+    char_edge_forward(text, nominal, end)
 }
 
 /// How a line is laid out: its content, and how many segments it has. One means whole.
@@ -381,7 +431,7 @@ impl DirectWriteLayout {
             text,
             at.0.saturating_sub(LOOK_BACK_FOR_TAB).max(start.0),
             at.0,
-        );
+        )?;
         let before = read(text, ByteOffset(from)..at)?;
         let column = match before.rfind('\t') {
             Some(last) => {
@@ -497,14 +547,14 @@ impl DirectWriteLayout {
             text,
             byte.0.saturating_sub(context).max(content.start.0),
             byte.0,
-        );
+        )?;
         let right = char_edge_backward(
             text,
             byte.0.saturating_add(context).min(content.end.0),
             byte.0,
-        );
+        )?;
         let window = read(text, ByteOffset(left)..ByteOffset(right))?;
-        let phase = flag_phase(text, content.start.0, left, &window);
+        let phase = flag_phase(text, content.start.0, left, &window)?;
         let edges: Vec<usize> = self
             .stops_in_window(&window, phase)?
             .into_iter()
@@ -556,14 +606,14 @@ impl DirectWriteLayout {
             text,
             at.0.saturating_sub(EDGE_CONTEXT).max(content.start.0),
             at.0,
-        );
+        )?;
         let to = char_edge_backward(
             text,
             at.0.saturating_add(EDGE_CONTEXT).min(content.end.0),
             at.0,
-        );
+        )?;
         let window = read(text, ByteOffset(from)..ByteOffset(to))?;
-        let phase = flag_phase(text, content.start.0, from, &window);
+        let phase = flag_phase(text, content.start.0, from, &window)?;
         if self
             .stops_in_window(&window, phase)?
             .binary_search(&(at.0 - from))

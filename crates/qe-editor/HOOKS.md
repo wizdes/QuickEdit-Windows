@@ -5,7 +5,8 @@
 **Rules for all of them**
 
 - All calls on `EditorView` run on the UI thread, because the view lives there. Only `worker_snapshot`'s result and `prepare_edits` go to other threads.
-- No call here waits for disk or shapes text on the UI thread. So some answers are "not yet".
+- No call here waits for disk on the UI thread, so some answers are "not yet". Geometry and the input method's layouts never shape on the UI thread.
+- Two kinds of call can shape one short piece of text on the UI thread, as every arrow key and Delete does: `word_range_at`, and an edit, which finds its caret stop. The piece is at most 2 KiB around the byte and only when non-ASCII text is next to it. Plain ASCII shapes nothing. `release_budget_a_word_query_on_shaped_text_has_a_bounded_cost` in `tests/hooks.rs` measures and limits it.
 - "Not yet" is one of two things. `GeometryError::NotLaidOut` means that the layout has not arrived. `LookupError::NotYetKnown` means that the index of a mapped file has not reached this text, or that its page is not in memory. Ask again after a later `poll_layout`. The host already calls `poll_layout` from its timer and from the wake that `set_wake` sets.
 - Offsets are bytes in UTF-8, unless a name says UTF-16. All rectangles and points are in window coordinates, in device-independent pixels.
 
@@ -16,15 +17,25 @@ A worker reads a snapshot that never changes. A search or a spell check stays cu
 | Call | Thread | Not yet |
 | --- | --- | --- |
 | `worker_snapshot()` | Get it on the UI thread, use it on any thread | Its plain queries wait for disk on a mapped file, so use only its `try_` queries on the UI thread |
-| `revision()`, `document_number()` | UI | Always answers |
+| `revision()` | UI | Always answers. See "Revisions name their document" |
+| `document_number()` | UI | Always answers. Differs for each view, and goes up with each `adopt` |
 | `changes_since(revision)` | UI | `Current`, `Changes(list)` or `Rescan` |
 | `byte_to_utf16`, `utf16_to_byte` | UI | `LookupError` |
 | `store_status()` | UI | Says how much of a mapped file is known |
 
 - Each change has its offsets in bytes and in UTF-16, in the text just before that change.
 - The log holds the last 4,096 changes. Past that, or after a new document, the answer is `Rescan`.
-- An edit group and an undo of a group each count as one change, from the group's first byte to its last.
+- With `begin_edit_group`, each edit is its own change. An undo or a redo of a group is one change, from the group's first byte to its last. `apply_edits` is one change.
 - A mapped file's revision stays the same while its index grows, so read `store_status`.
+
+**Revisions name their document.** The value from `revision()`, from `worker_snapshot().revision()`, and in each `TrackedChange` holds the document's number as well as a count of edits. So:
+
+- Treat it as a whole value. Within one document it goes up with each edit. Do not take numbers from it.
+- `changes_since` says `Rescan` for a value from another document or view.
+- `apply_edits` refuses edits that were prepared from another document or view, or from a snapshot that did not come from `worker_snapshot`.
+- `mark_save_point_at` ignores a value from another document or view.
+
+No caller has to compare document numbers for these. A check of `revision()` alone is enough to know that the text is the same.
 
 ```rust
 use qe_api::ByteOffset;
@@ -49,7 +60,7 @@ match view.changes_since(seen) {
 
 ## Word and line queries (M12)
 
-`word_range_at(byte)`, `line_range(line)` and `line_of_byte(byte)` run on the UI thread. Each returns `LookupError::NotYetKnown` for text that the index or memory does not hold. Complete uses the first, and Select Line uses the other two. `line_range` includes the line ending.
+`word_range_at(byte)`, `line_range(line)` and `line_of_byte(byte)` run on the UI thread. Each returns `LookupError::NotYetKnown` for text that the index or memory does not hold. `word_range_at` uses the same rule as a double click, so it can shape its one short piece of text, as the rules at the top say. In a release build on an idle PC, the slowest of 800 queries took under 0.4 ms. On a busy PC, one run saw 30 ms for its slowest query. The budget test limits p99 to 2 ms. Complete uses the first, and Select Line uses the other two. `line_range` includes the line ending.
 
 ```rust
 use qe_api::{ByteOffset, LineIndex};
@@ -76,6 +87,7 @@ These answer from layouts on hand, on the UI thread, in window coordinates. They
 - `VisibleRow` has `line`, `first_byte`, `y`, `height` and `continuation`, which is true for a wrapped row. The gutter numbers rows where `continuation` is false.
 - With wrap off, a long line gives one row, for the part at the view's left edge.
 - A range far off screen has no layout. It says `NotLaidOut`, and that may stay true. Use it for text on screen.
+- While a composition shows, all of these answer for what is painted. The text after a composition has its moved place. Bytes stay document bytes, so `byte_at_point` over the composition gives its place in the text, and selected text that gives way to a composition has an empty range at that place.
 
 ```rust
 use qe_api::{ByteOffset, Dip, Rect, TextMeasurer, View};
@@ -103,7 +115,7 @@ match view.range_rects(ByteOffset(0)..ByteOffset(5)) {
 2. A mark wholly after the edit moves with its text.
 3. A mark with any of its bytes replaced is dropped. So is a mark with an insertion strictly inside it.
 4. An insertion at either end of a mark leaves the mark on its old text.
-5. An edit group, an undo of a group, and `apply_edits` count as one edit from the first byte to the last, so they drop every mark in that span.
+5. An undo or a redo of a group, and `apply_edits`, count as one edit from the first byte to the last, so they drop every mark in that span. With `begin_edit_group`, each edit moves marks by itself, so a mark between two edits stays until an undo of the group.
 
 **Cost.** Setting marks takes time in proportion to the list, and it sorts them. After that, a key costs only the distance between edits in the list, and a frame only the marks on screen. Marks do not paint on a line that a composition stands on. A ghost line, shown while its new layout is on the way, paints with no marks.
 
@@ -134,11 +146,16 @@ Send the `InputKind` events through `handle`, or call the methods. Both keep the
 
 - **`composition()`** gives the text, the cursor, the place, and `showing`, which is false until the first layout arrives. **`composition_rects()`** gives the rectangles for a candidate list, and `caret_rect()` gives its cursor.
 - **Esc** ends the composition and asks the host with `ViewRequest::CancelComposition`. Any other edit or caret move does the same. The shell passes this request on as `ShellEvent::CancelComposition`, and the host then tells TSF.
+- **A change of width, wrap, font or margins** lays the composition out again. Until the worker answers, the plain line shows.
+- **If a layout fails**, a warning says so, and the last good layout stays.
+- **`flush_input` does not end a composition.** Its text is not in the store. A Save decides whether to ask TSF to commit or cancel it first.
+- **A late `ImeEnd`** has no composition number. After `CancelComposition`, the host must not pass on text from a composition it cancelled, because the view would put it at the caret.
 - **A read-only view** counts the attempt in `refused_edits` and shows nothing.
 - **Line breaks** in the text show as spaces while composing. A commit keeps them.
 - **A cursor** inside a surrogate pair steps back to its start. Past the end, it stops at the end.
 - **On a wrapped line**, the lines below move down while the composition is tall, and move back at its end.
-- **On a long line**, the composition shows inside its 2 KiB segment, so the text after it moves only inside that segment. An extra row can overlap the next segment until the commit.
+- **On a line the text makes long**, all of the line still shows, whatever its size was before.
+- **On a line already long**, the composition shows inside its 2 KiB segment, so the text after it moves only inside that segment. An extra row can overlap the next segment until the commit.
 
 ```rust
 use qe_api::{ByteOffset, ViewContext};
@@ -157,7 +174,7 @@ assert_eq!(view.text().unwrap(), "\u{4e2d}abc");
 
 | Call | What it does |
 | --- | --- |
-| `set_margins(left, right, ctx)` | Keeps space for a gutter and a map. `layout` and `Resize` still take the whole area. The text, hit tests and drags use the space between |
+| `set_margins(left, right, ctx)` | Keeps space for a gutter and a map. `layout` and `Resize` still take the whole area. The text, hit tests and drags use the space between, and the text clips to it |
 | `text_area()` | The rectangle the text paints in |
 | `set_scroll_position(y, ctx)` | Exact, within 0 to `max_scroll_position()`. It ends any wait for a place, as the wheel does |
 | `scroll_offset()`, `horizontal_offset()`, `total_height()` | Read the view. `total_height` counts lines with no layout at their estimate, so it changes as layouts arrive |
@@ -183,9 +200,9 @@ assert!(view.total_height() > 0.0);
 
 ## Edits from tools (M12)
 
-Replace All has two steps. A worker runs `prepare_edits(snapshot, edits, cancel)`, which merges sorted edits into one edit. The UI thread runs `apply_edits(prepared, selection, ctx)`, which makes one edit and one undo step and sets the selection that the caller chose. If the text changed in between, `apply_edits` returns an error and changes nothing, so prepare again. A read-only view refuses it. Its cost follows the size of the merged text. `crates/qe-editor/tests/hooks.rs` has the measurement, as `measure_replace_all_on_100_000_matches_in_100_mb`.
+Replace All has two steps. A worker runs `prepare_edits(snapshot, edits, cancel)`, which merges sorted edits into one edit, and refuses a range that does not start and end on character edges. The UI thread runs `apply_edits(prepared, selection, ctx)`, which makes one edit and one undo step and sets the selection that the caller chose. If the text changed in between, or the edits came from another document, `apply_edits` returns an error and changes nothing, so prepare again. A read-only view refuses it. If the edit itself fails, it returns that error and leaves the selection alone. Its cost follows the size of the merged text. `crates/qe-editor/tests/hooks.rs` has the measurement, as `measure_replace_all_on_100_000_matches_in_100_mb`.
 
-For a few edits, run both on the UI thread.
+**Which thread.** `prepare_edits` reads and copies every byte from the first edit to the last, however few the edits are, and a mapped snapshot can wait for disk. So choose by the byte span and not by the count of edits. On an editable view, a span under about 64 KiB can run on the UI thread. Anything larger goes to a worker.
 
 ```rust
 use qe_api::{ByteOffset, ViewContext};
@@ -225,9 +242,9 @@ assert_eq!(view.selection(), range);
 
 1. Call `flush_input(ctx)` so that typing still in the queue goes into the text. Keys that wait for a layout are dropped with their warning. Keys that wait for an index run on what is known.
 2. Take `worker_snapshot()`, remember `revision()`, and write the snapshot on a worker.
-3. When the write ends, call `mark_save_point_at(revision)`. It returns false if the user typed during the write, and the view then stays unsaved. `mark_save_point()` marks the text as it stands.
+3. When the write ends well, call `mark_save_point_at(revision)`. It returns true when the view still holds that text, and it is then saved. It returns false in two cases. If the user changed the text during the write, the disk now holds text the view no longer has, so the view reads as unsaved, even after an Undo back to the old save point or to the written text, until the next save. If the revision is from another document, nothing changes. `mark_save_point()` marks the text as it stands.
 
-`is_at_save_point()` reads the result. `cut_is_running()` says that a Cut's text is still on its way to the clipboard, and `adopt` refuses until it ends, so Cut then Open cannot lose the text.
+`is_at_save_point()` reads the result. `flush_input` keeps the warning of a dropped key, even when typing behind that key goes in at the unmoved caret, and a Save should show it. `cut_is_running()` says that a Cut's text is still on its way to the clipboard, and `adopt` refuses until it ends, so Cut then Open cannot lose the text.
 
 ```rust
 use qe_api::{InputEvent, InputKind, View, ViewContext};

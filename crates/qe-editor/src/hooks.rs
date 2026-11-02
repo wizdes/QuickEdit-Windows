@@ -6,9 +6,9 @@
 //! - A big edit is prepared on the caller's thread, and applied as one edit.
 use crate::{EditorView, Queued};
 use qe_api::{
-    Affinity, ByteOffset, Dip, DisplayList, DrawCommand, HitTest, LayoutRow, LineIndex, LineLayout,
-    LookupError, Point, Rect, TextSnapshot, TextStore, Theme, TrackedChange, Utf16Change,
-    Utf16Offset, ViewContext,
+    Affinity, ByteOffset, Dip, DisplayList, DrawCommand, HitTest, KnownLine, LayoutRow, LineIndex,
+    LineLayout, LookupError, Point, Rect, StoreStatus, TextPosition, TextSnapshot, TextStore,
+    Theme, TrackedChange, Utf16Change, Utf16Offset, ViewContext,
 };
 use qe_buffer::PieceStore;
 use std::{
@@ -16,10 +16,19 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
+
+/// The low bits of a revision value count edits. The high bits name the document, and
+/// each view and each `adopt` gets a new name. So a revision value from one document never
+/// equals, or passes for, a value from another.
+const REVISION_BITS: u32 = 40;
+static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
+fn new_document() -> u64 {
+    NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// How many changes `changes_since` remembers.
 const CHANGE_LOG: usize = 4096;
@@ -112,7 +121,7 @@ impl DecorationKind {
 #[derive(Debug, Default)]
 pub(crate) struct RangeList {
     before: Vec<Range<usize>>,
-    after: Vec<Range<usize>>,
+    after: Vec<(isize, isize)>,
     delta: isize,
 }
 impl RangeList {
@@ -133,9 +142,8 @@ impl RangeList {
     fn is_empty(&self) -> bool {
         self.before.is_empty() && self.after.is_empty()
     }
-    fn shifted(&self, range: &Range<usize>) -> Range<usize> {
-        let at = |x: usize| x.saturating_add_signed(self.delta);
-        at(range.start)..at(range.end)
+    fn shifted(&self, range: &(isize, isize)) -> Range<usize> {
+        (range.0 + self.delta) as usize..(range.1 + self.delta) as usize
     }
     /// The rule: a range before the edit stays, a range after it moves with its text, and
     /// a range the edit touches inside is dropped. An insertion at either end of a range
@@ -143,9 +151,10 @@ impl RangeList {
     fn edit(&mut self, start: usize, old_end: usize, new_len: usize) {
         while self.before.last().is_some_and(|r| r.end > start) {
             if let Some(range) = self.before.pop() {
-                let delta = self.delta;
-                let back = |x: usize| x.saturating_add_signed(-delta);
-                self.after.push(back(range.start)..back(range.end));
+                self.after.push((
+                    range.start as isize - self.delta,
+                    range.end as isize - self.delta,
+                ));
             }
         }
         while let Some(range) = self.after.last().map(|r| self.shifted(r)) {
@@ -190,6 +199,67 @@ impl RangeList {
     }
 }
 
+/// How a composition's layout, whose bytes are its own, maps to the document.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ComposedBytes {
+    /// The document byte of the layout's byte 0.
+    window_start: usize,
+    /// The composition's place in the document.
+    at: usize,
+    /// The document byte where the text after the composition goes on.
+    resume: usize,
+    /// In the layout's own bytes.
+    pub(crate) text: Range<ByteOffset>,
+    /// In the layout's own bytes.
+    pub(crate) cursor: ByteOffset,
+}
+impl ComposedBytes {
+    /// Like `doc_of`, for the end of a part: the end of the text before the
+    /// composition is its place, not the text after it.
+    fn doc_end_of(&self, byte: ByteOffset) -> ByteOffset {
+        if byte <= self.text.start {
+            ByteOffset(self.window_start + byte.0)
+        } else {
+            self.doc_of(byte)
+        }
+    }
+    fn doc_of(&self, byte: ByteOffset) -> ByteOffset {
+        if byte < self.text.start {
+            ByteOffset(self.window_start + byte.0)
+        } else if byte < self.text.end {
+            ByteOffset(self.at)
+        } else {
+            ByteOffset(self.resume + byte.0 - self.text.end.0)
+        }
+    }
+    /// The parts of a document range that show in this layout, in its bytes: one on each
+    /// side of the composition. Text hidden by it shows as an empty range at its place.
+    fn in_layout(&self, range: &Range<ByteOffset>) -> Vec<Range<ByteOffset>> {
+        let to_layout = |doc: usize| -> usize {
+            if doc <= self.at {
+                doc.saturating_sub(self.window_start)
+            } else if doc < self.resume {
+                self.text.start.0
+            } else {
+                doc - self.resume + self.text.end.0
+            }
+        };
+        let (start, end) = (range.start.0, range.end.0);
+        let mut parts = Vec::new();
+        if start < self.at {
+            parts.push(ByteOffset(to_layout(start))..ByteOffset(to_layout(end.min(self.at))));
+        }
+        if end > self.resume {
+            let from = start.max(self.resume);
+            parts.push(ByteOffset(to_layout(from))..ByteOffset(to_layout(end)));
+        }
+        if parts.is_empty() {
+            parts.push(ByteOffset(to_layout(start))..ByteOffset(to_layout(start)));
+        }
+        parts
+    }
+}
+
 /// Text from an input method that shows at the caret and is not in the store.
 pub(crate) struct Composition {
     pub(crate) text: String,
@@ -199,19 +269,16 @@ pub(crate) struct Composition {
     pub(crate) line: usize,
     /// The segment of a long line, or `None` for a whole line.
     pub(crate) segment: Option<usize>,
-    /// The bytes of the line or segment that the layout below holds.
+    /// The latest finished layout, of the line or the segment with the text in it.
     pub(crate) layout: Option<Arc<LineLayout>>,
-    /// In the layout's own bytes.
-    pub(crate) text_range: Range<ByteOffset>,
-    /// In the layout's own bytes.
-    pub(crate) cursor: ByteOffset,
+    /// The bytes of `layout`.
+    pub(crate) shown: ComposedBytes,
+    /// The bytes of the layout that `task` will bring.
+    wanted: ComposedBytes,
     /// The task whose result is wanted.
     pub(crate) task: Option<u64>,
     /// The line's height before the composition, to put back at its end.
     pub(crate) old_height: Option<Dip>,
-    /// The latest values, until the task for them finishes.
-    pub(crate) wanted_range: Range<ByteOffset>,
-    pub(crate) wanted_cursor: ByteOffset,
 }
 
 /// What a host can read about a composition.
@@ -268,9 +335,11 @@ impl PreparedEdits {
     }
 }
 
-/// Merges edits into one edit of `snapshot`. It may wait for disk and takes time in
-/// proportion to the bytes from the first edit to the last, so run it on a worker. `edits`
-/// must be sorted, and must not overlap. It stops soon after `cancel` turns true.
+/// Merges edits into one edit of `snapshot`. It may wait for disk, and it takes time and
+/// memory in proportion to the bytes from the first edit to the last, however few the
+/// edits are. So run it on a worker unless that span is small and the snapshot is of an
+/// editable view. `edits` must be sorted, must not overlap, and must start and end on
+/// character edges. It stops soon after `cancel` turns true.
 pub fn prepare_edits(
     snapshot: &dyn TextSnapshot,
     edits: &[TextEdit],
@@ -283,6 +352,13 @@ pub fn prepare_edits(
         || edits.iter().any(|e| e.range.start > e.range.end)
     {
         return Err("The ranges to replace are out of order or overlap.".to_string());
+    }
+    for edit in edits {
+        if snapshot.byte_to_utf16(edit.range.start).is_none()
+            || snapshot.byte_to_utf16(edit.range.end).is_none()
+        {
+            return Err("A range to replace ends inside a character or past the text.".to_string());
+        }
     }
     let span = first.range.start..last.range.end;
     let removed: usize = edits.iter().map(|e| e.range.end.0 - e.range.start.0).sum();
@@ -301,7 +377,14 @@ pub fn prepare_edits(
         if cancel.load(Ordering::Acquire) {
             return Err("The replacement was cancelled.".to_string());
         }
-        if !snapshot.visit_chunks(next..edit.range.start, &mut |part| text.push_str(part)) {
+        let read = snapshot.visit_chunks_while(next..edit.range.start, &mut |part| {
+            let go_on = !cancel.load(Ordering::Acquire);
+            if go_on {
+                text.push_str(part);
+            }
+            go_on
+        });
+        if !read {
             return Err("The text between the replacements could not be read.".to_string());
         }
         text.push_str(&edit.text);
@@ -343,8 +426,95 @@ pub enum HostCommand {
     },
 }
 
+/// A store's snapshot with a revision value that names its document.
+struct NamedSnapshot {
+    text: Arc<dyn TextSnapshot>,
+    revision: u64,
+}
+impl TextSnapshot for NamedSnapshot {
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn len_bytes(&self) -> ByteOffset {
+        self.text.len_bytes()
+    }
+    fn len_utf16(&self) -> Utf16Offset {
+        self.text.len_utf16()
+    }
+    fn line_count(&self) -> usize {
+        self.text.line_count()
+    }
+    fn byte_to_utf16(&self, byte: ByteOffset) -> Option<Utf16Offset> {
+        self.text.byte_to_utf16(byte)
+    }
+    fn utf16_to_byte(&self, utf16: Utf16Offset) -> Option<ByteOffset> {
+        self.text.utf16_to_byte(utf16)
+    }
+    fn byte_to_position(&self, byte: ByteOffset) -> Option<TextPosition> {
+        self.text.byte_to_position(byte)
+    }
+    fn position_to_byte(&self, position: TextPosition) -> Option<ByteOffset> {
+        self.text.position_to_byte(position)
+    }
+    fn line_range(&self, line: LineIndex) -> Option<Range<ByteOffset>> {
+        self.text.line_range(line)
+    }
+    fn visit_chunks(&self, range: Range<ByteOffset>, visitor: &mut dyn FnMut(&str)) -> bool {
+        self.text.visit_chunks(range, visitor)
+    }
+    fn is_read_only(&self) -> bool {
+        self.text.is_read_only()
+    }
+    fn status(&self) -> StoreStatus {
+        self.text.status()
+    }
+    fn try_known_line(&self, line: LineIndex) -> Result<KnownLine, LookupError> {
+        self.text.try_known_line(line)
+    }
+    fn try_line_ending_len(&self, line: LineIndex) -> Result<usize, LookupError> {
+        self.text.try_line_ending_len(line)
+    }
+    fn visit_chunks_while(
+        &self,
+        range: Range<ByteOffset>,
+        visitor: &mut dyn FnMut(&str) -> bool,
+    ) -> bool {
+        self.text.visit_chunks_while(range, visitor)
+    }
+    fn try_len_bytes(&self) -> Result<ByteOffset, LookupError> {
+        self.text.try_len_bytes()
+    }
+    fn try_len_utf16(&self) -> Result<Utf16Offset, LookupError> {
+        self.text.try_len_utf16()
+    }
+    fn try_line_count(&self) -> Result<usize, LookupError> {
+        self.text.try_line_count()
+    }
+    fn try_byte_to_utf16(&self, byte: ByteOffset) -> Result<Utf16Offset, LookupError> {
+        self.text.try_byte_to_utf16(byte)
+    }
+    fn try_utf16_to_byte(&self, utf16: Utf16Offset) -> Result<ByteOffset, LookupError> {
+        self.text.try_utf16_to_byte(utf16)
+    }
+    fn try_byte_to_position(&self, byte: ByteOffset) -> Result<TextPosition, LookupError> {
+        self.text.try_byte_to_position(byte)
+    }
+    fn try_position_to_byte(&self, position: TextPosition) -> Result<ByteOffset, LookupError> {
+        self.text.try_position_to_byte(position)
+    }
+    fn try_line_range(&self, line: LineIndex) -> Result<Range<ByteOffset>, LookupError> {
+        self.text.try_line_range(line)
+    }
+    fn try_visit_chunks(
+        &self,
+        range: Range<ByteOffset>,
+        visitor: &mut dyn FnMut(&str),
+    ) -> Result<(), LookupError> {
+        self.text.try_visit_chunks(range, visitor)
+    }
+}
+
 /// The hooks' state inside the view.
-#[derive(Default)]
 pub(crate) struct HookState {
     /// Changes in order, and the revision before the first of them.
     log: VecDeque<TrackedChange>,
@@ -359,6 +529,32 @@ pub(crate) struct HookState {
     pub(crate) page: Option<PageWrap>,
     pub(crate) no_background: bool,
     pub(crate) next_task: u64,
+    pub(crate) test_refuse_edit: bool,
+    /// A write ended with other text than the view holds, so the history's save point
+    /// no longer names what is on disk.
+    pub(crate) save_point_gone: bool,
+    /// A layout, a width or a font changed, so the composition lays out again.
+    pub(crate) composition_stale: bool,
+}
+impl Default for HookState {
+    fn default() -> Self {
+        Self {
+            log: VecDeque::new(),
+            log_base: None,
+            document: new_document(),
+            decorations: Default::default(),
+            composition: None,
+            outer: Rect::default(),
+            left: 0.0,
+            right: 0.0,
+            page: None,
+            no_background: false,
+            next_task: 0,
+            test_refuse_edit: false,
+            save_point_gone: false,
+            composition_stale: false,
+        }
+    }
 }
 
 impl EditorView {
@@ -368,17 +564,31 @@ impl EditorView {
     /// may wait for disk, so it must not be used on the UI thread. Use its `try_` queries
     /// there, which never wait.
     pub fn worker_snapshot(&self) -> Arc<dyn TextSnapshot> {
-        match &self.mapped {
+        let text = match &self.mapped {
             Some(mapped) => mapped.snapshot(),
             None => self.store.snapshot(),
-        }
+        };
+        Arc::new(NamedSnapshot {
+            text,
+            revision: self.revision(),
+        })
     }
-    /// Changes with each edit. A mapped file stays the same while its index grows, so
+    /// Changes with each edit, and names this document. Values from other documents and
+    /// other views never match. A mapped file keeps one value while its index grows, so
     /// read `store_status` to learn how much of it is known.
     pub fn revision(&self) -> u64 {
-        self.source().revision()
+        let edits = if self.mapped.is_some() {
+            0
+        } else {
+            self.store.revision()
+        };
+        self.revision_in_this_document(edits)
     }
-    /// Goes up when another document replaces this one, and the text is then all new.
+    fn revision_in_this_document(&self, edits: u64) -> u64 {
+        (self.hooks.document << REVISION_BITS) | (edits & ((1 << REVISION_BITS) - 1))
+    }
+    /// Differs for each view and goes up when another document replaces this one. Its text
+    /// is then all new. `revision` already holds this number.
     pub fn document_number(&self) -> u64 {
         self.hooks.document
     }
@@ -390,6 +600,8 @@ impl EditorView {
         let Some(base) = self.hooks.log_base else {
             return ChangesSince::Rescan;
         };
+        // A value from another document is older than this one's or newer than it. Both
+        // fall outside this range, because the document's number is in the high bits.
         if revision < base || revision > self.revision() {
             return ChangesSince::Rescan;
         }
@@ -418,7 +630,7 @@ impl EditorView {
     /// Called by `after_change`, once the store holds the new text.
     pub(crate) fn note_change(&mut self, old: &dyn TextSnapshot, change: &qe_api::TextChange) {
         let revision = self.revision();
-        let before = old.revision();
+        let before = self.revision_in_this_document(old.revision());
         for list in &mut self.hooks.decorations {
             if !list.is_empty() {
                 list.edit(
@@ -461,7 +673,9 @@ impl EditorView {
     }
     /// Called by `adopt`: nothing known about the old text applies to the new.
     pub(crate) fn forget_document(&mut self) {
-        self.hooks.document += 1;
+        self.hooks.document = new_document();
+        self.hooks.save_point_gone = false;
+        self.hooks.composition_stale = false;
         self.hooks.log.clear();
         self.hooks.log_base = None;
         self.hooks.decorations = Default::default();
@@ -528,6 +742,39 @@ impl EditorView {
             (along, 0.0)
         })
     }
+    /// The composition's layout, if it stands in for this line or segment.
+    fn composed(&self, line: usize, segment: Option<usize>) -> Option<(&Composition, &LineLayout)> {
+        let composition = self.hooks.composition.as_ref()?;
+        let layout = composition.layout.as_ref()?;
+        (composition.line == line && composition.segment == segment)
+            .then_some((composition, &**layout))
+    }
+    fn composed_rects(
+        &self,
+        composition: &Composition,
+        layout: &LineLayout,
+        range: &Range<ByteOffset>,
+        out: &mut Vec<RangeRect>,
+    ) {
+        let (x, y) = self.composition_origin(composition);
+        for part in composition.shown.in_layout(range) {
+            for row in &layout.rows {
+                for (start, end, right_to_left, inside) in row_spans(row, &part) {
+                    out.push(RangeRect {
+                        rect: Rect {
+                            x: Dip(x + start),
+                            y: Dip(y + row.y.0),
+                            width: Dip((end - start).max(1.0)),
+                            height: row.height,
+                        },
+                        right_to_left,
+                        range: composition.shown.doc_of(inside.start)
+                            ..composition.shown.doc_end_of(inside.end),
+                    });
+                }
+            }
+        }
+    }
     /// The rectangles of a range: one for each row with one direction, and one for each
     /// run on a row with mixed directions. An empty range gives the caret's place.
     pub fn range_rects(&self, range: Range<ByteOffset>) -> Result<Vec<RangeRect>, GeometryError> {
@@ -552,12 +799,18 @@ impl EditorView {
                 let from = segment_of(range.start.max(line_range.start))?;
                 let to = segment_of(range.end.min(line_range.end))?;
                 for segment in from..=to {
+                    if let Some((composition, layout)) = self.composed(line, Some(segment)) {
+                        self.composed_rects(composition, layout, &range, &mut rects);
+                        continue;
+                    }
                     let layout = self
                         .cached_part(line, segment)
                         .ok_or(GeometryError::NotLaidOut)?;
                     let (dx, dy) = self.segment_offset(line, segment).unwrap_or((0.0, 0.0));
                     self.layout_rects(&layout, &range, dx, top + dy, &mut rects);
                 }
+            } else if let Some((composition, layout)) = self.composed(line, None) {
+                self.composed_rects(composition, layout, &range, &mut rects);
             } else {
                 let layout = self.cached_whole(line).ok_or(GeometryError::NotLaidOut)?;
                 self.layout_rects(&layout, &range, 0.0, top, &mut rects);
@@ -631,15 +884,21 @@ impl EditorView {
             let along = if self.wrap { local } else { x };
             let segment = map.scroll_to_line(along).0;
             let start = map.line_to_scroll(LineIndex(segment));
-            let layout = self
-                .cached_part(line.0, segment)
-                .ok_or(GeometryError::NotLaidOut)?;
             let inside = if self.wrap {
                 point(x, local - start)
             } else {
                 point(x - start, local)
             };
+            if let Some((composition, layout)) = self.composed(line.0, Some(segment)) {
+                return Ok(composed_hit(composition, layout, inside));
+            }
+            let layout = self
+                .cached_part(line.0, segment)
+                .ok_or(GeometryError::NotLaidOut)?;
             return Ok(layout.hit_test_point(inside));
+        }
+        if let Some((composition, layout)) = self.composed(line.0, None) {
+            return Ok(composed_hit(composition, layout, point(x, local)));
         }
         let layout = self.cached_whole(line.0).ok_or(GeometryError::NotLaidOut)?;
         Ok(layout.hit_test_point(point(x, local)))
@@ -681,12 +940,32 @@ impl EditorView {
                     if line_top + dy >= view_bottom {
                         break;
                     }
+                    if let Some((composition, layout)) = self.composed(line, Some(segment)) {
+                        self.push_composed_rows(
+                            composition,
+                            layout,
+                            line,
+                            line_top + dy,
+                            segment > 0,
+                            &mut answer.rows,
+                        );
+                        continue;
+                    }
                     let Some(layout) = self.cached_part(line, segment) else {
                         answer.complete = false;
                         continue;
                     };
                     self.push_rows(&layout, line, line_top + dy, segment > 0, &mut answer.rows);
                 }
+            } else if let Some((composition, layout)) = self.composed(line, None) {
+                self.push_composed_rows(
+                    composition,
+                    layout,
+                    line,
+                    line_top,
+                    false,
+                    &mut answer.rows,
+                );
             } else if let Some(layout) = self.cached_whole(line) {
                 self.push_rows(&layout, line, line_top, false, &mut answer.rows);
             } else {
@@ -696,6 +975,21 @@ impl EditorView {
             line_top += f64::from(height.0);
         }
         answer
+    }
+    fn push_composed_rows(
+        &self,
+        composition: &Composition,
+        layout: &LineLayout,
+        line: usize,
+        top: f64,
+        later_segment: bool,
+        rows: &mut Vec<VisibleRow>,
+    ) {
+        let first = rows.len();
+        self.push_rows(layout, line, top, later_segment, rows);
+        for row in &mut rows[first..] {
+            row.first_byte = composition.shown.doc_of(row.first_byte);
+        }
     }
     fn push_rows(
         &self,
@@ -740,6 +1034,17 @@ impl EditorView {
                 .find(|r| r.range.start == row.first_byte)
                 .map(|r| r.range.end)
         };
+        if let Some(composition) = &self.hooks.composition
+            && composition.line == row.line.0
+            && let Some(layout) = &composition.layout
+        {
+            let shown = &composition.shown;
+            return layout
+                .rows
+                .iter()
+                .find(|r| shown.doc_of(r.range.start) == row.first_byte)
+                .map(|r| shown.doc_of(r.range.end));
+        }
         if self.long_maps.contains_key(&row.line.0) {
             let snapshot = self.snapshot();
             let (_, segment, _) = self
@@ -913,7 +1218,7 @@ impl EditorView {
         let (x, y) = self.composition_origin(composition);
         let mut rects = Vec::new();
         for row in &layout.rows {
-            for (start, end, right_to_left, part) in row_spans(row, &composition.text_range) {
+            for (start, end, right_to_left, part) in row_spans(row, &composition.shown.text) {
                 rects.push(RangeRect {
                     rect: Rect {
                         x: Dip(x + start),
@@ -939,7 +1244,7 @@ impl EditorView {
     fn composition_place(&self) -> Option<Rect> {
         let composition = self.hooks.composition.as_ref()?;
         let layout = composition.layout.as_ref()?;
-        let rect = layout.caret_rect(composition.cursor, Affinity::After)?;
+        let rect = layout.caret_rect(composition.shown.cursor, Affinity::After)?;
         let (x, y) = self.composition_origin(composition);
         Some(Rect {
             x: Dip(x + rect.x.0),
@@ -968,12 +1273,10 @@ impl EditorView {
             line,
             segment: None,
             layout: None,
-            text_range: at..at,
-            cursor: at,
+            shown: ComposedBytes::default(),
+            wanted: ComposedBytes::default(),
             task: None,
             old_height: None,
-            wanted_range: at..at,
-            wanted_cursor: at,
         });
     }
     /// Shows `text` at the composition's place. A worker lays it out, and until then the
@@ -993,7 +1296,12 @@ impl EditorView {
         };
         let snapshot = self.snapshot();
         // A long line shows its composition inside one segment, so its cost has a limit.
-        let (segment, window) = if self.long_maps.contains_key(&line) {
+        // This asks the engine, because a line's map may not have arrived yet.
+        let long = self
+            .engine
+            .is_long_line(snapshot.as_ref(), LineIndex(line))
+            .unwrap_or(false);
+        let (segment, window) = if long {
             match self
                 .engine
                 .segment_at(snapshot.as_ref(), at, Affinity::After)
@@ -1057,6 +1365,7 @@ impl EditorView {
             store.snapshot(),
             self.engine.clone(),
             width,
+            self.wrap,
         ));
         if let Err(error) = sent {
             self.set_warning(format!("The layout workers stopped: {error}"), true);
@@ -1067,12 +1376,43 @@ impl EditorView {
             composition.cursor_utf16 = cursor_utf16;
             composition.segment = segment;
             composition.task = Some(task);
-            composition.wanted_range = text_start..text_end;
-            composition.wanted_cursor = cursor;
+            composition.wanted = ComposedBytes {
+                window_start: window.start.0,
+                at: at.0,
+                resume: resume.0,
+                text: text_start..text_end,
+                cursor,
+            };
         }
         self.pending = true;
         self.repaint_line(line, ctx);
         self.finish(Instant::now(), ctx);
+    }
+    /// A restart made the composition's layout useless. It lays out again, at the new
+    /// width and font. A task still on its way is for the old ones, so it is forgotten.
+    pub(crate) fn composition_after_restart(&mut self) {
+        if let Some(composition) = self.hooks.composition.as_mut() {
+            composition.layout = None;
+            composition.task = None;
+            composition.old_height = None;
+            self.hooks.composition_stale = true;
+        }
+    }
+    pub(crate) fn lay_out_stale_composition(&mut self, ctx: &mut ViewContext) {
+        if !std::mem::take(&mut self.hooks.composition_stale) {
+            return;
+        }
+        let Some((text, cursor)) = self
+            .hooks
+            .composition
+            .as_ref()
+            .map(|c| (c.text.clone(), c.cursor_utf16))
+        else {
+            return;
+        };
+        if !text.is_empty() {
+            self.ime_update(&text, cursor, ctx);
+        }
     }
     /// Called with each finished composition layout.
     pub(crate) fn note_composition(
@@ -1092,6 +1432,10 @@ impl EditorView {
         let layout = match layout {
             Ok(layout) => Arc::new(layout),
             Err(problem) => {
+                // Nothing more will come for this task. The last good layout stays.
+                if let Some(composition) = self.hooks.composition.as_mut() {
+                    composition.task = None;
+                }
                 self.set_warning(format!("The composition cannot show: {problem}"), false);
                 return;
             }
@@ -1102,8 +1446,7 @@ impl EditorView {
         if let Some(composition) = self.hooks.composition.as_mut() {
             composition.task = None;
             composition.layout = Some(layout);
-            composition.text_range = composition.wanted_range.clone();
-            composition.cursor = composition.wanted_cursor;
+            composition.shown = composition.wanted.clone();
             line = composition.line;
             whole_line = composition.segment.is_none();
         }
@@ -1134,12 +1477,14 @@ impl EditorView {
         } else if bottom > height && height > 0.0 {
             self.scroll += bottom - height;
         }
-        if !self.wrap {
+        if !self.wrap || self.hooks.page.is_some() {
             let x = f64::from(rect.x.0 - self.bounds.x.0);
             if x < 0.0 {
                 self.scroll_x = (self.scroll_x + x).max(0.0);
             } else if x > width - 2.0 && width > 0.0 {
-                self.widest = self.widest.max(self.scroll_x + x);
+                if !self.wrap {
+                    self.widest = self.widest.max(self.scroll_x + x);
+                }
                 self.scroll_x += x - width + 2.0;
             }
         }
@@ -1261,6 +1606,20 @@ impl EditorView {
 
     // ---- Edits from tools ----
 
+    /// Runs `apply_edits` with its edit refused by the history, as an out-of-step store
+    /// would refuse it, so that a test can see how the failure comes out.
+    #[doc(hidden)]
+    pub fn test_apply_failing(
+        &mut self,
+        edits: &PreparedEdits,
+        selection: Range<ByteOffset>,
+        ctx: &mut ViewContext,
+    ) -> Result<(), String> {
+        self.hooks.test_refuse_edit = true;
+        let result = self.apply_edits(edits, selection, ctx);
+        self.hooks.test_refuse_edit = false;
+        result
+    }
     /// Applies edits that `prepare_edits` made, as one edit and one undo step, and then
     /// sets the selection. It refuses edits made for another revision, because their
     /// offsets no longer mean the same text. Its cost follows `new_len`, and not how many
@@ -1290,8 +1649,18 @@ impl EditorView {
         }
         self.touch();
         self.history.break_group();
-        self.apply_edit(edits.range.clone(), &edits.text, false, ctx);
+        let before = self.revision();
+        if self.hooks.test_refuse_edit {
+            self.set_warning("The edit failed: refused by a test.".to_string(), false);
+        } else {
+            self.apply_edit(edits.range.clone(), &edits.text, false, ctx);
+        }
         self.history.break_group();
+        // A failed edit leaves the same revision, and its warning says why.
+        let nothing_to_do = edits.range.is_empty() && edits.text.is_empty();
+        if self.revision() == before && !nothing_to_do {
+            return Err(self.warning().unwrap_or("The edit failed.").to_string());
+        }
         let new_len = self.source().status().known_bytes;
         let start = selection.start.min(new_len);
         let end = selection.end.min(new_len).max(start);
@@ -1365,16 +1734,25 @@ impl EditorView {
     /// Marks the current text as saved.
     pub fn mark_save_point(&mut self) {
         self.history.save_point();
+        self.hooks.save_point_gone = false;
     }
-    /// Marks the text as saved if it is still `revision`, the revision of the snapshot
-    /// that was written. Edits made during the write leave the view unsaved, and this
-    /// returns false.
+    /// A write of the snapshot with this `revision` ended well. True means the view holds
+    /// that text, and it is now saved. False means one of two things:
+    /// - The revision is from another document or view, and nothing changes here.
+    /// - The user changed the text during the write. The disk now holds text this view
+    ///   cannot name, so the view reads as unsaved until the next mark, even after an Undo
+    ///   back to the old save point or to the written text.
     pub fn mark_save_point_at(&mut self, revision: u64) -> bool {
-        let same = revision == self.revision();
-        if same {
-            self.history.save_point();
+        if revision >> REVISION_BITS != self.hooks.document {
+            return false;
         }
-        same
+        if revision == self.revision() {
+            self.mark_save_point();
+            true
+        } else {
+            self.hooks.save_point_gone = true;
+            false
+        }
     }
 }
 
@@ -1418,6 +1796,14 @@ fn row_spans(
         spans.push((a.min(b), a.max(b), false, first..last));
     }
     spans
+}
+
+fn composed_hit(composition: &Composition, layout: &LineLayout, at: Point) -> HitTest {
+    let hit = layout.hit_test_point(at);
+    HitTest {
+        byte: composition.shown.doc_of(hit.byte),
+        affinity: hit.affinity,
+    }
 }
 
 fn push_straight_underline(

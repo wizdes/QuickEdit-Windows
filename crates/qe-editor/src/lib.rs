@@ -162,7 +162,13 @@ enum WorkerTask {
     /// A whole old document, with its history, to free away from the UI thread.
     DropDocument(Box<dyn std::any::Any + Send>),
     /// A line with composition text in it, which only the view's own hooks know of.
-    Composition(u64, Arc<dyn TextSnapshot>, Arc<DirectWriteLayout>, Dip),
+    Composition(
+        u64,
+        Arc<dyn TextSnapshot>,
+        Arc<DirectWriteLayout>,
+        Dip,
+        bool,
+    ),
 }
 struct ComposedResult {
     task: u64,
@@ -179,6 +185,7 @@ struct WorkerShared {
     skipped: AtomicU64,
     /// A test sets this to make one line's layout always fail.
     fail_line: AtomicUsize,
+    fail_composition: AtomicBool,
     test_paused: AtomicBool,
     /// Old snapshots sent to a worker that it has not dropped yet.
     drops_out: AtomicUsize,
@@ -854,6 +861,7 @@ impl EditorView {
             wanted_last: AtomicUsize::new(usize::MAX),
             skipped: AtomicU64::new(0),
             fail_line: AtomicUsize::new(usize::MAX),
+            fail_composition: AtomicBool::new(false),
             test_paused: AtomicBool::new(false),
             drops_out: AtomicUsize::new(0),
             wake: std::sync::Mutex::new(None),
@@ -987,7 +995,7 @@ impl EditorView {
     /// Takes the document that `FileLoad` finished. The view starts over on it. Work
     /// queued for the old text is dropped when it arrives.
     pub fn adopt(&mut self, loaded: LoadedFile) -> Result<(), String> {
-        if self.mapped.is_none() && !self.history.is_at_save_point(&self.store) {
+        if self.mapped.is_none() && !self.is_at_save_point() {
             return Err("This view has edits, so a file cannot replace them.".to_string());
         }
         if self.cut_is_running() {
@@ -1222,6 +1230,11 @@ impl EditorView {
     pub fn test_byte_at_top(&mut self) -> usize {
         self.byte_at_top().0
     }
+    /// Makes every composition layout fail, as a shaping failure would.
+    #[doc(hidden)]
+    pub fn test_fail_composition_layout(&mut self, fail: bool) {
+        self.shared.fail_composition.store(fail, Ordering::Release);
+    }
     #[doc(hidden)]
     pub fn test_total_height(&self) -> f64 {
         self.heights.total_height()
@@ -1250,7 +1263,9 @@ impl EditorView {
         self.drag_point = None;
     }
     pub fn is_at_save_point(&self) -> bool {
-        self.mapped.is_none() && self.history.is_at_save_point(&self.store)
+        self.mapped.is_none()
+            && !self.hooks.save_point_gone
+            && self.history.is_at_save_point(&self.store)
     }
     /// Edits until `end_edit_group` undo as one step. Replace All needs this.
     pub fn begin_edit_group(&mut self) {
@@ -1440,6 +1455,7 @@ impl EditorView {
         .map_err(|e| e.to_string())?;
         self.scroll = self.heights.line_to_scroll(top);
         self.clamp_scroll();
+        self.composition_after_restart();
         // The next timer lays the text out again.
         self.pending = true;
         Ok(())
@@ -1616,6 +1632,7 @@ impl EditorView {
     fn poll_inner(&mut self, now: Instant, ctx: &mut ViewContext) {
         self.drain_results(ctx);
         self.poll_copy(ctx);
+        self.lay_out_stale_composition(ctx);
         self.settle_widest(ctx);
         if self.caret_line.is_none() {
             self.refresh_caret_line();
@@ -3586,6 +3603,19 @@ impl EditorView {
     }
     /// Runs held input in order, as far as the first key that still waits.
     fn run_deferred(&mut self, now: Instant, ctx: &mut ViewContext) {
+        // Typing behind a dropped key would clear its warning before anyone could read it.
+        let mut dropped_warning = None;
+        self.run_deferred_inner(now, &mut dropped_warning, ctx);
+        if let Some(warning) = dropped_warning {
+            self.set_warning(warning, false);
+        }
+    }
+    fn run_deferred_inner(
+        &mut self,
+        now: Instant,
+        dropped_warning: &mut Option<String>,
+        ctx: &mut ViewContext,
+    ) {
         while let Some(input) = self.deferred.front().cloned() {
             let wait = self.wait_of(&input, ctx);
             let timed_out = now.saturating_duration_since(self.deferred_since) >= DEFER_LIMIT
@@ -3597,10 +3627,9 @@ impl EditorView {
             // The next key that waits starts its own wait from here.
             self.deferred_since = now;
             if wait == Some(WaitsFor::Layout) {
-                self.set_warning(
+                *dropped_warning = Some(
                     "Home or End was dropped, because this line's layout did not arrive."
                         .to_string(),
-                    false,
                 );
                 continue;
             }
@@ -4233,13 +4262,14 @@ impl EditorView {
             selection: ByteOffset(0)..ByteOffset(0),
             x,
             y,
-            caret: (self.focused && self.visible).then_some((composition.cursor, Affinity::After)),
+            caret: (self.focused && self.visible)
+                .then_some((composition.shown.cursor, Affinity::After)),
             view_right,
             content_end: None,
             wrap: self.wrap,
         };
         paint_line_layout(list, layout, &frame);
-        hooks::paint_composition_underline(list, layout, &composition.text_range, x, y, theme);
+        hooks::paint_composition_underline(list, layout, &composition.shown.text, x, y, theme);
         true
     }
     /// The line as it was before an edit, with no selection, until its layout arrives.
@@ -4380,10 +4410,12 @@ fn worker_loop(
                 }
                 shared.wake_host();
             }
-            WorkerTask::Composition(task, snapshot, engine, width) => {
-                let result = engine
-                    .try_layout_line(snapshot.as_ref(), LineIndex(0), width)
-                    .map_err(|e| e.to_string());
+            WorkerTask::Composition(task, snapshot, engine, width, wrap) => {
+                let result = if shared.fail_composition.load(Ordering::Acquire) {
+                    Err("a test made this fail".to_string())
+                } else {
+                    composed_layout(&engine, snapshot.as_ref(), width, wrap)
+                };
                 drop(snapshot);
                 if composed.send(ComposedResult { task, result }).is_err() {
                     return;
@@ -4399,6 +4431,63 @@ fn worker_loop(
     }
 }
 
+/// All of a line with composition text in it. Adding the text can make a line long, and
+/// `try_layout_line` then gives only its first segment, so this joins its segments. The
+/// line is short enough, because a line already long gives only one segment here.
+fn composed_layout(
+    engine: &DirectWriteLayout,
+    text: &dyn TextSnapshot,
+    width: Dip,
+    wrap: bool,
+) -> Result<LineLayout, String> {
+    let line = LineIndex(0);
+    let problem = |e: LayoutError| e.to_string();
+    if !engine.is_long_line(text, line).map_err(problem)? {
+        return engine.try_layout_line(text, line, width).map_err(problem);
+    }
+    let mut rows = Vec::new();
+    let mut along = 0.0_f32;
+    let mut height = 0.0_f32;
+    for segment in 0..engine.segment_count(text, line).map_err(problem)? {
+        let part = engine
+            .layout_segment(text, line, segment, width)
+            .map_err(problem)?;
+        let extent = engine.segment_extent(&part).0;
+        height = if wrap {
+            height + part.height.0
+        } else {
+            height.max(part.height.0)
+        };
+        for mut row in part.rows {
+            if wrap {
+                row.y.0 += along;
+                for run in &mut row.glyph_runs {
+                    run.origin.y.0 += along;
+                }
+            } else {
+                for run in &mut row.glyph_runs {
+                    run.origin.x.0 += along;
+                }
+                for stop in &mut row.caret_stops {
+                    stop.x.0 += along;
+                    stop.x_before.0 += along;
+                }
+                for stop in &mut row.visual_stops {
+                    stop.x.0 += along;
+                }
+            }
+            rows.push(row);
+        }
+        along += extent;
+    }
+    Ok(LineLayout {
+        line,
+        rows,
+        height: Dip(height),
+        partial: false,
+    })
+}
+
 impl View for EditorView {
     fn handle(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
         let handled = self.handle_now(event, ctx);
@@ -4408,6 +4497,11 @@ impl View for EditorView {
         handled
     }
     fn draw(&self, list: &mut DisplayList, theme: &Theme, _measure: &dyn TextMeasurer) {
+        // With side space kept for others, text scrolled sideways must stay out of it.
+        let clip = self.hooks.left > 0.0 || self.hooks.right > 0.0;
+        if clip {
+            list.push(DrawCommand::PushClip(self.bounds));
+        }
         if !self.hooks.no_background {
             list.push(DrawCommand::FillRect {
                 rect: self.bounds,
@@ -4563,6 +4657,9 @@ impl View for EditorView {
                 font_size: Dip(theme.font_pt * 96.0 / 72.0),
                 color: theme.warning,
             });
+        }
+        if clip {
+            list.push(DrawCommand::PopClip);
         }
     }
     fn layout(&mut self, bounds: Rect, _measure: &dyn TextMeasurer) {

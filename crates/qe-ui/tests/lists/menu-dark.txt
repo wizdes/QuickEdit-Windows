@@ -1,6 +1,12 @@
-display-list-v3
+display-list-v4
 round 0.000,0.000,180.000,100.000 8.000 #2b2b2bff
-stroke-rect 0.000,0.000,180.000,100.000 8.000 1.000 #ffffff38
-text 28.000,16.000 "Segoe UI" #ffffffff "Open"
-line 8.000,50.000 172.000,50.000 1.000 #ffffff38
-text 28.000,72.000 "Segoe UI" #ffffffff "Save"
+stroke-rect 0.000,0.000,180.000,100.000 8.000 1.000 #ffffff6e
+push-clip 0.000,0.000,180.000,100.000
+push-clip 28.000,8.000,140.000,28.000
+text 28.000,26.500 "Segoe UI" 13.000 #ffffffff "Open"
+pop-clip
+line 8.000,40.500 172.000,40.500 1.000 #ffffff38
+push-clip 28.000,45.000,140.000,28.000
+text 28.000,63.500 "Segoe UI" 13.000 #ffffffff "Save"
+pop-clip
+pop-clip

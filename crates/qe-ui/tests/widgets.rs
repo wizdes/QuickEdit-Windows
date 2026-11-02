@@ -223,6 +223,31 @@ fn theme_lists_and_uia() {
     scroll.layout(bounds(), &Measure);
     assert!(scroll.widgets().is_some());
     let _ = Point::default();
+    // Each theme paints the control differently, and the focused tab is one node.
+    let mut light = DisplayList::default();
+    let mut dark = DisplayList::default();
+    let mut contrast = DisplayList::default();
+    b.draw(&mut light, &Theme::new(ThemeKind::Light), &Measure);
+    b.draw(&mut dark, &Theme::new(ThemeKind::Dark), &Measure);
+    b.draw(
+        &mut contrast,
+        &SystemPalette::HIGH_CONTRAST_BLACK.theme(),
+        &Measure,
+    );
+    assert_ne!(light, dark);
+    assert_ne!(dark, contrast);
+    let mut ctx = ViewContext::default();
+    tabs.handle(&event(InputKind::Focus), &mut ctx);
+    let tree = tabs.widgets().unwrap();
+    assert_eq!(focused_nodes(&tree).len(), 1);
+    assert_eq!(focused_nodes(&tree)[0].role, WidgetRole::Tab);
+    assert_ne!(tree.name, "Settings tabs");
+    assert_eq!(tree.children[0].name, "New Document");
+    combo.open = true;
+    let tree = combo.widgets().unwrap();
+    assert!(tree.states.expanded);
+    assert_eq!(tree.children[0].children.len(), 2, "the two named rows");
+    assert_ne!(scroll.widgets().unwrap().value.as_deref(), Some("0"));
 }
 
 #[test]
@@ -267,8 +292,11 @@ fn backspace_removes_a_joined_emoji_as_one_step() {
 #[test]
 fn saved_display_lists() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/lists");
-    for (theme_name, kind) in [("light", ThemeKind::Light), ("dark", ThemeKind::Dark)] {
-        let theme = Theme::new(kind);
+    for (theme_name, theme) in [
+        ("light", Theme::new(ThemeKind::Light)),
+        ("dark", Theme::new(ThemeKind::Dark)),
+        ("contrast", SystemPalette::HIGH_CONTRAST_BLACK.theme()),
+    ] {
         let mut samples: Vec<(&str, Box<dyn View>)> = Vec::new();
         let mut normal = Button::new(WidgetId(50), "Save");
         normal.layout(bounds(), &Measure);
@@ -288,8 +316,17 @@ fn saved_display_lists() {
         samples.push(("checkbox-off", Box::new(cb.clone())));
         cb.checked = true;
         samples.push(("checkbox-on", Box::new(cb.clone())));
+        cb.hovered = true;
+        samples.push(("checkbox-on-hover", Box::new(cb.clone())));
+        cb.pressed = true;
+        samples.push(("checkbox-on-pressed", Box::new(cb.clone())));
+        cb.hovered = false;
+        cb.pressed = false;
         cb.focused = true;
-        samples.push(("checkbox-focused", Box::new(cb)));
+        samples.push(("checkbox-focused", Box::new(cb.clone())));
+        cb.focused = false;
+        cb.enabled = false;
+        samples.push(("checkbox-disabled", Box::new(cb)));
         let mut field = TextField::new(WidgetId(52), "Line");
         field.placeholder = "Line number".into();
         field.layout(bounds(), &Measure);
@@ -303,7 +340,10 @@ fn saved_display_lists() {
         samples.push(("field-selected", Box::new(field.clone())));
         field.anchor = 3;
         field.composition = Some(("あ".into(), 1));
-        samples.push(("field-ime", Box::new(field)));
+        samples.push(("field-ime", Box::new(field.clone())));
+        field.composition = None;
+        field.enabled = false;
+        samples.push(("field-disabled", Box::new(field)));
         let mut combo = ComboBox::new(
             WidgetId(53),
             "Encoding",
@@ -311,6 +351,9 @@ fn saved_display_lists() {
         );
         combo.layout(bounds(), &Measure);
         samples.push(("combo-closed", Box::new(combo.clone())));
+        combo.enabled = false;
+        samples.push(("combo-disabled", Box::new(combo.clone())));
+        combo.enabled = true;
         combo.open = true;
         samples.push(("combo-open", Box::new(combo)));
         let mut tabs = TabBar::new(WidgetId(54), vec!["New".into(), "Keyboard".into()]);
@@ -343,7 +386,9 @@ fn saved_display_lists() {
             },
             &Measure,
         );
-        samples.push(("table", Box::new(table)));
+        samples.push(("table", Box::new(table.clone())));
+        table.focused = true;
+        samples.push(("table-focused", Box::new(table)));
         let mut scroll = ScrollBar::new(WidgetId(56), 500.0, 100.0);
         scroll.layout(
             Rect {
@@ -412,6 +457,8 @@ fn saved_display_lists() {
             let saved = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert_eq!(actual, saved, "{}", path.display());
+            // A saved list stands for a picture, so no list may be only a header.
+            assert!(!list.commands.is_empty(), "{name}");
         }
     }
 }
@@ -463,6 +510,11 @@ fn alert_dialog_has_three_buttons_and_keyboard_order() {
         ],
     );
     assert_eq!(alert.buttons.len(), 3);
+    assert_eq!(
+        alert.dropped_buttons,
+        ["Extra"],
+        "a dropped button is reported"
+    );
     let mut frame = DialogFrame::from_alert(
         WidgetId(80),
         &alert,
@@ -477,13 +529,23 @@ fn alert_dialog_has_three_buttons_and_keyboard_order() {
     assert_eq!(tree.role, WidgetRole::Dialog);
     assert_eq!(tree.children.len(), 4);
     assert_eq!(tree.children[1].name, "Save");
+    assert!(
+        tree.children[1].states.focused,
+        "the first button has focus"
+    );
+    assert_eq!(tree.children[1].id, WidgetId(82));
+    assert_eq!(duplicate_ids(&tree), vec![]);
     let mut ctx = ViewContext::default();
     frame.handle(&press(0x09), &mut ctx);
     assert_eq!(frame.focus_index, 2);
+    let tree = frame.widgets().unwrap();
+    assert!(!tree.children[1].states.focused, "Save lost focus");
+    assert!(tree.children[2].states.focused, "Cancel got focus");
     assert!(
         ctx.requests
             .contains(&qe_api::ViewRequest::SetFocus(WidgetId(83)))
     );
     frame.handle(&press(0x1b), &mut ctx);
     assert!(frame.closed);
+    assert_eq!(frame.result(), Some(DialogResult::Dismissed));
 }

@@ -1,2 +1,4 @@
-display-list-v3
-text 0.000,0.000 "Segoe UI" #000000ff "Sample"
+display-list-v4
+push-clip 0.000,0.000,240.000,32.000
+text 0.000,20.500 "Segoe UI" 13.000 #000000ff "Sample"
+pop-clip

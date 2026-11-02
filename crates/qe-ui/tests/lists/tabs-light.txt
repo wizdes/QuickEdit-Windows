@@ -1,4 +1,8 @@
-display-list-v3
+display-list-v4
 round 0.000,0.000,120.000,32.000 4.000 #ddecfaff
-text 8.000,8.000 "Segoe UI" #000000ff "New"
-text 128.000,8.000 "Segoe UI" #000000ff "Keyboard"
+push-clip 0.000,0.000,120.000,32.000
+text 8.000,20.500 "Segoe UI" 13.000 #000000ff "New"
+pop-clip
+push-clip 120.000,0.000,120.000,32.000
+text 128.000,20.500 "Segoe UI" 13.000 #000000ff "Keyboard"
+pop-clip

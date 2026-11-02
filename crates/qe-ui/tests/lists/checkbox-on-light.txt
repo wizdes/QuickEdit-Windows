@@ -1,5 +1,7 @@
-display-list-v3
+display-list-v4
 round 0.000,8.000,16.000,16.000 4.000 #005fb8ff
-stroke-rect 0.000,8.000,16.000,16.000 4.000 1.000 #00000038
-text 2.000,8.000 "Segoe UI" #ffffffff "✓"
-text 22.000,8.000 "Segoe UI" #000000ff "Check spelling"
+stroke-rect 0.000,8.000,16.000,16.000 4.000 1.000 #005fb8ff
+icon 4.500,20.500 "E73E" 12.000 #ffffffff
+push-clip 0.000,0.000,240.000,32.000
+text 22.000,20.500 "Segoe UI" 13.000 #000000ff "Check spelling"
+pop-clip

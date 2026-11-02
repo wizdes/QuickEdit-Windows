@@ -1,4 +1,6 @@
-display-list-v3
+display-list-v4
 round 0.000,0.000,240.000,32.000 4.000 #fafafaff
-stroke-rect 0.000,0.000,240.000,32.000 4.000 1.000 #00000038
-text 8.000,8.000 "Segoe UI" #0000009e "Line number"
+stroke-rect 0.000,0.000,240.000,32.000 4.000 1.000 #00000078
+push-clip 8.000,2.000,224.000,28.000
+text 8.000,20.500 "Segoe UI" 13.000 #0000009e "Line number"
+pop-clip

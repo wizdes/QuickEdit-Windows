@@ -1,0 +1,6 @@
+display-list-v4
+round 0.000,0.000,240.000,32.000 4.000 #1e1e1eff
+stroke-rect 0.000,0.000,240.000,32.000 4.000 1.000 #ffffff38
+push-clip 8.000,2.000,224.000,28.000
+text 8.000,20.500 "Segoe UI" 13.000 #ffffff9e "123"
+pop-clip

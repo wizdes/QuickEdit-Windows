@@ -22,7 +22,12 @@ fn point(x: f32, y: f32) -> Point {
 fn scene(dark: bool) -> DisplayList {
     let mut list = DisplayList::default();
     let background = if dark {
-        Color::rgb(30, 30, 30)
+        Color::rgb(0x27, 0x27, 0x27)
+    } else {
+        Color::rgb(255, 255, 255)
+    };
+    let active_tab = if dark {
+        Color::rgb(0x2c, 0x2c, 0x2c)
     } else {
         Color::rgb(255, 255, 255)
     };
@@ -38,7 +43,7 @@ fn scene(dark: bool) -> DisplayList {
     list.push(DrawCommand::FillRect {
         rect: rect(0.0, 0.0, 400.0, 40.0),
         color: if dark {
-            Color::rgb(38, 38, 38)
+            Color::rgb(0x20, 0x20, 0x20)
         } else {
             Color::rgb(240, 240, 240)
         },
@@ -46,7 +51,7 @@ fn scene(dark: bool) -> DisplayList {
     list.push(DrawCommand::RoundedRect {
         rect: rect(8.0, 8.0, 160.0, 32.0),
         radius: Dip(8.0),
-        color: background,
+        color: active_tab,
     });
     list.push(DrawCommand::TextRun {
         at: point(22.0, 29.0),

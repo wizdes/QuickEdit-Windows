@@ -289,11 +289,11 @@ impl Script {
     }
 }
 
-/// A hidden window whose owner does just what QuickEdit's owner does.
 /// A menu the owner opens by itself, as a context menu is. Format is the shortest group.
 fn owner_menu() -> MenuModel {
     menu_bar_groups()[2].submenu.clone().unwrap()
 }
+/// A hidden window whose owner does just what QuickEdit's owner does.
 fn script(record_system_commands: bool) -> Rc<Script> {
     script_at(record_system_commands, None)
 }
@@ -615,9 +615,10 @@ fn wm_close_with_a_submenu_open_destroys_both_levels() {
     assert_eq!(s.popups().len(), 0);
 }
 
-/// On an inactive window, Windows' default handler sends no close for Alt+F4, and a hidden
-/// window is never active. So this checks that the menu goes and that the key reaches that
-/// handler. `WM_CLOSE` with a menu open has its own tests, and root's live run does the rest.
+/// On an inactive window, Windows' default handler sends no close for Alt+F4. A hidden window
+/// is inactive unless a test makes it active, and this one does not. So this checks that the
+/// menu goes and that the key reaches that handler. `alt_f4_closes_the_window_through_windows`
+/// makes the window active and follows the key all the way to the close.
 fn alt_f4_reaches_the_default_handler_and_the_text_has_the_keys(open: Step) {
     let s = script(true);
     let steps = vec![
@@ -2775,6 +2776,22 @@ fn alt_f4_closes_the_window_from_a_focused_menu_bar() {
             vec![
                 step(|s| s.alt_tap()),
                 step(|s| s.expect(s.focused_label() == Some(0), "Alt focuses the bar")),
+            ]
+        },
+    );
+}
+
+#[test]
+fn alt_f4_closes_the_window_from_a_focused_top_row() {
+    alt_f4_closes_the_window_through_windows(
+        "alt_f4_closes_the_window_from_a_focused_top_row",
+        || {
+            vec![
+                step(|s| s.window.with_strip(|strip| strip.focus_strip()).unwrap()),
+                step(|s| {
+                    let focused = s.window.with_strip(|strip| strip.focused()).unwrap();
+                    s.expect(focused.is_some(), "the top row has the keyboard focus");
+                }),
             ]
         },
     );

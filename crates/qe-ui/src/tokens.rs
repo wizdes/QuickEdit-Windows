@@ -101,6 +101,17 @@ pub fn is_high_contrast(theme: &Theme) -> bool {
     theme.border.a == 255 && theme.dim_text.a == 255
 }
 
+/// The menu bar's fill. It is the active tab's color, so that the two join with no line. In high
+/// contrast `tab_selected` is the highlight color, which belongs to the tab, so the bar takes
+/// the window color.
+pub fn menu_bar_background(theme: &Theme) -> Color {
+    if is_high_contrast(theme) {
+        theme.text_background
+    } else {
+        theme.tab_selected
+    }
+}
+
 fn channel(value: u8) -> f32 {
     let v = f32::from(value) / 255.0;
     if v <= 0.03928 {

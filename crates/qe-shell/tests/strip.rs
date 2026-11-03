@@ -15,6 +15,7 @@ const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0d;
 const VK_MENU: u16 = 0x12;
 const VK_ESCAPE: u16 = 0x1b;
+const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
 
 fn measure() -> FixedTextMeasurer {
@@ -907,7 +908,7 @@ fn strip_fills_only_its_row_and_the_active_tab_joins_the_text_area() {
     let DrawCommand::RoundedRect { rect, color, .. } = &list.commands[2] else {
         panic!("{:?}", list.commands[2]);
     };
-    assert_eq!(*color, theme.text_background);
+    assert_eq!(*color, theme.tab_selected);
     assert!(rect.y.0 + rect.height.0 >= 40.0);
     // No rule and no separator runs across the bottom of the row.
     for command in &list.commands {
@@ -1059,7 +1060,7 @@ fn tokens_match_the_design_spec_and_the_theme() {
     assert_eq!(t.tab_height, theme.tab_height.0);
     assert_eq!(t.caption_width, theme.caption_button_width.0);
     assert_eq!(t.row, theme.tab_background);
-    assert_eq!(t.active, theme.text_background);
+    assert_eq!(t.active, theme.tab_selected);
     assert_eq!(t.plus_width, 31.0);
     assert_eq!(t.plus_height, 24.0);
 }
@@ -1410,6 +1411,52 @@ fn with_overflow_the_plus_touches_the_window_buttons_and_nothing_overlaps() {
         CaptionHit::ScrollRight
     );
     assert_eq!(s.hit_test(point(500.0 - 137.0, y)), CaptionHit::Minimize);
+    // The exact seam: the last half dip of the + button, then the first dip of Minimize.
+    assert_eq!(s.hit_test(point(361.5, y)), CaptionHit::NewTab);
+    assert_eq!(s.hit_test(point(362.0, y)), CaptionHit::Minimize);
+}
+
+#[test]
+fn left_from_the_first_stop_lands_on_the_plus() {
+    let mut s = strip(2, 800.0);
+    assert!(!s.overflow());
+    s.set_focused(Some(CaptionHit::Tab(0)));
+    assert_eq!(key(&mut s, VK_LEFT, Modifiers::default()), Handled::Yes);
+    assert_eq!(s.focused(), Some(CaptionHit::NewTab));
+    // With overflow the first stop is the left scroll button.
+    let mut s = strip(40, 500.0);
+    assert!(s.overflow());
+    s.set_focused(Some(CaptionHit::ScrollLeft));
+    assert_eq!(key(&mut s, VK_LEFT, Modifiers::default()), Handled::Yes);
+    assert_eq!(s.focused(), Some(CaptionHit::NewTab));
+}
+
+#[test]
+fn right_from_the_plus_goes_to_the_left_scroll_button_when_tabs_overflow() {
+    let mut s = strip(40, 500.0);
+    assert!(s.overflow());
+    s.set_focused(Some(CaptionHit::NewTab));
+    assert_eq!(key(&mut s, VK_RIGHT, Modifiers::default()), Handled::Yes);
+    assert_eq!(s.focused(), Some(CaptionHit::ScrollLeft));
+}
+
+#[test]
+fn shift_tab_from_the_plus_goes_back_one_stop() {
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    // With no overflow, the stop before the + is the last tab's close button.
+    let mut s = strip(2, 800.0);
+    s.set_focused(Some(CaptionHit::NewTab));
+    assert_eq!(key(&mut s, VK_TAB, shift), Handled::Yes);
+    assert_eq!(s.focused(), Some(CaptionHit::TabClose(1)));
+    assert_eq!(s.take_events(), vec![], "focus moved, nothing ran");
+    // With overflow, it is the right scroll button.
+    let mut s = strip(40, 500.0);
+    s.set_focused(Some(CaptionHit::NewTab));
+    assert_eq!(key(&mut s, VK_TAB, shift), Handled::Yes);
+    assert_eq!(s.focused(), Some(CaptionHit::ScrollRight));
 }
 
 #[test]

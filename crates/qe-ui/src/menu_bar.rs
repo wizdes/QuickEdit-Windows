@@ -1,5 +1,5 @@
 //! The flat five-label menu bar. Models are made only when a label opens.
-use crate::{UI_MEASURE_TOKEN, UiTokens};
+use crate::{UI_MEASURE_TOKEN, UiTokens, menu_bar_background};
 use qe_api::{
     Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, MouseButton, Point, Rect,
     TextMeasurer, Theme, ThemeKind, View, ViewContext, Widget, WidgetId, WidgetRole, WidgetStates,
@@ -377,8 +377,7 @@ impl View for MenuBar {
         let t = UiTokens::from_theme(theme);
         list.push(DrawCommand::FillRect {
             rect: self.bounds,
-            // The active tab's color, so that the tab joins the bar with no line.
-            color: theme.text_background,
+            color: menu_bar_background(theme),
         });
         for (i, label) in MENU_LABELS.iter().enumerate() {
             let r = self.labels[i];

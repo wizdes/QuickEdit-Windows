@@ -62,7 +62,7 @@ impl Theme {
         Self {
             kind,
             text_background: if dark {
-                Color::rgb(30, 30, 30)
+                Color::rgb(0x27, 0x27, 0x27)
             } else {
                 Color::rgb(255, 255, 255)
             },
@@ -120,12 +120,12 @@ impl Theme {
             dim_text: Color { a: 158, ..text },
             group_header: Color { a: 217, ..text },
             tab_background: if dark {
-                Color::rgb(38, 38, 38)
+                Color::rgb(0x20, 0x20, 0x20)
             } else {
                 Color::rgb(240, 240, 240)
             },
             tab_selected: if dark {
-                Color::rgb(30, 30, 30)
+                Color::rgb(0x2c, 0x2c, 0x2c)
             } else {
                 Color::rgb(255, 255, 255)
             },

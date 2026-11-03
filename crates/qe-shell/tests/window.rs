@@ -310,8 +310,14 @@ fn real_renderer_paints_a_window_that_is_not_blank() {
         bg,
         "the row starts 1 pixel down, so 40 is in it"
     );
-    // The bar is the active tab's color and the text's, so that the tab joins it.
-    assert_eq!(pixel(&image, 300, 41), text, "the menu bar starts at 41");
+    // The bar is the active tab's color, so that the tab joins it.
+    let theme = f.window.theme().unwrap();
+    let bar = [
+        theme.tab_selected.r,
+        theme.tab_selected.g,
+        theme.tab_selected.b,
+    ];
+    assert_eq!(pixel(&image, 300, 41), bar, "the menu bar starts at 41");
     assert_eq!(pixel(&image, 300, 73), text, "the text starts at 73");
     let log = f.renderer.took();
     assert!(!log.iter().any(|l| l == "render_to_bitmap"), "{log:?}");
@@ -744,15 +750,140 @@ fn alt_alone_focuses_the_bar_and_skips_the_menu_loop() {
             .iter()
             .any(|e| matches!(e, ShellEvent::OpenMenuGroup(0, _)))
     );
+}
+
+#[test]
+fn a_repeat_of_alt_or_a_lost_focus_does_not_make_a_release_a_tap() {
+    let bar_focus = |f: &Fixture| {
+        let tree = f.window.widgets().unwrap();
+        let bar = tree.children.iter().find(|c| c.name == "Menu bar").unwrap();
+        bar.children.iter().position(|item| item.states.focused)
+    };
+    let alt = usize::from(VK_MENU.0);
+    const ALT_DOWN: isize = 1 << 29;
+    const WAS_DOWN: isize = 1 << 30;
+    // The control: a real tap does focus the bar, so the two cases below can fail.
+    let f = fixture(None);
+    f.send(WM_SYSKEYDOWN, alt, ALT_DOWN);
+    f.send(WM_SYSKEYUP, alt, ALT_DOWN);
+    assert_eq!(bar_focus(&f), Some(0), "a tap");
     // A repeat of the press does not arm a release.
-    f.send(WM_SYSKEYDOWN, alt, 1 << 29);
+    let f = fixture(None);
+    f.send(WM_SYSKEYDOWN, alt, ALT_DOWN | WAS_DOWN);
+    f.send(WM_SYSKEYUP, alt, ALT_DOWN);
+    assert_eq!(bar_focus(&f), None, "a repeat");
+    // Losing the focus while Alt is down takes the arming away.
+    let f = fixture(None);
+    f.send(WM_SYSKEYDOWN, alt, ALT_DOWN);
     f.send(WM_KILLFOCUS, 0, 0);
-    f.send(WM_SYSKEYUP, alt, 1 << 29);
-    assert!(
-        !f.events()
-            .iter()
-            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(..)))
+    f.send(WM_SYSKEYUP, alt, ALT_DOWN);
+    assert_eq!(bar_focus(&f), None, "a lost focus");
+}
+
+const fn opaque(value: u32) -> [u8; 3] {
+    [(value >> 16) as u8, (value >> 8) as u8, value as u8]
+}
+/// The colors of one device-pixel column, top to bottom, with each run of a color as one entry.
+fn color_runs(image: &Bitmap, x: u32, y0: u32, y1: u32) -> Vec<[u8; 3]> {
+    let mut runs: Vec<[u8; 3]> = Vec::new();
+    for y in y0..y1 {
+        let color = pixel(image, x, y);
+        if runs.last() != Some(&color) {
+            runs.push(color);
+        }
+    }
+    runs
+}
+/// The columns through the active tab and through the empty part of the row, each from the
+/// row down into the text area, in device pixels.
+fn top_of_window_columns(f: &Fixture) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+    f.send(WM_PAINT, 0, 0);
+    let image = f.renderer.bitmap();
+    let device = |dips: f32| (dips * f.scale) as u32;
+    let tab = f.window.with_strip(|s| s.tab_rects()[s.active()]).unwrap();
+    let row = f.window.with_strip(|s| s.row_rect()).unwrap();
+    let below_text = f.window.content_rect().unwrap().y.0 + 20.0;
+    // Left of the tab's text, and below its round corner.
+    let in_tab = color_runs(
+        &image,
+        device(tab.x.0 + 6.0),
+        device(tab.y.0 + 12.0),
+        device(below_text),
     );
+    // The first and last rows of the strip's own fill are inside this range.
+    let in_row = color_runs(
+        &image,
+        device(f.width_dips() - 200.0),
+        (row.y.0 * f.scale).ceil() as u32,
+        device(below_text),
+    );
+    (in_tab, in_row)
+}
+
+/// Root measured a real Notepad 11.2607 in dark mode, exact pixels, active and inactive alike.
+/// The runs also prove the joins: any stray line between them would be a run of its own.
+#[test]
+fn a_dark_window_has_notepads_exact_colors_at_each_scale() {
+    const ROW: [u8; 3] = opaque(0x202020);
+    const ACTIVE_AND_BAR: [u8; 3] = opaque(0x2c2c2c);
+    const TEXT: [u8; 3] = opaque(0x272727);
+    for dpi in [96u32, 120, 144, 192] {
+        let f = fixture(Some(dpi));
+        f.window.apply_theme(true, None).unwrap();
+        for window_active in [true, false] {
+            f.window
+                .with_strip(|s| s.set_window_active(window_active))
+                .unwrap();
+            let (in_tab, in_row) = top_of_window_columns(&f);
+            assert_eq!(
+                in_tab,
+                vec![ACTIVE_AND_BAR, TEXT],
+                "{dpi} {window_active}: tab, bar, text"
+            );
+            assert_eq!(
+                in_row,
+                vec![ROW, ACTIVE_AND_BAR, TEXT],
+                "{dpi} {window_active}: row, bar, text"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_light_window_keeps_its_colors() {
+    for dpi in [96u32, 120, 144, 192] {
+        let f = fixture(Some(dpi));
+        f.window.apply_theme(false, None).unwrap();
+        let (in_tab, in_row) = top_of_window_columns(&f);
+        assert_eq!(in_tab, vec![opaque(0xffffff)], "{dpi}: tab, bar, text");
+        assert_eq!(
+            in_row,
+            vec![opaque(0xf0f0f0), opaque(0xffffff)],
+            "{dpi}: row, then bar and text"
+        );
+    }
+}
+
+#[test]
+fn high_contrast_keeps_the_highlight_tab_and_a_window_color_bar() {
+    let colors = ContrastColors {
+        window: Color::rgb(1, 2, 3),
+        window_text: Color::rgb(255, 255, 255),
+        highlight: Color::rgb(26, 235, 255),
+        highlight_text: Color::rgb(0, 0, 0),
+        gray_text: Color::rgb(63, 242, 63),
+    };
+    for dpi in [96u32, 120, 144, 192] {
+        let f = fixture(Some(dpi));
+        f.window.apply_theme(true, Some(colors)).unwrap();
+        let (in_tab, in_row) = top_of_window_columns(&f);
+        assert_eq!(
+            in_tab,
+            vec![[26, 235, 255], [1, 2, 3]],
+            "{dpi}: highlight tab, then window color"
+        );
+        assert_eq!(in_row, vec![[1, 2, 3]], "{dpi}: all window color");
+    }
 }
 
 #[test]
@@ -1774,6 +1905,20 @@ fn restored_row_starts_below_the_top_border_as_in_terminal() {
     assert_eq!(px(50.0, 9), HTCLIENT, "the tab's first row");
     assert_eq!(px(50.0, 40), HTCLIENT, "the tab's last row");
     assert_eq!(f.window.content_rect().unwrap().y.0, 73.0);
+}
+
+/// The down caret sat right of the + button. Its place now drags the window.
+#[test]
+fn where_the_caret_was_the_row_drags_the_window() {
+    let f = fixture(None);
+    assert_eq!(f.window.with_strip(|s| s.tabs().len()).unwrap(), 1);
+    let plus = f.window.with_strip(|s| s.plus_rect()).unwrap();
+    let end = plus.x.0 + plus.width.0;
+    let y = plus.y.0 + plus.height.0 / 2.0;
+    assert_eq!(f.hit(end - 1.0, y), HTCLIENT, "the + button's last column");
+    for x in [end, end + 15.0, end + plus.width.0] {
+        assert_eq!(f.hit(x, y), HTCAPTION, "x={x}");
+    }
 }
 
 #[test]

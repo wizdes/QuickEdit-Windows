@@ -102,7 +102,15 @@ fn theme_and_display_text_are_stable() {
     );
     assert_eq!(
         Theme::new(ThemeKind::Dark).text_background,
-        Color::rgb(30, 30, 30)
+        Color::rgb(0x27, 0x27, 0x27)
+    );
+    assert_eq!(
+        Theme::new(ThemeKind::Dark).tab_background,
+        Color::rgb(0x20, 0x20, 0x20)
+    );
+    assert_eq!(
+        Theme::new(ThemeKind::Dark).tab_selected,
+        Color::rgb(0x2c, 0x2c, 0x2c)
     );
     let mut list = DisplayList::default();
     list.push(DrawCommand::FillRect {

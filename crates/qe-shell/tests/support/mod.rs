@@ -77,7 +77,8 @@ pub fn render_strip(
     let mut list = DisplayList::default();
     list.push(DrawCommand::FillRect {
         rect: rect(0.0, 0.0, width_dips, height_dips),
-        color: theme.text_background,
+        // A real window has the menu bar under the row.
+        color: qe_ui::menu_bar_background(theme),
     });
     strip.set_scale(scale);
     strip.draw(&mut list, theme, &RealMeasurer);

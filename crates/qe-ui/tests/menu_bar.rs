@@ -497,10 +497,25 @@ fn the_bar_is_the_color_of_the_active_tab() {
         laid_out_bar().draw(&mut list, &theme, &Measure);
         match &list.commands[0] {
             qe_api::DrawCommand::FillRect { color, .. } => {
-                assert_eq!(*color, theme.text_background)
+                assert_eq!(*color, theme.tab_selected)
             }
             other => panic!("the bar starts with {other:?}"),
         }
+    }
+}
+
+#[test]
+fn in_high_contrast_the_bar_is_the_window_color_and_not_the_highlight() {
+    let palette = qe_ui::SystemPalette::HIGH_CONTRAST_BLACK;
+    let theme = palette.theme();
+    assert_ne!(theme.tab_selected, theme.text_background);
+    let mut list = qe_api::DisplayList::default();
+    laid_out_bar().draw(&mut list, &theme, &Measure);
+    match &list.commands[0] {
+        qe_api::DrawCommand::FillRect { color, .. } => {
+            assert_eq!(*color, theme.text_background)
+        }
+        other => panic!("the bar starts with {other:?}"),
     }
 }
 

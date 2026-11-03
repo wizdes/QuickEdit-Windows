@@ -1,7 +1,7 @@
 display-list-v4
-fill 0.000,0.000,800.000,40.000 #262626ff
+fill 0.000,0.000,800.000,40.000 #202020ff
 push-clip 0.000,0.000,631.000,40.000
-round 0.000,8.000,210.333,40.000 8.000 #1e1e1eff
+round 0.000,8.000,210.333,40.000 8.000 #2c2c2cff
 text 16.000,28.000 "Segoe UI" 13.000 #ffffffff "Tab 0"
 text 190.833,28.000 "Segoe UI" 13.000 #ffffffff "•"
 text 226.333,28.000 "Segoe UI" 13.000 #ffffff9e "Tab 1"

@@ -194,7 +194,7 @@ impl ShellTokens {
             new_window_columns: 90.0,
             new_window_rows: 30.0,
             row: theme.tab_background,
-            active: theme.text_background,
+            active: theme.tab_selected,
             text: theme.text,
             dim: theme.dim_text,
             button_text: if dark {
@@ -900,7 +900,7 @@ impl TabStrip {
     }
     /// Everything Tab stops at, in the order it shows on screen.
     fn focus_stops(&self, with_close: bool) -> Vec<CaptionHit> {
-        let mut out = Vec::with_capacity(self.tabs.len() * 2 + 4);
+        let mut out = Vec::with_capacity(self.tabs.len() * 2 + 3);
         if self.overflow {
             out.push(CaptionHit::ScrollLeft);
         }
@@ -1339,7 +1339,7 @@ impl TabStrip {
                 Look::Rest
             };
             // The box runs past the row's bottom, and the clip cuts it there. So only
-            // the top corners are round, and an active tab joins the text area.
+            // the top corners are round, and an active tab joins the menu bar.
             let shape = r(b.x.0, b.y.0, b.width.0, b.height.0 + t.radius);
             if active {
                 list.push(DrawCommand::RoundedRect {

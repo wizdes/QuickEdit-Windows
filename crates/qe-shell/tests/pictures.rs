@@ -155,7 +155,7 @@ fn icons_and_text_sit_in_the_center_of_their_boxes() {
     for name in ["light", "dark"] {
         let theme = theme_for(name);
         let row = background(theme.tab_background);
-        let active = background(theme.text_background);
+        let active = background(theme.tab_selected);
         for maximized in [false, true] {
             for dpi in [96, 120, 144, 192] {
                 let scale = dpi as f32 / 96.0;
@@ -227,7 +227,7 @@ fn plus_stays_inside_its_box() {
 }
 
 #[test]
-fn active_tab_joins_the_text_area_with_no_rule() {
+fn active_tab_joins_the_menu_bar_with_no_rule() {
     for name in ["light", "dark"] {
         let theme = theme_for(name);
         let s = sample(name, false);
@@ -235,21 +235,21 @@ fn active_tab_joins_the_text_area_with_no_rule() {
             let scale = dpi as f32 / 96.0;
             let image = render_strip(&s, &theme, dpi, WIDTH, HEIGHT);
             let x = (150.0 * scale) as u32;
-            let text = background(theme.text_background);
+            let bar = background(theme.tab_selected);
             for y in [39.0, 40.0, 41.0, 47.0] {
                 assert_eq!(
                     pixel(&image, x, (y * scale) as u32),
-                    text,
+                    bar,
                     "{name} {dpi} y={y}"
                 );
             }
-            // The row color stops at the row: the next tab's bottom meets the text area.
+            // The row color stops at the row: the next tab's bottom meets the bar.
             let other = (300.0 * scale) as u32;
             assert_eq!(
                 pixel(&image, other, (39.5 * scale) as u32),
                 background(theme.tab_background)
             );
-            assert_eq!(pixel(&image, other, (40.5 * scale) as u32), text);
+            assert_eq!(pixel(&image, other, (40.5 * scale) as u32), bar);
             // Top corners are round, and the tab's bottom corners are square.
             assert_eq!(
                 pixel(&image, 0, (8.0 * scale) as u32),
@@ -258,7 +258,7 @@ fn active_tab_joins_the_text_area_with_no_rule() {
             );
             assert_eq!(
                 pixel(&image, 0, (39.5 * scale) as u32),
-                text,
+                bar,
                 "square bottom"
             );
         }
@@ -437,13 +437,13 @@ fn saved_images_of_the_active_tab_joining_the_bar() {
             renderer.end_frame().unwrap();
             let image = renderer.bitmap().unwrap();
 
-            // Far from any label, the bar has one color: the text's, with no line above it.
+            // Far from any label, the bar has one color, with no line above it.
             let x = ((WIDTH - 40.0) * scale) as u32;
             let (first, last) = (
                 (top * scale).ceil() as u32,
                 ((top + theme.menu_bar_height.0) * scale).floor() as u32 - 1,
             );
-            let flat = background(theme.text_background);
+            let flat = background(qe_ui::menu_bar_background(&theme));
             assert_eq!(
                 pixel(&image, x, first),
                 flat,

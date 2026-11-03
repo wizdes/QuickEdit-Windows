@@ -23,6 +23,6 @@ mod ui;
 
 fn main() {
     let started = std::time::Instant::now();
-    let dll_rule = platform::keep_dll_search_to_system_and_app_folders();
+    let dll_rule = platform::keep_dll_search_to_system32();
     std::process::exit(app::run(dll_rule, started.elapsed()));
 }

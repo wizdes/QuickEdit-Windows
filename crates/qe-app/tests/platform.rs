@@ -344,3 +344,100 @@ fn a_bad_settings_file_is_shown_and_the_app_still_runs() {
     assert_eq!(app.text(), "still works");
     app.quit();
 }
+
+/// A DLL with one of these names beside a loose copy of the exe must never load. They are real
+/// copies from System32, so a load does no harm, and it shows in the module list.
+const PLANTED: [&str; 8] = [
+    "TextShaping.dll",
+    "UIAutomationCore.dll",
+    "dwrite.dll",
+    "d2d1.dll",
+    "dxgi.dll",
+    "MSCTF.dll",
+    "propsys.dll",
+    "version.dll",
+];
+
+/// The review's case: `TextShaping.dll` loaded from the exe's folder at every start, and
+/// `UIAutomationCore.dll` at the first `WM_GETOBJECT`. Fails too if `main` sets no rule at all.
+/// Text services, UI Automation, the file dialogs and spelling must still start from System32.
+#[test]
+fn no_dll_planted_beside_the_exe_loads_and_com_still_works() {
+    let _one = ONE_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = Folder::new("planted");
+    let beside = folder.0.join("loose");
+    std::fs::create_dir_all(&beside).unwrap();
+    let copy = beside.join("QuickEdit.exe");
+    std::fs::copy(support::exe(), &copy).unwrap();
+    let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+    for name in PLANTED {
+        std::fs::copy(system.join(name), beside.join(name)).unwrap();
+    }
+    let file = folder.file("planted.txt", b"plain words\n");
+    let root = folder.root();
+    let mut app = App::launch_exe(copy.to_str().unwrap(), &root, &[&file], &[], None);
+    app.wait_for("the first window", |app| {
+        app.ask("restored") == "true" && !app.ask("windows").is_empty()
+    });
+    app.wait_text("plain words\n");
+    app.ok("focus");
+    app.wait_for("text services", |app| app.ask("tsf-started") == "true");
+    assert_eq!(app.ask("com-check"), "ok");
+    // A real client's first look sends the window its first `WM_GETOBJECT`.
+    let hwnd: isize = app.ask("hwnd").parse().unwrap();
+    let uia = client();
+    // SAFETY: a live COM object on this thread, and the window of a running process.
+    let element = unsafe { uia.ElementFromHandle(HWND(hwnd as *mut _)) }.expect("the window");
+    names_below(&uia, &element);
+
+    let paths = support::decode(&app.ask("module-paths")).to_lowercase();
+    println!("{paths}");
+    let lines: Vec<&str> = paths.lines().collect();
+    let beside = beside.display().to_string().to_lowercase();
+    for line in &lines {
+        assert!(
+            !line.starts_with(&beside) || line.ends_with("quickedit.exe"),
+            "a planted DLL loaded: {line}"
+        );
+    }
+    // So that this test cannot pass by the DLLs not loading at all.
+    let system = system.display().to_string().to_lowercase();
+    for wanted in [
+        "textshaping.dll",
+        "uiautomationcore.dll",
+        "msctf.dll",
+        "dwrite.dll",
+    ] {
+        assert!(
+            lines.contains(&format!("{system}\\{wanted}").as_str()),
+            "{wanted} did not load from System32"
+        );
+    }
+    app.quit();
+}
+
+/// The review's case for a bad flag: with `--hidden` it must not stop on a message box. No
+/// stream here has a reader, so the old code would open a box and never end.
+#[test]
+fn a_bad_flag_on_a_hidden_run_opens_no_box_and_ends_with_the_error_code() {
+    let mut child = std::process::Command::new(support::exe())
+        .args(["--hidden", "--no-such-flag"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if std::time::Instant::now() > end {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the run did not end, so it waits on a box");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(code, Some(2));
+}

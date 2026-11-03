@@ -634,3 +634,168 @@ fn a_cancelled_copy_with_text_still_unsaved_leaves_the_timer_set() {
             })
     });
 }
+
+// ---- The look at a new file at a deleted name, while its writer still holds it.
+
+#[test]
+fn a_new_file_held_for_a_moment_at_a_deleted_name_is_looked_at_again() {
+    let folder = test_folder("final-return-held");
+    let root = folder.join("root");
+    let path = folder.join("f.txt");
+    write(&path, b"same text\n");
+    let mut h = quick(&root);
+    let doc = h.open(&path);
+    deleted(&mut h, doc, &path);
+    write(&path, b"same text\n");
+    let holder = hold_exclusively(&path);
+    h.store.app_activated();
+    // Shorter than the tries add up to, and long enough for the first look to fail.
+    h.settle(Duration::from_millis(150));
+    assert!(
+        h.store.open_questions().is_empty(),
+        "it asked about a file it could not read: {:?}",
+        h.store.open_questions()
+    );
+    assert_eq!(h.store.title_note(doc).as_deref(), Some("Deleted"));
+    drop(holder);
+    h.until("the file is back and clean", |h| {
+        h.store.title_note(doc).is_none() && !h.store.is_dirty(doc)
+    });
+    assert!(h.store.open_questions().is_empty());
+    assert_eq!(h.text(doc), "same text\n");
+}
+
+#[test]
+fn a_new_file_held_past_every_try_at_a_deleted_name_keeps_the_text_and_asks() {
+    let folder = test_folder("final-return-held-long");
+    let root = folder.join("root");
+    let path = folder.join("f.txt");
+    write(&path, b"only here\n");
+    let mut h = quick(&root);
+    let doc = h.open(&path);
+    deleted(&mut h, doc, &path);
+    write(&path, b"another\n");
+    let holder = hold_exclusively(&path);
+    h.store.app_activated();
+    let question = h.question("the changed-on-disk question");
+    assert_eq!(question.kind, QuestionKind::ChangedOnDisk);
+    drop(holder);
+    assert_eq!(h.text(doc), "only here\n");
+    assert!(h.store.is_dirty(doc));
+    assert!(!autosave_files(&root).is_empty(), "the copy stays");
+}
+
+// ---- Copies kept ready for the end of the session.
+
+#[test]
+fn a_save_makes_a_ready_copy_of_older_text_not_write() {
+    let folder = test_folder("final-ready-saved");
+    let root = folder.join("root");
+    let path = folder.join("f.txt");
+    write(&path, b"before\n");
+    {
+        let mut h = Harness::new(&root);
+        let doc = h.open(&path);
+        h.type_text(doc, "a");
+        let copies = h.store.session_end_copies().expect("a round of copies");
+        h.store.save(doc).unwrap();
+        h.saved(doc);
+        assert!(!h.store.is_dirty(doc));
+        let failed = copies.write();
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            autosave_files(&root),
+            Vec::<String>::new(),
+            "a copy of text that is on disk"
+        );
+        h.quit();
+    }
+    // The next launch shows the file, with nothing unsaved.
+    let mut h = Harness::new(&root);
+    let doc = h.store.all_documents()[0];
+    h.loaded(doc);
+    assert_eq!(h.text(doc), "abefore\n");
+    assert!(!h.store.is_dirty(doc));
+}
+
+#[test]
+fn a_ready_copy_of_text_typed_after_the_save_began_still_writes() {
+    let folder = test_folder("final-ready-newer");
+    let root = folder.join("root");
+    let path = folder.join("f.txt");
+    write(&path, b"before\n");
+    let mut h = Harness::new(&root);
+    let doc = h.open(&path);
+    h.type_text(doc, "a");
+    h.store.save(doc).unwrap();
+    h.type_text(doc, "b");
+    let copies = h.store.session_end_copies().expect("a round of copies");
+    h.saved(doc);
+    assert!(h.store.is_dirty(doc), "the second key is not on disk");
+    let failed = copies.write();
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(!autosave_files(&root).is_empty(), "the newer text was lost");
+}
+
+// ---- A copy written while only queued keys counted as unsaved text.
+
+#[test]
+fn a_copy_goes_when_queued_keys_change_nothing() {
+    let folder = test_folder("final-queued-nothing");
+    let root = folder.join("root");
+    let path = folder.join("f.txt");
+    write(&path, "\u{4e2d}".repeat(400).as_bytes());
+    let mut h = quick(&root);
+    let doc = h.open(&path);
+    // A due copy from typing that Undo has taken back: the file is clean again.
+    h.type_text(doc, "x");
+    h.undo(doc);
+    // Home on a wrapped line with no layout waits, and the Backspace behind it waits too. At the
+    // start of the file it will change nothing.
+    let measure = qe_layout::DirectWriteLayout::new().unwrap();
+    let mut ctx = ViewContext::default();
+    let view = h.store.view_mut(doc).unwrap();
+    view.set_wrap(true).unwrap();
+    view.layout(
+        qe_api::Rect {
+            x: qe_api::Dip(0.0),
+            y: qe_api::Dip(0.0),
+            width: qe_api::Dip(300.0),
+            height: qe_api::Dip(600.0),
+        },
+        &measure,
+    );
+    view.test_pause_workers(true);
+    for (time_us, virtual_key) in [(0, 0x24), (1, 0x08)] {
+        view.handle(
+            &InputEvent {
+                time_us,
+                kind: InputKind::KeyDown {
+                    virtual_key,
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                },
+            },
+            &mut ctx,
+        );
+    }
+    assert!(view.has_queued_edits(), "the keys really wait");
+    assert!(h.store.is_dirty(doc));
+    h.until("the copy is written", |h| {
+        !autosave_files(&h.root).is_empty() && !h.store.is_autosaving(doc)
+    });
+
+    let view = h.store.view_mut(doc).unwrap();
+    view.test_pause_workers(false);
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while view.queued_input_count() > 0 {
+        assert!(std::time::Instant::now() < end, "the keys never ran");
+        view.poll_layout(&mut ctx);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!view.has_queued_edits());
+    assert!(!h.store.is_dirty(doc), "the keys changed nothing");
+    // What the host does after a view call. Nothing but this and the poll may be needed: no timer.
+    h.store.note_view_changed(doc);
+    h.until("the copy goes", |h| autosave_files(&h.root).is_empty());
+}

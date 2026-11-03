@@ -19,6 +19,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 $repo = Split-Path -Parent $PSScriptRoot
 $target = Join-Path $repo 'target'
 $layout = Join-Path $target 'package'
+$packagedExe = $null
 
 function Find-SdkTool([string]$name) {
     $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
@@ -31,6 +32,11 @@ function Find-SdkTool([string]$name) {
     if (-not $found) { throw "$name was not found under $bin. Install the Windows SDK." }
     return $found
 }
+
+# Cargo finds .cargo\config.toml, with its C runtime rule, and the toolchain file from the current
+# folder. So this must not depend on the folder the script was started from.
+Push-Location $repo
+try {
 
 $manifestPath = Join-Path $PSScriptRoot 'AppxManifest.xml'
 [xml]$manifest = Get-Content -Raw $manifestPath
@@ -66,7 +72,8 @@ $flags = foreach ($remap in $remaps) {
 $rustflags = 'target.x86_64-pc-windows-msvc.rustflags=[' + ($flags -join ',') + ']'
 
 Write-Host "Building $executable $version in release..."
-& cargo build --release --locked -p qe-app --bin QuickEdit --manifest-path (Join-Path $repo 'Cargo.toml') --config $rustflags
+# --target-dir beats CARGO_TARGET_DIR and build.target-dir, which would leave an old exe here.
+& cargo build --release --locked -p qe-app --bin QuickEdit --manifest-path (Join-Path $repo 'Cargo.toml') --target-dir $target --config $rustflags
 $exe = Join-Path $target "release\$executable"
 if (-not (Test-Path $exe)) { throw "The build gave no $exe." }
 
@@ -100,11 +107,24 @@ if ($flatConfig -eq $configText) { throw "makepri's config has no <packaging> pa
 & $makepri new /pr $layout /cf $config /mn (Join-Path $layout 'AppxManifest.xml') /of (Join-Path $layout 'resources.pri') /o
 Remove-Item $config
 
+# The tests that a normal run ignores, on the exact exe that goes in the package. The count
+# must match, so a test that is renamed cannot drop out of this with no word.
+$packagedExe = Join-Path $layout $executable
+$env:QE_RELEASE_EXE = $packagedExe
+try {
+    $results = & cargo test --locked -p qe-app --test package --target-dir $target -- --ignored the_release_exe_ 2>&1 | Out-String
+}
+finally {
+    Remove-Item env:QE_RELEASE_EXE
+}
+Write-Host $results
+if ($results -notmatch 'test result: ok\. 5 passed') { throw 'The release tests did not all run and pass.' }
+
 $exeSize = (Get-Item $exe).Length
 if ($LooseLayout) {
     Write-Host "Loose layout ready. $executable is $exeSize bytes."
     Write-Host "Register it with: Add-AppxPackage -Register `"$(Join-Path $layout 'AppxManifest.xml')`""
-    exit 0
+    return
 }
 
 $package = Join-Path $target "QuickEdit-$version-x64.msix"
@@ -113,3 +133,8 @@ if ($identity.Name -like 'PLACEHOLDER*' -or $identity.Publisher -like '*PLACEHOL
     Write-Warning 'The manifest still has its placeholders, so Partner Center will refuse this package. See packaging\README.md.'
 }
 Write-Host "$package is $((Get-Item $package).Length) bytes. $executable is $exeSize bytes."
+
+}
+finally {
+    Pop-Location
+}

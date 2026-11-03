@@ -812,8 +812,6 @@ fn remove_stale_list_temps(dir: &Path, prefix: &str) {
     }
 }
 
-/// Takes a session folder and reads what the last run left, from this folder and from any
-/// other folder no running QuickEdit holds. It reads only descriptions, never text.
 const SESSION_END_FAILURES: &str = "session-end-failures.txt";
 
 /// Word of Saves that failed as Windows ended the session, for the next launch to show. A
@@ -848,6 +846,8 @@ fn read_session_end_failures(root: &Path, problems: &mut Vec<DocError>) {
     }
 }
 
+/// Takes a session folder and reads what the last run left, from this folder and from any
+/// other folder no running QuickEdit holds. It reads only descriptions, never text.
 pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
     let what = "QuickEdit could not use its session folder at";
     let mut lock = None;

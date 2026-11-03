@@ -452,6 +452,7 @@ impl App {
             return;
         };
         let (revision, place) = (view.revision(), (view.selection(), view.scroll_offset()));
+        let queued = view.has_queued_edits();
         let bytes = self.store.byte_count(doc);
         let Some(ui) = self.docs.get_mut(&doc) else {
             return;
@@ -459,9 +460,13 @@ impl App {
         ui.bytes.set(bytes);
         let text_changed = ui.seen_revision != revision;
         let place_changed = ui.seen_place != place;
+        // Queued keys that ran and changed nothing leave the revision as it was, but the text no
+        // longer counts as unsaved.
+        let queue_ended = ui.seen_queued_edits && !queued;
         ui.seen_revision = revision;
         ui.seen_place = place;
-        if text_changed {
+        ui.seen_queued_edits = queued;
+        if text_changed || queue_ended {
             self.store.note_view_changed(doc);
         }
         if place_changed {

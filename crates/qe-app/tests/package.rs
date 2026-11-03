@@ -599,26 +599,15 @@ fn debug_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_QuickEdit"))
 }
 
-/// The release exe beside this build, or the one `QE_RELEASE_EXE` names. Tests that need it say
-/// so and pass when there is none, and `packaging/build.ps1` makes the same checks on its own.
-fn release_exe() -> Option<PathBuf> {
-    if let Some(named) = std::env::var_os("QE_RELEASE_EXE") {
-        return Some(PathBuf::from(named));
-    }
-    let debug = debug_exe();
-    let beside = debug
-        .parent()?
-        .parent()?
-        .join("release")
-        .join("QuickEdit.exe");
-    if beside.is_file() {
-        return Some(beside);
-    }
-    println!(
-        "skipped for the release exe: there is none at {}",
-        beside.display()
-    );
-    None
+/// The exe `QE_RELEASE_EXE` names. The tests that need it are ignored in a normal run, because a
+/// release build takes minutes and needs `packaging/build.ps1`'s flags. That script runs them on
+/// the exact exe it packages, and they fail with no such exe, so none can pass by skipping.
+fn release_exe() -> PathBuf {
+    let named = std::env::var_os("QE_RELEASE_EXE")
+        .expect("QE_RELEASE_EXE must name the exe. packaging\\build.ps1 sets it for these tests.");
+    let exe = PathBuf::from(named);
+    assert!(exe.is_file(), "{} is not a file", exe.display());
+    exe
 }
 
 fn check_no_c_runtime_import(exe: &Path) {
@@ -641,9 +630,12 @@ fn check_no_c_runtime_import(exe: &Path) {
 #[test]
 fn the_exe_imports_no_c_runtime() {
     check_no_c_runtime_import(&debug_exe());
-    if let Some(exe) = release_exe() {
-        check_no_c_runtime_import(&exe);
-    }
+}
+
+#[test]
+#[ignore = "needs QE_RELEASE_EXE: packaging/build.ps1 runs this on the exe it packages"]
+fn the_release_exe_imports_no_c_runtime() {
+    check_no_c_runtime_import(&release_exe());
 }
 
 fn find_case_blind(haystack: &[u8], needle: &str) -> Option<usize> {
@@ -659,10 +651,9 @@ fn find_case_blind(haystack: &[u8], needle: &str) -> Option<usize> {
 /// A release exe from plain `cargo build --release` fails here: `packaging/build.ps1` adds the
 /// `--remap-path-prefix` flags that this needs, as they differ from one PC to the next.
 #[test]
+#[ignore = "needs QE_RELEASE_EXE: packaging/build.ps1 runs this on the exe it packages"]
 fn the_release_exe_names_no_user_folder() {
-    let Some(exe) = release_exe() else {
-        return;
-    };
+    let exe = release_exe();
     let bytes = std::fs::read(&exe).unwrap();
     for needle in [r"\Users\", "/Users/", ".cargo", ".rustup"] {
         if let Some(at) = find_case_blind(&bytes, needle) {
@@ -682,13 +673,17 @@ fn the_release_exe_names_no_user_folder() {
     }
 }
 
-/// 0x800 is `LOAD_LIBRARY_SEARCH_SYSTEM32`: a planted DLL beside the exe must not load.
+/// 0x800 is `LOAD_LIBRARY_SEARCH_SYSTEM32`. This mark covers only the exe's own imports. A test
+/// in `platform.rs` plants DLLs beside a copy of the exe, for what loads after `main` starts.
 #[test]
 fn the_exe_loads_its_imports_only_from_system32() {
     assert_eq!(Pe::read(&debug_exe()).dependent_load_flags(), 0x800);
-    if let Some(exe) = release_exe() {
-        assert_eq!(Pe::read(&exe).dependent_load_flags(), 0x800);
-    }
+}
+
+#[test]
+#[ignore = "needs QE_RELEASE_EXE: packaging/build.ps1 runs this on the exe it packages"]
+fn the_release_exe_loads_its_imports_only_from_system32() {
+    assert_eq!(Pe::read(&release_exe()).dependent_load_flags(), 0x800);
 }
 
 fn utf16(text: &str) -> Vec<u8> {
@@ -701,6 +696,16 @@ fn the_exe_version_record_matches_the_package_manifest() {
         println!("skipped: rc.exe is missing, so this debug exe has no resources");
         return;
     }
+    check_version_record(&debug_exe());
+}
+
+#[test]
+#[ignore = "needs QE_RELEASE_EXE: packaging/build.ps1 runs this on the exe it packages"]
+fn the_release_exe_version_record_matches_the_package_manifest() {
+    check_version_record(&release_exe());
+}
+
+fn check_version_record(exe: &Path) {
     let elements = read_manifest();
     let text = find(&elements, "Identity")
         .attr("Version")
@@ -708,41 +713,66 @@ fn the_exe_version_record_matches_the_package_manifest() {
         .to_string();
     let parts: Vec<u16> = text.split('.').map(|n| n.parse().unwrap()).collect();
     let want: [u16; 4] = parts.try_into().unwrap();
-    let mut exes = vec![debug_exe()];
-    exes.extend(release_exe());
-    for exe in exes {
-        let pe = Pe::read(&exe);
-        let found = pe.fixed_versions().expect("a version record");
-        assert_eq!(found, (want, want), "{}", exe.display());
-        for field in [
-            "ProductName",
-            "FileDescription",
-            "QuickEdit plain-text editor",
-        ] {
-            assert!(holds(&pe.bytes, &utf16(field)), "{field}");
-        }
-        assert!(holds(&pe.bytes, &utf16(&text)), "{text}");
+    let pe = Pe::read(exe);
+    let found = pe.fixed_versions().expect("a version record");
+    assert_eq!(found, (want, want), "{}", exe.display());
+    for field in [
+        "ProductName",
+        "FileDescription",
+        "QuickEdit plain-text editor",
+    ] {
+        assert!(holds(&pe.bytes, &utf16(field)), "{field}");
     }
+    assert!(holds(&pe.bytes, &utf16(&text)), "{text}");
 }
 
 /// Test words must not read as test words to a customer who opens the exe in a text viewer.
 #[test]
 fn no_test_message_ships_in_the_exe() {
-    let mut exes = vec![debug_exe()];
-    exes.extend(release_exe());
-    for exe in exes {
-        let bytes = std::fs::read(&exe).unwrap();
-        for text in [
-            "A test made this raise fail.",
-            "this test asked for a window that fails",
-        ] {
-            assert!(
-                !holds(&bytes, text.as_bytes()),
-                "{text} in {}",
-                exe.display()
-            );
-        }
+    check_no_test_message(&debug_exe());
+}
+
+#[test]
+#[ignore = "needs QE_RELEASE_EXE: packaging/build.ps1 runs this on the exe it packages"]
+fn the_release_exe_holds_no_test_message() {
+    check_no_test_message(&release_exe());
+}
+
+fn check_no_test_message(exe: &Path) {
+    let bytes = std::fs::read(exe).unwrap();
+    for text in [
+        "A test made this raise fail.",
+        "this test asked for a window that fails",
+    ] {
+        assert!(
+            !holds(&bytes, text.as_bytes()),
+            "{text} in {}",
+            exe.display()
+        );
     }
+}
+
+/// `packaging/build.ps1` runs each of these. The count there must match, or it stops, so a test
+/// that is renamed cannot drop out of the run with no word.
+#[test]
+fn the_package_script_builds_in_its_own_folder_and_checks_the_exact_exe() {
+    let script = std::fs::read_to_string(packaging().join("build.ps1")).unwrap();
+    for needed in [
+        "Push-Location $repo",
+        "Pop-Location",
+        "--target-dir $target",
+        "$env:QE_RELEASE_EXE = $packagedExe",
+        "--ignored the_release_exe_",
+    ] {
+        assert!(script.contains(needed), "build.ps1 lacks {needed}");
+    }
+    let source =
+        std::fs::read_to_string(repo_root().join("crates/qe-app/tests/package.rs")).unwrap();
+    let count = source.matches("\nfn the_release_exe_").count();
+    assert!(
+        script.contains(&format!("test result: ok\\. {count} passed")),
+        "build.ps1 must expect {count} release tests"
+    );
 }
 
 // ---- The words that go with the package ----

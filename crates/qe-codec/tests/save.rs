@@ -6,6 +6,7 @@ use qe_codec::{
 };
 use std::fs;
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -503,5 +504,79 @@ fn find_leftovers_lists_our_files_and_deletes_nothing() {
     assert_eq!(find_leftovers(&missing).unwrap(), []);
 
     assert_eq!(names_in(&dir), before, "find_leftovers changed the folder");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// The built-in Guests group by its id, which reads the same in every language of Windows.
+const GUESTS_ADD: &str = "*S-1-5-32-546:(OI)(CI)(R)";
+const GUESTS_ID: &str = "*S-1-5-32-546";
+/// The same group as SDDL writes it.
+const GUESTS_RULE: &str = ";BG)";
+
+/// Changes a folder's rules the way Explorer does, which also carries them to its files.
+fn icacls(path: &Path, what: &[&str]) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(what)
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// A file whose rules come from its folder keeps following that folder after a Save. The plain
+/// file beside it shows what the folder's change does to a file that was never saved.
+#[test]
+fn a_file_that_inherits_keeps_following_its_folder_after_a_save() {
+    let dir = scratch("follows");
+    let path = dir.join("doc.txt");
+    let plain = dir.join("plain.txt");
+    fs::write(&path, b"before").unwrap();
+    fs::write(&plain, b"x").unwrap();
+    assert!(!rules_of(&path).contains(GUESTS_RULE), "the fixture");
+
+    assert_eq!(
+        atomic_write(&path, b"after").unwrap(),
+        AtomicWriteResult::Replaced
+    );
+
+    assert_eq!(
+        rules_of(&path),
+        rules_of(&plain),
+        "the Save changed the rules"
+    );
+    icacls(&dir, &["/grant", GUESTS_ADD]);
+    assert!(
+        rules_of(&plain).contains(GUESTS_RULE),
+        "the folder's rule reached no file"
+    );
+    let got = rules_of(&path);
+    assert!(
+        got.contains(GUESTS_RULE),
+        "the file stopped following: {got}"
+    );
+
+    // A rule taken away from the folder leaves too, so the file's rules are truly inherited.
+    icacls(&dir, &["/remove", GUESTS_ID]);
+    assert!(!rules_of(&plain).contains(GUESTS_RULE));
+    let got = rules_of(&path);
+    assert!(!got.contains(GUESTS_RULE), "the old rule stayed: {got}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A file with its inheritance removed stays out of the folder's reach after a Save.
+#[test]
+fn a_file_with_inheritance_removed_stays_protected_after_a_save() {
+    let dir = scratch("stays-protected");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    set_rules(&path, "D:P(A;;FA;;;OW)");
+
+    atomic_write(&path, b"after").unwrap();
+
+    icacls(&dir, &["/grant", GUESTS_ADD]);
+    let got = rules_of(&path);
+    assert!(!got.contains(GUESTS_RULE), "the folder reached it: {got}");
+    assert!(got.contains("P"), "no longer protected: {got}");
     fs::remove_dir_all(dir).unwrap();
 }

@@ -35,6 +35,8 @@ pub struct DocUi {
     pub spell_waiting: bool,
     pub found: Option<qe_spell::FixMenu>,
     pub seen_revision: u64,
+    /// Whether keys that will change the text were waiting at the last view call.
+    pub seen_queued_edits: bool,
     pub seen_place: (Range<ByteOffset>, f64),
     /// The revision the frame last looked at, so that one edit costs one look.
     pub synced_revision: u64,
@@ -156,6 +158,7 @@ impl App {
                     spell_waiting: false,
                     found: None,
                     seen_revision: 0,
+                    seen_queued_edits: false,
                     seen_place: (ByteOffset(0)..ByteOffset(0), 0.0),
                     synced_revision: 0,
                     notices: Vec::new(),

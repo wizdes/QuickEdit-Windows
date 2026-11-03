@@ -17,7 +17,9 @@ use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
-use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
+use windows::Win32::System::ProcessStatus::{
+    EnumProcessModules, GetModuleBaseNameW, GetModuleFileNameExW,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::Shell::DROPFILES;
@@ -363,6 +365,8 @@ impl App {
                 }
             }
             "modules" => loaded_modules().join(" "),
+            "module-paths" => encode(&loaded_module_paths().join("\n")),
+            "com-check" => com_check(),
             "say" => {
                 self.note(decode(rest.first().copied().unwrap_or("")));
                 "ok".to_owned()
@@ -1288,6 +1292,56 @@ fn find_named<'a>(widget: &'a qe_api::Widget, name: &str) -> Option<&'a qe_api::
 
 /// The base names of every loaded module, in lower case.
 fn loaded_modules() -> Vec<String> {
+    // SAFETY: the buffer lives through the call, and the handle is the pseudo handle.
+    each_module(|module, name| unsafe {
+        GetModuleBaseNameW(GetCurrentProcess(), Some(module), name)
+    })
+    .into_iter()
+    .map(|name| name.to_lowercase())
+    .collect()
+}
+
+fn loaded_module_paths() -> Vec<String> {
+    // SAFETY: the buffer lives through the call, and the handle is the pseudo handle.
+    each_module(|module, name| unsafe {
+        GetModuleFileNameExW(Some(GetCurrentProcess()), Some(module), name)
+    })
+}
+
+/// Makes each COM object that a run may need, with no window, on a thread of its own, under the
+/// rule for where DLLs load from. "ok", or the first that failed.
+fn com_check() -> String {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    use windows::core::{GUID, IUnknown};
+    let check = || {
+        // SAFETY: plain COM set-up on a thread that this function alone uses.
+        if let Err(e) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
+            return format!("error COM set-up: {e}");
+        }
+        for (name, class) in [
+            ("file open dialog", 0xDC1C5A9C_E88A_4DDE_A5A1_60F82A20AEF7),
+            ("file save dialog", 0xC0B4E2F3_BA21_4773_8DBA_335EC946EB8B),
+            ("spelling factory", 0x7AB36653_1796_484B_BDFA_E74F1DB7C1DC),
+            ("text services", 0x529A9E6B_6587_4F23_AB9E_9C7D683E3C50),
+        ] {
+            // SAFETY: the class id lives through the call. The object is released at its drop.
+            let made: windows::core::Result<IUnknown> =
+                unsafe { CoCreateInstance(&GUID::from_u128(class), None, CLSCTX_INPROC_SERVER) };
+            if let Err(e) = made {
+                return format!("error {name}: {e}");
+            }
+        }
+        "ok".to_owned()
+    };
+    match std::thread::spawn(check).join() {
+        Ok(answer) => answer,
+        Err(_) => "error the check's thread stopped".to_owned(),
+    }
+}
+
+fn each_module(read: impl Fn(HMODULE, &mut [u16]) -> u32) -> Vec<String> {
     let mut modules = vec![HMODULE::default(); 1024];
     let mut needed = 0;
     // SAFETY: the buffer and the count live through each call.
@@ -1305,9 +1359,9 @@ fn loaded_modules() -> Vec<String> {
         modules
             .iter()
             .map(|module| {
-                let mut name = [0u16; 260];
-                let length = GetModuleBaseNameW(process, Some(*module), &mut name) as usize;
-                String::from_utf16_lossy(&name[..length]).to_lowercase()
+                let mut name = [0u16; 1024];
+                let length = read(*module, &mut name) as usize;
+                String::from_utf16_lossy(&name[..length])
             })
             .collect()
     }

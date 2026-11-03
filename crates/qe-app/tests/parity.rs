@@ -277,7 +277,9 @@ fn p12_save_all_writes_every_document() {
     }
     app.run("SaveAll");
     eventually("both files", || {
-        std::fs::read(&one).unwrap() == b"x1" && std::fs::read(&two).unwrap() == b"x2"
+        // A read can meet the moment of the save's swap, so a failed read only means "not yet".
+        std::fs::read(&one).is_ok_and(|bytes| bytes == b"x1")
+            && std::fs::read(&two).is_ok_and(|bytes| bytes == b"x2")
     });
     app.quit();
 }

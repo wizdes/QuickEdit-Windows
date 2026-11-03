@@ -102,3 +102,72 @@ fn a_pdf_with_a_very_long_path_still_saves() {
     assert!(std::fs::read(&target).unwrap().starts_with(b"%PDF"));
     export(&target);
 }
+
+/// The built-in Guests group by its id, which reads the same in every language of Windows.
+const GUESTS_ADD: &str = "*S-1-5-32-546:(OI)(CI)(R)";
+const GUESTS_ID: &str = "*S-1-5-32-546";
+
+fn names_guests(path: &Path) -> bool {
+    rules(path).iter().any(|rule| rule.contains("Guests"))
+}
+
+/// A file whose rules come from its folder keeps following that folder after a PDF replaces it.
+/// The plain file beside it shows what the folder's change does to a file that never saw a PDF.
+#[test]
+fn a_pdf_over_a_file_that_inherits_keeps_following_its_folder() {
+    let folder = Folder::new("follows");
+    let target = folder.0.join("inherits.pdf");
+    let plain = folder.0.join("plain.txt");
+    std::fs::write(&target, b"the old file").unwrap();
+    std::fs::write(&plain, b"x").unwrap();
+    assert!(!names_guests(&target), "the fixture must start without it");
+
+    export(&target);
+
+    assert_eq!(
+        rules(&target),
+        rules(&plain),
+        "the export changed the rules"
+    );
+    icacls(&folder.0, &["/grant", GUESTS_ADD]);
+    assert!(
+        names_guests(&plain),
+        "the folder's new rule reached no file"
+    );
+    assert!(
+        names_guests(&target),
+        "the PDF stopped following: {:?}",
+        rules(&target)
+    );
+
+    // A rule taken away from the folder leaves too, so the PDF's rules are truly inherited.
+    icacls(&folder.0, &["/remove", GUESTS_ID]);
+    assert!(!names_guests(&plain));
+    assert!(
+        !names_guests(&target),
+        "the old rule stayed: {:?}",
+        rules(&target)
+    );
+}
+
+/// A file with its inheritance removed stays out of the folder's reach after a PDF replaces it.
+#[test]
+fn a_pdf_over_a_file_with_inheritance_removed_stays_protected() {
+    let folder = Folder::new("protected");
+    let target = folder.0.join("private.pdf");
+    std::fs::write(&target, b"the old file").unwrap();
+    let user = std::env::var("USERNAME").unwrap();
+    icacls(
+        &target,
+        &["/inheritance:r", "/grant:r", &format!("{user}:(F)")],
+    );
+
+    export(&target);
+
+    icacls(&folder.0, &["/grant", GUESTS_ADD]);
+    assert!(
+        !names_guests(&target),
+        "the folder reached it: {:?}",
+        rules(&target)
+    );
+}

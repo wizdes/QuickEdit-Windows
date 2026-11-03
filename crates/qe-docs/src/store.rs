@@ -510,6 +510,9 @@ struct Doc {
     reload_again: bool,
     reload_tries: u32,
     reload_retry_at: Option<Instant>,
+    /// Revisions below this are on disk through a Save. A round of `SessionEndCopies` made
+    /// earlier reads it, because the host may write that round with no access to the store.
+    saved_below: Arc<AtomicU64>,
     undecodable: Option<FileStamp>,
     missing_recheck_at: Option<Instant>,
     rename_hint: Option<PathBuf>,
@@ -766,15 +769,23 @@ struct SessionEndCopy {
     generation: u64,
     previous: Option<u64>,
     snapshot: Arc<dyn TextSnapshot>,
+    /// The text's revision in this copy, and the document's `saved_below`.
+    revision: u64,
+    saved_below: Arc<AtomicU64>,
 }
 
 impl SessionEndCopies {
     /// Writes every copy, on this thread. It waits on the disk, so a host calls it only when
-    /// Windows is ending the session. It returns what could not be written.
+    /// Windows is ending the session. It returns what could not be written. A Save that
+    /// finished after this round was made has put its text on disk, so a copy no newer than
+    /// that Save is not written: it would come back at the next launch as older, unsaved text.
     pub fn write(&self) -> Vec<DocError> {
         let cancel = AtomicBool::new(false);
         let mut failed = Vec::new();
         for item in &self.items {
+            if item.revision < item.saved_below.load(Ordering::Acquire) {
+                continue;
+            }
             let result = write_generation(&AutosaveWrite {
                 docs_dir: &self.docs_dir,
                 meta: &item.meta,
@@ -1316,6 +1327,7 @@ impl DocumentStore {
             reload_again: false,
             reload_tries: 0,
             reload_retry_at: None,
+            saved_below: Arc::new(AtomicU64::new(0)),
             undecodable: None,
             missing_recheck_at: None,
             rename_hint: None,
@@ -1804,6 +1816,7 @@ impl DocumentStore {
                 d.base = base;
                 d.stamp = stamp;
                 d.changed_while_away = false;
+                d.reload_tries = 0;
                 d.file_state_is_present(now);
                 self.events.push(DocEvent::DocChanged(doc));
                 self.reload_ended(doc);
@@ -1812,6 +1825,7 @@ impl DocumentStore {
             }
             Err(error) if error.kind == DocErrorKind::FileNotFound => {
                 // It has gone again. The tab stays as it was, and the next look decides.
+                d.reload_tries = 0;
                 self.reload_ended(doc);
                 return;
             }
@@ -1824,6 +1838,17 @@ impl DocumentStore {
                 d.base = base.or(d.base);
                 d.stamp = stamp;
             }
+            // Whoever wrote the new file may hold it for a moment, as a normal reload allows.
+            Err(error)
+                if (error.kind == DocErrorKind::FileInUse
+                    || error.kind == DocErrorKind::ChangedOutside)
+                    && d.reload_tries + 1 < RELOAD_TRIES =>
+            {
+                d.reloading = false;
+                d.reload_tries += 1;
+                d.reload_retry_at = Some(now + RELOAD_RETRY);
+                return;
+            }
             Err(_) => {
                 if let Some((base, stamp)) = identity_now {
                     d.base = base.or(d.base);
@@ -1831,6 +1856,7 @@ impl DocumentStore {
                 }
             }
         }
+        d.reload_tries = 0;
         d.file_state = FileState::Present;
         d.dirty_from_delete = false;
         d.changed_while_away = true;
@@ -2338,6 +2364,16 @@ impl DocumentStore {
         };
         let revision = d.view.revision();
         if revision == d.seen_revision {
+            // Queued keys that changed nothing, such as Backspace at the start. A copy written
+            // while they counted as unsaved text holds nothing new. The next poll removes it.
+            if !d.is_dirty() && !d.read_only {
+                if d.autosave.generation.is_some() {
+                    d.autosave.due.get_or_insert(now);
+                }
+                if std::mem::take(&mut d.was_dirty) {
+                    self.events.push(DocEvent::DocChanged(doc));
+                }
+            }
             return;
         }
         let inserted = last_inserted(&d.view, d.seen_revision);
@@ -3176,6 +3212,7 @@ impl DocumentStore {
         let Some(d) = self.docs.get_mut(&doc) else {
             return;
         };
+        d.saved_below.fetch_max(revision + 1, Ordering::AcqRel);
         let was_read_only = d.read_only;
         let was_deleted = d.file_state == FileState::Deleted;
         // The stamp is taken just after the swap, and it cannot cover that instant. A file of
@@ -4940,7 +4977,10 @@ impl DocumentStore {
             };
             if d.reload_retry_at.is_some_and(|at| at <= now) {
                 d.reload_retry_at = None;
-                if !d.is_dirty() {
+                if d.file_state == FileState::Deleted && d.dirty_from_delete {
+                    // The look at a new file at a deleted name could not read it yet.
+                    self.start_return_check(doc);
+                } else if !d.is_dirty() {
                     self.start_reload(doc);
                 }
                 continue;
@@ -5348,6 +5388,8 @@ impl DocumentStore {
                 generation,
                 previous: d.autosave.generation,
                 snapshot: d.view.worker_snapshot(),
+                revision: d.view.revision(),
+                saved_below: d.saved_below.clone(),
             });
         }
         Some(SessionEndCopies { docs_dir, items })

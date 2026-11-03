@@ -47,6 +47,18 @@ impl Args {
     pub fn help_text() -> &'static str {
         HELP
     }
+    /// Whether the line asks for no window on screen. A line that fails to parse still answers
+    /// this, so a bad flag on a hidden run opens no message box. Past `--`, all are files.
+    pub fn asks_for_hidden(items: impl Iterator<Item = OsString>) -> bool {
+        items
+            .take_while(|item| item != "--" && item != "--print-packaged-args")
+            .any(|item| {
+                matches!(
+                    item.to_str(),
+                    Some("--hidden" | "--hidden-smoke" | "--test-channel" | "--bench-keys")
+                )
+            })
+    }
     /// `packaged` is whether this process has a package identity. There, no argument is a flag.
     pub fn parse(items: impl Iterator<Item = OsString>, packaged: bool) -> Result<Self, String> {
         if packaged {
@@ -151,6 +163,27 @@ mod tests {
         assert_eq!(args.files, files);
         assert!(!args.help && !args.hidden && !args.channel && !args.smoke);
         assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn a_hidden_flag_anywhere_before_the_files_means_no_box() {
+        for line in [
+            &["--hidden", "--bad"][..],
+            &["--bad", "--hidden"],
+            &["--bad", "--hidden-smoke"],
+            &["--test-channel", "--bad"],
+            &["--bench-keys", "many"],
+        ] {
+            assert!(Args::asks_for_hidden(items(line)), "{line:?}");
+        }
+        for line in [
+            &["--bad"][..],
+            &["a.txt", "--bad"],
+            &["--bad", "--", "--hidden"],
+            &[],
+        ] {
+            assert!(!Args::asks_for_hidden(items(line)), "{line:?}");
+        }
     }
 
     #[test]

@@ -277,3 +277,47 @@ fn session_end_during_a_borrow_writes_the_copies_before_its_answer() {
     again.wait_text("typed base");
     again.quit();
 }
+
+/// The whole road in the real app: a copy written while only queued keys count as unsaved goes
+/// when they run and change nothing, with no later key or quit to prompt it.
+#[test]
+fn a_copy_goes_when_queued_keys_change_nothing_in_the_app() {
+    let folder = Folder::new("final-queued-nothing");
+    let root = folder.root();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("settings.txt"), "AutosavingDelaySeconds=1\n").unwrap();
+    let body = long_body();
+    let a = folder.file("a.txt", body.as_bytes());
+    let mut app = App::start(&root, &[&a]);
+    app.wait_text(&body);
+    // Typing that Undo takes back leaves a copy due, on a clean document.
+    app.type_text("x");
+    app.run("Undo");
+    assert_eq!(app.doc("dirty"), "false");
+    app.ok("pause-workers true");
+    app.run("ZoomIn");
+    // Home waits for a layout the paused workers hold back. Backspace at the start changes nothing.
+    app.ok("key 36");
+    app.ok("key 8");
+    assert_ne!(
+        app.ask("queued-keys"),
+        "0",
+        "this test needs keys that wait"
+    );
+    assert_eq!(app.doc("dirty"), "true", "and they count as unsaved");
+    let docs = root.join("session").join("docs");
+    let copies = |docs: &std::path::Path| {
+        std::fs::read_dir(docs).map_or(0, |dir| {
+            dir.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "qea"))
+                .count()
+        })
+    };
+    app.wait_for("the copy", |_| copies(&docs) > 0);
+    app.ok("pause-workers false");
+    app.wait_for("the keys", |app| app.ask("queued-keys") == "0");
+    assert_eq!(app.doc("dirty"), "false", "the keys changed nothing");
+    assert_eq!(app.text(), body);
+    app.wait_for("the copy goes", |_| copies(&docs) == 0);
+    app.quit();
+}

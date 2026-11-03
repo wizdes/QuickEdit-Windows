@@ -32,9 +32,9 @@ fn main() {
             println!("cargo:rustc-link-arg-bin=QuickEdit=/DELAYLOAD:{library}");
         }
         println!("cargo:rustc-link-arg-bin=QuickEdit=delayimp.lib");
-        // 0x800 is LOAD_LIBRARY_SEARCH_SYSTEM32: the exe's own imports load only from System32,
-        // so a DLL planted beside a loose copy of the exe is never loaded. `main` sets the same
-        // rule for what loads later.
+        // 0x800 is LOAD_LIBRARY_SEARCH_SYSTEM32. This covers only the exe's own imports, which
+        // load before `main`. `main` sets the same rule for everything that loads later, such as
+        // what DirectWrite or UI Automation load, so that a DLL beside the exe never loads.
         println!("cargo:rustc-link-arg-bin=QuickEdit=/DEPENDENTLOADFLAG:0x800");
     }
     let release = env("PROFILE") == "release";

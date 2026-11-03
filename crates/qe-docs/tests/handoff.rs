@@ -412,7 +412,16 @@ fn open_client(names: &PipeNames) -> std::fs::File {
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(format!(r"\\.\pipe\{}-medium", names.base));
+            .open(format!(
+                r"\\.\pipe\{}-{}",
+                names.base,
+                match names.level {
+                    IntegrityLevel::Low => "low",
+                    IntegrityLevel::Medium => "medium",
+                    IntegrityLevel::High => "high",
+                    IntegrityLevel::System => "system",
+                }
+            ));
         match opened {
             Ok(file) => return file,
             // The server makes its next pipe a moment after each connect.
@@ -866,12 +875,9 @@ fn the_real_identity_check_passes_this_process_and_refuses_system() {
         matches!(system, Err(HandoffError::UntrustedServer { .. })),
         "{system:?}"
     );
-    // A process that is gone is refused too.
+    // A process that is gone is refused too, by a name that says what happened.
     let gone = server_is_this_user_and_level(0xFFFF_FFF0);
-    assert!(
-        matches!(gone, Err(HandoffError::UntrustedServer { .. })),
-        "{gone:?}"
-    );
+    assert_eq!(gone, Err(HandoffError::ServerGone));
 }
 
 /// A launch's added cost is small: the check on a real server, 50 times.
@@ -887,4 +893,163 @@ fn the_identity_check_takes_little_time() {
     samples.sort();
     println!("the identity check: median {:?}", samples[25]);
     assert!(samples[25] < Duration::from_millis(5), "{:?}", samples[25]);
+}
+
+// ---- An instance that ends between the connect and the check.
+
+/// The real order of events: this launch has the pipe open, and the instance ends before the
+/// check on it. No other program holds the name, so the launch must not say one does.
+#[test]
+fn an_instance_that_ends_during_the_check_is_not_called_another_program() {
+    let base = format!("QuickEdit-test-{}-gone", std::process::id());
+    let names = PipeNames {
+        base: base.clone(),
+        level: IntegrityLevel::Medium,
+    };
+    let mut child = spawn_role_child(&base, r"C:\gone.txt", true);
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("ROLE") {
+        line.clear();
+        assert_ne!(output.read_line(&mut line).unwrap(), 0, "the child ended");
+    }
+    assert!(line.contains("ROLE primary"), "{line}");
+    let child = std::sync::Mutex::new(Some(child));
+    let tries = AtomicU64::new(0);
+    let check = |server: u32| {
+        tries.fetch_add(1, Ordering::Relaxed);
+        // The last handle on the process goes too, so Windows forgets the id.
+        if let Some(mut child) = child.lock().unwrap().take() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        server_is_this_user_and_level(server)
+    };
+    assert_eq!(hand_off_checked(&names, &[], &check), Ok(false));
+    assert_eq!(tries.load(Ordering::Relaxed), 1, "the pipe went with it");
+}
+
+#[test]
+fn a_process_id_that_nothing_holds_counts_as_gone() {
+    let mut child = Command::new("cmd")
+        .args(["/c", "exit"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap();
+    let id = child.id();
+    child.wait().unwrap();
+    // This handle is one more thing that keeps the process's record. Either way it has ended.
+    assert_eq!(
+        server_is_this_user_and_level(id),
+        Err(HandoffError::ServerGone)
+    );
+    drop(child);
+    assert_eq!(
+        server_is_this_user_and_level(id),
+        Err(HandoffError::ServerGone)
+    );
+}
+
+#[test]
+fn a_connect_is_tried_again_when_the_instance_goes_and_nothing_is_lost() {
+    let names = names("gone-once");
+    let (server, _) = server(&names);
+    let tries = AtomicU64::new(0);
+    let check = |_: u32| {
+        if tries.fetch_add(1, Ordering::Relaxed) == 0 {
+            Err(HandoffError::ServerGone)
+        } else {
+            Ok(())
+        }
+    };
+    let paths = [PathBuf::from(r"D:\kept.txt")];
+    assert_eq!(hand_off_checked(&names, &paths, &check), Ok(true));
+    assert_eq!(tries.load(Ordering::Relaxed), 2);
+    let got: Vec<PathBuf> = server
+        .take_requests()
+        .into_iter()
+        .flat_map(|request| request.paths)
+        .collect();
+    assert_eq!(got, paths, "sent once, after the check that passed");
+}
+
+#[test]
+fn a_connect_stops_trying_and_says_the_instance_closed() {
+    let names = names("gone-always");
+    let (_server, _) = server(&names);
+    let tries = AtomicU64::new(0);
+    let check = |_: u32| {
+        tries.fetch_add(1, Ordering::Relaxed);
+        Err(HandoffError::ServerGone)
+    };
+    let error = hand_off_checked(&names, &[], &check).unwrap_err();
+    assert_eq!(error, HandoffError::ServerGone);
+    assert_eq!(tries.load(Ordering::Relaxed), 3);
+    let shown = error.to_string();
+    assert!(shown.contains("closed"), "{shown}");
+    assert!(!shown.contains("Another program"), "{shown}");
+}
+
+/// A real pipe at this process's level, with the level mark read back through a client's handle.
+/// At normal level there must be no mark. An elevated run sees the High mark; that branch needs
+/// a person to run these tests from an elevated terminal.
+#[test]
+fn the_pipe_carries_a_level_mark_exactly_when_elevated() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
+    };
+    use windows::Win32::Security::{LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::core::PWSTR;
+    let real = PipeNames::for_this_process().unwrap();
+    let names = PipeNames {
+        base: format!("QuickEdit-test-{}-label", std::process::id()),
+        level: real.level,
+    };
+    let (_server, _) = server(&names);
+    let client = open_client(&names);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the handle is open, and `descriptor` is freed below.
+    let read = unsafe {
+        GetSecurityInfo(
+            HANDLE(client.as_raw_handle()),
+            SE_KERNEL_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    assert!(read.is_ok(), "{read:?}");
+    let mut text = PWSTR::null();
+    // SAFETY: the descriptor came from the call above, and `text` is freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            LABEL_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+    }
+    .unwrap();
+    // SAFETY: Windows gave a string that ends in a zero.
+    let label = unsafe { text.to_string() }.unwrap();
+    // SAFETY: both came from Windows, and each is freed once.
+    unsafe {
+        LocalFree(Some(HLOCAL(text.0.cast())));
+        LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    println!("level {:?}, the pipe's mark: {label:?}", real.level);
+    match real.level {
+        IntegrityLevel::High => assert_eq!(label, "S:(ML;;NW;;;HI)"),
+        IntegrityLevel::System => assert_eq!(label, "S:(ML;;NW;;;SI)"),
+        IntegrityLevel::Low | IntegrityLevel::Medium => {
+            assert!(!label.contains("ML;"), "{label}");
+        }
+    }
 }

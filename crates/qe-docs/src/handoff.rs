@@ -27,9 +27,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -52,9 +53,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentProcessId, INFINITE, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, ResetEvent, SetEvent, WaitForMultipleObjects,
-    WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, INFINITE,
+    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, ResetEvent, SetEvent,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use windows::core::{PCWSTR, PWSTR};
@@ -73,6 +74,8 @@ const MAX_CLIENT_THREADS: usize = 64;
 const TAKEN: u8 = 0x51;
 /// A running instance answers in far less. Past this it counts as hung.
 const CONNECT_WAIT: Duration = Duration::from_millis(1500);
+/// How many times one launch connects when the instance ends under it.
+const CONNECT_TRIES: u32 = 3;
 const ANSWER_WAIT: Duration = Duration::from_millis(3000);
 /// How long one launch has for its whole message, and again for reading its answer.
 const SERVER_READ_WAIT: Duration = Duration::from_millis(1000);
@@ -90,6 +93,8 @@ pub enum HandoffError {
     /// The process that holds the pipe's name is not this user at this level, or Windows would
     /// not say who it is. It was sent nothing. Show this, then run as an instance of your own.
     UntrustedServer { why: String },
+    /// The process that held the pipe ended during the connect, on every try. Nothing was sent.
+    ServerGone,
     /// The server took the files and answered with a byte that QuickEdit never sends, so it is
     /// not QuickEdit, or not this version. Show this, then run as an instance of your own.
     WrongAnswer { byte: u8 },
@@ -111,6 +116,10 @@ impl std::fmt::Display for HandoffError {
             Self::UntrustedServer { why } => write!(
                 f,
                 "Another program holds the name QuickEdit uses to pass files between its windows, so it was sent nothing, and this launch opens its own window. {why}"
+            ),
+            Self::ServerGone => write!(
+                f,
+                "The running QuickEdit closed just as this launch reached it, so this launch opens its own window."
             ),
             Self::WrongAnswer { byte } => write!(
                 f,
@@ -270,10 +279,35 @@ pub fn server_is_this_user_and_level(server: u32) -> Result<(), HandoffError> {
     // SAFETY: a plain number. The handle is closed by `Owned`.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, server) }
         .map(Owned)
-        .map_err(|e| refuse(format!("Windows would not open process {server}: {e}")))?;
-    let theirs = process_identity(process.0)
-        .map_err(|e| refuse(format!("Windows would not read process {server}: {e}")))?;
+        .map_err(|e| {
+            // This is what Windows says for a process id that nothing holds any more. A process
+            // of another user gives "access denied".
+            if e.code() == ERROR_INVALID_PARAMETER.to_hresult() {
+                HandoffError::ServerGone
+            } else {
+                refuse(format!("Windows would not open process {server}: {e}"))
+            }
+        })?;
+    // Windows keeps an ended process's record while anything holds a handle on it, so its token
+    // may still read as this user's. It can answer nobody.
+    if process_has_ended(process.0) {
+        return Err(HandoffError::ServerGone);
+    }
+    let theirs = process_identity(process.0).map_err(|e| {
+        if process_has_ended(process.0) {
+            HandoffError::ServerGone
+        } else {
+            refuse(format!("Windows would not read process {server}: {e}"))
+        }
+    })?;
     identities_match(&ours, &theirs).map_err(refuse)
+}
+
+fn process_has_ended(process: HANDLE) -> bool {
+    let mut code = 0;
+    // SAFETY: the caller gives an open process handle, and `code` outlives the call.
+    let read = unsafe { GetExitCodeProcess(process, &mut code) };
+    read.is_ok() && code != STILL_ACTIVE.0 as u32
 }
 
 fn identities_match(ours: &Identity, theirs: &Identity) -> Result<(), String> {
@@ -396,6 +430,22 @@ pub fn hand_off_checked(
             ),
         });
     }
+    // An instance that closes as this launch connects has been sent nothing yet, so the whole
+    // connect is safe to try again. The next try usually finds no pipe, or the next instance.
+    let mut tries = 1;
+    loop {
+        match connect_and_send(names, paths, check) {
+            Err(HandoffError::ServerGone) if tries < CONNECT_TRIES => tries += 1,
+            result => return result,
+        }
+    }
+}
+
+fn connect_and_send(
+    names: &PipeNames,
+    paths: &[PathBuf],
+    check: &dyn Fn(u32) -> Result<(), HandoffError>,
+) -> Result<bool, HandoffError> {
     let pipe = names.pipe(names.level);
     let started = Instant::now();
     let file = loop {
@@ -440,8 +490,14 @@ pub fn hand_off_checked(
     let mut server = 0;
     // SAFETY: the pipe is open and `server` outlives the call.
     unsafe { GetNamedPipeServerProcessId(file.0, &mut server) }.map_err(|e| {
-        HandoffError::UntrustedServer {
-            why: format!("Windows would not say which process it is: {e}"),
+        if e.code() == ERROR_BROKEN_PIPE.to_hresult()
+            || e.code() == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+        {
+            HandoffError::ServerGone
+        } else {
+            HandoffError::UntrustedServer {
+                why: format!("Windows would not say which process it is: {e}"),
+            }
         }
     })?;
     check(server)?;
@@ -652,9 +708,20 @@ impl Drop for HandoffServer {
     }
 }
 
-/// One rule, for one user, and no rules from a parent. Its text is what a test reads back.
-fn only_this_user(sid: &str) -> Vec<u16> {
-    format!("D:P(A;;GA;;;{sid})")
+/// One rule, for one user, and no rules from a parent. An elevated process also marks its pipe
+/// with its level, because a pipe with no mark counts as normal level, and a normal program of
+/// the same user could then write to it. Its text is what a test reads back.
+fn pipe_rights_text(identity: &Identity) -> String {
+    let label = match identity.level {
+        IntegrityLevel::Low | IntegrityLevel::Medium => "",
+        IntegrityLevel::High => "S:(ML;;NW;;;HI)",
+        IntegrityLevel::System => "S:(ML;;NW;;;SI)",
+    };
+    format!("D:P(A;;GA;;;{}){label}", identity.sid)
+}
+
+fn pipe_rights(identity: &Identity) -> Vec<u16> {
+    pipe_rights_text(identity)
         .encode_utf16()
         .chain([0])
         .collect()
@@ -710,7 +777,7 @@ pub fn listen(
 ) -> Result<Option<HandoffServer>, HandoffError> {
     let pipe = names.pipe(names.level);
     // SAFETY: the pseudo handle is always valid.
-    let rights = only_this_user(&process_identity(unsafe { GetCurrentProcess() })?.sid);
+    let rights = pipe_rights(&process_identity(unsafe { GetCurrentProcess() })?);
     let first = match create_pipe(&pipe, &rights, true) {
         Ok(handle) => handle,
         // The first-instance flag fails with access denied when the name is taken.
@@ -1111,6 +1178,69 @@ mod tests {
         };
         let shown = identities_match(&ours, &level).unwrap_err();
         assert!(shown.contains("administrator"), "{shown}");
+    }
+    #[test]
+    fn a_pipe_is_marked_with_its_level_only_when_elevated() {
+        let identity = |level| Identity {
+            sid: "S-1-5-21-1".into(),
+            level,
+        };
+        for level in [IntegrityLevel::Low, IntegrityLevel::Medium] {
+            assert_eq!(
+                pipe_rights_text(&identity(level)),
+                "D:P(A;;GA;;;S-1-5-21-1)"
+            );
+        }
+        assert_eq!(
+            pipe_rights_text(&identity(IntegrityLevel::High)),
+            "D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NW;;;HI)"
+        );
+        assert_eq!(
+            pipe_rights_text(&identity(IntegrityLevel::System)),
+            "D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NW;;;SI)"
+        );
+    }
+    /// Windows must read the mark as a level rule, not ignore it. The text goes through the same
+    /// conversion as a real pipe's, with no pipe, as this test may run at normal level, where
+    /// Windows refuses a mark above the process's own level.
+    #[test]
+    fn windows_reads_the_mark_back_from_the_text() {
+        use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows::Win32::Security::LABEL_SECURITY_INFORMATION;
+        for (level, want) in [
+            (IntegrityLevel::High, "S:(ML;;NW;;;HI)"),
+            (IntegrityLevel::System, "S:(ML;;NW;;;SI)"),
+        ] {
+            let rights = pipe_rights(&Identity {
+                sid: "S-1-5-21-1".into(),
+                level,
+            });
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let mut text = windows::core::PWSTR::null();
+            // SAFETY: the text ends in a zero, and each thing Windows gives is freed once.
+            let read = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(rights.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    None,
+                )
+                .unwrap();
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    LABEL_SECURITY_INFORMATION,
+                    &mut text,
+                    None,
+                )
+                .unwrap();
+                let read = text.to_string().unwrap();
+                LocalFree(Some(HLOCAL(text.0.cast())));
+                LocalFree(Some(HLOCAL(descriptor.0)));
+                read
+            };
+            assert_eq!(read, want);
+        }
     }
     #[test]
     fn real_names_come_from_the_token() {

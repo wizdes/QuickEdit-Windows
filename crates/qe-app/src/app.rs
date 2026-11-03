@@ -259,7 +259,11 @@ pub fn run(dll_rule: Result<(), String>, dll_rule_took: Duration) -> i32 {
     let args = match Args::parse(std::env::args_os().skip(1), packaged) {
         Ok(args) => args,
         Err(problem) => {
-            tell_the_person(STD_ERROR_HANDLE, &problem, MB_OK | MB_ICONERROR);
+            if Args::asks_for_hidden(std::env::args_os().skip(1)) {
+                eprintln!("{problem}");
+            } else {
+                tell_the_person(STD_ERROR_HANDLE, &problem, MB_OK | MB_ICONERROR);
+            }
             return 2;
         }
     };

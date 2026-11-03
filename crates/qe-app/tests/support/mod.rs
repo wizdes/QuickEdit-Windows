@@ -108,11 +108,21 @@ impl App {
     }
     /// Starts the app, and does not wait for a window.
     pub fn launch(root: &Path, files: &[&Path], flags: &[&str], log: Option<&Path>) -> Self {
+        Self::launch_exe(&exe(), root, files, flags, log)
+    }
+    /// As `launch`, with this exe.
+    pub fn launch_exe(
+        exe: &str,
+        root: &Path,
+        files: &[&Path],
+        flags: &[&str],
+        log: Option<&Path>,
+    ) -> Self {
         let errors = match log {
             Some(path) => Stdio::from(std::fs::File::create(path).expect("a log file")),
             None => Stdio::inherit(),
         };
-        let mut child = Command::new(exe())
+        let mut child = Command::new(exe)
             .arg("--test-channel")
             .arg("--stub-spell")
             .args(flags)

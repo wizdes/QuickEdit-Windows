@@ -211,6 +211,33 @@ fn temp_file_keeps_rules_that_are_not_protected() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// The temp file carries the target's rules as they are. ReplaceFileW puts right a temp file marked
+/// protected over a target that inherits, but a temp file kept after a failed swap would stay so.
+#[test]
+fn temp_file_of_a_target_that_inherits_is_not_protected() {
+    let dir = scratch("temp-inherits");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"before").unwrap();
+    let wanted = rules_of(&path);
+    assert!(wanted.contains("ID;"), "the fixture must inherit: {wanted}");
+    let checks = std::rc::Rc::new(RefCell::new(0));
+    let seen = checks.clone();
+    let mut env = FakeEnv {
+        on_temp_created: Some(Box::new(move |temp| {
+            // Windows leaves off the "auto-inherited" mark (AI), which changes no access.
+            let rules = rules_of(temp);
+            let (flags, list) = rules.split_at(rules.find('(').unwrap());
+            assert!(!flags.contains('P'), "protected: {rules}");
+            assert_eq!(list, &wanted[wanted.find('(').unwrap()..]);
+            *seen.borrow_mut() += 1;
+        })),
+        ..Default::default()
+    };
+    atomic_write_with(&path, b"after", &mut env).unwrap();
+    assert_eq!(*checks.borrow(), 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// Item 5: a name that is taken stays as it was, for temp and backup.
 #[test]
 fn stale_files_with_the_same_name_are_kept_and_do_not_block_a_save() {

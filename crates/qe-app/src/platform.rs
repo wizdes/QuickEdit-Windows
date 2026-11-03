@@ -10,28 +10,27 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{
-    APPMODEL_ERROR_NO_PACKAGE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    APPMODEL_ERROR_NO_PACKAGE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
 use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::Win32::System::Console::{GetStdHandle, STD_HANDLE};
 use windows::Win32::System::LibraryLoader::{
-    GetModuleHandleW, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    SetDefaultDllDirectories,
+    GetModuleHandleW, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-/// A DLL loaded by name comes from System32 or the app's own folder, never the current folder
-/// or `PATH`. The linker's `/DEPENDENTLOADFLAG` in `build.rs` does the same for the exe's own
-/// imports, which load before this runs. The result is for the caller to show.
-pub fn keep_dll_search_to_system_and_app_folders() -> Result<(), String> {
+/// A DLL loaded by name comes from System32 only, never the app's folder, the current folder or
+/// `PATH`. The app ships no DLLs, so its folder has none to offer, and one found there was put
+/// there by someone else. The linker's `/DEPENDENTLOADFLAG` in `build.rs` does the same for the
+/// exe's own imports, which load before this runs. COM still finds its servers: it names them by
+/// full path. The result is for the caller to show.
+pub fn keep_dll_search_to_system32() -> Result<(), String> {
     // SAFETY: plain flags, and no other thread is running yet.
-    unsafe {
-        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)
-    }
-    .map_err(|e| format!("Windows refused the rule for where DLLs load from: {e}"))
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }
+        .map_err(|e| format!("Windows refused the rule for where DLLs load from: {e}"))
 }
 
 /// Whether Windows runs this process from a package, as the Store's install does. Only "no
@@ -40,6 +39,10 @@ pub fn has_package_identity() -> bool {
     let mut length = 0;
     // SAFETY: with a length of zero and no buffer, this only reports what it would need.
     let answer = unsafe { GetCurrentPackageFullName(&mut length, None) };
+    answer_means_a_package(answer)
+}
+
+fn answer_means_a_package(answer: WIN32_ERROR) -> bool {
     answer != APPMODEL_ERROR_NO_PACKAGE
 }
 
@@ -266,4 +269,28 @@ pub fn cursor_pos() -> Result<POINT, String> {
     // SAFETY: `at` lives through the call.
     unsafe { GetCursorPos(&mut at) }.map_err(|e| e.to_string())?;
     Ok(at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::Args;
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+
+    /// The branch that decides whether flags count. Only "no package" reads flags. A real
+    /// package's run gives "buffer too small" here, and root checks that on a real install.
+    #[test]
+    fn only_the_no_package_answer_lets_flags_count() {
+        assert!(!answer_means_a_package(APPMODEL_ERROR_NO_PACKAGE));
+        for answer in [ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR(5)] {
+            assert!(answer_means_a_package(answer), "{answer:?}");
+        }
+        let flag = || vec![std::ffi::OsString::from("--hidden")].into_iter();
+        let read = Args::parse(flag(), answer_means_a_package(ERROR_INSUFFICIENT_BUFFER));
+        let read = read.unwrap();
+        assert!(!read.hidden);
+        assert_eq!(read.files, [PathBuf::from("--hidden")]);
+        let read = Args::parse(flag(), answer_means_a_package(APPMODEL_ERROR_NO_PACKAGE));
+        assert!(read.unwrap().hidden);
+    }
 }

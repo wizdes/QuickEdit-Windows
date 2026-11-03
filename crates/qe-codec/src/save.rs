@@ -22,8 +22,8 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SetFileSecurityW, SetSecurityDescriptorControl,
+    DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    SetFileSecurityW,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL,
@@ -332,9 +332,10 @@ impl AccessRules {
     }
 }
 /// Reads the target's access rules. `None` on a file system that has none, such
-/// as FAT or exFAT, where a new file cannot be wider than the target. The rules
-/// are marked protected so that Windows keeps them exactly and does not mix in
-/// rules inherited from the folder.
+/// as FAT or exFAT, where a new file cannot be wider than the target. The rules go
+/// to the new file as they are. Rules marked as inherited stay so, and a list with
+/// its inheritance removed stays protected, so the new file follows its folder
+/// exactly when the old one did.
 fn read_access_rules(path: &Path) -> Result<Option<AccessRules>, u32> {
     let name = wide_path(path);
     let mut needed = 0u32;
@@ -376,9 +377,6 @@ fn read_access_rules(path: &Path) -> Result<Option<AccessRules>, u32> {
         // SAFETY: the call takes no arguments.
         return Err(unsafe { GetLastError() }.0);
     }
-    // SAFETY: `pointer` holds the valid descriptor that the call just wrote.
-    unsafe { SetSecurityDescriptorControl(pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED) }
-        .map_err(|e| win32_code(&e))?;
     Ok(Some(rules))
 }
 

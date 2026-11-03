@@ -13,8 +13,7 @@ use windows::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
 };
 use windows::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SetSecurityDescriptorControl,
+    DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -52,8 +51,9 @@ fn raw_call_path(path: &Path) -> Result<Vec<u16>, PdfError> {
     Ok(out)
 }
 
-/// A file's access rules, ready to give to a new one, as `qe-codec`'s save does. The rules are
-/// marked protected, so that Windows keeps them as they are and adds none from the folder.
+/// A file's access rules, ready to give to a new one, as `qe-codec`'s save does. Rules marked as
+/// inherited stay so, and a list with its inheritance removed stays protected, so the new file
+/// follows its folder exactly when the old one did.
 pub struct AccessRules {
     // u64 gives the alignment a security descriptor needs.
     descriptor: Vec<u64>,
@@ -112,9 +112,6 @@ pub fn read_access_rules(path: &Path) -> Result<Option<AccessRules>, PdfError> {
         // SAFETY: the call takes no arguments.
         return Err(refuse(unsafe { GetLastError() }.0));
     }
-    // SAFETY: `pointer` holds the valid descriptor that the call just wrote.
-    unsafe { SetSecurityDescriptorControl(pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED) }
-        .map_err(|e| refuse((e.code().0 as u32) & 0xffff))?;
     Ok(Some(rules))
 }
 

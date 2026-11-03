@@ -29,8 +29,22 @@ version = "0.1.0"
 name = "qe-app"
 version = "0.1.0"
 dependencies = [
+ "qe-a11y",
  "qe-api",
+ "qe-buffer",
+ "qe-codec",
  "qe-docs",
+ "qe-editor",
+ "qe-ime",
+ "qe-layout",
+ "qe-pdf",
+ "qe-render",
+ "qe-settings",
+ "qe-shell",
+ "qe-spell",
+ "qe-tools",
+ "qe-ui",
+ "qe-views",
  "windows",
 ]
 

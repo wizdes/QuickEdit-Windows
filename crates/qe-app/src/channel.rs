@@ -13,7 +13,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
@@ -26,7 +27,7 @@ use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, GW_OWNER, GetClassNameW, GetWindow, GetWindowRect, PostMessageW,
     SendMessageW, WM_CLOSE, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_PAINT, WM_SETTINGCHANGE,
+    WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
 };
 use windows::core::BOOL;
 
@@ -426,6 +427,18 @@ impl App {
                     None => "error no tab".to_owned(),
                 }
             }
+            "tab-point" => {
+                // The center of a tab in client pixels, and the real `WM_NCHITTEST` answer there.
+                let index = rest
+                    .first()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(0);
+                match window.and_then(|window| self.windows.get(&window)) {
+                    Some(win) => tab_point(win, index),
+                    None => "error no window".to_owned(),
+                }
+            }
+            "tab-drag-held" => self.tab_drag.get().is_some().to_string(),
             "queued-keys" => self
                 .doc_in_use()
                 .and_then(|doc| self.store.view(doc))
@@ -1400,6 +1413,36 @@ fn thread_window_of_class(class: &str) -> Option<HWND> {
 }
 
 /// Builds the block a drop hands over, and posts it as Windows does.
+fn tab_point(win: &crate::ui::Win, index: usize) -> String {
+    let rect = win
+        .handle
+        .with_strip(|strip| strip.tab_rects().get(index).copied());
+    let (rect, dpi) = match (rect, win.handle.dpi()) {
+        (Ok(Some(rect)), Ok(dpi)) => (rect, dpi),
+        (Ok(None), _) => return "error no such tab".to_owned(),
+        (Err(e), _) | (_, Err(e)) => return format!("error {e}"),
+    };
+    let scale = dpi as f32 / 96.0;
+    let x = ((rect.x.0 + rect.width.0 / 2.0) * scale) as i32;
+    let y = ((rect.y.0 + rect.height.0 / 2.0) * scale) as i32;
+    let mut screen = POINT { x, y };
+    // SAFETY: a window of this thread, and plain queries.
+    let hit = unsafe {
+        if !ClientToScreen(win.hwnd, &mut screen).as_bool() {
+            return "error ClientToScreen failed".to_owned();
+        }
+        let packed =
+            ((screen.y as i16 as u16 as u32) << 16 | (screen.x as i16 as u16 as u32)) as i32;
+        SendMessageW(
+            win.hwnd,
+            WM_NCHITTEST,
+            Some(WPARAM(0)),
+            Some(LPARAM(packed as isize)),
+        )
+    };
+    format!("{x} {y} {}", hit.0)
+}
+
 fn post_drop(hwnd: HWND, wide: &[u16]) -> String {
     let header = size_of::<DROPFILES>();
     let bytes = header + (wide.len() + 2) * 2;

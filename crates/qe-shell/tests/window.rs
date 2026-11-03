@@ -2198,3 +2198,213 @@ fn the_active_tab_joins_the_bar_with_no_line_between() {
     let row = pixel(&image, right, bottom - 1);
     assert_ne!(row, bar, "the rest of the row is the row's own color");
 }
+
+/// What Windows really sends for a middle button at this point. With no capture it asks
+/// `WM_NCHITTEST`, and the answer picks the client or the non-client message. Under capture,
+/// every mouse message is the client form.
+fn middle_as_windows_sends_it(f: &Fixture, x: f32, y: f32, down: bool) {
+    let code = if capture(f) { HTCLIENT } else { f.hit(x, y) };
+    if code == HTCLIENT {
+        let msg = if down { WM_MBUTTONDOWN } else { WM_MBUTTONUP };
+        f.send(msg, if down { 0x10 } else { 0 }, f.at(x, y));
+    } else {
+        let msg = if down {
+            WM_NCMBUTTONDOWN
+        } else {
+            WM_NCMBUTTONUP
+        };
+        f.send(msg, code as usize, f.screen_at(x, y));
+    }
+}
+fn middle_messages_to_default(f: &Fixture) -> Vec<u32> {
+    f.window
+        .default_messages()
+        .unwrap()
+        .into_iter()
+        .filter(|m| matches!(*m, WM_NCMBUTTONDOWN | WM_NCMBUTTONUP | WM_NCMBUTTONDBLCLK))
+        .collect()
+}
+
+#[test]
+fn a_middle_click_on_a_tab_arrives_as_client_messages_and_asks_to_close_it() {
+    let f = fixture(None);
+    let first = f.window.with_strip(|s| s.tab_id(0).unwrap()).unwrap();
+    f.window.add_tab(Tab::new("Second")).unwrap();
+    f.events();
+    assert_eq!(f.hit(100.0, 20.0), HTCLIENT, "tabs are client area");
+    middle_as_windows_sends_it(&f, 100.0, 20.0, true);
+    assert!(capture(&f), "the release must come back to this window");
+    assert_eq!(f.events(), vec![], "nothing happens on the press");
+    middle_as_windows_sends_it(&f, 100.0, 20.0, false);
+    assert!(!capture(&f), "capture ends with the press");
+    assert_eq!(f.events(), vec![ShellEvent::CloseTabRequested(first)]);
+    assert_eq!(
+        f.window.with_strip(|s| s.active()).unwrap(),
+        1,
+        "the tab on show stays on show"
+    );
+}
+
+#[test]
+fn a_middle_release_off_the_tab_does_nothing_and_ends_capture() {
+    let f = fixture(None);
+    f.window.add_tab(Tab::new("Second")).unwrap();
+    f.events();
+    let second = f.window.with_strip(|s| s.tab_rects()[1].x.0).unwrap() + 20.0;
+    let w = f.width_dips();
+    for (x, y) in [
+        (second, 20.0),
+        (100.0, 300.0),
+        (w - 200.0, 20.0),
+        (w - 23.0, 20.0),
+        (w + 500.0, -50.0),
+    ] {
+        middle_as_windows_sends_it(&f, 100.0, 20.0, true);
+        assert!(capture(&f));
+        f.send(WM_MOUSEMOVE, 0x10, f.at(x, y));
+        middle_as_windows_sends_it(&f, x, y, false);
+        assert!(!capture(&f), "at {x},{y}");
+        assert_eq!(f.events(), vec![], "at {x},{y}");
+    }
+}
+
+#[test]
+fn a_middle_click_on_the_rest_of_the_row_does_nothing_and_never_reaches_windows() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    let plus = f.window.with_strip(|s| s.plus_rect()).unwrap();
+    for (x, y, want) in [
+        (plus.x.0 + 4.0, plus.y.0 + 4.0, HTCLIENT),
+        (w - 23.0, 20.0, HTCLOSE),
+        (w - 69.0, 20.0, HTMAXBUTTON),
+        (w - 115.0, 20.0, HTMINBUTTON),
+        (w - 200.0, 20.0, HTCAPTION),
+        (100.0, 2.0, HTTOP),
+    ] {
+        assert_eq!(f.hit(x, y), want, "at {x},{y}");
+        middle_as_windows_sends_it(&f, x, y, true);
+        assert!(!capture(&f), "code {want}");
+        middle_as_windows_sends_it(&f, x, y, false);
+        assert_eq!(f.events(), vec![], "code {want}");
+    }
+    // Windows reports a fast second click on the frame as a double click.
+    f.send(
+        WM_NCMBUTTONDBLCLK,
+        HTCAPTION as usize,
+        f.screen_at(w - 200.0, 20.0),
+    );
+    assert_eq!(middle_messages_to_default(&f), vec![]);
+    assert_eq!(f.commands(), vec![], "no window command ran");
+}
+
+#[test]
+fn a_middle_press_on_the_drag_area_and_a_release_on_a_tab_does_nothing() {
+    let f = fixture(None);
+    let w = f.width_dips();
+    f.events();
+    middle_as_windows_sends_it(&f, w - 200.0, 20.0, true);
+    middle_as_windows_sends_it(&f, 100.0, 20.0, false);
+    assert!(!capture(&f));
+    assert_eq!(f.events(), vec![]);
+}
+
+#[test]
+fn a_middle_click_during_a_left_press_on_a_tab_leaves_it_alone() {
+    let f = fixture(None);
+    let first = f.window.with_strip(|s| s.tab_id(0).unwrap()).unwrap();
+    f.window.add_tab(Tab::new("Second")).unwrap();
+    f.events();
+    let second = f.window.with_strip(|s| s.tab_rects()[1].x.0).unwrap() + 20.0;
+    f.send(WM_LBUTTONDOWN, 1, f.at(100.0, 20.0));
+    assert!(capture(&f));
+    // On a tab, and in the text area, where a press would otherwise take the mouse.
+    for (x, y) in [(second, 20.0), (100.0, 300.0)] {
+        f.send(WM_MBUTTONDOWN, 0x11, f.at(x, y));
+        f.send(WM_MBUTTONUP, 1, f.at(x, y));
+        assert!(capture(&f), "the left press still holds at {x},{y}");
+        assert_eq!(f.events(), vec![], "at {x},{y}");
+    }
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 20.0));
+    assert!(!capture(&f));
+    assert_eq!(f.events(), vec![ShellEvent::SelectTab(first)]);
+}
+
+#[test]
+fn a_left_press_on_a_tab_during_a_middle_press_keeps_its_capture() {
+    let f = fixture(None);
+    let first = f.window.with_strip(|s| s.tab_id(0).unwrap()).unwrap();
+    f.window.add_tab(Tab::new("Second")).unwrap();
+    f.events();
+    let second = f.window.with_strip(|s| s.tab_rects()[1].x.0).unwrap() + 20.0;
+    f.send(WM_MBUTTONDOWN, 0x10, f.at(second, 20.0));
+    f.send(WM_LBUTTONDOWN, 0x11, f.at(100.0, 20.0));
+    assert!(capture(&f), "the left press has the mouse");
+    f.send(WM_MBUTTONUP, 1, f.at(second, 20.0));
+    assert!(capture(&f), "and keeps it after the middle release");
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 20.0));
+    assert!(!capture(&f));
+    assert_eq!(f.events(), vec![ShellEvent::SelectTab(first)]);
+}
+
+#[test]
+fn a_left_press_in_the_text_during_a_middle_press_goes_to_the_text() {
+    let f = fixture(None);
+    f.events();
+    f.send(WM_MBUTTONDOWN, 0x10, f.at(100.0, 20.0));
+    f.send(WM_LBUTTONDOWN, 0x11, f.at(100.0, 300.0));
+    assert!(capture(&f), "the text area holds the mouse");
+    assert!(matches!(
+        content_events(&f).as_slice(),
+        [InputKind::MouseDown {
+            button: MouseButton::Left,
+            ..
+        }]
+    ));
+    f.send(WM_MBUTTONUP, 1, f.at(100.0, 20.0));
+    assert!(capture(&f), "the middle release does not end the selection");
+    let events = f.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ShellEvent::CloseTabRequested(_))),
+        "{events:?}"
+    );
+    f.send(WM_LBUTTONUP, 0, f.at(100.0, 300.0));
+    assert!(!capture(&f));
+}
+
+#[test]
+fn a_focus_or_capture_loss_during_a_middle_press_cancels_it() {
+    let f = fixture(None);
+    f.events();
+    f.send(WM_MBUTTONDOWN, 0x10, f.at(100.0, 20.0));
+    assert!(capture(&f));
+    f.send(WM_KILLFOCUS, 0, 0);
+    assert!(!capture(&f), "focus loss ends capture");
+    f.send(WM_MBUTTONUP, 0, f.at(100.0, 20.0));
+    assert_eq!(f.events(), vec![], "focus");
+
+    f.send(WM_MBUTTONDOWN, 0x10, f.at(100.0, 20.0));
+    assert!(capture(&f));
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() }.unwrap();
+    assert!(!capture(&f));
+    f.send(WM_MBUTTONUP, 0, f.at(100.0, 20.0));
+    assert_eq!(f.events(), vec![], "capture");
+}
+
+#[test]
+fn a_middle_click_on_the_menu_bar_stays_as_it_was() {
+    let f = fixture(None);
+    f.events();
+    let content = f.window.content_rect().unwrap();
+    let y = content.y.0 - 4.0;
+    f.send(WM_MBUTTONDOWN, 0x10, f.at(30.0, y));
+    f.send(WM_MBUTTONUP, 0, f.at(30.0, y));
+    let events = f.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ShellEvent::CloseTabRequested(_))),
+        "{events:?}"
+    );
+}

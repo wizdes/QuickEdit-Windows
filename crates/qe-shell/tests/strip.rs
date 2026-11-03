@@ -1238,8 +1238,14 @@ fn full_screen_row_never_gives_clicks_to_the_text_area() {
 fn other_buttons_on_the_row_stay_out_of_the_text_area() {
     let mut s = strip(1, 800.0);
     for button in [MouseButton::Right, MouseButton::Middle] {
+        // A middle click on a tab closes it, so this button tries the drag area.
+        let x = if button == MouseButton::Middle {
+            500.0
+        } else {
+            100.0
+        };
         for (y, expected) in [(20.0, Handled::Yes), (300.0, Handled::No)] {
-            let at = point(100.0, y);
+            let at = point(x, y);
             let modifiers = Modifiers::default();
             assert_eq!(
                 send(
@@ -1525,4 +1531,310 @@ fn tab_from_the_plus_leaves_the_row_and_arrows_wrap_to_the_first_tab() {
     );
     assert_eq!(s.focused(), None);
     assert_eq!(s.take_events(), vec![ShellEvent::FocusContent]);
+}
+
+fn middle_down(s: &mut TabStrip, x: f32, y: f32) -> (Handled, ViewContext) {
+    send(
+        s,
+        InputKind::MouseDown {
+            at: point(x, y),
+            button: MouseButton::Middle,
+            modifiers: Modifiers::default(),
+        },
+    )
+}
+fn middle_up(s: &mut TabStrip, x: f32, y: f32) -> (Handled, ViewContext) {
+    send(
+        s,
+        InputKind::MouseUp {
+            at: point(x, y),
+            button: MouseButton::Middle,
+            modifiers: Modifiers::default(),
+        },
+    )
+}
+fn asks_capture(ctx: &ViewContext, wanted: bool) -> bool {
+    ctx.requests
+        .iter()
+        .any(|r| matches!(r, ViewRequest::CaptureMouse(c) if *c == wanted))
+}
+fn tab_x(s: &TabStrip, index: usize) -> f32 {
+    s.tab_rects()[index].x.0 + 20.0
+}
+
+#[test]
+fn a_middle_click_asks_to_close_the_tab_under_the_pointer_on_release() {
+    let mut s = strip(3, 1000.0);
+    s.select(s.tab_id(2).unwrap());
+    s.take_events();
+    let x = tab_x(&s, 0);
+    let (handled, ctx) = middle_down(&mut s, x, 20.0);
+    assert_eq!(handled, Handled::Yes);
+    assert!(asks_capture(&ctx, true), "the release must come back here");
+    assert!(s.holds_mouse());
+    assert_eq!(s.take_events(), vec![], "nothing happens on the press");
+    let (handled, ctx) = middle_up(&mut s, x, 20.0);
+    assert_eq!(handled, Handled::Yes);
+    assert!(asks_capture(&ctx, false), "capture ends with the press");
+    assert!(!s.holds_mouse());
+    // The very event of the X on a tab, and no `SelectTab`.
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(0).unwrap())]
+    );
+    assert_eq!(s.active(), 2, "the tab on show stays on show");
+    assert_eq!(s.tabs().len(), 3, "the owner removes it");
+}
+
+#[test]
+fn a_middle_click_on_a_tabs_x_or_the_active_tab_closes_that_tab() {
+    let mut s = strip(3, 1000.0);
+    let b = s.tab_rects()[1];
+    let x = b.x.0 + b.width.0 - 10.0;
+    assert_eq!(s.hit_test(point(x, 20.0)), CaptionHit::TabClose(1));
+    middle_down(&mut s, x, 20.0);
+    middle_up(&mut s, x, 20.0);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(1).unwrap())]
+    );
+    // From the body of a tab to its X is still the same tab.
+    middle_down(&mut s, b.x.0 + 20.0, 20.0);
+    middle_up(&mut s, x, 20.0);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(1).unwrap())]
+    );
+    let x = tab_x(&s, 0);
+    assert_eq!(s.active(), 0);
+    middle_down(&mut s, x, 20.0);
+    middle_up(&mut s, x, 20.0);
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::CloseTabRequested(s.tab_id(0).unwrap())]
+    );
+}
+
+#[test]
+fn moving_off_the_tab_before_the_middle_release_does_nothing() {
+    let width = 1000.0;
+    let mut s = strip(3, width);
+    let (first, second) = (tab_x(&s, 0), tab_x(&s, 1));
+    for (x, y, what) in [
+        (second, 20.0, "another tab"),
+        (first, 300.0, "the text area"),
+        (width - 200.0, 20.0, "the drag area"),
+        (width - 20.0, 20.0, "a window button"),
+        (-50.0, -50.0, "outside the window"),
+    ] {
+        middle_down(&mut s, first, 20.0);
+        send(&mut s, InputKind::MouseMove { at: point(x, y) });
+        let (handled, ctx) = middle_up(&mut s, x, y);
+        assert_eq!(handled, Handled::Yes, "{what}: the press owns the release");
+        assert!(asks_capture(&ctx, false), "{what}");
+        assert!(!s.holds_mouse(), "{what}");
+        assert_eq!(s.take_events(), vec![], "{what}");
+    }
+}
+
+#[test]
+fn a_middle_click_on_the_rest_of_the_row_does_nothing() {
+    let width = 500.0;
+    let mut s = strip(60, width);
+    let plus = s.plus_rect();
+    let places = [
+        (plus.x.0 + 4.0, plus.y.0 + 4.0, CaptionHit::NewTab),
+        (width - 20.0, 20.0, CaptionHit::Close),
+        (width - 60.0, 20.0, CaptionHit::Maximize),
+        (width - 110.0, 20.0, CaptionHit::Minimize),
+        (10.0, plus.y.0 + 4.0, CaptionHit::ScrollLeft),
+        (100.0, 2.0, CaptionHit::ResizeTop),
+    ];
+    let before = s.tab_rects().to_vec();
+    for (x, y, hit) in places {
+        assert_eq!(s.hit_test(point(x, y)), hit);
+        let (handled, ctx) = middle_down(&mut s, x, y);
+        assert_eq!(handled, Handled::Yes, "{hit:?}");
+        assert!(!asks_capture(&ctx, true), "{hit:?}");
+        assert!(!s.holds_mouse(), "{hit:?}");
+        let (handled, _) = middle_up(&mut s, x, y);
+        assert_eq!(handled, Handled::Yes, "{hit:?}");
+        assert_eq!(s.take_events(), vec![], "{hit:?}");
+    }
+    assert_eq!(s.tab_rects(), before.as_slice(), "nothing scrolled");
+
+    let mut few = strip(1, width);
+    assert_eq!(few.hit_test(point(350.0, 20.0)), CaptionHit::Drag);
+    middle_down(&mut few, 350.0, 20.0);
+    assert!(!few.holds_mouse());
+    middle_up(&mut few, 350.0, 20.0);
+    assert_eq!(few.take_events(), vec![]);
+}
+
+#[test]
+fn a_middle_click_during_a_left_press_leaves_the_left_press_alone() {
+    let mut s = strip(3, 1000.0);
+    let (first, second) = (tab_x(&s, 0), tab_x(&s, 1));
+    down(&mut s, second, 20.0);
+    s.take_events();
+    for (x, y) in [(first, 20.0), (second, 20.0), (first, 300.0)] {
+        let (handled, ctx) = middle_down(&mut s, x, y);
+        assert_eq!(handled, Handled::Yes, "it never reaches the text");
+        assert!(ctx.requests.is_empty(), "{:?}", ctx.requests);
+        let (handled, ctx) = middle_up(&mut s, x, y);
+        assert_eq!(handled, Handled::Yes, "it never reaches the text");
+        assert!(ctx.requests.is_empty(), "{:?}", ctx.requests);
+        assert!(s.holds_mouse(), "the left press still holds");
+        assert_eq!(s.take_events(), vec![]);
+    }
+    let (_, ctx) = up(&mut s, second, 20.0);
+    assert!(asks_capture(&ctx, false));
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::SelectTab(s.tab_id(1).unwrap())],
+        "the left click still counts"
+    );
+}
+
+#[test]
+fn a_middle_click_during_a_left_tab_drag_leaves_the_drag_alone() {
+    let mut s = strip(3, 1000.0);
+    let (first, second, third) = (tab_x(&s, 0), tab_x(&s, 1), tab_x(&s, 2));
+    down(&mut s, first, 20.0);
+    send(
+        &mut s,
+        InputKind::MouseMove {
+            at: point(second, 20.0),
+        },
+    );
+    s.take_events();
+    middle_down(&mut s, third, 20.0);
+    middle_up(&mut s, third, 20.0);
+    assert_eq!(s.take_events(), vec![]);
+    send(
+        &mut s,
+        InputKind::MouseMove {
+            at: point(third, 20.0),
+        },
+    );
+    let events = s.take_events();
+    assert!(
+        matches!(events.as_slice(), [ShellEvent::ReorderTab { to: 2, .. }]),
+        "the drag goes on: {events:?}"
+    );
+    up(&mut s, third, 20.0);
+    assert!(!s.holds_mouse());
+}
+
+#[test]
+fn a_left_press_during_a_middle_press_ends_the_middle_press() {
+    let mut s = strip(3, 1000.0);
+    let (first, second) = (tab_x(&s, 0), tab_x(&s, 1));
+    middle_down(&mut s, first, 20.0);
+    let (_, ctx) = down(&mut s, second, 20.0);
+    assert!(
+        !asks_capture(&ctx, false),
+        "a release here would end the left press too"
+    );
+    assert!(s.holds_mouse(), "the left press has the mouse now");
+    let (handled, ctx) = middle_up(&mut s, first, 20.0);
+    assert_eq!(handled, Handled::Yes);
+    assert!(ctx.requests.is_empty(), "{:?}", ctx.requests);
+    assert_eq!(s.take_events(), vec![], "no close");
+    let (_, ctx) = up(&mut s, second, 20.0);
+    assert!(asks_capture(&ctx, false));
+    assert!(!s.holds_mouse());
+    assert_eq!(
+        s.take_events(),
+        vec![ShellEvent::SelectTab(s.tab_id(1).unwrap())]
+    );
+}
+
+#[test]
+fn another_press_with_no_use_for_capture_ends_the_middle_press_and_lets_go() {
+    let width = 1000.0;
+    for (x, y, button, handled) in [
+        (300.0, 300.0, MouseButton::Left, Handled::No),
+        (width - 200.0, 20.0, MouseButton::Left, Handled::Yes),
+        (300.0, 300.0, MouseButton::Right, Handled::No),
+        (100.0, 20.0, MouseButton::Right, Handled::Yes),
+    ] {
+        let mut s = strip(3, width);
+        let first = tab_x(&s, 0);
+        middle_down(&mut s, first, 20.0);
+        let (got, ctx) = send(
+            &mut s,
+            InputKind::MouseDown {
+                at: point(x, y),
+                button,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert_eq!(got, handled, "{button:?} at {x}");
+        assert!(asks_capture(&ctx, false), "{button:?} at {x}");
+        assert!(!s.holds_mouse(), "{button:?} at {x}");
+        middle_up(&mut s, first, 20.0);
+        assert_eq!(s.take_events(), vec![], "{button:?} at {x}");
+    }
+}
+
+#[test]
+fn losing_focus_or_capture_during_a_middle_press_cancels_it() {
+    let mut s = strip(3, 1000.0);
+    let first = tab_x(&s, 0);
+    middle_down(&mut s, first, 20.0);
+    let (_, ctx) = send(&mut s, InputKind::Blur);
+    assert!(asks_capture(&ctx, false), "focus loss lets go of the mouse");
+    assert!(!s.holds_mouse());
+    middle_up(&mut s, first, 20.0);
+    assert_eq!(s.take_events(), vec![]);
+
+    middle_down(&mut s, first, 20.0);
+    let mut ctx = ViewContext::default();
+    s.capture_lost(&mut ctx);
+    assert!(!asks_capture(&ctx, false), "capture has already gone");
+    assert!(!s.holds_mouse());
+    middle_up(&mut s, first, 20.0);
+    assert_eq!(s.take_events(), vec![]);
+}
+
+#[test]
+fn a_tab_that_changes_during_a_middle_press_is_not_closed() {
+    // Closed by something else: the press ends, and the window is told to let go.
+    let mut s = strip(3, 1000.0);
+    let first = tab_x(&s, 0);
+    middle_down(&mut s, first, 20.0);
+    s.close(s.tab_id(1).unwrap());
+    assert!(!s.holds_mouse());
+    assert!(s.take_capture_release());
+    middle_up(&mut s, first, 20.0);
+    assert_eq!(s.take_events(), vec![]);
+
+    // The wheel brings another tab under the pointer.
+    let mut s = strip(60, 500.0);
+    let x = tab_x(&s, 1);
+    middle_down(&mut s, x, 20.0);
+    send(
+        &mut s,
+        InputKind::Wheel {
+            at: point(x, 20.0),
+            delta_x: 3.0,
+            delta_y: 0.0,
+            modifiers: Modifiers::default(),
+        },
+    );
+    middle_up(&mut s, x, 20.0);
+    assert!(!s.holds_mouse());
+    assert_eq!(s.take_events(), vec![]);
+}
+
+#[test]
+fn a_middle_release_with_no_press_belongs_to_whatever_is_under_it() {
+    let mut s = strip(3, 1000.0);
+    let first = tab_x(&s, 0);
+    assert_eq!(middle_up(&mut s, first, 20.0).0, Handled::Yes);
+    assert_eq!(s.take_events(), vec![], "the press went elsewhere");
+    assert_eq!(middle_up(&mut s, first, 300.0).0, Handled::No);
+    assert_eq!(middle_down(&mut s, first, 300.0).0, Handled::No);
+    assert!(!s.holds_mouse(), "the text area owns this press");
 }

@@ -344,6 +344,11 @@ fn is_caption_code(code: usize) -> bool {
     let code = code as u32;
     code == HTMINBUTTON || code == HTMAXBUTTON || code == HTCLOSE
 }
+/// The top row's non-client answers. The middle button has no job on any of them.
+fn is_top_row_code(code: usize) -> bool {
+    let code = code as u32;
+    is_caption_code(code as usize) || matches!(code, HTCAPTION | HTTOP | HTTOPLEFT | HTTOPRIGHT)
+}
 fn hit_code(hit: CaptionHit, mode: FrameMode) -> u32 {
     match hit {
         CaptionHit::Close => HTCLOSE,
@@ -2268,6 +2273,10 @@ impl Shared {
                 } else {
                     default()
                 }
+            }
+            // A tab answers `HTCLIENT`, so its middle click is `WM_MBUTTONDOWN` above.
+            WM_NCMBUTTONDOWN | WM_NCMBUTTONUP | WM_NCMBUTTONDBLCLK if is_top_row_code(w.0) => {
+                LRESULT(0)
             }
             WM_CAPTURECHANGED => {
                 if l.0 != hwnd.0 as isize {

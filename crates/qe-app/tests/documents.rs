@@ -553,3 +553,113 @@ fn a_file_changed_outside_reloads_a_clean_document() {
     assert_eq!(app.doc("dirty"), "false");
     app.quit();
 }
+
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const MK_LBUTTON: usize = 1;
+const MK_MBUTTON: usize = 0x10;
+const HTCLIENT: i64 = 1;
+
+/// The center of a tab in client pixels, and the real `WM_NCHITTEST` answer there.
+fn tab_point(app: &mut App, index: usize) -> (isize, isize, i64) {
+    let answer = app.ask(&format!("tab-point {index}"));
+    let parts: Vec<i64> = answer
+        .split(' ')
+        .map(|n| n.parse().unwrap_or_else(|_| panic!("{answer}")))
+        .collect();
+    (parts[0] as isize, parts[1] as isize, parts[2])
+}
+fn pack(x: isize, y: isize) -> isize {
+    (y << 16) | x
+}
+/// A middle click as Windows delivers it on a tab: `WM_NCHITTEST` answers client area, so
+/// the client messages come, in order, through the real window's queue.
+fn middle_click(app: &mut App, press: (isize, isize), release: (isize, isize)) {
+    let (down, up) = (pack(press.0, press.1), pack(release.0, release.1));
+    app.ok(&format!("post {WM_MBUTTONDOWN} {MK_MBUTTON} {down}"));
+    app.ok(&format!("post {WM_MBUTTONUP} 0 {up}"));
+}
+
+#[test]
+fn a_middle_click_on_a_tab_closes_it_through_the_usual_question() {
+    let folder = Folder::new("middle-click");
+    let file = folder.file("doc.txt", b"base");
+    let clean = folder.file("clean.txt", b"clean text");
+    let mut app = App::start(&folder.root(), &[&file]);
+    app.wait_text("base");
+    app.ok("select 4 4");
+    app.type_text("+");
+    app.run("NewTab");
+    app.ok(&format!("open {}", encode(&clean.to_string_lossy())));
+    app.wait_text("clean text");
+    app.wait_for("three tabs", |app| app.tab_count() == 3);
+
+    // The dirty tab is not the one on show. The real hit test says the client form comes.
+    let (x, y, hit) = tab_point(&mut app, 0);
+    assert_eq!(hit, HTCLIENT, "a tab is client area");
+    middle_click(&mut app, (x, y), (x, y));
+    let (title, _, buttons) = app.wait_value("the question", App::alert);
+    assert!(title.contains("doc.txt"), "{title}");
+    assert!(buttons.contains(&"Don't Save".to_owned()), "{buttons:?}");
+    app.press("Cancel");
+    app.wait_for("the question to go", |app| app.alert().is_none());
+    assert_eq!(app.tab_count(), 3, "Cancel leaves it open");
+    assert_eq!(
+        app.text(),
+        "clean text",
+        "as with the X, the tab on show stays"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"base");
+
+    // A blank tab that is not on show closes with no question, and nothing else changes.
+    let (x, y, _) = tab_point(&mut app, 1);
+    middle_click(&mut app, (x, y), (x, y));
+    app.wait_for("the blank tab to close", |app| app.tab_count() == 2);
+    assert!(app.alert().is_none());
+    assert_eq!(app.text(), "clean text", "the tab on show did not change");
+
+    // Off the tab before the release: nothing happens.
+    let (x, y, _) = tab_point(&mut app, 0);
+    let (other_x, other_y, _) = tab_point(&mut app, 1);
+    middle_click(&mut app, (x, y), (other_x, other_y));
+    app.settled();
+    assert!(app.alert().is_none());
+    assert_eq!(app.tab_count(), 2);
+
+    // The text survived all of this.
+    app.run("PreviousTab");
+    app.wait_text("base+");
+    app.ok("tab-x");
+    app.wait_value("the question again", App::alert);
+    app.press("Don't Save");
+    app.wait_for("the tab to close", |app| app.tab_count() == 1);
+    app.quit();
+}
+
+#[test]
+fn a_middle_click_during_a_tab_dragged_out_of_the_row_does_not_end_the_drag() {
+    let folder = Folder::new("middle-tear");
+    let file = folder.file("doc.txt", b"base");
+    let mut app = App::start(&folder.root(), &[&file]);
+    app.wait_text("base");
+    app.run("NewTab");
+    app.wait_for("two tabs", |app| app.tab_count() == 2);
+    let (x, y, _) = tab_point(&mut app, 1);
+    let at = pack(x, y);
+    app.ok(&format!("post {WM_LBUTTONDOWN} {MK_LBUTTON} {at}"));
+    let far = pack(x, y + 400);
+    app.ok(&format!("post {WM_MOUSEMOVE} {MK_LBUTTON} {far}"));
+    app.wait_for("the drag out", |app| app.ask("tab-drag-held") == "true");
+    middle_click(&mut app, (x, y), (x, y));
+    app.settled();
+    assert_eq!(app.ask("tab-drag-held"), "true", "the drag goes on");
+    assert_eq!(app.tab_count(), 2);
+    assert!(app.alert().is_none());
+    // Esc ends the drag, and the tab stays where it was.
+    app.ok("post-key 27");
+    app.wait_for("the drag to end", |app| app.ask("tab-drag-held") == "false");
+    assert_eq!(app.tab_count(), 2);
+    app.quit();
+}

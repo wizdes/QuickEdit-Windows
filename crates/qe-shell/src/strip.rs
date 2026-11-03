@@ -403,6 +403,9 @@ pub struct TabStrip {
     mode: FrameMode,
     contrast: Option<ContrastColors>,
     drag: Option<TabDrag>,
+    /// The tab a middle press began on. It has the mouse, as a left press does, until the
+    /// release, which closes this tab if the pointer is still on it.
+    middle_press: Option<TabId>,
     capturing: bool,
     reveal_on_layout: bool,
     release_capture: bool,
@@ -433,6 +436,7 @@ impl TabStrip {
             mode: FrameMode::Restored,
             contrast: None,
             drag: None,
+            middle_press: None,
             capturing: false,
             reveal_on_layout: true,
             release_capture: false,
@@ -748,6 +752,7 @@ impl TabStrip {
         self.hover = CaptionHit::None;
         self.pressed = CaptionHit::None;
         self.drag = None;
+        self.middle_press = None;
         self.capturing = false;
     }
     fn clip_start(&self) -> f32 {
@@ -1061,8 +1066,25 @@ impl TabStrip {
             Handled::No
         }
     }
-    fn mouse_down(&mut self, at: Point, left: bool, ctx: &mut ViewContext) -> Handled {
+    fn mouse_down(&mut self, at: Point, button: MouseButton, ctx: &mut ViewContext) -> Handled {
+        // A left press holds the mouse. Its drag goes on as if this press never happened.
+        if button == MouseButton::Middle && self.capturing {
+            return Handled::Yes;
+        }
+        let left = button == MouseButton::Left;
         let hit = self.hit_test(at);
+        // Any other press ends a middle press. A left press on a target below keeps the
+        // capture: a release here would end that new press too, through `capture_lost`.
+        if self.middle_press.take().is_some()
+            && (!left
+                || matches!(
+                    hit,
+                    CaptionHit::None | CaptionHit::Drag | CaptionHit::ResizeTop
+                ))
+        {
+            self.capturing = false;
+            ctx.capture_mouse(false);
+        }
         if hit == CaptionHit::None {
             // A click in the text area takes keyboard focus away from the strip.
             if self.focused.take().is_some() {
@@ -1070,6 +1092,14 @@ impl TabStrip {
                 ctx.invalidate(self.row_rect());
             }
             return Handled::No;
+        }
+        if button == MouseButton::Middle
+            && let CaptionHit::Tab(index) | CaptionHit::TabClose(index) = hit
+        {
+            self.middle_press = self.tab_id(index);
+            self.capturing = true;
+            ctx.capture_mouse(true);
+            return Handled::Yes;
         }
         // The rest of the row never reaches the text area, even in full screen, where
         // its empty part is client area because a full-screen window does not move.
@@ -1088,6 +1118,27 @@ impl TabStrip {
         self.capturing = true;
         ctx.capture_mouse(true);
         ctx.invalidate(self.part_rect(hit));
+        Handled::Yes
+    }
+    /// The tab under the pointer closes the way its X does, if the press began on it.
+    fn middle_up(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
+        let hit = self.hit_test(at);
+        let Some(pressed) = self.middle_press.take() else {
+            // During a left press, this release is no one else's either.
+            return if self.capturing || inside(at, self.row_rect()) {
+                Handled::Yes
+            } else {
+                Handled::No
+            };
+        };
+        self.capturing = false;
+        ctx.capture_mouse(false);
+        self.set_hover(hit, ctx);
+        if let CaptionHit::Tab(index) | CaptionHit::TabClose(index) = hit
+            && self.tab_id(index) == Some(pressed)
+        {
+            self.activate(CaptionHit::TabClose(index));
+        }
         Handled::Yes
     }
     fn mouse_up(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
@@ -1146,14 +1197,17 @@ impl View for TabStrip {
                 self.focused_key(virtual_key, modifiers, repeat, ctx)
             }
             InputKind::MouseMove { at } => self.mouse_move(at, ctx),
-            InputKind::MouseDown { at, button, .. } => {
-                self.mouse_down(at, button == MouseButton::Left, ctx)
-            }
+            InputKind::MouseDown { at, button, .. } => self.mouse_down(at, button, ctx),
             InputKind::MouseUp {
                 at,
                 button: MouseButton::Left,
                 ..
             } => self.mouse_up(at, ctx),
+            InputKind::MouseUp {
+                at,
+                button: MouseButton::Middle,
+                ..
+            } => self.middle_up(at, ctx),
             InputKind::MouseUp { at, .. } => {
                 if inside(at, self.row_rect()) {
                     Handled::Yes

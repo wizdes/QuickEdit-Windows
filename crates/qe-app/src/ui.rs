@@ -197,6 +197,8 @@ fn message_hook(
                 | WM_SETTINGCHANGE
                 | WM_MOUSEMOVE
                 | WM_LBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
                 | WM_CAPTURECHANGED
                 | WM_KEYDOWN
         ) {
@@ -207,7 +209,7 @@ fn message_hook(
             && from == window
         {
             match message {
-                WM_MOUSEMOVE => return Some(LRESULT(0)),
+                WM_MOUSEMOVE | WM_MBUTTONDOWN | WM_MBUTTONUP => return Some(LRESULT(0)),
                 WM_LBUTTONUP => {
                     drag.set(None);
                     // SAFETY: a plain call. Nothing depends on its answer here.

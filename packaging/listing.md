@@ -22,13 +22,13 @@ New files are saved as UTF-8, and you can pick another encoding when you open or
 
 Very large files open too. A file over 512 MiB opens read-only, so you can view it, search it and copy from it.
 
-QuickEdit collects nothing about you and does not use the network.
+QuickEdit collects nothing about you. It has no network code and contacts no server. If you open a file on a network share, Windows reads it for you.
 
 ## Features
 
 - Tabs, with one tab bar in the style of Windows Terminal
 - Find and Replace
-- Spell check, using the checker built into Windows
+- Spell check, using the checker built into Windows. Words you add go to your Windows dictionary
 - Word wrap and zoom
 - Keyboard shortcuts you can change in Settings
 - Reads and writes many text encodings
@@ -42,7 +42,7 @@ QuickEdit collects nothing about you and does not use the network.
 
 ## Keywords
 
-text editor, plain text, notepad, txt, markdown, log viewer
+text editor, plain text, txt, markdown, log viewer
 
 ## Copyright
 
@@ -54,7 +54,11 @@ The first release.
 
 ## Privacy answer for Partner Center
 
-The app does not access, collect or send personal information. It reads and writes only the files a person opens or saves, and its own settings and autosave folder on the same PC.
+Answer Yes to "accesses, collects or transmits personal information", and give the address where you published `PRIVACY.md`. Store policy 10.5.1 asks every Win32 app for a policy, and this app reads whatever files a person opens.
+
+If there is a box for a short description, use this:
+
+QuickEdit reads and writes the files you open or save, and keeps settings and autosaved text in its own folder on your PC. Words you add in spell check go to your Windows dictionary. QuickEdit has no network code and contacts no server, and if you open a file on a network share, Windows reads it for you.
 
 ## Check before upload
 
@@ -62,4 +66,4 @@ These lines come from plans and need a look at the finished app:
 
 - "Keyboard shortcuts you can change in Settings" comes from `docs/plan.md`, decision 3.
 - "Word wrap and zoom" comes from `qe-views` and `docs/design-spec.md`.
-- "Open a file from File Explorer" needs the real test in `README.md`, under "Several files at once".
+- "Open a file from File Explorer" needs the real test in `README.md`, under "Several files at once". Windows reserves `.txt` for its own app, so check whether Explorer offers QuickEdit for it before the listing leans on that line.

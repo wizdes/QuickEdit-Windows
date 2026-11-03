@@ -635,7 +635,7 @@ fn widths_below_one_cell_agree_with_shaping() {
     }
 }
 
-// Astra finding E.
+// Review finding E.
 #[test]
 fn left_of_row_clicks_around_direction_controls_match_directwrite() {
     let engine = DirectWriteLayout::new().unwrap();

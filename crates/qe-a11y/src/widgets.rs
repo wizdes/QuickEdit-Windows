@@ -1119,7 +1119,7 @@ fn check_raise() -> Result<()> {
         left.set(left.get() - 1);
         Err(windows::core::Error::new(
             E_FAIL,
-            "A test made this raise fail.",
+            "This event was refused on request.",
         ))
     })
 }

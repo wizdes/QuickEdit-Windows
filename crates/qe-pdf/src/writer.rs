@@ -2,10 +2,25 @@
 //! the document, and checks the finished file's structure from disk.
 use crate::deflate::Compressor;
 use crate::{PdfError, PdfOptions};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+};
+use windows::Win32::Security::{
+    DACL_SECURITY_INFORMATION, GetFileSecurityW, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, SetSecurityDescriptorControl,
+};
+use windows::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
+};
+use windows::core::PCWSTR;
 
 pub const CATALOG_ID: usize = 1;
 pub const PAGES_ID: usize = 2;
@@ -17,6 +32,118 @@ fn problem(error: std::io::Error) -> PdfError {
     PdfError::Write(format!("The PDF could not be written: {error}"))
 }
 
+/// The `\\?\` form, which raw calls need for paths over 260 characters.
+fn raw_call_path(path: &Path) -> Result<Vec<u16>, PdfError> {
+    let full = std::path::absolute(path).map_err(problem)?;
+    let units: Vec<u16> = full.as_os_str().encode_wide().collect();
+    let text = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    let mut out = if units.starts_with(&text(r"\\?\")) {
+        units
+    } else if units.starts_with(&text(r"\\")) {
+        let mut out = text(r"\\?\UNC\");
+        out.extend_from_slice(&units[2..]);
+        out
+    } else {
+        let mut out = text(r"\\?\");
+        out.extend_from_slice(&units);
+        out
+    };
+    out.push(0);
+    Ok(out)
+}
+
+/// A file's access rules, ready to give to a new one, as `qe-codec`'s save does. The rules are
+/// marked protected, so that Windows keeps them as they are and adds none from the folder.
+pub struct AccessRules {
+    // u64 gives the alignment a security descriptor needs.
+    descriptor: Vec<u64>,
+}
+
+/// The rules of the file this PDF will replace. `None` when there is no such file, or on a file
+/// system with no rules, such as exFAT. Rules that cannot be read stop the export, since a new
+/// file could then be open to more people than the old one.
+pub fn read_access_rules(path: &Path) -> Result<Option<AccessRules>, PdfError> {
+    let name = raw_call_path(path)?;
+    let refuse = |code: u32| {
+        PdfError::Write(format!(
+            "The PDF was not saved, because the access rules of {} could not be read: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(code as i32)
+        ))
+    };
+    let mut needed = 0u32;
+    // SAFETY: the path ends in a zero and outlives the call. With no buffer, the call only
+    // reports the size.
+    let done = unsafe {
+        GetFileSecurityW(
+            PCWSTR(name.as_ptr()),
+            DACL_SECURITY_INFORMATION.0,
+            None,
+            0,
+            &mut needed,
+        )
+    };
+    if !done.as_bool() && needed == 0 {
+        // SAFETY: the call takes no arguments.
+        let error = unsafe { GetLastError() };
+        return match error {
+            ERROR_FILE_NOT_FOUND
+            | ERROR_PATH_NOT_FOUND
+            | ERROR_NOT_SUPPORTED
+            | ERROR_INVALID_FUNCTION => Ok(None),
+            other => Err(refuse(other.0)),
+        };
+    }
+    let mut rules = AccessRules {
+        descriptor: vec![0u64; (needed as usize).div_ceil(8).max(1)],
+    };
+    let pointer = PSECURITY_DESCRIPTOR(rules.descriptor.as_mut_ptr().cast());
+    // SAFETY: as above, and `descriptor` holds at least `needed` bytes.
+    let done = unsafe {
+        GetFileSecurityW(
+            PCWSTR(name.as_ptr()),
+            DACL_SECURITY_INFORMATION.0,
+            Some(pointer),
+            needed,
+            &mut needed,
+        )
+    };
+    if !done.as_bool() {
+        // SAFETY: the call takes no arguments.
+        return Err(refuse(unsafe { GetLastError() }.0));
+    }
+    // SAFETY: `pointer` holds the valid descriptor that the call just wrote.
+    unsafe { SetSecurityDescriptorControl(pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED) }
+        .map_err(|e| refuse((e.code().0 as u32) & 0xffff))?;
+    Ok(Some(rules))
+}
+
+/// A new file with the given rules in place from its first moment. It must not exist yet.
+fn create_new_with_rules(path: &Path, rules: Option<&mut AccessRules>) -> Result<File, PdfError> {
+    let name = raw_call_path(path)?;
+    let attributes = rules.map(|rules| SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: rules.descriptor.as_mut_ptr().cast(),
+        bInheritHandle: false.into(),
+    });
+    // SAFETY: the path ends in a zero, and `attributes` and its descriptor outlive the call.
+    let handle: HANDLE = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            // The same sharing as `std::fs`, which this call replaced.
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            attributes.as_ref().map(|a| a as *const SECURITY_ATTRIBUTES),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| problem(std::io::Error::from_raw_os_error(e.code().0 & 0xffff)))?;
+    // SAFETY: the handle was just opened for this file, and nothing else owns it.
+    Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
 pub struct PdfFile {
     out: BufWriter<File>,
     at: u64,
@@ -26,12 +153,8 @@ pub struct PdfFile {
 }
 
 impl PdfFile {
-    pub fn create(path: &Path) -> Result<Self, PdfError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(problem)?;
+    pub fn create(path: &Path, rules: Option<&mut AccessRules>) -> Result<Self, PdfError> {
+        let file = create_new_with_rules(path, rules)?;
         let mut pdf = Self {
             out: BufWriter::with_capacity(1 << 20, file),
             at: 0,
@@ -213,7 +336,7 @@ mod tests {
 
     /// A small whole file, as `verify_on_disk` expects, with one page.
     fn good_file(path: &Path) {
-        let mut file = PdfFile::create(path).unwrap();
+        let mut file = PdfFile::create(path, None).unwrap();
         file.object(RESOURCES_ID, b"<< >>").unwrap();
         file.object(CATALOG_ID, b"<< >>").unwrap();
         file.object(PAGES_ID, b"<< /Count 1 /Type /Pages /Kids [] >>")

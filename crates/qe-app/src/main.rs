@@ -22,5 +22,7 @@ mod timing;
 mod ui;
 
 fn main() {
-    std::process::exit(app::run());
+    let started = std::time::Instant::now();
+    let dll_rule = platform::keep_dll_search_to_system_and_app_folders();
+    std::process::exit(app::run(dll_rule, started.elapsed()));
 }

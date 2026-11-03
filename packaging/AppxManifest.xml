@@ -70,7 +70,7 @@
           </uap3:AppExecutionAlias>
         </uap3:Extension>
         <uap:Extension Category="windows.fileTypeAssociation">
-          <uap3:FileTypeAssociation Name="plaintext" MultiSelectModel="Player">
+          <uap3:FileTypeAssociation Name="plaintext" Parameters="&quot;%1&quot;" MultiSelectModel="Document">
             <uap:DisplayName>Plain text</uap:DisplayName>
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
             <uap:SupportedFileTypes>

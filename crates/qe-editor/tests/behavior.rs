@@ -2087,7 +2087,7 @@ fn a_text_area_below_the_top_row_keeps_every_position_right() {
     assert!(e.scroll_offset() < scrolled);
 }
 
-// ---- The Opus report, second pass ----
+// ---- A review's report, second pass ----
 
 #[test]
 fn shift_home_then_backspace_on_a_long_line_takes_one_row() {

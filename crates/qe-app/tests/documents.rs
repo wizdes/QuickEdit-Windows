@@ -1,6 +1,8 @@
 //! The real exe: open, edit, save, questions, kill and relaunch, second launches.
 mod support;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use support::{App, Folder, encode, exe};
 
 #[test]
@@ -25,6 +27,209 @@ fn an_unknown_flag_opens_nothing() {
     let output = Command::new(exe()).arg("--no-such-flag").output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+}
+
+/// A file whose name looks like a flag: a full path opens it, as does anything after `--`.
+#[test]
+fn a_file_named_like_a_flag_opens_by_full_path_or_after_two_dashes() {
+    let folder = Folder::new("flag-name");
+    let help = folder.file("--help", b"in the help file");
+    let root = folder.root();
+    let mut app = App::start(&root, &[&help]);
+    app.wait_text("in the help file");
+    app.quit();
+    let other = folder.file("--notes.txt", b"in the notes file");
+    let mut app = App::start(&root, &[Path::new("--"), &other]);
+    app.wait_for("the notes file", |app| app.text() == "in the notes file");
+    app.quit();
+    // By its bare name, after the two dashes, from its own folder.
+    let output = Command::new(exe())
+        .current_dir(&folder.0)
+        .args(["--hidden-smoke", "--data-root"])
+        .arg(folder.0.join("smoke-data"))
+        .args(["--", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        said.contains("hidden smoke passed"),
+        "help ran instead: {said}"
+    );
+}
+
+/// Bare `--help` stays a flag in a copy with no package, and `--` alone opens no file.
+#[test]
+fn an_unpackaged_run_keeps_its_help_flag_and_two_dashes_alone_are_fine() {
+    let output = Command::new(exe()).arg("--help").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--data-root"));
+    let folder = Folder::new("two-dashes");
+    let output = Command::new(exe())
+        .args(["--hidden-smoke", "--data-root"])
+        .arg(folder.root())
+        .arg("--")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// The hook for the package rule. A real packaged run cannot start here, because an install is
+/// ruled out. This asks the real exe how a package would read the line, and each word is a file.
+#[test]
+fn a_packaged_run_reads_every_flag_as_a_file() {
+    let line = [
+        "--help",
+        "--hidden",
+        "--test-channel",
+        "--data-root",
+        r"\\host\share",
+        "--bench-keys",
+        "0",
+        "--no-such-flag",
+        "--",
+        r"C:\My Docs\a b.txt",
+    ];
+    let output = Command::new(exe())
+        .arg("--print-packaged-args")
+        .args(line)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stdout);
+    let mut lines = said.lines();
+    // This test's own run has no package. A package would read the flag as a file instead.
+    assert_eq!(lines.next(), Some("package identity: false"));
+    let files: Vec<&str> = lines.map(|l| l.strip_prefix("file: ").unwrap()).collect();
+    assert_eq!(files, line);
+}
+
+/// What File Explorer does with `MultiSelectModel="Document"` and `Parameters="&quot;%1&quot;"`:
+/// 15 processes at once, each with one quoted path that has spaces in it. They arrive in the
+/// order the pipe takes them, which is not the order chosen in Explorer.
+#[test]
+fn fifteen_real_launches_at_once_with_spaces_land_in_one_window() {
+    let folder = Folder::new("fifteen launches");
+    let root = folder.root();
+    let spaced = folder.0.join("My Docs and Notes");
+    std::fs::create_dir_all(&spaced).unwrap();
+    let paths: Vec<PathBuf> = (0..15)
+        .map(|i| {
+            let path = spaced.join(format!("file number {i:02}.txt"));
+            std::fs::write(&path, format!("file {i}")).unwrap();
+            path
+        })
+        .collect();
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(paths.len()));
+    let started = Instant::now();
+    let launches: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let (gate, root, path) = (gate.clone(), root.clone(), path.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                App::launch(&root, &[&path], &[], None)
+            })
+        })
+        .collect();
+    let mut apps: Vec<App> = launches.into_iter().map(|l| l.join().unwrap()).collect();
+    // All but the one that became the instance end, each with success.
+    let limit = Instant::now() + Duration::from_secs(30);
+    let mut alive = Vec::new();
+    while alive.len() != 1 {
+        alive.clear();
+        for (at, app) in apps.iter_mut().enumerate() {
+            match app.child.try_wait().unwrap() {
+                Some(status) => assert!(status.success(), "launch {at}: {status}"),
+                None => alive.push(at),
+            }
+        }
+        assert!(Instant::now() < limit, "{} launches still run", alive.len());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let handed_off = started.elapsed();
+    let mut app = apps.swap_remove(alive[0]);
+    app.wait_for("15 tabs", |app| {
+        app.ask("restored") == "true" && app.tab_count() >= 15
+    });
+    let all_open = started.elapsed();
+    let windows = app.windows();
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    println!(
+        "15 launches at once: all handed off in {:.0} ms, 15 tabs in {:.0} ms, in this order: {:?}",
+        handed_off.as_secs_f64() * 1000.0,
+        all_open.as_secs_f64() * 1000.0,
+        windows[0]
+    );
+    // A star marks the active tab.
+    let mut got: Vec<String> = windows[0].iter().map(|t| t.replace('*', "")).collect();
+    got.sort();
+    let want: Vec<String> = (0..15).map(|i| format!("file number {i:02}.txt")).collect();
+    assert_eq!(
+        got, want,
+        "each path stayed whole, and the blank tab gave way"
+    );
+    app.quit();
+}
+
+/// The pipe name a test's own data folder gives, as `app.rs` makes it.
+fn pipe_for_root(root: &Path) -> String {
+    let names = qe_docs::handoff::PipeNames::for_this_process().unwrap();
+    let tag = root
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    format!(r"\\.\pipe\{}-{tag:016x}-medium", names.base)
+}
+
+/// The whole road on the real exe: another program holds the name and answers wrong. The launch
+/// says so and opens its own window with the file in it.
+#[test]
+fn a_launch_that_meets_a_fake_server_opens_its_own_window_and_says_why() {
+    use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, ReadFile, WriteFile};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    let folder = Folder::new("fake-server");
+    let root = folder.root();
+    let file = folder.file("mine.txt", b"my words");
+    let name = windows::core::HSTRING::from(pipe_for_root(&root));
+    // SAFETY: the name outlives the call.
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            &name,
+            FILE_FLAGS_AND_ATTRIBUTES(3),
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    assert!(!pipe.is_invalid());
+    let raw = pipe.0 as usize;
+    let fake = std::thread::spawn(move || {
+        let pipe = windows::Win32::Foundation::HANDLE(raw as *mut _);
+        // SAFETY: the pipe is open and blocking. Each call ends when the client acts or leaves.
+        unsafe {
+            let _ = ConnectNamedPipe(pipe, None);
+            let mut bytes = [0u8; 4096];
+            let _ = ReadFile(pipe, Some(&mut bytes), None, None);
+            WriteFile(pipe, Some(b"X"), None, None).unwrap();
+            let _ = ReadFile(pipe, Some(&mut bytes), None, None);
+            windows::Win32::Foundation::CloseHandle(pipe).unwrap();
+        }
+    });
+    let mut app = App::start(&root, &[&file]);
+    app.wait_text("my words");
+    let notes = app.notes();
+    assert!(notes.contains("opens its own window"), "{notes}");
+    fake.join().unwrap();
+    app.quit();
 }
 
 #[test]

@@ -101,7 +101,7 @@ fn blocks(offset: f32) -> DisplayList {
 }
 #[test]
 fn a_shift_just_off_a_whole_pixel_matches_a_full_redraw() {
-    // Astra's case: at 96 DPI this copy differed by 60 pixels.
+    // A review's case: at 96 DPI this copy differed by 60 pixels.
     let mut r = BitmapRenderer::new(40, 60).unwrap();
     frame(&mut r, &blocks(0.0));
     r.scroll(rect(0.0, 0.0, 40.0, 60.0), Dip(1.001)).unwrap();

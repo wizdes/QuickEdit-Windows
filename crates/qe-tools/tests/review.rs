@@ -226,7 +226,7 @@ impl Window {
     }
 }
 
-// ---- Finding 1 and Astra 1: Replace All keeps its own request ----
+// ---- Finding 1 and second review 1: Replace All keeps its own request ----
 
 #[test]
 fn f1_a_changed_query_cancels_replace_all() {
@@ -284,7 +284,7 @@ fn f1_a_rerun_uses_what_was_asked_not_the_fields() {
     assert_eq!(w.tools.last_replaced(), Some(3));
 }
 
-// ---- Finding 4 and Astra 2: Replace uses only the current query's match ----
+// ---- Finding 4 and second review 2: Replace uses only the current query's match ----
 
 #[test]
 fn f4_replace_after_the_query_changed_does_not_replace_the_old_match() {
@@ -722,7 +722,7 @@ fn f14_a_new_step_replaces_one_that_waits_for_the_index() {
     assert!(!w.tools.is_step_waiting_for_test());
 }
 
-// ---- Astra 3: an edit beside a match ----
+// ---- Second review 3: an edit beside a match ----
 
 #[test]
 fn a3_an_edit_beside_a_full_word_match_ends_it() {
@@ -766,7 +766,7 @@ fn a3_replace_checks_the_match_even_before_a_poll() {
     assert_eq!(w.text(), "e\u{301} dog");
 }
 
-// ---- Astra 7: a result for the text as it stands ----
+// ---- Second review 7: a result for the text as it stands ----
 
 #[test]
 fn a7_replace_moves_the_next_match_only_once() {
@@ -783,7 +783,7 @@ fn a7_replace_moves_the_next_match_only_once() {
     assert_eq!(w.current(), Some((9, 12)));
 }
 
-// ---- Astra 11 ----
+// ---- Second review 11 ----
 
 #[test]
 fn a11_capitalize_keeps_the_final_sigma() {
@@ -800,7 +800,7 @@ fn a11_capitalize_keeps_the_final_sigma() {
     }
 }
 
-// ---- Tests that passed with the bug: Astra's section and Opus's table ----
+// ---- Tests that passed with the bug: the reviews' lists ----
 
 #[test]
 fn survivor_the_current_match_moves_with_edits_before_it() {

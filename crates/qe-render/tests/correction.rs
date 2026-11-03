@@ -835,7 +835,7 @@ fn nearby_pending_rectangles_merge_and_their_number_stays_small() {
 }
 #[test]
 fn overlapping_damage_does_not_blend_translucent_patches_twice() {
-    // Astra's review: a half-opacity white patch over black read 192, not 128.
+    // A review: a half-opacity white patch over black read 192, not 128.
     let mut r = BitmapRenderer::new(40, 40).unwrap();
     let mut black = DisplayList::default();
     fill(&mut black, rect(0.0, 0.0, 40.0, 40.0), BLACK);
@@ -1075,7 +1075,7 @@ fn text_after_a_clipped_or_invisible_white_fill_blends_with_the_real_background(
 }
 #[test]
 fn overlapping_text_on_white_does_not_paste_white_over_earlier_text() {
-    // Astra's review: 222 wrong pixels. Black over black can only add ink, so
+    // A review: 222 wrong pixels. Black over black can only add ink, so
     // every pixel of both words alone must stay at least as dark.
     let word = |x: f32| text_run(MONO, 13.0, "QuickEdit", point(x, 20.0), BLACK);
     let alone = fresh(
@@ -2021,7 +2021,7 @@ fn example(name: &str) -> std::path::PathBuf {
     path.join("examples").join(format!("{name}.exe"))
 }
 /// Runs the example window. `None` means this account cannot run it: the test account
-/// over SSH can get Access Denied (0x80070005) with no desktop to make a window on.
+/// with no desktop can get Access Denied (0x80070005) with no desktop to make a window on.
 /// Only that exact failure skips, and it says so.
 fn run_window(args: &[&str]) -> Option<std::process::Output> {
     let path = example("render_window");
@@ -2086,7 +2086,7 @@ fn render_window_follows_the_suggested_rectangle_and_starts_at_the_window_dpi() 
 }
 #[test]
 fn render_window_keeps_supplementary_characters_typed_as_two_messages() {
-    // Astra's review: char::from_u32 rejected each half of a surrogate pair.
+    // A review: char::from_u32 rejected each half of a surrogate pair.
     let Some(output) = run_window(&[
         "--hidden",
         "--exit-after-first-frame",

@@ -5,6 +5,9 @@
 //! no icon and no manifest. Any other build prints a warning and goes on.
 //!
 //! `QE_RC` names an `rc.exe` to use, and then no other is tried.
+//!
+//! The version record comes from `Version` in `packaging/AppxManifest.xml`, the one place that
+//! number is kept. So File Explorer and the Store package show the same version.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,7 +16,9 @@ fn main() {
     let packaging = root.join("..").join("..").join("packaging");
     let manifest = packaging.join("QuickEdit.exe.manifest");
     let icon = packaging.join("QuickEdit.ico");
+    let package = packaging.join("AppxManifest.xml");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", package.display());
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rerun-if-env-changed=QE_RC");
@@ -27,6 +32,10 @@ fn main() {
             println!("cargo:rustc-link-arg-bin=QuickEdit=/DELAYLOAD:{library}");
         }
         println!("cargo:rustc-link-arg-bin=QuickEdit=delayimp.lib");
+        // 0x800 is LOAD_LIBRARY_SEARCH_SYSTEM32: the exe's own imports load only from System32,
+        // so a DLL planted beside a loose copy of the exe is never loaded. `main` sets the same
+        // rule for what loads later.
+        println!("cargo:rustc-link-arg-bin=QuickEdit=/DEPENDENTLOADFLAG:0x800");
     }
     let release = env("PROFILE") == "release";
     let compiler = match find_rc() {
@@ -47,9 +56,10 @@ fn main() {
     // 24 is RT_MANIFEST, and 1 is the id Windows reads for an exe's manifest. The lowest icon
     // id is the one the shell shows.
     let text = format!(
-        "1 24 \"{}\"\n1 ICON \"{}\"\n",
+        "1 24 \"{}\"\n1 ICON \"{}\"\n{}",
         rc_path(&manifest),
-        rc_path(&icon)
+        rc_path(&icon),
+        version_record(&package_version(&package))
     );
     if let Err(error) = std::fs::write(&script, text) {
         stop(&format!(
@@ -79,6 +89,54 @@ fn main() {
     // The linker's own manifest would be a second copy of resource 24.
     println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
     println!("cargo:rustc-link-arg-bins={}", resources.display());
+}
+
+/// The four numbers of `Version` on the `Identity` element.
+fn package_version(manifest: &Path) -> [u16; 4] {
+    let text = std::fs::read_to_string(manifest)
+        .unwrap_or_else(|e| stop(&format!("QE_VERSION: {}: {e}", manifest.display())));
+    let found = text
+        .find("<Identity")
+        .map(|at| &text[at..])
+        .and_then(|rest| rest.split_once("Version=\""))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(version, _)| version)
+        .unwrap_or_else(|| stop("QE_VERSION: the package manifest's Identity has no Version"));
+    let numbers: Vec<u16> = found.split('.').filter_map(|n| n.parse().ok()).collect();
+    numbers
+        .try_into()
+        .unwrap_or_else(|_| stop(&format!("QE_VERSION: {found} is not four numbers")))
+}
+
+/// Windows shows this on the exe's Details page. 0x40004 is a Windows NT app, and 1 is an app.
+fn version_record(version: &[u16; 4]) -> String {
+    let [a, b, c, d] = version;
+    let dots = format!("{a}.{b}.{c}.{d}");
+    format!(
+        "1 VERSIONINFO\n\
+         FILEVERSION {a},{b},{c},{d}\n\
+         PRODUCTVERSION {a},{b},{c},{d}\n\
+         FILEOS 0x40004\n\
+         FILETYPE 0x1\n\
+         BEGIN\n\
+         BLOCK \"StringFileInfo\"\n\
+         BEGIN\n\
+         BLOCK \"040904B0\"\n\
+         BEGIN\n\
+         VALUE \"FileDescription\", \"QuickEdit plain-text editor\"\n\
+         VALUE \"FileVersion\", \"{dots}\"\n\
+         VALUE \"InternalName\", \"QuickEdit\"\n\
+         VALUE \"OriginalFilename\", \"QuickEdit.exe\"\n\
+         VALUE \"ProductName\", \"QuickEdit\"\n\
+         VALUE \"ProductVersion\", \"{dots}\"\n\
+         END\n\
+         END\n\
+         BLOCK \"VarFileInfo\"\n\
+         BEGIN\n\
+         VALUE \"Translation\", 0x409, 1200\n\
+         END\n\
+         END\n"
+    )
 }
 
 fn env(name: &str) -> String {

@@ -12,6 +12,12 @@
 //!
 //! Each launch that connects gets a short-lived thread of its own, so one that stalls holds up
 //! nobody else, and a limit on the whole exchange ends that thread.
+//!
+//! The name is easy to work out, so a launch trusts nothing because it holds the name. It opens
+//! at the identification level, so a server can learn who it is and cannot act as it. It sends
+//! nothing until the server's process has this user and this level. A server's pipe has one
+//! rule, for its own user. Another program of the same user at the same level has the same
+//! rights as QuickEdit, and no check here can tell the two apart.
 use crate::error::DocError;
 use crate::identity::wide;
 use std::ffi::OsString;
@@ -25,14 +31,18 @@ use windows::Win32::Foundation::{
     ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
     INVALID_HANDLE_VALUE, LocalFree, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
+    TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -42,8 +52,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentProcessId, INFINITE, OpenProcessToken, ResetEvent,
-    SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, INFINITE, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, ResetEvent, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use windows::core::{PCWSTR, PWSTR};
@@ -76,6 +87,12 @@ pub enum HandoffError {
     /// An instance holds the pipe and does not answer: it hangs, or it is closing. Show
     /// this, then run as an instance of your own.
     StaleInstance { waited: Duration },
+    /// The process that holds the pipe's name is not this user at this level, or Windows would
+    /// not say who it is. It was sent nothing. Show this, then run as an instance of your own.
+    UntrustedServer { why: String },
+    /// The server took the files and answered with a byte that QuickEdit never sends, so it is
+    /// not QuickEdit, or not this version. Show this, then run as an instance of your own.
+    WrongAnswer { byte: u8 },
     /// Anything else Windows reported, with its text.
     Failed { what: String },
 }
@@ -90,6 +107,14 @@ impl std::fmt::Display for HandoffError {
                 f,
                 "A running QuickEdit did not answer in {} ms, so this launch opens its own window.",
                 waited.as_millis()
+            ),
+            Self::UntrustedServer { why } => write!(
+                f,
+                "Another program holds the name QuickEdit uses to pass files between its windows, so it was sent nothing, and this launch opens its own window. {why}"
+            ),
+            Self::WrongAnswer { byte } => write!(
+                f,
+                "A program that answered as QuickEdit gave the answer 0x{byte:02x}, which QuickEdit never sends, so this launch opens its own window."
             ),
             Self::Failed { what } => {
                 write!(f, "The running QuickEdit could not be reached: {what}")
@@ -167,60 +192,105 @@ impl IntegrityLevel {
 impl PipeNames {
     /// The real names, from this process's token.
     pub fn for_this_process() -> Result<Self, HandoffError> {
-        let fail = |what: &str, error: &windows::core::Error| HandoffError::Failed {
-            what: format!("{what}: {error}"),
-        };
-        let mut token = HANDLE::default();
-        // SAFETY: the process handle is the pseudo handle, and `token` outlives the call.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-            .map_err(|e| fail("reading this process's token", &e))?;
-        let result = (|| {
-            let user = token_bytes(token, TokenUser)
-                .map_err(|e| fail("reading the user from the token", &e))?;
-            // SAFETY: Windows filled the buffer with a TOKEN_USER, and it is aligned for it.
-            let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-            let mut text = PWSTR::null();
-            // SAFETY: the SID lives in `user`, and `text` is freed below.
-            unsafe { ConvertSidToStringSidW(user_sid, &mut text) }
-                .map_err(|e| fail("reading the user's name", &e))?;
-            // SAFETY: Windows gave a string that ends in a zero.
-            let sid = unsafe { text.to_string() }.unwrap_or_default();
-            // SAFETY: the pointer came from the call above and is freed once.
-            unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
-            let label = token_bytes(token, TokenIntegrityLevel)
-                .map_err(|e| fail("reading the integrity level", &e))?;
-            // SAFETY: Windows filled the buffer with a TOKEN_MANDATORY_LABEL.
-            let label_sid = unsafe { (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid };
-            // SAFETY: the SID is valid while `label` lives, and has at least one part.
-            let rid = unsafe {
-                let parts = *GetSidSubAuthorityCount(label_sid);
-                *GetSidSubAuthority(label_sid, u32::from(parts) - 1)
-            };
-            let level = match rid {
-                0..=0x0fff => IntegrityLevel::Low,
-                0x1000..=0x2fff => IntegrityLevel::Medium,
-                0x3000..=0x3fff => IntegrityLevel::High,
-                _ => IntegrityLevel::System,
-            };
-            let mut session = 0;
-            // SAFETY: plain numbers, and `session` outlives the call.
-            unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) }
-                .map_err(|e| fail("reading the Windows session", &e))?;
-            Ok(Self {
-                base: format!("QuickEdit-{sid}-{session}"),
-                level,
-            })
-        })();
-        // SAFETY: the token is open, and this is its only close.
-        if let Err(error) = unsafe { CloseHandle(token) } {
-            eprintln!("QuickEdit: closing the token failed: {error}");
-        }
-        result
+        // SAFETY: the pseudo handle is always valid.
+        let identity = process_identity(unsafe { GetCurrentProcess() })?;
+        let mut session = 0;
+        // SAFETY: plain numbers, and `session` outlives the call.
+        unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) }
+            .map_err(|e| windows_failure("reading the Windows session", &e))?;
+        Ok(Self {
+            base: format!("QuickEdit-{}-{session}", identity.sid),
+            level: identity.level,
+        })
     }
     fn pipe(&self, level: IntegrityLevel) -> Vec<u16> {
         let name = format!(r"\\.\pipe\{}-{}", self.base, level.suffix());
         wide(Path::new(&name))
     }
+}
+
+/// Who a process runs as: the two things the pipe's name stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Identity {
+    sid: String,
+    level: IntegrityLevel,
+}
+
+fn process_identity(process: HANDLE) -> Result<Identity, HandoffError> {
+    let mut token = HANDLE::default();
+    // SAFETY: the caller gives an open process handle, and `token` outlives the call.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .map_err(|e| windows_failure("reading a process's token", &e))?;
+    let result = token_identity(token);
+    // SAFETY: the token is open, and this is its only close.
+    if let Err(error) = unsafe { CloseHandle(token) } {
+        eprintln!("QuickEdit: closing the token failed: {error}");
+    }
+    result
+}
+
+fn token_identity(token: HANDLE) -> Result<Identity, HandoffError> {
+    let user = token_bytes(token, TokenUser)
+        .map_err(|e| windows_failure("reading the user from the token", &e))?;
+    // SAFETY: Windows filled the buffer with a TOKEN_USER, and it is aligned for it.
+    let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text = PWSTR::null();
+    // SAFETY: the SID lives in `user`, and `text` is freed below.
+    unsafe { ConvertSidToStringSidW(user_sid, &mut text) }
+        .map_err(|e| windows_failure("reading the user's name", &e))?;
+    // SAFETY: Windows gave a string that ends in a zero.
+    let sid = unsafe { text.to_string() }.unwrap_or_default();
+    // SAFETY: the pointer came from the call above and is freed once.
+    unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    let label = token_bytes(token, TokenIntegrityLevel)
+        .map_err(|e| windows_failure("reading the integrity level", &e))?;
+    // SAFETY: Windows filled the buffer with a TOKEN_MANDATORY_LABEL.
+    let label_sid = unsafe { (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid };
+    // SAFETY: the SID is valid while `label` lives, and has at least one part.
+    let rid = unsafe {
+        let parts = *GetSidSubAuthorityCount(label_sid);
+        *GetSidSubAuthority(label_sid, u32::from(parts) - 1)
+    };
+    let level = match rid {
+        0..=0x0fff => IntegrityLevel::Low,
+        0x1000..=0x2fff => IntegrityLevel::Medium,
+        0x3000..=0x3fff => IntegrityLevel::High,
+        _ => IntegrityLevel::System,
+    };
+    Ok(Identity { sid, level })
+}
+
+/// The check a real launch makes on the process that holds the pipe: the same user and the same
+/// level as this one. Windows refusing to say who it is counts as a failure of the check.
+#[doc(hidden)]
+pub fn server_is_this_user_and_level(server: u32) -> Result<(), HandoffError> {
+    let refuse = |why: String| HandoffError::UntrustedServer { why };
+    // SAFETY: the pseudo handle is always valid.
+    let ours = process_identity(unsafe { GetCurrentProcess() })?;
+    // SAFETY: a plain number. The handle is closed by `Owned`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, server) }
+        .map(Owned)
+        .map_err(|e| refuse(format!("Windows would not open process {server}: {e}")))?;
+    let theirs = process_identity(process.0)
+        .map_err(|e| refuse(format!("Windows would not read process {server}: {e}")))?;
+    identities_match(&ours, &theirs).map_err(refuse)
+}
+
+fn identities_match(ours: &Identity, theirs: &Identity) -> Result<(), String> {
+    if ours.sid != theirs.sid {
+        return Err(format!(
+            "It runs as user {}, and this launch runs as {}.",
+            theirs.sid, ours.sid
+        ));
+    }
+    if ours.level != theirs.level {
+        return Err(format!(
+            "It runs with {} rights, and this launch has {} rights.",
+            theirs.level.words(),
+            ours.level.words()
+        ));
+    }
+    Ok(())
 }
 
 fn token_bytes(
@@ -307,6 +377,17 @@ fn windows_failure(what: &str, error: &windows::core::Error) -> HandoffError {
 /// none is running at any level. Up to about 4.5 seconds when an instance hangs; a launch
 /// has no UI to hold up yet.
 pub fn hand_off(names: &PipeNames, paths: &[PathBuf]) -> Result<bool, HandoffError> {
+    hand_off_checked(names, paths, &server_is_this_user_and_level)
+}
+
+/// `hand_off` with the check on the server given by the caller, so that a test can make it fail.
+/// The check gets the server's process id before any of this launch's files go out.
+#[doc(hidden)]
+pub fn hand_off_checked(
+    names: &PipeNames,
+    paths: &[PathBuf],
+    check: &dyn Fn(u32) -> Result<(), HandoffError>,
+) -> Result<bool, HandoffError> {
     if paths.len() > MAX_PATHS {
         return Err(HandoffError::Failed {
             what: format!(
@@ -326,7 +407,7 @@ pub fn hand_off(names: &PipeNames, paths: &[PathBuf]) -> Result<bool, HandoffErr
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 None,
             )
         };
@@ -356,13 +437,17 @@ pub fn hand_off(names: &PipeNames, paths: &[PathBuf]) -> Result<bool, HandoffErr
             Err(error) => return Err(windows_failure("opening the pipe", &error)),
         }
     };
-    // So that the instance may bring its window forward.
     let mut server = 0;
     // SAFETY: the pipe is open and `server` outlives the call.
-    if unsafe { GetNamedPipeServerProcessId(file.0, &mut server) }.is_ok()
-        // SAFETY: a plain number.
-        && let Err(error) = unsafe { AllowSetForegroundWindow(server) }
-    {
+    unsafe { GetNamedPipeServerProcessId(file.0, &mut server) }.map_err(|e| {
+        HandoffError::UntrustedServer {
+            why: format!("Windows would not say which process it is: {e}"),
+        }
+    })?;
+    check(server)?;
+    // So that the instance may bring its window forward.
+    // SAFETY: a plain number.
+    if let Err(error) = unsafe { AllowSetForegroundWindow(server) } {
         // Only the window's coming forward depends on this.
         eprintln!("QuickEdit: AllowSetForegroundWindow failed: {error}");
     }
@@ -377,10 +462,13 @@ pub fn hand_off(names: &PipeNames, paths: &[PathBuf]) -> Result<bool, HandoffErr
             Waited::TimedOut(waited) => HandoffError::StaleInstance { waited },
             Waited::Failed(error) => windows_failure("reading the answer", &error),
         })?;
-    if got != 1 || answer[0] != TAKEN {
+    if got != 1 {
         return Err(HandoffError::Failed {
             what: "the running QuickEdit refused the message".into(),
         });
+    }
+    if answer[0] != TAKEN {
+        return Err(HandoffError::WrongAnswer { byte: answer[0] });
     }
     Ok(true)
 }
@@ -564,7 +652,30 @@ impl Drop for HandoffServer {
     }
 }
 
-fn create_pipe(pipe: &[u16], first: bool) -> windows::core::Result<Owned> {
+/// One rule, for one user, and no rules from a parent. Its text is what a test reads back.
+fn only_this_user(sid: &str) -> Vec<u16> {
+    format!("D:P(A;;GA;;;{sid})")
+        .encode_utf16()
+        .chain([0])
+        .collect()
+}
+
+fn create_pipe(pipe: &[u16], rights: &[u16], first: bool) -> windows::core::Result<Owned> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the text ends in a zero, and `descriptor` is freed below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(rights.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
     let mut flags = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
         flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -579,13 +690,17 @@ fn create_pipe(pipe: &[u16], first: bool) -> windows::core::Result<Owned> {
             4096,
             4096,
             0,
-            None,
+            Some(&raw const attributes),
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(windows::core::Error::from_thread());
-    }
-    Ok(Owned(handle))
+    let made = if handle == INVALID_HANDLE_VALUE {
+        Err(windows::core::Error::from_thread())
+    } else {
+        Ok(Owned(handle))
+    };
+    // SAFETY: Windows made this copy for this call, and it is freed once.
+    unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    made
 }
 
 /// Takes the pipe's name and starts listening. `Ok(None)`: another process holds the name.
@@ -594,7 +709,9 @@ pub fn listen(
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<Option<HandoffServer>, HandoffError> {
     let pipe = names.pipe(names.level);
-    let first = match create_pipe(&pipe, true) {
+    // SAFETY: the pseudo handle is always valid.
+    let rights = only_this_user(&process_identity(unsafe { GetCurrentProcess() })?.sid);
+    let first = match create_pipe(&pipe, &rights, true) {
         Ok(handle) => handle,
         // The first-instance flag fails with access denied when the name is taken.
         Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => return Ok(None),
@@ -615,6 +732,7 @@ pub fn listen(
     let clients = Arc::new(AtomicUsize::new(0));
     let shared = Shared {
         pipe,
+        rights,
         queue: queue.clone(),
         events: events.clone(),
         stop: stop.clone(),
@@ -648,6 +766,17 @@ pub fn start(
     start_with(names, paths, wake, &|| {})
 }
 
+/// `start`, with the check on the server given by the caller, for a test.
+#[doc(hidden)]
+pub fn start_checked(
+    names: &PipeNames,
+    paths: &[PathBuf],
+    wake: Arc<dyn Fn() + Send + Sync>,
+    check: &dyn Fn(u32) -> Result<(), HandoffError>,
+) -> LaunchRole {
+    start_inner(names, paths, wake, &|| {}, check)
+}
+
 /// `start`, with a call between finding no instance and taking the name, so that a test can
 /// be the other launch that wins the race at that moment.
 #[doc(hidden)]
@@ -657,11 +786,21 @@ pub fn start_with(
     wake: Arc<dyn Fn() + Send + Sync>,
     between: &dyn Fn(),
 ) -> LaunchRole {
+    start_inner(names, paths, wake, between, &server_is_this_user_and_level)
+}
+
+fn start_inner(
+    names: &PipeNames,
+    paths: &[PathBuf],
+    wake: Arc<dyn Fn() + Send + Sync>,
+    between: &dyn Fn(),
+    check: &dyn Fn(u32) -> Result<(), HandoffError>,
+) -> LaunchRole {
     let paths = absolute_paths(paths);
     // A loser of the race may arrive before the winner listens, so it tries a few times.
     let deadline = Instant::now() + CONNECT_WAIT;
     loop {
-        match hand_off(names, &paths) {
+        match hand_off_checked(names, &paths, check) {
             Ok(true) => return LaunchRole::HandedOff,
             Ok(false) => {}
             Err(error) => return LaunchRole::Alone { error },
@@ -687,6 +826,7 @@ pub fn start_with(
 /// What the server's threads share.
 struct Shared {
     pipe: Vec<u16>,
+    rights: Vec<u16>,
     queue: Arc<Mutex<Vec<HandoffRequest>>>,
     events: Arc<Mutex<Vec<HandoffEvent>>>,
     stop: Arc<Owned>,
@@ -722,7 +862,7 @@ fn supervise(first: Owned, shared: &Shared) {
         // A launch being served still holds the name, so then no other process can have taken
         // it, and only then may the new pipe skip the first-instance rule.
         let first = shared.clients.load(Ordering::Acquire) == 0;
-        match create_pipe(&shared.pipe, first) {
+        match create_pipe(&shared.pipe, &shared.rights, first) {
             Ok(pipe) => {
                 listening = pipe;
                 shared.tell(HandoffEvent::ServerRestarted { reason });
@@ -794,7 +934,7 @@ fn serve(mut listening: Owned, shared: &Shared) -> Result<(), String> {
         }
         // A new instance must exist before this one is busy, or a launch would find no pipe
         // and think it is the first.
-        let next = create_pipe(&shared.pipe, false)
+        let next = create_pipe(&shared.pipe, &shared.rights, false)
             .map_err(|e| format!("the handoff pipe could not grow: {e}"))?;
         let client = std::mem::replace(&mut listening, next);
         serve_on_its_own_thread(client, shared);
@@ -951,6 +1091,26 @@ mod tests {
         count[4] = 9;
         assert!(decode_message(&count).is_none(), "count");
         assert!(decode_message(&[]).is_none());
+    }
+    #[test]
+    fn another_user_or_another_level_fails_the_identity_comparison() {
+        let ours = Identity {
+            sid: "S-1-5-21-1".into(),
+            level: IntegrityLevel::Medium,
+        };
+        assert_eq!(identities_match(&ours, &ours.clone()), Ok(()));
+        let user = Identity {
+            sid: "S-1-5-21-2".into(),
+            ..ours.clone()
+        };
+        let shown = identities_match(&ours, &user).unwrap_err();
+        assert!(shown.contains("S-1-5-21-2"), "{shown}");
+        let level = Identity {
+            level: IntegrityLevel::High,
+            ..ours.clone()
+        };
+        let shown = identities_match(&ours, &level).unwrap_err();
+        assert!(shown.contains("administrator"), "{shown}");
     }
     #[test]
     fn real_names_come_from_the_token() {

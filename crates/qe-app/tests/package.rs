@@ -311,10 +311,11 @@ fn the_app_entry_runs_quickedit_exe_with_full_trust_and_each_launch_its_own_proc
         .map(|element| element.attr("Name").unwrap())
         .collect();
     assert_eq!(capabilities, ["runFullTrust"]);
-    assert_eq!(
-        find(&elements, "uap3:FileTypeAssociation").attr("MultiSelectModel"),
-        Some("Player")
-    );
+    // Each file is one launch with one quoted argument, so a path with a space stays whole. The
+    // parser here does not expand entities, so this is the text as it stands in the file.
+    let association = find(&elements, "uap3:FileTypeAssociation");
+    assert_eq!(association.attr("MultiSelectModel"), Some("Document"));
+    assert_eq!(association.attr("Parameters"), Some("&quot;%1&quot;"));
 }
 
 /// The list between the two marks in `packaging/README.md`.
@@ -495,6 +496,374 @@ fn the_built_exe_holds_the_manifest_and_icon_and_still_starts() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("hidden smoke passed"));
 }
 
+// ---- What the built exe holds ----
+
+/// The parts of a PE file these tests read.
+struct Pe {
+    bytes: Vec<u8>,
+    /// (virtual address, size in the file's image, offset in the file)
+    sections: Vec<(u32, u32, u32)>,
+    data_directories: usize,
+}
+
+impl Pe {
+    fn read(path: &Path) -> Self {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let pe = u32_at(0x3c) as usize;
+        assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "{}", path.display());
+        let count = u16_at(pe + 6) as usize;
+        let optional = pe + 24;
+        assert_eq!(u16_at(optional), 0x20b, "a 64-bit exe");
+        let table = optional + u16_at(pe + 20) as usize;
+        let sections = (0..count)
+            .map(|index| {
+                let at = table + 40 * index;
+                let size = u32_at(at + 8).max(u32_at(at + 16));
+                (u32_at(at + 12), size, u32_at(at + 20))
+            })
+            .collect();
+        Self {
+            data_directories: optional + 112,
+            bytes,
+            sections,
+        }
+    }
+    fn u16_at(&self, at: usize) -> u16 {
+        u16::from_le_bytes(self.bytes[at..at + 2].try_into().unwrap())
+    }
+    fn u32_at(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap())
+    }
+    /// The file offset of an address in the loaded image.
+    fn offset(&self, address: u32) -> usize {
+        let (start, _, raw) = self
+            .sections
+            .iter()
+            .find(|(start, size, _)| address >= *start && address < start + size)
+            .unwrap_or_else(|| panic!("the address {address:#x} is in no section"));
+        (address - start + raw) as usize
+    }
+    /// The address of one data directory, or `None` if the exe has none.
+    fn directory(&self, index: usize) -> Option<u32> {
+        let address = self.u32_at(self.data_directories + 8 * index);
+        (address != 0).then_some(address)
+    }
+    fn name_at(&self, address: u32) -> String {
+        let at = self.offset(address);
+        let end = at + self.bytes[at..].iter().position(|b| *b == 0).unwrap();
+        String::from_utf8_lossy(&self.bytes[at..end]).into_owned()
+    }
+    /// Every DLL in the import table, normal and delay-loaded.
+    fn imports(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        // The name's place is 12 bytes into a normal entry of 20, and 4 into a delay entry of 32.
+        for (directory, name_field, step) in [(1, 12, 20), (13, 4, 32)] {
+            let Some(address) = self.directory(directory) else {
+                continue;
+            };
+            let mut at = self.offset(address);
+            loop {
+                let name = self.u32_at(at + name_field);
+                if name == 0 {
+                    break;
+                }
+                names.push(self.name_at(name));
+                at += step;
+            }
+        }
+        assert!(!names.is_empty(), "no imports were read");
+        names
+    }
+    /// `DependentLoadFlags`, 78 bytes into a 64-bit load configuration.
+    fn dependent_load_flags(&self) -> u16 {
+        let address = self
+            .directory(10)
+            .expect("the exe has a load configuration");
+        self.u16_at(self.offset(address) + 78)
+    }
+    /// (file version, product version) from `VS_FIXEDFILEINFO`, whose first word is its mark.
+    fn fixed_versions(&self) -> Option<([u16; 4], [u16; 4])> {
+        let mark = 0xFEEF_04BDu32.to_le_bytes();
+        let at = self.bytes.windows(4).position(|part| part == mark)?;
+        let read = |at: usize| {
+            let (ms, ls) = (self.u32_at(at), self.u32_at(at + 4));
+            [(ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16]
+        };
+        Some((read(at + 8), read(at + 16)))
+    }
+}
+
+fn debug_exe() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_QuickEdit"))
+}
+
+/// The release exe beside this build, or the one `QE_RELEASE_EXE` names. Tests that need it say
+/// so and pass when there is none, and `packaging/build.ps1` makes the same checks on its own.
+fn release_exe() -> Option<PathBuf> {
+    if let Some(named) = std::env::var_os("QE_RELEASE_EXE") {
+        return Some(PathBuf::from(named));
+    }
+    let debug = debug_exe();
+    let beside = debug
+        .parent()?
+        .parent()?
+        .join("release")
+        .join("QuickEdit.exe");
+    if beside.is_file() {
+        return Some(beside);
+    }
+    println!(
+        "skipped for the release exe: there is none at {}",
+        beside.display()
+    );
+    None
+}
+
+fn check_no_c_runtime_import(exe: &Path) {
+    let imports = Pe::read(exe).imports();
+    println!("{} imports {imports:?}", exe.display());
+    for name in &imports {
+        let lower = name.to_ascii_lowercase();
+        assert!(
+            !lower.starts_with("vcruntime")
+                && !lower.starts_with("msvcp")
+                && !lower.starts_with("api-ms-win-crt-")
+                && !lower.starts_with("ucrtbase"),
+            "{} needs {name}, which a clean PC may not have",
+            exe.display()
+        );
+    }
+}
+
+/// With no C runtime in the package, an import of one fails before any Rust code runs.
+#[test]
+fn the_exe_imports_no_c_runtime() {
+    check_no_c_runtime_import(&debug_exe());
+    if let Some(exe) = release_exe() {
+        check_no_c_runtime_import(&exe);
+    }
+}
+
+fn find_case_blind(haystack: &[u8], needle: &str) -> Option<usize> {
+    let needle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    haystack.windows(needle.len()).position(|part| {
+        part.iter()
+            .map(u8::to_ascii_lowercase)
+            .eq(needle.iter().copied())
+    })
+}
+
+/// The folder an exe was built in holds the builder's account name. Store customers get the exe.
+/// A release exe from plain `cargo build --release` fails here: `packaging/build.ps1` adds the
+/// `--remap-path-prefix` flags that this needs, as they differ from one PC to the next.
+#[test]
+fn the_release_exe_names_no_user_folder() {
+    let Some(exe) = release_exe() else {
+        return;
+    };
+    let bytes = std::fs::read(&exe).unwrap();
+    for needle in [r"\Users\", "/Users/", ".cargo", ".rustup"] {
+        if let Some(at) = find_case_blind(&bytes, needle) {
+            let end = (at + 80).min(bytes.len());
+            panic!(
+                "{} holds {needle} at {at}: {}. Build it with packaging\\build.ps1.",
+                exe.display(),
+                String::from_utf8_lossy(&bytes[at..end])
+            );
+        }
+        let wide: Vec<u8> = needle.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(
+            !holds(&bytes, &wide),
+            "{} holds {needle} in UTF-16",
+            exe.display()
+        );
+    }
+}
+
+/// 0x800 is `LOAD_LIBRARY_SEARCH_SYSTEM32`: a planted DLL beside the exe must not load.
+#[test]
+fn the_exe_loads_its_imports_only_from_system32() {
+    assert_eq!(Pe::read(&debug_exe()).dependent_load_flags(), 0x800);
+    if let Some(exe) = release_exe() {
+        assert_eq!(Pe::read(&exe).dependent_load_flags(), 0x800);
+    }
+}
+
+fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+#[test]
+fn the_exe_version_record_matches_the_package_manifest() {
+    if sdk_tool("rc.exe").is_none() && std::env::var_os("QE_RC").is_none() {
+        println!("skipped: rc.exe is missing, so this debug exe has no resources");
+        return;
+    }
+    let elements = read_manifest();
+    let text = find(&elements, "Identity")
+        .attr("Version")
+        .unwrap()
+        .to_string();
+    let parts: Vec<u16> = text.split('.').map(|n| n.parse().unwrap()).collect();
+    let want: [u16; 4] = parts.try_into().unwrap();
+    let mut exes = vec![debug_exe()];
+    exes.extend(release_exe());
+    for exe in exes {
+        let pe = Pe::read(&exe);
+        let found = pe.fixed_versions().expect("a version record");
+        assert_eq!(found, (want, want), "{}", exe.display());
+        for field in [
+            "ProductName",
+            "FileDescription",
+            "QuickEdit plain-text editor",
+        ] {
+            assert!(holds(&pe.bytes, &utf16(field)), "{field}");
+        }
+        assert!(holds(&pe.bytes, &utf16(&text)), "{text}");
+    }
+}
+
+/// Test words must not read as test words to a customer who opens the exe in a text viewer.
+#[test]
+fn no_test_message_ships_in_the_exe() {
+    let mut exes = vec![debug_exe()];
+    exes.extend(release_exe());
+    for exe in exes {
+        let bytes = std::fs::read(&exe).unwrap();
+        for text in [
+            "A test made this raise fail.",
+            "this test asked for a window that fails",
+        ] {
+            assert!(
+                !holds(&bytes, text.as_bytes()),
+                "{text} in {}",
+                exe.display()
+            );
+        }
+    }
+}
+
+// ---- The words that go with the package ----
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn the_listing_names_no_other_product_and_makes_no_network_claim_it_cannot_keep() {
+    let listing = std::fs::read_to_string(packaging().join("listing.md")).unwrap();
+    assert!(!listing.to_lowercase().contains("notepad"), "policy 10.1.3");
+    assert!(!listing.contains("does not use the network"));
+    assert!(listing.contains("has no network code and contacts no server"));
+    assert!(listing.contains("network share"));
+    assert!(listing.to_lowercase().contains("dictionary"));
+    assert!(!listing.contains("does not access"));
+}
+
+#[test]
+fn the_privacy_policy_says_what_the_app_does_and_the_readme_says_it_must_be_published() {
+    let policy = std::fs::read_to_string(packaging().join("PRIVACY.md")).unwrap();
+    for needed in [
+        "no network code",
+        "contacts no server",
+        "dictionary",
+        "autosave",
+        r"%LOCALAPPDATA%\QuickEdit",
+        r"%LOCALAPPDATA%\Packages",
+    ] {
+        assert!(policy.contains(needed), "{needed}");
+    }
+    let readme = std::fs::read_to_string(packaging().join("README.md")).unwrap();
+    assert!(readme.contains("10.5.1"));
+    assert!(
+        readme.contains("You must publish `PRIVACY.md` at a web address"),
+        "the person's step"
+    );
+    assert!(readme.contains("PRIVACY.md"));
+    assert!(!readme.contains("does not access, collect or send"));
+}
+
+/// `LICENSE` names MIT, the build script copies the notices into the package, and the notices
+/// file is what its own command makes from `Cargo.lock` now.
+#[test]
+fn the_licence_and_notices_are_there_and_the_notices_are_current() {
+    let license = std::fs::read_to_string(repo_root().join("LICENSE")).unwrap();
+    assert!(license.starts_with("MIT License"), "{license:.40}");
+    let notices = std::fs::read_to_string(packaging().join("NOTICES.txt")).unwrap();
+    for name in ["windows ", "windows-core ", "unicode-segmentation "] {
+        assert!(notices.contains(name), "{name}");
+    }
+    assert!(notices.contains("not legal advice"));
+    let script = std::fs::read_to_string(packaging().join("build.ps1")).unwrap();
+    assert!(script.contains("NOTICES.txt") && script.contains("'LICENSE'"));
+    let Some(powershell) = find_on_path("pwsh.exe") else {
+        println!("skipped the notices compare: pwsh.exe is not on PATH");
+        return;
+    };
+    let output = Command::new(powershell)
+        .args(["-NoProfile", "-File"])
+        .arg(packaging().join("make-notices.ps1"))
+        .arg("-Check")
+        .creation_flags(NO_WINDOW)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|folder| folder.join(name))
+        .find(|file| file.is_file())
+}
+
+/// A public repo holds no account names, machine names or the names of the reviewers. The state
+/// note is left out here because another file owner updates it. The git history still has these.
+#[test]
+fn tracked_text_holds_no_account_machine_or_reviewer_names() {
+    // Written in two parts, so this test does not find itself.
+    let names = [
+        concat!("yj", "li"),
+        concat!("alpha", "-wolf"),
+        concat!("rog", "-wolf"),
+        concat!("tail", "scale"),
+        concat!("\\bAs", "tra\\b"),
+        concat!("\\bOp", "us\\b"),
+        concat!("\\bFa", "ble\\b"),
+        concat!("\\bS", "ol\\b"),
+        concat!("remote_", "machines"),
+        concat!("quickedit_", "windows"),
+    ];
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo_root())
+        .args(["grep", "-n", "-I", "-E", "-e"])
+        .arg(names.join("|"))
+        .args(["--", "."])
+        .creation_flags(NO_WINDOW);
+    let Ok(output) = command.output() else {
+        println!("skipped: git is not on PATH");
+        return;
+    };
+    // git grep exits 1 for no match, 0 for a match, and more for a failure.
+    if output.status.code() == Some(128) {
+        println!("skipped: this copy is not a git checkout");
+        return;
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 fn temp_folder(name: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("qe-package")
@@ -558,6 +927,8 @@ fn makeappx_packs_the_real_manifest_and_icons_around_a_stand_in_exe() {
     )
     .unwrap();
     std::fs::write(layout.join("QuickEdit.exe"), b"MZ stand-in, never run").unwrap();
+    std::fs::copy(packaging().join("NOTICES.txt"), layout.join("NOTICES.txt")).unwrap();
+    std::fs::copy(repo_root().join("LICENSE"), layout.join("LICENSE")).unwrap();
     let os = |text: &'static str| std::ffi::OsStr::new(text);
     let config = folder.join("priconfig.xml");
     let manifest = layout.join("AppxManifest.xml");
@@ -625,6 +996,8 @@ fn makeappx_packs_the_real_manifest_and_icons_around_a_stand_in_exe() {
         "AppxBlockMap.xml",
         "resources.pri",
         "QuickEdit.exe",
+        "NOTICES.txt",
+        "LICENSE",
         "Assets/Square44x44Logo.targetsize-16_altform-unplated.png",
     ] {
         assert!(unpacked.join(file).is_file(), "{file}");

@@ -4,7 +4,8 @@ mod support;
 
 use qe_docs::handoff::{
     HandoffError, HandoffEvent, HandoffServer, IntegrityLevel, LaunchRole, MAX_PATHS, PipeNames,
-    hand_off, listen, start, start_with,
+    hand_off, hand_off_checked, listen, server_is_this_user_and_level, start, start_checked,
+    start_with,
 };
 use qe_docs::{DocEvent, OpenTarget};
 use std::io::{BufRead, BufReader, Write as _};
@@ -616,4 +617,274 @@ fn stopping_the_server_gives_back_what_came_and_the_next_launch_becomes_the_inst
         start(&names, &[], no_wake()),
         LaunchRole::Primary(_)
     ));
+}
+
+// ---- Who is on the other end of the pipe ----
+
+/// A pipe held by a test, as a program that took the name first would hold it. `serve` runs on
+/// a thread with the connected handle, and its result comes back at `join`.
+fn fake_server<T: Send + 'static>(
+    names: &PipeNames,
+    serve: impl FnOnce(windows::Win32::Foundation::HANDLE) -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows::core::PCWSTR;
+    let name: Vec<u16> = format!(r"\\.\pipe\{}-medium", names.base)
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // SAFETY: the name ends in a zero and outlives the call.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(3),
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    assert!(
+        !handle.is_invalid(),
+        "{}",
+        windows::core::Error::from_thread()
+    );
+    let raw = handle.0 as usize;
+    std::thread::spawn(move || {
+        let handle = HANDLE(raw as *mut _);
+        // SAFETY: the pipe is open and blocking, so this waits for the client.
+        // A client that came first reports "connected", which is success for this test.
+        let _ = unsafe { ConnectNamedPipe(handle, None) };
+        let out = serve(handle);
+        // SAFETY: this thread holds the only copy of the handle.
+        unsafe { CloseHandle(handle) }.unwrap();
+        out
+    })
+}
+
+/// All that the client sends before it closes, or stops sending for this server's one read.
+fn fake_read(pipe: windows::Win32::Foundation::HANDLE) -> Vec<u8> {
+    let mut bytes = vec![0u8; 4096];
+    let mut got = 0;
+    // SAFETY: the buffer and the count outlive this blocking call. A closed pipe reads zero.
+    let _ = unsafe {
+        windows::Win32::Storage::FileSystem::ReadFile(pipe, Some(&mut bytes), Some(&mut got), None)
+    };
+    bytes.truncate(got as usize);
+    bytes
+}
+
+/// The first bug's proof: a server that takes the name can read how far it may act as the
+/// client. It must see the identification level, which lets it read who, and do nothing as them.
+#[test]
+fn a_launch_lets_the_server_learn_who_it_is_and_never_act_as_it() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        GetTokenInformation, RevertToSelf, SECURITY_IMPERSONATION_LEVEL, SecurityIdentification,
+        TOKEN_QUERY, TokenImpersonationLevel,
+    };
+    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+    let names = names("identification-level");
+    let fake = fake_server(&names, |pipe| {
+        drop(fake_read(pipe));
+        // SAFETY: the client has written, so its identity is there to take.
+        unsafe { ImpersonateNamedPipeClient(pipe) }.unwrap();
+        let mut token = HANDLE::default();
+        // SAFETY: the out value outlives the call.
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) };
+        let mut level = SECURITY_IMPERSONATION_LEVEL::default();
+        let mut size = 0;
+        opened.unwrap();
+        // SAFETY: the buffer is the right size for this class and outlives the call.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenImpersonationLevel,
+                Some((&raw mut level).cast()),
+                size_of::<SECURITY_IMPERSONATION_LEVEL>() as u32,
+                &mut size,
+            )
+        }
+        .unwrap();
+        // SAFETY: this thread took the identity above.
+        unsafe { RevertToSelf() }.unwrap();
+        // SAFETY: the token is open, and this is its only close.
+        unsafe { windows::Win32::Foundation::CloseHandle(token) }.unwrap();
+        level
+    });
+    // The fake never answers, so the launch fails after it sends. That is not this test's point.
+    let launch = hand_off(&names, &[PathBuf::from(r"C:\a.txt")]);
+    assert!(launch.is_err(), "{launch:?}");
+    assert_eq!(fake.join().unwrap(), SecurityIdentification);
+}
+
+/// The rights Windows holds for the real server's pipe, read back through a client's handle.
+#[test]
+fn the_pipe_allows_only_this_user() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
+    };
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::core::PWSTR;
+    let real = PipeNames::for_this_process().unwrap();
+    let names = names("rights");
+    let (_server, _) = server(&names);
+    let client = open_client(&names);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the handle is open, and `descriptor` is freed below.
+    let read = unsafe {
+        GetSecurityInfo(
+            HANDLE(client.as_raw_handle()),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    assert!(read.is_ok(), "{read:?}");
+    let mut text = PWSTR::null();
+    // SAFETY: the descriptor came from the call above, and `text` is freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+    }
+    .unwrap();
+    // SAFETY: Windows gave a string that ends in a zero.
+    let rights = unsafe { text.to_string() }.unwrap();
+    // SAFETY: both came from Windows, and each is freed once.
+    unsafe {
+        LocalFree(Some(HLOCAL(text.0.cast())));
+        LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    // The base is `QuickEdit-<the user's id>-<session>`.
+    let user = real.base.split('-').skip(1).collect::<Vec<_>>();
+    let user = user[..user.len() - 1].join("-");
+    println!("the pipe's rights: {rights}");
+    assert!(rights.starts_with("D:P"), "not protected: {rights}");
+    assert_eq!(rights.matches('(').count(), 1, "one rule only: {rights}");
+    assert!(rights.ends_with(&format!(";;;{user})")), "{rights}");
+    for other in ["WD", "AN", "SY", "BA"] {
+        assert!(!rights.contains(other), "{other} in {rights}");
+    }
+}
+
+/// The fake holds the name and answers with a wrong byte, as another program would. The launch
+/// names the problem and runs alone, so its file still opens.
+#[test]
+fn a_fake_server_with_the_wrong_answer_is_named_and_the_launch_runs_alone() {
+    let names = names("wrong-protocol");
+    let fake = fake_server(&names, |pipe| {
+        let got = fake_read(pipe);
+        // SAFETY: the pipe is open, and the bytes outlive this blocking call.
+        unsafe { windows::Win32::Storage::FileSystem::WriteFile(pipe, Some(b"X"), None, None) }
+            .unwrap();
+        // The launch reads its answer, then closes. This read ends then.
+        drop(fake_read(pipe));
+        got
+    });
+    let role = start(&names, &[PathBuf::from(r"C:\some folder\a.txt")], no_wake());
+    let LaunchRole::Alone { error } = role else {
+        panic!("the launch trusted a fake server");
+    };
+    assert_eq!(error, HandoffError::WrongAnswer { byte: b'X' });
+    assert!(
+        error.to_string().contains("opens its own window"),
+        "{error}"
+    );
+    assert!(
+        !fake.join().unwrap().is_empty(),
+        "it passed the same-user check"
+    );
+}
+
+/// A server that fails the identity check is sent nothing at all, and the launch runs alone.
+#[test]
+fn a_server_that_fails_the_identity_check_gets_no_files() {
+    let names = names("bad-identity");
+    let fake = fake_server(&names, fake_read);
+    let refuse = |_server: u32| {
+        Err(HandoffError::UntrustedServer {
+            why: "a test says so".to_owned(),
+        })
+    };
+    let role = start_checked(
+        &names,
+        &[PathBuf::from(r"C:\secret folder\my taxes.txt")],
+        no_wake(),
+        &refuse,
+    );
+    let LaunchRole::Alone { error } = role else {
+        panic!("the launch did not run alone");
+    };
+    assert!(
+        matches!(error, HandoffError::UntrustedServer { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("a test says so"), "{error}");
+    assert_eq!(fake.join().unwrap(), Vec::<u8>::new(), "bytes were sent");
+}
+
+/// The check gets the process that really holds the pipe.
+#[test]
+fn the_identity_check_is_given_the_process_that_holds_the_pipe() {
+    let names = names("check-pid");
+    let (_server, _) = server(&names);
+    let seen = std::sync::Mutex::new(0);
+    let check = |server: u32| {
+        *seen.lock().unwrap() = server;
+        Ok(())
+    };
+    assert_eq!(hand_off_checked(&names, &[], &check), Ok(true));
+    assert_eq!(*seen.lock().unwrap(), std::process::id());
+}
+
+/// The real check, on real processes: this one passes. The System process is another user, and
+/// Windows also may not let this process read it. Either way the launch must refuse it.
+#[test]
+fn the_real_identity_check_passes_this_process_and_refuses_system() {
+    assert_eq!(server_is_this_user_and_level(std::process::id()), Ok(()));
+    let system = server_is_this_user_and_level(4);
+    assert!(
+        matches!(system, Err(HandoffError::UntrustedServer { .. })),
+        "{system:?}"
+    );
+    // A process that is gone is refused too.
+    let gone = server_is_this_user_and_level(0xFFFF_FFF0);
+    assert!(
+        matches!(gone, Err(HandoffError::UntrustedServer { .. })),
+        "{gone:?}"
+    );
+}
+
+/// A launch's added cost is small: the check on a real server, 50 times.
+#[test]
+fn the_identity_check_takes_little_time() {
+    let mut samples: Vec<Duration> = (0..50)
+        .map(|_| {
+            let started = Instant::now();
+            server_is_this_user_and_level(std::process::id()).unwrap();
+            started.elapsed()
+        })
+        .collect();
+    samples.sort();
+    println!("the identity check: median {:?}", samples[25]);
+    assert!(samples[25] < Duration::from_millis(5), "{:?}", samples[25]);
 }

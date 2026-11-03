@@ -783,7 +783,7 @@ fn stand_in_spaces_never_make_a_row() {
     }
 }
 
-// Astra finding A.
+// Review finding A.
 fn assert_no_stop_inside(text: &str, unit: &str, prefix: usize, layout: &qe_api::LineLayout) {
     for row in &layout.rows {
         for edge in [row.range.start.0, row.range.end.0] {
@@ -882,7 +882,7 @@ fn a_run_edge_inside_a_cluster_is_no_caret_stop() {
     assert!(!got.contains(&1) && !got.contains(&4), "{got:?}");
 }
 
-// Astra finding C.
+// Review finding C.
 #[test]
 fn removing_many_runs_costs_about_one_edit_and_memory_is_reused() {
     let lines = 1usize << 20;

@@ -9,6 +9,8 @@ These files make the Microsoft Store package for QuickEdit, for Windows 11 x64. 
 | `QuickEdit.ico`, `QuickEdit.exe.manifest` | The icon and the settings that `crates/qe-app/build.rs` puts inside the exe |
 | `build.ps1` | Builds the exe and the package |
 | `listing.md` | A draft of the Store page text |
+| `PRIVACY.md` | The privacy policy. You must publish it at a web address |
+| `NOTICES.txt`, `make-notices.ps1` | The outside crates in the exe and their licences, and the command that lists them from `Cargo.lock` |
 | `crates/qe-app/tests/package.rs` | Checks all of this, and packs a real package |
 
 ## What a person does
@@ -31,7 +33,13 @@ The test `the_identity_is_all_placeholders_or_all_filled_in` fails if only some 
 pwsh -NoProfile -File packaging\build.ps1
 ```
 
-It writes `target\QuickEdit-<version>-x64.msix` and prints the size. The version comes from `Version` in `AppxManifest.xml`. Raise it for each upload. The Store needs the last of the 4 numbers to stay 0.
+It writes `target\QuickEdit-<version>-x64.msix` and prints the size. The version comes from `Version` in `AppxManifest.xml`, and `crates/qe-app/build.rs` puts the same number in the exe's version record. Raise it for each upload. The Store needs the last of the 4 numbers to stay 0.
+
+The script does three things that a plain `cargo build --release` does not:
+
+- It passes `--remap-path-prefix` for your home, Cargo, Rust and repo folders, so that your account name is not in the exe. These paths differ on each PC, so `.cargo/config.toml` cannot hold them.
+- It stops if the exe imports a C runtime DLL or holds `\Users\`.
+- It stops if `NOTICES.txt` no longer matches `Cargo.lock`. Run `pwsh -NoProfile -File packaging\make-notices.ps1` to write it again. The list is made by a script and is not legal advice, so read it before a release.
 
 The package has no signature, and the Store adds its own after review. So this file cannot be installed by double-click. To try the app on a PC with Developer Mode on, use the loose form:
 
@@ -42,7 +50,29 @@ Add-AppxPackage -Register target\package\AppxManifest.xml
 
 To remove it again, use `Get-AppxPackage *QuickEdit* | Remove-AppxPackage`. This also deletes the app's settings and autosaved text, as "Where the app's data goes" says below.
 
-### 3. Run Microsoft's checks
+### 3. Publish the privacy policy
+
+You must publish `PRIVACY.md` at a web address that anyone can open, such as a page on your own site or the repo's file view. First fill in its 2 `PLACEHOLDER` lines. Then put that URL in Partner Center under Privacy policy.
+
+[Store policy 10.5.1](https://learn.microsoft.com/en-us/windows/apps/publish/store-policies) says that "Product types that inherently have access to Personal Information must always have privacy policies. These include, but are not limited to, Desktop Bridge and Win32 products." QuickEdit is a Win32 product in a package, so it needs one even though it collects nothing. [Partner Center](https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/msix/support-info) may also mark the question Yes by itself from the package's capabilities.
+
+### 4. Test the install
+
+These steps need a real install, so no automated test here covers them. On a PC with Developer Mode on, run the loose form from step 2, then:
+
+1. **Paths with spaces.** Make a folder named `My Docs`. Select 15 `.log` files in it, and press Enter, with QuickEdit closed. All 15 must open as tabs in one window. Repeat with QuickEdit running.
+2. **Open with.** Right-click a `.txt` file and pick Open with, with QuickEdit running and with it closed. See "Choices to check" for what `.txt` may do.
+3. **Package rule for flags.** From a terminal in a folder with a file named `--hidden`, run `quickedit.exe --hidden`. A visible window must open with that file. The same line from an unpackaged exe would run with hidden windows.
+4. **New file inside AppData.** In the app, use Save As to save `%LOCALAPPDATA%\qe-test\new.txt`, where `qe-test` is a real folder you made first. Then, from another terminal, run `Get-Content "$env:LOCALAPPDATA\qe-test\new.txt"`. If this says the file is missing, Windows sent the file to the app's private folder, and uninstalling will delete it.
+5. **Existing file inside AppData.** Make `%LOCALAPPDATA%\qe-test\old.txt` from a terminal with the text `before`. Open it in the app, type, and save. Run the same `Get-Content` on it from another terminal. It must show the new text. Then run `Get-ChildItem "$env:LOCALAPPDATA\Packages\*QuickEdit*\LocalCache\Local" -Recurse` and check that no copy of `old.txt` or a temp file is there.
+6. **Roaming AppData.** Repeat steps 4 and 5 under `%APPDATA%\qe-test`, with `LocalCache\Roaming` in the last command.
+7. **Saving over the top folder.** Repeat step 5 with a file directly in `%LOCALAPPDATA%`, since Microsoft's table treats some top folders differently.
+
+**If step 4, 5, 6 or 7 fails:** a saved file is a person's document, so it must not vanish. The options are `uap10:RuntimeBehavior="win32App"` or the `unvirtualizedResources` capability with `virtualization:ExcludedDirectory`. Each one changes where the app's own data goes, so "Where the app's data goes" and `PRIVACY.md` then need rewriting. Sources: [Flexible virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization) and [How packaged desktop apps run on Windows](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes). Do not add either one before the test shows the need.
+
+To remove the test folders afterward, delete `qe-test` from both places.
+
+### 5. Run Microsoft's checks
 
 Run the Windows App Certification Kit before the upload, from an elevated prompt in a signed-in session. These commands have not been run here, because the kit starts the app and may show windows. The kit is at `C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe`.
 
@@ -51,18 +81,20 @@ appcert.exe reset
 appcert.exe test -appxpackagepath <full path to the .msix> -reportoutputpath <full path to report.xml>
 ```
 
-### 4. Fill in the Store page
+An [unsigned package needs a special `OID` value in its `Publisher` to install](https://learn.microsoft.com/en-us/windows/msix/package/unsigned-package), and this manifest has none. So the kit may fail at its install step on the `.msix`. In that case, register the loose form from step 2, and pass `-packagefullname` from `Get-AppxPackage *QuickEdit*` in place of `-appxpackagepath`.
+
+### 6. Fill in the Store page
 
 | Item | What to give |
 | --- | --- |
 | Description and features | Start from `listing.md` |
 | Screenshots | At least 1, and 4 are suggested. PNG, at least 1366 by 768 pixels. Take them from the real app |
 | Category | Productivity. This matches the Mac app's category |
-| Privacy | The app collects nothing, stores nothing away from this PC and has no network code. Answer that it does not access, collect or send personal information. Store policy 10.5.1 asks for a privacy policy web address only for an app that does, or where a law asks. See "Choices to check" |
+| Privacy | Give the URL from step 3. Answer Yes to whether the product accesses personal information, because it reads whatever files a person opens. `listing.md` has text for this |
 | Age rating | Answer the IARC questionnaire (the age rating form) in Partner Center. A person must answer it. The answers should say that the app shows only the text of files the person opens |
 | `runFullTrust` | Partner Center asks why on the Submission options page. Say: "QuickEdit is a Win32 desktop app written in Rust. It runs as a normal desktop process, so the package must declare runFullTrust. It uses no other restricted capability." |
 
-### 5. What the Store's review looks for
+### 7. What the Store's review looks for
 
 - **The kit's checks pass.** For a full-trust app these cover a valid package and manifest, the file and capability rules, and that the app starts and stops cleanly.
 - **The app does what the listing says.** The reviewer runs it, so every feature in the listing must be there.
@@ -92,19 +124,13 @@ The reserved list also names `.txt`. Microsoft's own sample in the packaging pag
 
 ### Several files at once
 
-The association sets `MultiSelectModel="Player"`.
+The association sets `MultiSelectModel="Document"` and `Parameters="&quot;%1&quot;"`, which is `"%1"` with its quotes.
 
-- **15 files selected:** Windows starts `QuickEdit.exe` one time, with all 15 paths on its command line. With no running copy, that launch is the app. With a running copy, it passes all 15 through the pipe, in one message, and exits. So they arrive as tabs in the last used window.
-- **Why it is set here:** Microsoft's page says that with no setting the default is `Player` for 15 files or fewer, and `Document` above that, which starts one process for each file. Setting it keeps one rule for all counts.
-- **Over 100 files:** Microsoft's Win32 page says a verb of this kind stops appearing past 100 items for `Player`, and past 15 for `Document`. This page is about the registry form, so the limit for a package has not been checked.
-- **The fallback:** `Document` also works with the handoff code, as 15 launches of one path each, with more processes.
-
-**Not yet checked on an install.** A report in Microsoft's docs repository says the paths arrive "separated by spaces", and it does not say whether a path with a space in it is quoted. `crates/qe-app/src/args.rs` takes each argument as one file, so an unquoted path would break. Test these after registering:
-
-1. Select 15 files in a folder whose name has a space, and press Enter.
-2. Open `.txt` from Open with, with the app running and with it closed.
-
-If the paths split at spaces, change `Player` to `Document`.
+- **15 files selected:** Windows starts `QuickEdit.exe` 15 times, each with one quoted path. The first to take the pipe is the app. The others pass their one file through the pipe and exit. The tabs join the last used window in the order the pipe takes them, which may differ from the order in Explorer.
+- **Why not `Player`:** `Player` passes all the paths on one line, and a [report in Microsoft's docs repository](https://github.com/MicrosoftDocs/winrt-related/issues/124) says they arrive "separated by spaces", with no word on quotes. A path such as `C:\Users\First Last\a.txt` would then split in two. Nothing in Microsoft's docs settles it, and `Document` with a quoted `%1` avoids the question.
+- **Where the attributes go:** [uap3:FileTypeAssociation](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap3-filetypeassociation) lists both `Parameters` and `MultiSelectModel` on the association itself, and [Microsoft's File Explorer page](https://github.com/MicrosoftDocs/windows-dev-docs/blob/docs/hub/apps/desktop/modernize/integrate-packaged-app-with-file-explorer.md) says `Parameters` there is what a double-click passes. So no separate `uap3:Verb` is needed, and none adds a menu line.
+- **Measured here:** the test `fifteen_real_launches_at_once_with_spaces_land_in_one_window` starts 15 real exes at once, with quoted paths in a folder with spaces. All arrive in one window.
+- **Over 15 files:** [Microsoft's Win32 page](https://learn.microsoft.com/en-us/windows/win32/shell/how-to-employ-the-verb-selection-model) says a `Document` verb stops appearing past 15 selected items. That page is about the registry form, so the limit for a package has not been checked. Step 4 of "What a person does" covers the real install.
 
 ### Second launches
 
@@ -122,6 +148,7 @@ The handoff in `crates/qe-docs/README.md` needs each launch to run its own proce
 The app keeps its settings, session and autosave under `%LOCALAPPDATA%\QuickEdit`. Inside a package, Windows sends new files there to a private folder for this package, `%LOCALAPPDATA%\Packages\<package family name>\LocalCache\Local\QuickEdit`, and shows them to the app at the normal path.
 
 - **The app reads what it wrote.** It needs no code change.
+- **A person's own files in `AppData`:** Save As or a save inside `%APPDATA%` or `%LOCALAPPDATA%` may be redirected in the same way. Step 4 of "What a person does" tests it.
 - **No `FileSystemWriteVirtualization` setting.** Turning this off needs the `unvirtualizedResources` restricted capability, which Microsoft says is not meant for apps like this, and nothing outside the app needs these files.
 - **Uninstalling deletes this data.** That includes autosaved text that was never saved to a file. The listing and the app's help should say so.
 - **Other programs cannot see the folder at the normal path.** To find a `.damaged` copy, a person must look under `Packages`.
@@ -130,7 +157,7 @@ The app keeps its settings, session and autosave under `%LOCALAPPDATA%\QuickEdit
 
 ## The exe's own manifest
 
-`crates/qe-app/build.rs` compiles `QuickEdit.exe.manifest` and `QuickEdit.ico` with `rc.exe`, and adds them to the bin only.
+`crates/qe-app/build.rs` compiles `QuickEdit.exe.manifest`, `QuickEdit.ico` and a version record with `rc.exe`, and adds them to the bin only.
 
 | Setting | Why |
 | --- | --- |
@@ -147,6 +174,13 @@ The app keeps its settings, session and autosave under `%LOCALAPPDATA%\QuickEdit
 
 `QE_RC` names an `rc.exe` to use, in place of the search.
 
+## How the exe is built for the Store
+
+- **C runtime inside the exe.** `.cargo/config.toml` sets `+crt-static`, so the exe needs no `VCRUNTIME140.dll` or `api-ms-win-crt-*` DLL. [Microsoft says](https://learn.microsoft.com/en-us/troubleshoot/developer/visualstudio/cpp/libraries/c-runtime-packages-desktop-bridge) a packaged app that uses the shared runtime must name its framework package. This one uses none, so its manifest names none. The test `the_exe_imports_no_c_runtime` reads the import table.
+- **No flags in a package.** When `GetCurrentPackageFullName` says the process has a package, every argument is a file. So a file named `--hidden` opens, and the test flags cannot run. The test `a_packaged_run_reads_every_flag_as_a_file` asks the exe how a package would read a line.
+- **Where DLLs load from.** `/DEPENDENTLOADFLAG:0x800` keeps the exe's own imports to System32, and `main` calls `SetDefaultDllDirectories` first, so later loads come from System32 or the app's folder. This matters only for a loose copy of the exe, as a package's folder is locked. A shell extension in the Open dialog that loads a helper DLL from `PATH` would fail to load it.
+- **The pipe.** See `crates/qe-docs/src/handoff.rs`. A launch sends nothing until the server has the same user and level, and the pipe has one rule, for its own user.
+
 ## Icons
 
 `make-icons.ps1` draws all of them with `System.Drawing`, from numbers copied from the Mac app's `QuickEdit.icon` files. Run it again after any change, and commit the results.
@@ -159,12 +193,13 @@ The app keeps its settings, session and autosave under `%LOCALAPPDATA%\QuickEdit
 
 | Decision | Source |
 | --- | --- |
+| Quoted `Parameters` on the association | [Integrate a packaged desktop app with File Explorer](https://github.com/MicrosoftDocs/windows-dev-docs/blob/docs/hub/apps/desktop/modernize/integrate-packaged-app-with-file-explorer.md), [uap3:FileTypeAssociation](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap3-filetypeassociation) |
 | Alias, file types, `MultiSelectModel`, the default at 15 files | [Integrate your desktop app with Windows using packaging extensions](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/desktop-to-uwp-extensions) |
 | `MultiSelectModel` as an attribute | [uap3:FileTypeAssociation](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap3-filetypeassociation) |
 | Limits of 15 and 100 items | [How to employ the verb selection model](https://learn.microsoft.com/en-us/windows/win32/shell/how-to-employ-the-verb-selection-model) |
-| What `Player` does in a package, as measured by someone else | [winrt-related issue 124](https://github.com/MicrosoftDocs/winrt-related/issues/124) |
+| What `Player` does in a package, as measured by someone else, and why it is not used | [winrt-related issue 124](https://github.com/MicrosoftDocs/winrt-related/issues/124) |
 | "Already taken" types such as `.txt` | [Integrate a packaged desktop app with File Explorer](https://github.com/MicrosoftDocs/windows-dev-docs/blob/docs/hub/apps/desktop/modernize/integrate-packaged-app-with-file-explorer.md) |
-| Reserved file types | [Reserved file and URI scheme names](https://learn.microsoft.com/en-us/windows/apps/develop/launch/reserved-uri-scheme-names) |
+| Reserved file types | [reserved-uri-scheme-names.md](https://github.com/MicrosoftDocs/windows-dev-docs/blob/docs/hub/apps/develop/launch/reserved-uri-scheme-names.md) in Microsoft's docs repository. The learn.microsoft.com address now redirects to "Handle URI activation" |
 | `SupportsMultipleInstances`, `uap10` over `desktop4` | [Create a multi-instance app](https://learn.microsoft.com/en-us/windows/uwp/launch-resume/multi-instance-uwp), [Application](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-application) |
 | Alias elements | [uap3:AppExecutionAlias](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap3-appexecutionalias), [desktop:ExecutionAlias](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-desktop-executionalias) |
 | `AppData` redirection, removal on uninstall | [How packaged desktop apps run on Windows](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes), [Flexible virtualization](https://learn.microsoft.com/en-us/windows/msix/desktop/flexible-virtualization) |
@@ -178,6 +213,7 @@ The app keeps its settings, session and autosave under `%LOCALAPPDATA%\QuickEdit
 
 ## Choices to check
 
-1. **Privacy address.** The rule asks for an address only for an app that collects personal information. A short page saying "QuickEdit collects nothing" costs little, and it answers a reviewer who asks.
+1. **`.txt`.** Windows' list says a registration for a reserved type is ignored, and it names `.txt`. Microsoft's sample registers `.txt` too. Step 4 shows which is true here. If `.txt` is ignored, change the listing's File Explorer line to say which types it covers.
 2. **File list.** It is short on purpose. Adding a type is one line here and one in the manifest.
-3. **App version.** The package says `1.0.0.0`, and the workspace's `Cargo.toml` says `0.1.0`. The exe shows neither at present.
+3. **App version.** The package and the exe's version record say `1.0.0.0`, from the manifest. The workspace's `Cargo.toml` says `0.1.0`, and nothing shows it.
+4. **The name.** [QuickEdit Text Editor](https://play.google.com/store/apps/details?hl=en&id=com.rhmsoft.edit) is on Google Play. Store policy 10.1.1 bars a name "the same as that of other products" unless you publish them. Name reservation may still pass, but a person decides this.

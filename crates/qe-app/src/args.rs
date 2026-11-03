@@ -1,4 +1,9 @@
 //! The command line. Every flag that is not a file keeps the window off the screen, or measures.
+//!
+//! The flags are for tests and for measuring, so they work only in a copy with no package. In
+//! the Store's package every argument is a file: Windows puts paths there, and the path may be
+//! any name at all. See [`Args::parse`].
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const HELP: &str = "\
@@ -13,7 +18,12 @@ QuickEdit [options] [files]
   --timings          prints the timers when the app ends, with real keys
   --watchdog MS      test channel: ends with code 99 if the UI thread stops answering
   --test-fail-windows N  the next N windows fail to open, for tests
-  --help             prints this and opens nothing";
+  --print-packaged-args ARGS  prints what a packaged run reads ARGS as, and opens nothing
+  --help             prints this and opens nothing
+  --                 everything after this is a file, whatever its name
+
+A file whose name starts with -- also opens when given by its full path, or after --.
+In the Store's package there are no options, and every argument is a file.";
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -29,16 +39,38 @@ pub struct Args {
     pub help: bool,
     pub watchdog_ms: u64,
     pub fail_windows: usize,
+    /// `--print-packaged-args`: what a packaged run would read the rest of the line as.
+    pub packaged_view: Option<Vec<PathBuf>>,
 }
 
 impl Args {
     pub fn help_text() -> &'static str {
         HELP
     }
-    pub fn parse(mut items: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
+    /// `packaged` is whether this process has a package identity. There, no argument is a flag.
+    pub fn parse(items: impl Iterator<Item = OsString>, packaged: bool) -> Result<Self, String> {
+        if packaged {
+            Ok(Self::all_files(items))
+        } else {
+            Self::parse_flags(items)
+        }
+    }
+    fn all_files(items: impl Iterator<Item = OsString>) -> Self {
+        Self {
+            files: items.map(PathBuf::from).collect(),
+            ..Self::default()
+        }
+    }
+    fn parse_flags(mut items: impl Iterator<Item = OsString>) -> Result<Self, String> {
         let mut args = Self::default();
         while let Some(item) = items.next() {
             match item.to_str() {
+                Some("--") => {
+                    args.files.extend(items.by_ref().map(PathBuf::from));
+                }
+                Some("--print-packaged-args") => {
+                    args.packaged_view = Some(Self::all_files(items.by_ref()).files);
+                }
                 Some("--help") => args.help = true,
                 Some("--hidden") => args.hidden = true,
                 Some("--hidden-smoke") => {
@@ -88,5 +120,69 @@ impl Args {
             return Err(format!("--bench-middle needs --bench-keys\n{HELP}"));
         }
         Ok(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn items(list: &[&str]) -> impl Iterator<Item = OsString> {
+        list.iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn a_packaged_run_reads_every_argument_as_a_file() {
+        let line = [
+            "--help",
+            "--hidden",
+            "--test-channel",
+            "--data-root",
+            r"\\host\share",
+            "--no-such-flag",
+            "--",
+            "plain.txt",
+        ];
+        let args = Args::parse(items(&line), true).unwrap();
+        let files: Vec<PathBuf> = line.iter().map(PathBuf::from).collect();
+        assert_eq!(args.files, files);
+        assert!(!args.help && !args.hidden && !args.channel && !args.smoke);
+        assert!(args.root.is_none());
+    }
+
+    #[test]
+    fn an_unpackaged_run_keeps_its_flags_and_names_a_bad_one() {
+        let args = Args::parse(items(&["--hidden", "--stub-spell", "a.txt"]), false).unwrap();
+        assert!(args.hidden && args.stub_spell);
+        assert_eq!(args.files, [PathBuf::from("a.txt")]);
+        let bad = Args::parse(items(&["--no-such-flag"]), false).unwrap_err();
+        assert!(bad.contains("unknown option --no-such-flag"), "{bad}");
+    }
+
+    #[test]
+    fn two_dashes_end_the_flags_and_the_rest_are_files() {
+        let args = Args::parse(items(&["--hidden", "--", "--help", "--", "--x.txt"]), false);
+        let args = args.unwrap();
+        assert!(args.hidden && !args.help);
+        assert_eq!(
+            args.files,
+            [
+                PathBuf::from("--help"),
+                PathBuf::from("--"),
+                PathBuf::from("--x.txt")
+            ]
+        );
+        assert!(Args::parse(items(&["--"]), false).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn a_full_path_to_a_file_named_like_a_flag_is_a_file() {
+        let path = r"C:\some folder\--help";
+        let args = Args::parse(items(&[path]), false).unwrap();
+        assert!(!args.help);
+        assert_eq!(args.files, [PathBuf::from(path)]);
     }
 }

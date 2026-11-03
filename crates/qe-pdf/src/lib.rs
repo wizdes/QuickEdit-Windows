@@ -435,7 +435,9 @@ fn write_and_replace(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f64),
 ) -> Result<PdfSummary, PdfError> {
-    let mut file = PdfFile::create(temp)?;
+    // The new file replaces the old one, so it starts with the old one's rules.
+    let mut rules = writer::read_access_rules(path)?;
+    let mut file = PdfFile::create(temp, rules.as_mut())?;
     let mut summary = write_document(source, options, cancel, progress, &mut file)?;
     summary.bytes = file.finish(options, summary.pages)?;
     if let Some(after_write) = options.after_write {

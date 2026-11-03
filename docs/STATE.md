@@ -1,14 +1,14 @@
 # QuickEdit for Windows state
 
-Rewritten at each milestone, never appended. Last rewrite: 2026-11-02.
+Rewritten at each milestone, never appended. Last rewrite: 2026-11-03.
 
-Milestone: M1 to M7, M9, the menu bar and M10 to M13 are built and tested as parts. M8, M14 and M15 are not started. Only the top row, the menu bar and the editor run together in a real window, through `crates/qe-editor/examples/editor.rs`.
+Milestone: M1 to M14 are built and joined into `QuickEdit.exe`. M15 has its package files, parity sweep and fixes from the final reviews. Store submission has not started.
 
-Next action: M8 waits on the user's Settings and editor picks. Then M14 joins every part into the real app, using the lists in `crates/qe-tools/WIRING.md`, `crates/qe-a11y/README.md`, `crates/qe-views/README.md`, `crates/qe-pdf/README.md` and `crates/qe-editor/HOOKS.md`.
+Next action: the owner's final look before Store submission. Before upload, a person reserves the name in Partner Center, fills the placeholders in `packaging/AppxManifest.xml` and `packaging/PRIVACY.md`, publishes the privacy policy, and makes the checks in `packaging/README.md`.
 
-Reviews: Astra's usage limit ends 2026-11-04 21:32. M10 to M13 had a second review from Opus only. Their latest fixes have tests and no fresh review, so Astra reviews the final code when it returns.
+Reviews: a second model's review of the final code is still owed once its usage limit ends on 2026-11-04 at 21:32.
 
-Open checks that need a real window, a person or a real service: a real input method, Narrator, Accessibility Insights, the real clipboard, real file dialogs, 150% and 200% scale, high contrast, Store packaging and the speed table on a quiet PC.
+Open checks that need a person or a real service: a real input method, Narrator, Accessibility Insights, 150% and 200% scale, a second monitor, high contrast, selecting several files in File Explorer, the App Certification Kit and the Store upload.
 
 Branch: work happens on `dev` in `worktrees/dev`. It merges to `main` at the end of each wave.
 Approvals: see "Your decisions" and "Choices to check" in `docs/plan.md`.

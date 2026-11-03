@@ -6,6 +6,9 @@
 #
 # The release profile in the root Cargo.toml sets fat LTO. The version comes from
 # packaging\AppxManifest.xml and nowhere else. Any failure stops the script with a non-zero exit.
+#
+# This is the only build for the Store: it keeps this PC's folders out of the exe, and it checks
+# the exe. .cargo/config.toml sets the C runtime rule, and Cargo joins the two lists of flags.
 [CmdletBinding()]
 param([switch]$LooseLayout)
 
@@ -37,16 +40,52 @@ $executable = $manifest.Package.Applications.Application.Executable
 $makepri = Find-SdkTool 'makepri.exe'
 $makeappx = Find-SdkTool 'makeappx.exe'
 
+# These two would replace Cargo's list, and with it the rules this script relies on.
+foreach ($name in 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS') {
+    if (Test-Path "env:$name") { throw "$name is set. Clear it, because it would replace .cargo\config.toml." }
+}
+
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'make-notices.ps1') -Check
+
+# The last rule that matches wins, so the wide one goes first. Each path is a TOML literal string,
+# which keeps its backslashes and cannot hold a single quote.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+$rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
+$sysroot = (& rustc --print sysroot).Trim()
+$remaps = @(
+    @($HOME, '/home'),
+    @($cargoHome, '/cargo'),
+    @($rustupHome, '/rustup'),
+    @($sysroot, '/rust'),
+    @($repo, '/src')
+)
+$flags = foreach ($remap in $remaps) {
+    if ($remap[0].Contains("'")) { throw "This build cannot handle a quote in the path $($remap[0])." }
+    "'--remap-path-prefix=$($remap[0])=$($remap[1])'"
+}
+$rustflags = 'target.x86_64-pc-windows-msvc.rustflags=[' + ($flags -join ',') + ']'
+
 Write-Host "Building $executable $version in release..."
-& cargo build --release --locked -p qe-app --bin QuickEdit --manifest-path (Join-Path $repo 'Cargo.toml')
+& cargo build --release --locked -p qe-app --bin QuickEdit --manifest-path (Join-Path $repo 'Cargo.toml') --config $rustflags
 $exe = Join-Path $target "release\$executable"
 if (-not (Test-Path $exe)) { throw "The build gave no $exe." }
+
+# The same two facts that crates\qe-app\tests\package.rs checks, for a build where no test runs.
+# These read the whole file as text, which is stricter than the import table.
+$bytes = [System.IO.File]::ReadAllBytes($exe)
+$text = [System.Text.Encoding]::Latin1.GetString($bytes)
+$runtime = [regex]::Match($text, '(?i)(VCRUNTIME\d+[_\d]*\.dll|MSVCP\d+[_\d]*\.dll|api-ms-win-crt-[a-z-]+)')
+if ($runtime.Success) { throw "$exe still names $($runtime.Value), so a clean PC may not run it." }
+$userFolder = [regex]::Match($text, '(?i)\\Users\\[^\x00]{0,60}')
+if ($userFolder.Success) { throw "$exe holds a user folder: $($userFolder.Value)" }
 
 if (Test-Path $layout) { Remove-Item -Recurse -Force $layout }
 New-Item -ItemType Directory -Force $layout | Out-Null
 Copy-Item $exe $layout
 Copy-Item $manifestPath $layout
 Copy-Item -Recurse (Join-Path $PSScriptRoot 'Assets') $layout
+Copy-Item (Join-Path $PSScriptRoot 'NOTICES.txt') $layout
+Copy-Item (Join-Path $repo 'LICENSE') $layout
 
 # resources.pri is the index that lets Windows find Square44x44Logo.scale-200.png and the rest
 # when the manifest says only Square44x44Logo.png. Its config stays out of the package. The

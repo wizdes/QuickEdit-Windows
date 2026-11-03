@@ -31,11 +31,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::System::Console::{STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_OK, MessageBoxW, SW_MAXIMIZE, SendMessageW, ShowWindow, WM_PAINT,
-    WM_THEMECHANGED,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MessageBoxW, SW_MAXIMIZE,
+    SendMessageW, ShowWindow, WM_PAINT, WM_THEMECHANGED,
 };
 use windows::core::HSTRING;
 
@@ -230,17 +232,61 @@ pub fn fatal_box(hidden: bool, text: &str) {
     }
 }
 
-pub fn run() -> i32 {
-    let args = match Args::parse(std::env::args_os().skip(1)) {
+/// Text for the person who typed the command. It goes to a pipe or a file if one is there, as a
+/// test has, or else to a message box, since a Windows app has no console to print on.
+fn tell_the_person(stream: STD_HANDLE, text: &str, style: MESSAGEBOX_STYLE) {
+    if crate::platform::stream_has_a_reader(stream) {
+        if stream == STD_OUTPUT_HANDLE {
+            println!("{text}");
+        } else {
+            eprintln!("{text}");
+        }
+        return;
+    }
+    // SAFETY: both strings live through the call.
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from("QuickEdit"),
+            style,
+        );
+    }
+}
+
+pub fn run(dll_rule: Result<(), String>, dll_rule_took: Duration) -> i32 {
+    let packaged = crate::platform::has_package_identity();
+    let args = match Args::parse(std::env::args_os().skip(1), packaged) {
         Ok(args) => args,
         Err(problem) => {
-            eprintln!("{problem}");
+            tell_the_person(STD_ERROR_HANDLE, &problem, MB_OK | MB_ICONERROR);
             return 2;
         }
     };
-    if args.help {
-        println!("{}", Args::help_text());
+    if let Err(problem) = &dll_rule {
+        // The app still works, with the search order Windows gives by default.
+        eprintln!("{problem}");
+    }
+    if let Some(files) = &args.packaged_view {
+        println!("package identity: {packaged}");
+        for file in files {
+            println!("file: {}", file.display());
+        }
         return 0;
+    }
+    if args.help {
+        tell_the_person(
+            STD_OUTPUT_HANDLE,
+            Args::help_text(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return 0;
+    }
+    if args.timings {
+        eprintln!(
+            "DLL search rule set in {:.4} ms",
+            dll_rule_took.as_secs_f64() * 1000.0
+        );
     }
     let hidden = args.hidden;
     match start(args) {

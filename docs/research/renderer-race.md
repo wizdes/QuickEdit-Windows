@@ -2,7 +2,7 @@
 
 Winner: **arm a**, DirectWrite drawn to a bitmap and copied to the window with BitBlt, with no GPU. It has the lowest first frame of the arms that meet the typing budget, and it is the only arm that meets that budget.
 
-Root measured these on 2026-11-01 in real windows on `alpha-wolf`: i7-11700F, RTX 3060 Ti, a 60 Hz display, Windows build 26300. Other builders were running, so the numbers are noisy. A repeat on a quiet PC is part of M15.
+Root measured these on 2026-11-01 in real windows on one desktop PC: an 8-core CPU, a discrete GPU, a 60 Hz display, Windows build 26300. Other builders were running, so the numbers are noisy. A repeat on a quiet PC is part of M15.
 
 | Arm | Path | First frame, median (p95) | Key to screen, p50 (p95) | In-app time, p50 | Typing budget |
 | --- | --- | --- | --- | --- | --- |

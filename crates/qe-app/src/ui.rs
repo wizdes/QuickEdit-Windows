@@ -261,7 +261,7 @@ impl App {
     pub fn create_window(&mut self, id: WindowId) -> Result<(), String> {
         if self.fail_windows > 0 {
             self.fail_windows -= 1;
-            return Err("this test asked for a window that fails".to_owned());
+            return Err("--test-fail-windows refused this window".to_owned());
         }
         let capture = Capture::default();
         let shell = ShellWindow::create_with_refresh(

@@ -9,11 +9,54 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Foundation::{
+    APPMODEL_ERROR_NO_PACKAGE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+};
+use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+use windows::Win32::System::Console::{GetStdHandle, STD_HANDLE};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleW, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    SetDefaultDllDirectories,
+};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
+
+/// A DLL loaded by name comes from System32 or the app's own folder, never the current folder
+/// or `PATH`. The linker's `/DEPENDENTLOADFLAG` in `build.rs` does the same for the exe's own
+/// imports, which load before this runs. The result is for the caller to show.
+pub fn keep_dll_search_to_system_and_app_folders() -> Result<(), String> {
+    // SAFETY: plain flags, and no other thread is running yet.
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)
+    }
+    .map_err(|e| format!("Windows refused the rule for where DLLs load from: {e}"))
+}
+
+/// Whether Windows runs this process from a package, as the Store's install does. Only "no
+/// package" counts as no: any other answer takes the stricter road, with no flags.
+pub fn has_package_identity() -> bool {
+    let mut length = 0;
+    // SAFETY: with a length of zero and no buffer, this only reports what it would need.
+    let answer = unsafe { GetCurrentPackageFullName(&mut length, None) };
+    answer != APPMODEL_ERROR_NO_PACKAGE
+}
+
+/// Whether text written to this stream reaches somebody: a pipe or a file. A Windows app started
+/// from a terminal has no console, so anything else would vanish.
+pub fn stream_has_a_reader(stream: STD_HANDLE) -> bool {
+    // SAFETY: a plain query. A missing stream gives an error or a null handle.
+    let Ok(handle) = (unsafe { GetStdHandle(stream) }) else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+    // SAFETY: a plain query. A stale handle gives the unknown type.
+    let kind = unsafe { GetFileType(handle) };
+    kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK
+}
 
 const WM_APP_WAKE: u32 = WM_APP + 0x70;
 const WM_APP_BENCH: u32 = WM_APP + 0x71;

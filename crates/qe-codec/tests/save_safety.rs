@@ -22,7 +22,7 @@ const MIB: usize = 1 << 20;
 /// Windows error 448: "The path cannot be traversed because it contains an untrusted
 /// mount point." Some accounts, such as the builders' standard `agent` account, refuse
 /// to pass through a folder link. Link tests cannot prove anything there, so they skip
-/// with this reason. An account that may follow links, such as `yjli` on this PC, proves
+/// with this reason. A signed-in account that may follow links proves
 /// them. Any other error still fails the test.
 const UNTRUSTED_MOUNT_POINT: i32 = 448;
 fn is_untrusted_mount_point(error: &std::io::Error) -> bool {
@@ -39,7 +39,7 @@ fn skip_for_untrusted_mount_point(test: &str) {
     println!(
         "SKIPPED {test}: Windows error 448, untrusted mount point. This account may not \
          follow folder links, so link behavior is not verified here. Run it in an account \
-         that may, such as yjli on this PC."
+         that may, such as a signed-in one."
     );
 }
 /// True when this account may pass through `folder_link`.

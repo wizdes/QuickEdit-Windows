@@ -49,7 +49,7 @@ The full list came from reading the Swift code, and M1 commits it as `docs/parit
 6. Spell check stays. Speech, Share and real printing go, so Print saves a PDF as on the Mac.
 7. Files from Explorer and second launches open as a new tab in the last used window.
 8. New public repo: `Projects/QuickEdit-Windows`, remote `wizdes/QuickEdit-Windows`.
-9. I may add a `yjli` SSH key to the `agent` account on this PC, so that Sol builders can run there.
+9. Builders may run in a separate standard account on this PC.
 
 10. On 2026-11-02 the user said "overall looks good keep going" without naming a Settings or editor design. Root took that as the recommended A and A, and told the user this can still change.
 
@@ -123,15 +123,15 @@ Budgets are my estimates. If a milestone runs 50% over, I send you a note and cu
   3. Direct3D 11 with a glyph atlas and a waitable swap chain.
   4. A first frame without the GPU, then Direct3D started on a background thread.
   The winner has the lowest cold first frame among options that meet the typing budget.
-- **Builder probe:** I run a small program as `agent` over SSH to see which of these work there: software Direct3D (WARP), DirectWrite, `ISpellChecker` and hidden windows. If any fail, the test plan changes.
+- **Builder probe:** I run a small program in a standard account with no desktop to see which of these work there: software Direct3D (WARP), DirectWrite, `ISpellChecker` and hidden windows. If any fail, the test plan changes.
 - **Packaging check:** the same exe, launched four ways (direct, from the Start list, by opening a file, and by a second launch), to measure what MSIX adds.
-- **Design:** at least 3 mockups each of the top row and `⌄` list and of Settings, critiqued by Astra and a fresh reviewer, on one page with my recommendation. You pick before M6 and M7 finish.
+- **Design:** at least 3 mockups each of the top row and `⌄` list and of Settings, critiqued by two fresh reviewers, on one page with my recommendation. You pick before M6 and M7 finish.
 
 ## How I run it
-- **Builders:** Sol on `agent`, one per milestone, up one level on failure. `agent` cannot show windows and the runner refuses Opus there, so a failed Sol build goes to a native Opus builder.
+- **Builders:** one per milestone, in a standard account, with a stronger builder after a failure. That account cannot show windows.
 - **Builder tests (no window needed):** replay input scripts, draw to a bitmap, and compare with saved images.
 - **Root tests:** real windows, all timings, Snap, DPI, Explorer opening and MSIX install. I run routine checks on a hidden desktop, if that works. I never take timings there.
-- **Reviews:** Astra and a fresh Opus reviewer at the end of each milestone, with a 900 s limit. I check every finding myself.
+- **Reviews:** two fresh reviewers at the end of each milestone, with a 900 s limit. I check every finding myself.
 - **Milestone report:** a private page with what was done, real screenshots I have looked at, numbers and next steps. I do not wait for a reply.
 - **Commits:** each accepted milestone is committed and pushed. Tier 3 work happens in a worktree that is merged at the end of each wave. A diagram of what changed sits next to the code.
 - **Status:** a full checklist in chat when a wave starts or ends, and a push notification when the work ends or truly blocks.
@@ -162,4 +162,3 @@ I will also run Windows Notepad, Notepad++ and the renderer options through the 
 ## Critical files
 - New: `Projects/QuickEdit-Windows/crates/qe-api/src/lib.rs`, `crates/qe-app/src/main.rs`, `packaging/AppxManifest.xml`, `docs/plan.md`, `docs/STATE.md`, `docs/parity-windows.md`.
 - Copy target, read only: `Projects/QuickEdit/QuickEdit/**`, `Projects/QuickEdit/docs/parity.md`, `Projects/QuickEdit/docs/design-spec.md`.
-- After approval, I also update memory (`quickedit.md`, a new `quickedit_windows.md`, and the `yjli` key in `remote_machines.md`).

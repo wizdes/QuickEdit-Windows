@@ -1260,7 +1260,7 @@ fn track_mouse_event_watches_for_the_pointer_leaving() {
 }
 
 /// Terminal lets these reach `DefWindowProc`, and the Snap flyout may depend on it. The
-/// test before this one asserted the opposite. Astra's review reversed it.
+/// test before this one asserted the opposite. A later review reversed it.
 #[test]
 fn ncmousemove_on_a_window_button_reaches_the_default_handler() {
     let f = fixture(None);

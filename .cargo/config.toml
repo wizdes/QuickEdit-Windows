@@ -1,0 +1,7 @@
+# The C runtime goes inside the exe, so the Store package needs no framework package and runs on
+# a PC with no Visual C++ runtime. crates/qe-app/tests/package.rs reads the exe's imports to check.
+#
+# packaging/build.ps1 adds --remap-path-prefix for this machine's folders. Those paths differ by
+# account, so they cannot be written here. Cargo joins this list and the one that script passes.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

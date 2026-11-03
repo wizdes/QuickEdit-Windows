@@ -288,6 +288,8 @@ fn hooks_additions_keep_their_meaning() {
     let states = WidgetStates::default();
     assert!(!states.has_popup && !states.section);
     let widget = Widget {
+        char_boxes: Vec::new(),
+        access_key: None,
         id: WidgetId(1),
         bounds: Rect::default(),
         role: WidgetRole::ScrollBar,
@@ -296,6 +298,7 @@ fn hooks_additions_keep_their_meaning() {
         states,
         selection: Some(1..2),
         range_value: Some(WidgetRange {
+            step: None,
             minimum: 0.0,
             maximum: 10.0,
             value: 5.0,

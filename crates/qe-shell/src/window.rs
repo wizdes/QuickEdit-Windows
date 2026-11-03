@@ -12,9 +12,9 @@ use crate::{
     Tab, TabId, TabStrip, caption_hit, maximized_insets,
 };
 use qe_api::{
-    Color, Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, Modifiers, MouseButton,
-    MouseCursor, PixelRect, Point, Rect as ApiRect, Renderer, TextMeasurer, Theme, ThemeKind, View,
-    ViewContext, ViewRequest, Widget, WidgetId, WidgetRole, WidgetStates,
+    Color, CommandId, Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, Modifiers,
+    MouseButton, MouseCursor, PixelRect, Point, Rect as ApiRect, Renderer, TextMeasurer, Theme,
+    ThemeKind, View, ViewContext, ViewRequest, Widget, WidgetId, WidgetRole, WidgetStates,
 };
 use qe_ui::{
     MENU_LABELS, MenuBar, MenuModel, MenuView, POPUP_DISMISSED_MESSAGE, PopupDismissed, place_popup,
@@ -606,6 +606,8 @@ impl ShellWaker {
 type ContentPainter = Box<dyn FnMut(&mut DisplayList, ContentFrame)>;
 type EventHandler = Box<dyn FnMut(&ShellHandle, ShellEvent)>;
 struct Shared {
+    message_hook: RefCell<Option<MessageHook>>,
+    chord_filter: RefCell<Option<ChordFilter>>,
     /// What `ShellWaker` reads from other threads.
     waker: ShellWaker,
     hwnd: Cell<HWND>,
@@ -1641,6 +1643,11 @@ impl Shared {
         let weak = Rc::downgrade(self);
         let messages: PopupMessages = Rc::new(move |hwnd, msg, w, l| {
             let shared = weak.upgrade()?;
+            // A screen reader may ask a popup itself. The owner's tree holds the open menu.
+            if msg == WM_GETOBJECT {
+                let hook = shared.message_hook.borrow().clone();
+                return hook.and_then(|hook| hook(hwnd, msg, w, l));
+            }
             let answer = shared.menu_mouse(hwnd, msg, w, l);
             shared.dispatch();
             answer
@@ -1709,6 +1716,10 @@ impl Shared {
     /// Gives an event to the open menu, and acts on what the menu asked for. `end` says
     /// what the bar does if this event closes the menu with no command.
     fn menu_event(&self, kind: InputKind, end: MenuEnd) -> Handled {
+        // A screen reader follows the selected row by this.
+        self.queue
+            .borrow_mut()
+            .push_back(ShellEvent::WidgetsChanged);
         let Some(mut run) = self.menu.borrow_mut().take() else {
             return Handled::No;
         };
@@ -2415,7 +2426,20 @@ impl Shared {
             return LRESULT(0);
         }
         if down {
-            swallow_char(false);
+            // A key that is a command has no character, so none reaches the text and an
+            // input method never sees it. The owner still gets the key, below.
+            let chord = match (&event.kind, self.chord_filter.borrow().as_ref()) {
+                (
+                    InputKind::KeyDown {
+                        virtual_key,
+                        modifiers,
+                        ..
+                    },
+                    Some(filter),
+                ) => filter(*virtual_key, *modifiers),
+                _ => false,
+            };
+            swallow_char(chord);
         }
         self.queue
             .borrow_mut()
@@ -2517,6 +2541,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             drop(Rc::from_raw(raw));
             return DefWindowProcW(hwnd, msg, w, l);
         }
+        // The owner's hook goes first, with no borrow held. It holds its own `Rc`, so that it can
+        // destroy the window inside this call.
+        let hook = shared.message_hook.borrow().clone();
+        if let Some(hook) = hook
+            && let Some(answer) = hook(hwnd, msg, w, l)
+        {
+            shared.dispatch();
+            return answer;
+        }
         let result = shared.on_message(hwnd, msg, w, l);
         // The owner's handler may run a nested loop. This key's own answer still counts.
         let swallow = SWALLOW_CHAR.get();
@@ -2532,6 +2565,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
 pub struct ShellHandle {
     shared: Weak<Shared>,
 }
+/// Sees each message before the window does. `Some` is the answer, and the window never sees
+/// that message. The hook runs with no borrow of the window held.
+pub type MessageHook = Rc<dyn Fn(HWND, u32, WPARAM, LPARAM) -> Option<LRESULT>>;
+/// Says whether a key press is a command, and so has no character.
+pub type ChordFilter = Box<dyn Fn(u16, Modifiers) -> bool>;
 impl ShellHandle {
     fn live(&self) -> Result<Rc<Shared>, ShellError> {
         let shared = self.shared.upgrade().ok_or(ShellError::WindowGone)?;
@@ -2624,6 +2662,8 @@ impl ShellHandle {
         }
         children.push(bar);
         Ok(Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: WidgetId(9_999),
             bounds: ApiRect {
                 x: Dip(0.0),
@@ -2643,6 +2683,120 @@ impl ShellHandle {
             description: None,
             children,
         })
+    }
+    /// Sets the hook that sees each message first. UI Automation, drops and activation use it.
+    pub fn set_message_hook(&self, hook: MessageHook) -> Result<(), ShellError> {
+        *self.live()?.message_hook.borrow_mut() = Some(hook);
+        Ok(())
+    }
+    /// Sets the check that says a key press is a command, so that it makes no character.
+    pub fn set_chord_filter(&self, filter: ChordFilter) -> Result<(), ShellError> {
+        *self.live()?.chord_filter.borrow_mut() = Some(filter);
+        Ok(())
+    }
+    /// A screen reader's Invoke on a painted control of the top row, the bar or an open menu.
+    /// False means this window has no such control. No borrow is held while it acts.
+    pub fn invoke_widget(&self, id: WidgetId) -> Result<bool, ShellError> {
+        let shared = self.live()?;
+        // An open menu's rows first.
+        if shared.menu.borrow().is_some() {
+            let mut ctx = ViewContext::default();
+            let found = shared
+                .menu
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|run| run.view.invoke_row(id, &mut ctx));
+            if found {
+                let commands: Vec<CommandId> = ctx
+                    .requests
+                    .iter()
+                    .filter_map(|request| match request {
+                        ViewRequest::Run(command) => Some(*command),
+                        _ => None,
+                    })
+                    .collect();
+                if !commands.is_empty() {
+                    let data = shared
+                        .menu
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(|run| run.view.take_chosen_data());
+                    shared.end_menu(MenuEnd::Leave);
+                    *shared.chosen_data.borrow_mut() = data;
+                    for command in commands {
+                        shared
+                            .queue
+                            .borrow_mut()
+                            .push_back(ShellEvent::RunCommand(command));
+                    }
+                } else {
+                    shared.paint_menu();
+                }
+                shared.dispatch();
+                return Ok(true);
+            }
+        }
+        let bar_base = 10_000_u64;
+        if let Some(index) = id.0.checked_sub(bar_base + 1)
+            && (index as usize) < qe_ui::MENU_LABELS.len()
+        {
+            let rect = shared.with_state(WM_KEYDOWN, |state| {
+                state.menu_bar.label_rect(index as usize)
+            });
+            if let Some(rect) = rect {
+                shared
+                    .queue
+                    .borrow_mut()
+                    .push_back(ShellEvent::OpenMenuGroup(index as usize, rect));
+                shared.dispatch();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let hit = shared.with_state(WM_KEYDOWN, |state| {
+            let count = state.strip.tabs().len();
+            (0..count)
+                .flat_map(|i| [CaptionHit::Tab(i), CaptionHit::TabClose(i)])
+                .chain([
+                    CaptionHit::NewTab,
+                    CaptionHit::Minimize,
+                    CaptionHit::Maximize,
+                    CaptionHit::Close,
+                ])
+                .find(|hit| TabStrip::widget_id(*hit) == id)
+                .map(|hit| {
+                    let tab = match hit {
+                        CaptionHit::Tab(i) | CaptionHit::TabClose(i) => state.strip.tab_id(i),
+                        _ => None,
+                    };
+                    (hit, tab)
+                })
+        });
+        let Some(Some((hit, tab))) = hit else {
+            return Ok(false);
+        };
+        match (hit, tab) {
+            (CaptionHit::Tab(_), Some(tab)) => {
+                self.with_strip(|strip| strip.select(tab))?;
+            }
+            (CaptionHit::TabClose(_), Some(tab)) => {
+                shared
+                    .queue
+                    .borrow_mut()
+                    .push_back(ShellEvent::CloseTabRequested(tab));
+            }
+            (CaptionHit::NewTab, _) => shared.queue.borrow_mut().push_back(ShellEvent::NewTab),
+            (other, _) => shared.caption_command(other),
+        }
+        shared.dispatch();
+        Ok(true)
+    }
+    /// Goes into full screen, or back out, as the View menu asks.
+    pub fn toggle_full_screen(&self) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        shared.toggle_full_screen();
+        shared.dispatch();
+        Ok(())
     }
     /// Says how to make a popup level's renderer. Call once, before the first menu opens.
     pub fn set_popup_renderers(
@@ -2895,6 +3049,8 @@ impl ShellWindow {
             monitor: Cell::new(0),
             adopted: Cell::new(false),
             top_margin: Cell::new(0),
+            message_hook: RefCell::new(None),
+            chord_filter: RefCell::new(None),
             default_log: RefCell::new(Vec::new()),
             invalidated: RefCell::new(Vec::new()),
             content_buttons: Cell::new(0),

@@ -370,6 +370,37 @@ impl TextField {
     fn text_origin(&self, t: UiTokens) -> f32 {
         self.bounds.x.0 + t.inset.0
     }
+    /// Each character's place, from what the last paint measured. Empty before a paint.
+    fn char_boxes(&self) -> Vec<qe_api::CharBox> {
+        let t = UiTokens::sizes();
+        let cache = self.cache.borrow();
+        if cache.text != self.text {
+            return Vec::new();
+        }
+        let start = self.text_origin(t) - self.scroll_x.get();
+        let mut utf16 = 0;
+        cache
+            .stops
+            .windows(2)
+            .map(|pair| {
+                let (from, to) = (pair[0], pair[1]);
+                let found = qe_api::CharBox {
+                    utf16,
+                    rect: rect(
+                        start + from.1,
+                        self.bounds.y.0,
+                        (to.1 - from.1).max(0.0),
+                        self.bounds.height.0,
+                    ),
+                };
+                utf16 += self
+                    .text
+                    .get(from.0..to.0)
+                    .map_or(0, |part| part.encode_utf16().count());
+                found
+            })
+            .collect()
+    }
     fn rebuild_stops(&self, m: &dyn TextMeasurer, t: UiTokens) {
         let mut cache = self.cache.borrow_mut();
         if cache.text == self.text && !cache.stops.is_empty() {
@@ -855,7 +886,7 @@ impl View for TextField {
         if let Some(error) = self.error_message() {
             children.push(label(1, &error));
         }
-        Some(node(
+        let mut widget = node(
             self.id,
             self.bounds,
             WidgetRole::TextField,
@@ -863,7 +894,9 @@ impl View for TextField {
             Some(self.text.clone()),
             state(self.enabled, self.focused, false, false),
             children,
-        ))
+        );
+        widget.char_boxes = self.char_boxes();
+        Some(widget)
     }
 }
 fn inset_text_area(bounds: Rect, t: UiTokens) -> Rect {

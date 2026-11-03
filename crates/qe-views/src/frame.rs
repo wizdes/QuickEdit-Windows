@@ -741,7 +741,12 @@ impl ViewFrame {
         if scrollable > 0 {
             let fraction = first / scrollable as f64;
             self.drag_fraction = Some(fraction);
-            editor.set_scroll_position(fraction * editor.max_scroll_position(), ctx);
+            // The bottom of the track is the end of the text, whatever the rows' heights.
+            if fraction >= 1.0 {
+                editor.set_scroll_position(editor.max_scroll_position(), ctx);
+            } else {
+                editor.set_top_line(first, ctx);
+            }
         }
     }
 

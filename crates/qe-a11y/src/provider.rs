@@ -108,6 +108,15 @@ impl TextDoc for EditorDoc<'_> {
         let found = self.view.word_range_at(ByteOffset(byte))?;
         Ok(found.start.0..found.end.0)
     }
+    fn stop_after(&mut self, byte: usize) -> Answer<Option<usize>> {
+        Ok(self.view.caret_stop_after(ByteOffset(byte))?.map(|at| at.0))
+    }
+    fn stop_before(&mut self, byte: usize) -> Answer<Option<usize>> {
+        Ok(self
+            .view
+            .caret_stop_before(ByteOffset(byte))?
+            .map(|at| at.0))
+    }
     fn row_stops(&mut self, line: usize) -> Vec<usize> {
         let view = &*self.view;
         let rows = self.rows.get_or_insert_with(|| {
@@ -194,8 +203,9 @@ impl Doc for EditorDoc<'_> {
     }
     /// Puts the range's start at the top of the view, or its end at the bottom. Text with a
     /// layout lands exactly. The editor has no hook that gives the height of other text, so
-    /// that uses the same estimate as the scroll bar, and wrapped text can land off by the
-    /// rows the estimate does not know. The selection stays.
+    /// the editor's reveal places by estimate, and wrapped text can land off by the rows the
+    /// estimate does not know. Text the index has not reached says "ask again". The selection
+    /// stays.
     fn scroll(&mut self, range: TextRange, top: bool) -> Result<()> {
         let text = self.text.clone();
         // The last unit of the range, because its end may be on the next line.
@@ -205,33 +215,23 @@ impl Doc for EditorDoc<'_> {
             range.end - 1
         };
         let byte = byte_of(text.as_ref(), edge).map_err(read_error)?;
-        let area = self.view.text_area();
-        let height = f64::from(area.height.0);
-        let scroll = self.view.scroll_offset();
-        let exact = self
-            .view
-            .range_rects(ByteOffset(byte)..ByteOffset(byte))
-            .ok()
-            .and_then(|rects| rects.first().map(|part| part.rect));
-        let y = if let Some(rect) = exact {
-            let row_top = scroll + f64::from(rect.y.0 - area.y.0);
-            if top {
-                row_top
-            } else {
-                row_top + f64::from(rect.height.0) - height
-            }
-        } else {
-            let line = self
-                .view
-                .line_of_byte(ByteOffset(byte))
-                .map_err(|e| read_error(e.into()))?;
-            let lines = self.view.store_status().known_lines.max(1) as f64;
-            let row = self.view.total_height() / lines;
-            let row_top = row * line.0 as f64;
-            if top { row_top } else { row_top + row - height }
-        };
+        let at = ByteOffset(byte);
         self.view
-            .run_host(HostCommand::ScrollTo(y.max(0.0)), self.ctx);
+            .reveal_range(at..at, top, self.ctx)
+            .map_err(|error| read_error(error.into()))?;
+        // With wrap off the text may lie past the view's sides. A row with a layout says where.
+        if !self.view.wraps()
+            && let Ok(rects) = self.view.range_rects(at..at)
+            && let Some(part) = rects.first()
+        {
+            let area = self.view.text_area();
+            let x = f64::from(part.rect.x.0 - area.x.0);
+            let width = f64::from(area.width.0);
+            if x < 0.0 || x >= width {
+                let now = self.view.horizontal_position();
+                self.view.set_horizontal_position(now + x, self.ctx);
+            }
+        }
         Ok(())
     }
     /// Only text on screen has rectangles. An empty range has none, as UIA's contract says. A
@@ -413,29 +413,56 @@ impl Doc for FieldDoc {
     fn scroll(&mut self, _: TextRange, _: bool) -> Result<()> {
         Ok(())
     }
-    /// The field does not report where its characters are, so any text in it answers with
-    /// the field's whole box.
+    /// The field's character boxes give each row's place. A field that has not painted has
+    /// none yet, and any text in it then answers with the field's whole box.
     fn rects(&mut self, range: TextRange) -> Result<Vec<[f64; 4]>> {
         if range.start == range.end {
             return Ok(Vec::new());
         }
-        Ok(vec![to_screen(
-            self.window,
-            self.scale,
-            self.widget.bounds,
-        )?])
+        let boxes = &self.widget.char_boxes;
+        let mut inside = boxes
+            .iter()
+            .filter(|found| found.utf16 >= range.start && found.utf16 < range.end);
+        let Some(first) = inside.next() else {
+            return Ok(vec![to_screen(
+                self.window,
+                self.scale,
+                self.widget.bounds,
+            )?]);
+        };
+        let left = first.rect.x.0;
+        let right = inside.fold(left + first.rect.width.0, |right, found| {
+            right.max(found.rect.x.0 + found.rect.width.0)
+        });
+        let whole = Rect {
+            x: Dip(left),
+            y: first.rect.y,
+            width: Dip(right - left),
+            height: first.rect.height,
+        };
+        Ok(vec![to_screen(self.window, self.scale, whole)?])
     }
     fn visible(&mut self) -> Result<Option<TextRange>> {
         let len = known_len(self.text.as_ref()).map_err(read_error)?.0;
         Ok(Some(TextRange::new(0, len)))
     }
-    /// `Widget` does not say where a field's characters are, so this is an estimate: the same
-    /// share of the text as the point is of the box. The README lists this for M14.
+    /// The nearest character by the field's boxes. A field that has not painted has none yet,
+    /// and this is then an estimate: the same share of the text as the point is of the box.
     fn at_point(&mut self, x: f64, y: f64) -> Result<TextRange> {
         let _ = y;
         let (x, _) = to_window(self.window, self.scale, x, 0.0)?;
         let text = self.text.as_ref();
         let len = known_len(text).map_err(read_error)?.0;
+        if !self.widget.char_boxes.is_empty() {
+            let unit = self
+                .widget
+                .char_boxes
+                .iter()
+                .find(|found| x < found.rect.x.0 + found.rect.width.0 / 2.0)
+                .map_or(len, |found| found.utf16);
+            let at = unit.min(len);
+            return Ok(TextRange::new(at, at));
+        }
         let share =
             ((x - self.widget.bounds.x.0) / self.widget.bounds.width.0.max(1.0)).clamp(0.0, 1.0);
         let unit = (f64::from(share) * len as f64).round() as usize;

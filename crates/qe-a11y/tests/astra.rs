@@ -594,6 +594,7 @@ fn each_widget_change_a_client_can_read_raises_its_event() {
     combo.value = Some("UTF-8".into());
     let mut scroll = widget(34, WidgetRole::ScrollBar, "Scroll", 200.0, Vec::new());
     scroll.range_value = Some(qe_api::WidgetRange {
+        step: None,
         minimum: 0.0,
         maximum: 9.0,
         value: 1.0,

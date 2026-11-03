@@ -108,6 +108,8 @@ pub(crate) fn node(
     children: Vec<Widget>,
 ) -> Widget {
     Widget {
+        char_boxes: Vec::new(),
+        access_key: None,
         id,
         bounds,
         role,

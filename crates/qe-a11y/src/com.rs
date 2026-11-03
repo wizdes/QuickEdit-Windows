@@ -51,6 +51,7 @@ pub(crate) fn read_error(error: ReadError) -> Error {
     match error {
         ReadError::NotYetKnown => not_yet("This text is not in memory yet. Ask again soon."),
         ReadError::OutOfRange => invalid("The text range is outside this document."),
+        ReadError::NoStops => invalid("This text has no caret stops of its own."),
         ReadError::Failed(message) => {
             Error::new(HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), message)
         }

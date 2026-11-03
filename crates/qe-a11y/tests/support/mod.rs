@@ -128,6 +128,8 @@ impl UiaHost for TestHost {
 
 pub fn widget(id: u64, role: WidgetRole, name: &str, x: f32, children: Vec<Widget>) -> Widget {
     Widget {
+        char_boxes: Vec::new(),
+        access_key: None,
         id: WidgetId(id),
         bounds: Rect {
             x: Dip(x),

@@ -127,6 +127,8 @@ impl MenuBar {
     }
     pub fn widgets(&self) -> Widget {
         Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: self.id,
             bounds: self.bounds,
             role: WidgetRole::MenuBar,
@@ -144,7 +146,9 @@ impl MenuBar {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| Widget {
+                    char_boxes: Vec::new(),
                     id: WidgetId(self.id.0 + i as u64 + 1),
+                    access_key: Some(format!("Alt+{}", char::from(MNEMONICS[i] as u8))),
                     bounds: self.labels[i],
                     role: WidgetRole::MenuItem,
                     name: (*name).into(),

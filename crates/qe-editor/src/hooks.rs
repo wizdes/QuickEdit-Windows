@@ -1836,6 +1836,24 @@ impl EditorView {
         self.finish(now, ctx);
         Ok(())
     }
+    /// How far the text is scrolled sideways, with wrap off.
+    pub fn horizontal_position(&self) -> f64 {
+        self.scroll_x
+    }
+    /// Scrolls sideways with no change to the caret. With wrap on, nothing moves.
+    pub fn set_horizontal_position(&mut self, x: f64, ctx: &mut ViewContext) {
+        if self.wraps() || !x.is_finite() {
+            return;
+        }
+        let target = x.clamp(0.0, self.widest);
+        if target != self.scroll_x {
+            self.scroll_x = target;
+            self.keep_caret_visible = false;
+            self.reveal_pending = false;
+            ctx.invalidate(self.bounds);
+            self.schedule(ctx);
+        }
+    }
     /// The text's height so far. Lines with no layout count at their estimated height, so
     /// this changes as layouts arrive.
     pub fn total_height(&self) -> f64 {

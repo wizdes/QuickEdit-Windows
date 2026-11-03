@@ -213,6 +213,7 @@ fn a_client_in_another_process_hears_each_widget_change() {
     combo.value = Some("UTF-8".into());
     let mut scroll = widget(34, WidgetRole::ScrollBar, "Scroll", 250.0, Vec::new());
     scroll.range_value = Some(WidgetRange {
+        step: None,
         minimum: 0.0,
         maximum: 9.0,
         value: 1.0,

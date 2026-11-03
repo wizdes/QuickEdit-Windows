@@ -807,6 +807,8 @@ impl View for ShortcutTable {
             .filter(|row| matches!(row, KeyRow::Command { .. }))
             .count();
         Some(Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: self.id,
             bounds: self.bounds,
             role: WidgetRole::Table,
@@ -840,6 +842,8 @@ fn plain_node(
     children: Vec<Widget>,
 ) -> Widget {
     Widget {
+        char_boxes: Vec::new(),
+        access_key: None,
         id,
         bounds,
         role,

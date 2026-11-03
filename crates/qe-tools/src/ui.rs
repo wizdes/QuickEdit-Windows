@@ -25,7 +25,7 @@ const ALL_WIDTH: f32 = 50.0;
 const MIN_FIELD_WIDTH: f32 = 80.0;
 const PANEL_TITLE_HEIGHT: f32 = 26.0;
 
-const ID_BAR: u64 = 12100;
+pub(crate) const ID_BAR: u64 = 12100;
 
 fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
     Rect {
@@ -423,6 +423,8 @@ fn group(
     children: Vec<Widget>,
 ) -> Widget {
     Widget {
+        char_boxes: Vec::new(),
+        access_key: None,
         id,
         bounds,
         role,

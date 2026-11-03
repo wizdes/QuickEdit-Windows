@@ -55,6 +55,8 @@ pub enum ReadError {
     NotYetKnown,
     OutOfRange,
     Failed(String),
+    /// This document has no caret stops of its own. See `TextDoc::stop_after`.
+    NoStops,
 }
 impl From<LookupError> for ReadError {
     fn from(error: LookupError) -> Self {
@@ -88,6 +90,15 @@ pub trait TextDoc {
     /// Where the rows on screen on this line start and end, in bytes. Empty when no layout is
     /// known. A row's end matters where the next row is not on screen.
     fn row_stops(&mut self, line: usize) -> Vec<usize>;
+    /// The caret stop after this byte, by the same rule the arrow keys use. A document with
+    /// no editor behind it, such as a field, says `NoStops`, and `clusters` serves it.
+    fn stop_after(&mut self, _byte: usize) -> Answer<Option<usize>> {
+        Err(ReadError::NoStops)
+    }
+    /// The caret stop before this byte. See `stop_after`.
+    fn stop_before(&mut self, _byte: usize) -> Answer<Option<usize>> {
+        Err(ReadError::NoStops)
+    }
     fn line_of(&self, byte: usize) -> Answer<usize> {
         Ok(self
             .snapshot()
@@ -224,6 +235,36 @@ fn paired_window(
             return Ok(found);
         }
         reach = reach.saturating_mul(4).min(FLAG_RUN_LIMIT);
+    }
+}
+
+/// The editor's caret stops, in UTF-16 units. `NoStops` means this document has none, and the
+/// table in `clusters` serves it, as for a field's short text.
+fn next_stop(doc: &mut dyn TextDoc, at: usize) -> Answer<Option<usize>> {
+    let byte = byte_of(doc.snapshot(), at)?;
+    match doc.stop_after(byte)? {
+        Some(stop) => Ok(Some(utf16_of(doc.snapshot(), stop)?)),
+        None => Ok(None),
+    }
+}
+fn prev_stop(doc: &mut dyn TextDoc, at: usize) -> Answer<Option<usize>> {
+    let byte = byte_of(doc.snapshot(), at)?;
+    match doc.stop_before(byte)? {
+        Some(stop) => Ok(Some(utf16_of(doc.snapshot(), stop)?)),
+        None => Ok(None),
+    }
+}
+fn stop_at_or_before(doc: &mut dyn TextDoc, at: usize, len: usize) -> Answer<usize> {
+    if at >= len {
+        return Ok(at.min(len));
+    }
+    let byte = byte_of(doc.snapshot(), at)?;
+    let Some(next) = doc.stop_after(byte)? else {
+        return Ok(at);
+    };
+    match doc.stop_before(next)? {
+        Some(stop) => utf16_of(doc.snapshot(), stop),
+        None => Ok(0),
     }
 }
 
@@ -411,7 +452,10 @@ impl Mover<'_> {
             return Ok(None);
         }
         match unit {
-            Unit::Character => char_next(self.doc.snapshot(), at, len),
+            Unit::Character => match next_stop(&mut *self.doc, at) {
+                Err(ReadError::NoStops) => char_next(self.doc.snapshot(), at, len),
+                other => other,
+            },
             Unit::Document => Ok(Some(len)),
             Unit::Word => {
                 let byte = byte_of(self.doc.snapshot(), at)?;
@@ -440,7 +484,10 @@ impl Mover<'_> {
         }
         let at = at.min(len);
         match unit {
-            Unit::Character => char_prev(self.doc.snapshot(), at, len),
+            Unit::Character => match prev_stop(&mut *self.doc, at) {
+                Err(ReadError::NoStops) => char_prev(self.doc.snapshot(), at, len),
+                other => other,
+            },
             Unit::Document => Ok(Some(0)),
             Unit::Word => {
                 let byte = byte_of(self.doc.snapshot(), at)?;
@@ -478,7 +525,10 @@ impl Mover<'_> {
                 if at >= len {
                     return Ok(TextRange::new(len, len));
                 }
-                let start = char_at_or_before(self.doc.snapshot(), at, len)?;
+                let start = match stop_at_or_before(&mut *self.doc, at, len) {
+                    Err(ReadError::NoStops) => char_at_or_before(self.doc.snapshot(), at, len)?,
+                    other => other?,
+                };
                 let end = self.next(unit, start)?.unwrap_or(len);
                 Ok(TextRange::new(start, end))
             }

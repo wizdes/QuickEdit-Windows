@@ -69,6 +69,18 @@ fn row(
     key_of: &dyn Fn(CommandId) -> Option<KeyBinding>,
 ) -> MenuItem {
     let mut item = MenuItem::command(label, command);
+    item.checkable = matches!(
+        command,
+        CommandId::CheckSpellingWhileTyping
+            | CommandId::CorrectSpellingAutomatically
+            | CommandId::SmartCopyPaste
+            | CommandId::SmartQuotes
+            | CommandId::SmartDashes
+            | CommandId::PreventEditing
+            | CommandId::WrapToPage
+            | CommandId::ShowLineNumbers
+            | CommandId::ShowDocumentMap
+    );
     if let Some(key) = key_of(command) {
         item.key_text = key_text(key);
     }

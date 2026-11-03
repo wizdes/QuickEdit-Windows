@@ -181,6 +181,8 @@ impl View for Header {
     }
     fn widgets(&self) -> Option<Widget> {
         Some(Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: self.id,
             bounds: self.bounds,
             role: WidgetRole::Label,

@@ -71,6 +71,9 @@ pub enum ShellEvent {
     /// The window was destroyed. The owner quits the message loop after the last one.
     WindowDestroyed,
     Problem(ShellError),
+    /// A painted control changed in a way the top row's owner cannot see: a menu's selected
+    /// row, say. An owner with a screen reader's link reports it.
+    WidgetsChanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1217,6 +1220,8 @@ impl View for TabStrip {
     fn widgets(&self) -> Option<Widget> {
         let t = light_tokens();
         let button = |hit: CaptionHit, name: &str, bounds: Rect| Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: Self::widget_id(hit),
             bounds,
             role: WidgetRole::Button,
@@ -1236,6 +1241,8 @@ impl View for TabStrip {
         for (i, tab) in self.tabs.iter().enumerate() {
             let b = self.tab_rects[i];
             children.push(Widget {
+                char_boxes: Vec::new(),
+                access_key: None,
                 id: Self::widget_id(CaptionHit::Tab(i)),
                 bounds: b,
                 role: WidgetRole::Tab,
@@ -1279,6 +1286,8 @@ impl View for TabStrip {
             }
         }
         Some(Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: WidgetId(0),
             bounds: self.row_rect(),
             role: WidgetRole::TabList,

@@ -429,6 +429,10 @@ impl Node {
             UIA_ControlTypePropertyId => VARIANT::from(control_type(widget.role).0),
             UIA_NamePropertyId if is_root && widget.name.is_empty() => VARIANT::default(),
             UIA_NamePropertyId => VARIANT::from(widget.name.as_str()),
+            UIA_AccessKeyPropertyId => widget
+                .access_key
+                .as_deref()
+                .map_or_else(VARIANT::default, VARIANT::from),
             UIA_AutomationIdPropertyId if !is_root => {
                 VARIANT::from(format!("qe-{}", widget.id.0).as_str())
             }
@@ -734,12 +738,12 @@ impl IRangeValueProvider_Impl for Node_Impl {
         Ok(self.widget()?.range_value.ok_or_else(gone)?.minimum)
     }
     fn LargeChange(&self) -> Result<f64> {
-        self.widget()?.range_value.ok_or_else(gone)?;
-        Ok(1.0)
+        let range = self.widget()?.range_value.ok_or_else(gone)?;
+        Ok(range.step.unwrap_or(1.0) * LARGE_CHANGE_STEPS)
     }
     fn SmallChange(&self) -> Result<f64> {
-        self.widget()?.range_value.ok_or_else(gone)?;
-        Ok(1.0)
+        let range = self.widget()?.range_value.ok_or_else(gone)?;
+        Ok(range.step.unwrap_or(1.0))
     }
 }
 
@@ -994,6 +998,14 @@ impl UiaSlot {
             None => Ok(WidgetEvents::default()),
         }
     }
+    /// Says this to a screen reader, as a live region would: a count of matches, or a message
+    /// that has opened. With no client, this reads one `Option`.
+    pub fn announce(&self, text: &str) -> Result<()> {
+        match self.current() {
+            Some(ui) => ui.announce(text),
+            None => Ok(()),
+        }
+    }
     /// Call from WM_DESTROY. After this, a client's objects say UIA_E_ELEMENTNOTAVAILABLE. A
     /// second call does nothing.
     pub fn shutdown(&self) -> Result<()> {
@@ -1083,6 +1095,9 @@ fn check_raise() -> Result<()> {
         ))
     })
 }
+
+/// A large change is this many small ones.
+const LARGE_CHANGE_STEPS: f64 = 10.0;
 
 fn raise_event(node: &IRawElementProviderSimple, id: UIA_EVENT_ID) -> Result<()> {
     check_raise()?;
@@ -1327,6 +1342,23 @@ impl Accessibility {
             raise_event(&document, UIA_Text_TextSelectionChangedEventId)?;
         }
         Ok(())
+    }
+    /// Raises a notification that a screen reader says at once.
+    pub fn announce(&self, text: &str) -> Result<()> {
+        if !unsafe { UiaClientsAreListening() }.as_bool() {
+            return Ok(());
+        }
+        let root = self.root();
+        check_raise()?;
+        unsafe {
+            UiaRaiseNotificationEvent(
+                &root,
+                NotificationKind_ActionCompleted,
+                NotificationProcessing_ImportantMostRecent,
+                &BSTR::from(text),
+                &BSTR::from("qe-announcement"),
+            )
+        }
     }
     /// It raises a focus event if focus moved, a structure event if the shape of the tree
     /// changed, and an event for each change a client can read in a widget.

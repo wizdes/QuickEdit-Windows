@@ -1,7 +1,8 @@
 //! `ToolsHost`: the find bar, the panels and their workers, for one window. `WIRING.md` lists
 //! the calls a window makes. All of them run on the UI thread, and none reads a mapped file's
 //! disk there. One does work that grows with the text: applying a finished Replace All or
-//! transform, through `apply_edits` in `qe-editor`. `WIRING.md` says what would bound it.
+//! transform, through `apply_edits` in `qe-editor`. Edits that are dropped unused go through
+//! `discard_edits`, which frees them off this thread. `WIRING.md` says what would bound the rest.
 use crate::complete::complete_candidates;
 use crate::lines::{LINE_SUGGESTION, LineError, LineSpec, line_error_message, lines_for_spec};
 use crate::replace::{ReplaceAllReady, Worker, prepare_replace_all};
@@ -107,6 +108,15 @@ struct TransformRun {
 }
 
 /// The find bar, the Select Line panel, Complete's list and the workers behind them.
+/// What a screen reader can ask of a control here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolAction {
+    Invoke,
+    SetValue(String),
+    Focus,
+    Other,
+}
+
 pub struct ToolsHost {
     bar: FindBar,
     panel: SelectLinePanel,
@@ -1004,7 +1014,9 @@ impl ToolsHost {
         if let Some(run) = self.replace_job.take() {
             run.worker.cancel();
         }
-        self.replace_ready = None;
+        if let Some((ready, _)) = self.replace_ready.take() {
+            view.discard_edits(ready.prepared);
+        }
         if self.current.take().is_some() {
             self.set_current_mark(view, ctx);
         }
@@ -1020,6 +1032,8 @@ impl ToolsHost {
             return;
         }
         if ready.prepared.base_revision() != view.revision() {
+            // The old text may be huge, and freeing it here would stall the frame.
+            view.discard_edits(ready.prepared);
             self.start_replace_all(request, view);
             return;
         }
@@ -1630,7 +1644,9 @@ impl ToolsHost {
     /// Tells the view when the keyboard moves between the text and the tools, so that only one
     /// caret blinks.
     fn sync_view_focus(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
-        let has_keys = self.focus() == ToolsFocus::Editor;
+        // With the window in the background, no view has the keys, or a new tab's caret would
+        // blink behind other windows and keep a timer running.
+        let has_keys = self.focus() == ToolsFocus::Editor && self.window_active;
         if has_keys != self.view_has_keys {
             self.view_has_keys = has_keys;
             let kind = if has_keys {
@@ -2082,6 +2098,113 @@ impl ToolsHost {
                 self.snapshot_wake(),
             ));
         }
+    }
+    /// A screen reader's action on a control of the bar or the panel, by the same paths as a
+    /// click or typing. `Handled::No` means the control is not one of these.
+    pub fn widget_action(
+        &mut self,
+        id: WidgetId,
+        action: &ToolAction,
+        view: &mut EditorView,
+        measure: &dyn TextMeasurer,
+        ctx: &mut ViewContext,
+    ) -> Handled {
+        let bar_stop = |n: u64| match n {
+            1 => Some(BarStop::Find),
+            2 => Some(BarStop::Replace),
+            4 => Some(BarStop::Previous),
+            5 => Some(BarStop::Next),
+            6 => Some(BarStop::Options),
+            7 => Some(BarStop::Done),
+            8 => Some(BarStop::ReplaceOne),
+            9 => Some(BarStop::ReplaceAll),
+            _ => None,
+        };
+        let panel_stop = match id.0 {
+            12001 => Some(PanelStop::Field),
+            12002 => Some(PanelStop::Select),
+            12003 => Some(PanelStop::Close),
+            _ => None,
+        };
+        if let Some(stop) = panel_stop {
+            if !self.panel.open {
+                return Handled::No;
+            }
+            match action {
+                ToolAction::Focus => {
+                    self.bar.set_focus(None, ctx);
+                    self.panel.set_keyboard(Some(stop), ctx);
+                }
+                ToolAction::SetValue(text) if stop == PanelStop::Field => {
+                    self.panel.field.text.clone_from(text);
+                    ctx.invalidate(self.panel.frame);
+                }
+                ToolAction::Invoke if stop == PanelStop::Select => {
+                    let input = self.panel.field.text.clone();
+                    self.submit_lines(input, true, view, ctx);
+                }
+                ToolAction::Invoke if stop == PanelStop::Close => self.close_panel(ctx),
+                _ => return Handled::No,
+            }
+            self.sync_view_focus(view, ctx);
+            return Handled::Yes;
+        }
+        let Some(stop) = id.0.checked_sub(crate::ui::ID_BAR).and_then(bar_stop) else {
+            return Handled::No;
+        };
+        if !self.bar.open {
+            return Handled::No;
+        }
+        match action {
+            ToolAction::Focus => self.bar.set_focus(Some(stop), ctx),
+            ToolAction::SetValue(text) if stop == BarStop::Find => {
+                self.bar.find.text.clone_from(text);
+                self.query = text.clone();
+                self.query_changed(view, ctx);
+                self.start_search(view, true, ctx);
+                ctx.invalidate(self.bar.bounds);
+            }
+            ToolAction::SetValue(text) if stop == BarStop::Replace => {
+                self.bar.replace.text.clone_from(text);
+                ctx.invalidate(self.bar.bounds);
+            }
+            ToolAction::Invoke => match stop {
+                BarStop::Next => {
+                    self.typed_search = false;
+                    self.request_step(Direction::Forward, view);
+                }
+                BarStop::Previous => {
+                    self.typed_search = false;
+                    self.request_step(Direction::Backward, view);
+                }
+                BarStop::ReplaceOne => self.replace_one(view, ctx),
+                BarStop::ReplaceAll => self.press_replace_all(view),
+                BarStop::Done => self.close_bar(view, ctx),
+                BarStop::Options => self.open_options_list(measure, ctx),
+                BarStop::Find | BarStop::Replace => return Handled::No,
+            },
+            _ => return Handled::No,
+        }
+        self.sync_view_focus(view, ctx);
+        Handled::Yes
+    }
+    /// The first half of a tab change, for a host that cannot lend both views at once: `old`
+    /// loses its marks and the keyboard. Then call `view_switched(None, new, ctx)`.
+    pub fn leave_view(&mut self, old: &mut EditorView, ctx: &mut ViewContext) {
+        self.clear_marks(old, ctx);
+        if self.view_has_keys {
+            let blur = InputEvent {
+                time_us: 0,
+                kind: InputKind::Blur,
+            };
+            old.handle(&blur, ctx);
+        }
+        self.view_has_keys = false;
+    }
+    /// Lets a test type the replace text with no keys.
+    #[doc(hidden)]
+    pub fn set_replace_for_test(&mut self, text: &str) {
+        self.bar.replace.text = text.to_owned();
     }
     /// Call this when a window shows another document. `old` loses its marks, and the bar
     /// searches `new`.

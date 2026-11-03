@@ -13,6 +13,8 @@ const MIN_MENU_WIDTH: f32 = 160.0;
 
 #[derive(Clone, Debug)]
 pub struct MenuItem {
+    /// The row can show a check, whether or not it does now.
+    pub checkable: bool,
     pub label: String,
     pub key_text: String,
     pub enabled: bool,
@@ -28,6 +30,7 @@ pub struct MenuItem {
 impl MenuItem {
     pub fn command(label: impl Into<String>, command: CommandId) -> Self {
         Self {
+            checkable: false,
             label: label.into(),
             key_text: String::new(),
             enabled: true,
@@ -41,6 +44,7 @@ impl MenuItem {
     }
     pub fn separator() -> Self {
         Self {
+            checkable: false,
             label: String::new(),
             key_text: String::new(),
             enabled: false,
@@ -54,6 +58,7 @@ impl MenuItem {
     }
     pub fn submenu(label: impl Into<String>, model: MenuModel) -> Self {
         Self {
+            checkable: false,
             label: label.into(),
             key_text: String::new(),
             enabled: true,
@@ -438,6 +443,33 @@ impl MenuView {
         c.invalidate(self.bounds);
         self.child = Some(Box::new(child));
         self.child_row = Some(i);
+    }
+    /// Runs the row with this widget id, at any open depth, as Enter on it does. False means
+    /// no open row has this id.
+    pub fn invoke_row(&mut self, id: WidgetId, c: &mut ViewContext) -> bool {
+        for i in 0..self.model.items.len() {
+            if child_id(self.id, i as u64) == id && !self.model.items[i].separator {
+                self.selected = Some(i);
+                self.activate(c);
+                return true;
+            }
+        }
+        match &mut self.child {
+            Some(child) => {
+                let found = child.invoke_row(id, c);
+                if found && child.closed {
+                    self.chosen_data = child.chosen_data.take();
+                    let reason = child.ended;
+                    self.child = None;
+                    self.child_row = None;
+                    if let Some(reason) = reason {
+                        self.end(reason, c);
+                    }
+                }
+                found
+            }
+            None => false,
+        }
     }
     fn activate(&mut self, c: &mut ViewContext) {
         // A caller may have replaced the model, so the old row may be gone.
@@ -933,6 +965,10 @@ impl MenuView {
                 None
             };
             children.push(Widget {
+                char_boxes: Vec::new(),
+                access_key: item
+                    .mnemonic
+                    .map(|key| key.to_ascii_uppercase().to_string()),
                 id: child_id(self.id, i as u64),
                 bounds,
                 role: WidgetRole::MenuItem,
@@ -943,6 +979,7 @@ impl MenuView {
                     focused: selected && self.child.is_none() && !self.closed,
                     selected,
                     checked: item.checked,
+                    checkable: item.checked || item.checkable,
                     expanded: open_child.is_some(),
                     has_popup: item.submenu.is_some(),
                     ..Default::default()
@@ -954,6 +991,8 @@ impl MenuView {
             });
         }
         Some(Widget {
+            char_boxes: Vec::new(),
+            access_key: None,
             id: self.id,
             bounds: self.bounds,
             role: WidgetRole::Menu,

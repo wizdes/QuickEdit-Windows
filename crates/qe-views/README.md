@@ -45,7 +45,6 @@ The host applies `ctx.requests` as usual. The shell has one view timer and keeps
 ## Differences from the Mac
 
 - **Box place:** the box's top comes from the line really at the view's top, plus how far that line has scrolled, so it moves smoothly where the Mac's jumps by whole lines. A wrapped line holds it until the line's last row has gone. Its height is the same as the Mac's.
-- **Box during a drag:** the pointer holds the box, and the drag asks for that share of the document's height. Where lines wrap to different heights, the text can then settle on another line, and the box moves to it on release. The editor has no call that scrolls to a line's exact place, so `crates/qe-editor` needs one to close this.
 - **Number overlap:** the skip test uses the digit's ink, 0.72 of the font size. Segoe UI's line box is 16 dips at 9 pt and Cascadia Mono's 10 pt row is 15.6, so the Mac's test would hide every second number.
 - **Zoom:** zoom goes through `apply_font`, so the gutter's numbers grow with the text. A page's width and margins grow with it, which keeps its line breaks.
 - **Page size:** a point of paper is 96/72 dips, so a Letter text area is 624 dips wide at 100%.

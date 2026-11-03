@@ -27,6 +27,7 @@ fn sample() -> qe_api::Widget {
     combo.states.expanded = true;
     let mut scroll = widget(40, WidgetRole::ScrollBar, "Scroll", 300.0, Vec::new());
     scroll.range_value = Some(WidgetRange {
+        step: None,
         minimum: 0.0,
         maximum: 10.0,
         value: 3.0,

@@ -478,6 +478,7 @@ fn a_read_only_control_says_invalid_operation_and_one_that_is_off_says_not_enabl
     let mut off_field = widget(3, WidgetRole::TextField, "Off field", 50.0, Vec::new());
     off_field.states.enabled = false;
     let range = Some(WidgetRange {
+        step: None,
         minimum: 0.0,
         maximum: 10.0,
         value: 3.0,

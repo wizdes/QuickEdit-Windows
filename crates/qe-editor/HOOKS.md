@@ -321,3 +321,7 @@ let written = view.revision();
 assert!(view.mark_save_point_at(written));
 assert!(view.is_at_save_point());
 ```
+
+## Scrolling and rows (M11, M14)
+
+`wraps()` says whether long lines wrap. `visible_row_end(&row)` gives the byte after a visible row. `reveal_range(range, align_top, ctx)` brings a range into view with the selection left alone, and says `NotYetKnown` for text the index has not reached. `horizontal_position()` and `set_horizontal_position(x, ctx)` read and set the sideways scroll with wrap off, within the widest text seen. `caret_stop_after(byte)` and `caret_stop_before(byte)` give the caret stops, the same ones the arrow keys use.

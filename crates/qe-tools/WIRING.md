@@ -97,12 +97,7 @@ If the index stops because of a bad byte or a read error, `store_status().failur
 
 `tools.widgets()` gives the nodes to add to the window's tree. They say what is there and which one has focus. Exactly one of them reports focus while the tools have the keyboard, and none while the text has it. A client can read them and nothing more.
 
-For M11, `qe_a11y::WidgetHost::action(id, action)` needs a route to these controls, and `ToolsHost` has none yet. M11 needs:
-
-1. `ToolsHost::widget_action(id, WidgetAction, &mut view, &measure, &mut ctx)`, which does `Focus`, `Invoke` on each button and `SetValue` on the two fields and the panel's field, by the same paths as a click or typing.
-2. A UI Automation focus-changed event when `tools.focus()` changes.
-3. A live-region event when the count label changes, so that "3 found" is announced.
-4. An announcement when the Select Line message opens.
+`ToolsHost::widget_action(id, action, &mut view, &measure, &mut ctx)` is the route for a screen reader's actions. It does `Focus`, `Invoke` on each button and `SetValue` on the two fields and the panel's field. `qe-app` raises the focus and value events through `UiaSlot::widgets_changed` after every call into the tools.
 
 No screen reader has been run against any of this.
 
@@ -112,29 +107,6 @@ The panel is a painted part of the window, with its title row and close button, 
 
 Ctrl+L is the keyboard's way back from the text to the panel, and Tab stays inside the panel. Esc closes it while it has the keyboard. Esc in the text does not. The Mac's tooltip text is only the group's description for now, and nothing paints it on hover.
 
-## Hooks that `qe-editor` still needs
-
-Smart Quotes, Smart Dashes and Smart Copy need the editor to call these functions, and it has no place to do so yet.
-
-```rust
-// In EditorView. Called for one typed character, before it goes in, on the UI thread.
-pub fn set_typing_filter(
-    &mut self,
-    filter: Option<Box<dyn FnMut(&str /* typed */, &str /* last 8 bytes before the caret */)
-        -> Option<(usize /* bytes to remove before the caret */, String /* text to insert */)>>>,
-);
-// In EditorView. True when the selection was made by double-click, by word.
-pub fn selection_is_word(&self) -> bool;
-// In EditorView. Called for Cut, Delete and Paste, as the two calls in qe_tools below need.
-pub fn set_clipboard_filter(&mut self, filter: Option<Box<dyn ClipboardFilter>>);
-pub trait ClipboardFilter {
-    fn cut_range(&mut self, selected: Range<ByteOffset>, before: Option<char>, after: Option<char>,
-        was_word: bool) -> Range<ByteOffset>;
-    fn paste_text(&mut self, text: &str, before: Option<char>, after: Option<char>,
-        was_word: bool) -> String;
-}
-```
-
-Root then wires them to `qe_tools::substitute_typed`, `smart_delete_range` and `smart_paste`, with `Substitutions::for_document(bytes)` so that quotes and dashes turn off over 50 MiB.
+## What stays over a frame
 
 Replace All's apply also needs an editor change to stay inside a frame. `prepare_edits` builds the text on a worker, but `apply_edits` still does work that grows with it on the UI thread. A bounded design would let a worker hand over a finished buffer that the store adopts by moving it.

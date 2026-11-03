@@ -310,15 +310,25 @@ fn ten_kills_in_the_middle_of_saves_leave_a_whole_file() {
             bytes.iter().all(|b| *b == bytes[0]),
             "round {round}: one save's bytes, not a mix"
         );
-        // Each kill leaves at most a temp file, which `find_leftovers` lists and never offers
-        // while the document is whole.
+        // A kill leaves a temp file, which is never offered while the document is whole. A kill
+        // after the swap and before the backup's removal leaves the old text in a backup, which
+        // qe-codec offers on purpose. That backup must be whole too.
         let leftovers = qe_codec::find_leftovers(&file).unwrap();
-        assert!(
-            leftovers
-                .iter()
-                .all(|l| !l.offer_recovery || l.owner_running),
-            "round {round}: {leftovers:?}"
-        );
+        for leftover in &leftovers {
+            if !leftover.offer_recovery || leftover.owner_running {
+                continue;
+            }
+            assert!(
+                matches!(leftover.kind, qe_codec::LeftoverKind::Backup),
+                "round {round}: {leftovers:?}"
+            );
+            let old = std::fs::read(&leftover.path).unwrap();
+            assert_eq!(old.len(), 1 << 20, "round {round}: the backup is whole");
+            assert!(
+                old.iter().all(|b| *b == old[0]),
+                "round {round}: the backup holds one save's bytes"
+            );
+        }
         for leftover in leftovers {
             qe_codec::delete_leftover(&leftover, qe_codec::LeftoverDelete::IncludeRecoverable)
                 .unwrap();

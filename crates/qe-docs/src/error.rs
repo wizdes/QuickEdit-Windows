@@ -31,6 +31,10 @@ pub enum DocErrorKind {
     /// An autosaved copy failed its check when it was read back.
     AutosaveDamaged,
     SessionDamaged,
+    /// The path names no file QuickEdit may open: a device, a stream, a pipe.
+    PathRefused,
+    /// More files came at once than QuickEdit keeps waiting.
+    TooManyFiles,
     Cancelled,
     Other,
 }

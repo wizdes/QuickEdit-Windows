@@ -32,6 +32,8 @@ pub(crate) struct FileBase {
     pub(crate) written: u64,
     pub(crate) identity: FileIdentity,
     pub(crate) read_only: bool,
+    /// How many names the file had. Zero: not known, as in a row read from the session list.
+    pub(crate) links: u32,
 }
 
 pub(crate) fn wide(path: &Path) -> Vec<u16> {
@@ -100,6 +102,7 @@ fn base_of_handle(handle: HANDLE) -> std::io::Result<(FileBase, bool)> {
             | u64::from(info.ftLastWriteTime.dwLowDateTime),
         identity,
         read_only: info.dwFileAttributes & FILE_ATTRIBUTE_READONLY.0 != 0,
+        links: info.nNumberOfLinks,
     };
     Ok((
         base,

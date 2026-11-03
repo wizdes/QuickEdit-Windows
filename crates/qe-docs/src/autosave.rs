@@ -92,6 +92,8 @@ pub(crate) struct DocMeta {
     pub(crate) read_only: bool,
     pub(crate) copy_source: Option<PathBuf>,
     pub(crate) has_autosave: bool,
+    /// The file changed behind this document's text, and the person has not answered yet.
+    pub(crate) changed_while_away: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,7 +110,7 @@ fn flag(value: bool) -> &'static str {
 
 fn encode_meta(meta: &DocMeta) -> String {
     let mut line = format!(
-        "key={} window={} number={} enc={} bom={} endian={} ending={} lossy={} anchor={} caret={} top={} prevent={} page={} ro={} auto={}",
+        "key={} window={} number={} enc={} bom={} endian={} ending={} lossy={} anchor={} caret={} top={} prevent={} page={} ro={} auto={} away={}",
         meta.key,
         meta.window,
         meta.untitled_number,
@@ -132,6 +134,7 @@ fn encode_meta(meta: &DocMeta) -> String {
         flag(meta.wrap_to_page),
         flag(meta.read_only),
         flag(meta.has_autosave),
+        flag(meta.changed_while_away),
     );
     line.push_str(" open=");
     line.push_str(&match meta.open_choice {
@@ -203,6 +206,7 @@ fn decode_meta(line: &str) -> Option<DocMeta> {
                 file: u128::from_str_radix(map.get("id")?, 16).ok()?,
             },
             read_only: on("locked"),
+            links: 0,
         }),
         _ => None,
     };
@@ -236,10 +240,23 @@ fn decode_meta(line: &str) -> Option<DocMeta> {
             None => None,
         },
         has_autosave: on("auto"),
+        changed_while_away: on("away"),
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_manifest(windows: &[WindowMeta], docs: &[DocMeta]) -> String {
+    encode_session(windows, docs, &BTreeMap::new())
+}
+
+/// `dead`: for each document key, the copies below this generation hold nothing to bring
+/// back. Their text is on disk or the person chose to discard it, but a removal has not
+/// been seen to finish. A copy at or above it was written later, and it is live.
+pub(crate) fn encode_session(
+    windows: &[WindowMeta],
+    docs: &[DocMeta],
+    dead: &BTreeMap<String, u64>,
+) -> String {
     let mut out = String::from(MANIFEST_HEADER);
     out.push('\n');
     for window in windows {
@@ -266,16 +283,35 @@ pub(crate) fn encode_manifest(windows: &[WindowMeta], docs: &[DocMeta]) -> Strin
         out.push_str(&encode_meta(doc));
         out.push('\n');
     }
+    for (key, below) in dead {
+        out.push_str(&format!("dead key={key} below={below}\n"));
+    }
     out.push_str(&format!("end {} {}\n", windows.len(), docs.len()));
     out
 }
 
+#[cfg(test)]
 pub(crate) fn decode_manifest(text: &str) -> Option<(Vec<WindowMeta>, Vec<DocMeta>)> {
+    decode_session(text).map(|list| (list.windows, list.docs))
+}
+
+/// One folder's `session.txt`.
+#[derive(Default)]
+struct SessionList {
+    windows: Vec<WindowMeta>,
+    docs: Vec<DocMeta>,
+    dead: BTreeMap<String, u64>,
+    /// The file is there, and Windows would not let it be read.
+    unread: bool,
+}
+
+fn decode_session(text: &str) -> Option<SessionList> {
     let mut lines = text.lines();
     if lines.next() != Some(MANIFEST_HEADER) {
         return None;
     }
     let (mut windows, mut docs) = (Vec::new(), Vec::new());
+    let mut dead = BTreeMap::new();
     let mut ended = false;
     for line in lines {
         if let Some(rest) = line.strip_prefix("window ") {
@@ -298,6 +334,13 @@ pub(crate) fn decode_manifest(text: &str) -> Option<(Vec<WindowMeta>, Vec<DocMet
             });
         } else if let Some(rest) = line.strip_prefix("doc ") {
             docs.push(decode_meta(rest)?);
+        } else if let Some(rest) = line.strip_prefix("dead ") {
+            let map = fields(rest);
+            let key = map.get("key")?;
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            dead.insert((*key).to_owned(), map.get("below")?.parse::<u64>().ok()?);
         } else {
             let rest = line.strip_prefix("end ")?;
             let mut counts = rest.split(' ').map(str::parse::<usize>);
@@ -307,7 +350,26 @@ pub(crate) fn decode_manifest(text: &str) -> Option<(Vec<WindowMeta>, Vec<DocMet
             ended = true;
         }
     }
-    ended.then_some((windows, docs))
+    ended.then_some(SessionList {
+        windows,
+        docs,
+        dead,
+        unread: false,
+    })
+}
+
+/// Another program, such as a virus scanner, can hold a file for a moment.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 32 | 33)) && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Replaces `session.txt` whole. A reader finds the old file or the new one.
@@ -321,17 +383,7 @@ pub(crate) fn write_manifest(dir: &Path, text: &str) -> Result<(), DocError> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        // Another program, such as a virus scanner, can hold a file for a moment.
-        let mut tries = 0;
-        loop {
-            match std::fs::rename(&temp, &target) {
-                Err(e) if matches!(e.raw_os_error(), Some(5 | 32 | 33)) && tries < 10 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                other => return other,
-            }
-        }
+        rename_with_retry(&temp, &target)
     })();
     result.map_err(|e| {
         if let Err(gone) = std::fs::remove_file(&temp)
@@ -439,7 +491,7 @@ pub(crate) fn write_generation(job: &AutosaveWrite<'_>) -> Result<bool, DocError
     let finished = file.write_all(&buffer).and_then(|()| file.sync_all());
     drop(file);
     finished.map_err(fail)?;
-    std::fs::rename(&temp, &target).map_err(fail)?;
+    rename_with_retry(&temp, &target).map_err(fail)?;
     if let Some(previous) = job.previous
         && previous != job.generation
     {
@@ -454,8 +506,8 @@ pub(crate) fn write_generation(job: &AutosaveWrite<'_>) -> Result<bool, DocError
     Ok(true)
 }
 
-/// Removes every generation of one document. Errors name the file, since an autosaved
-/// copy that stays can come back at the next launch.
+/// Removes every generation of one document below `below`. A `.damaged` file is not one: a
+/// message has named it to the user as staying. Errors name the file.
 pub(crate) fn remove_generations(docs_dir: &Path, key: &str, below: u64) -> Result<(), DocError> {
     let entries = match std::fs::read_dir(docs_dir) {
         Ok(entries) => entries,
@@ -472,6 +524,9 @@ pub(crate) fn remove_generations(docs_dir: &Path, key: &str, below: u64) -> Resu
     let mut first_error = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".qea") || name.ends_with(".tmp")) {
+            continue;
+        }
         let older = name
             .strip_prefix(&prefix)
             .and_then(|rest| rest.split('.').next())
@@ -483,7 +538,7 @@ pub(crate) fn remove_generations(docs_dir: &Path, key: &str, below: u64) -> Resu
             && first_error.is_none()
         {
             first_error = Some(DocError::io(
-                "QuickEdit could not remove the autosaved copy, so it may come back at the next launch:",
+                "QuickEdit could not remove an old autosaved copy, and tries again at the next launch. The copy will not come back:",
                 &entry.path(),
                 &error,
             ));
@@ -568,16 +623,18 @@ fn damaged_memory(path: &Path, size: u64) -> DocError {
     )
 }
 
-fn read_generation_head(path: &Path) -> Option<DocMeta> {
-    let file = File::open(path).ok()?;
+/// `Ok(None)`: the file was read, and it has no good description. An error: it was not read.
+fn read_generation_head(path: &Path) -> std::io::Result<Option<DocMeta>> {
+    let file = File::open(path)?;
     let mut head = Vec::new();
-    file.take(MAX_HEADER_BYTES).read_to_end(&mut head).ok()?;
-    let end = head.iter().position(|b| *b == b'\n')?;
-    decode_meta(
-        std::str::from_utf8(&head[..end])
-            .ok()?
-            .strip_prefix(AUTOSAVE_MAGIC)?,
-    )
+    file.take(MAX_HEADER_BYTES).read_to_end(&mut head)?;
+    let Some(end) = head.iter().position(|b| *b == b'\n') else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(&head[..end])
+        .ok()
+        .and_then(|line| line.strip_prefix(AUTOSAVE_MAGIC))
+        .and_then(decode_meta))
 }
 
 /// This QuickEdit's hold on a session folder. A second one takes the next folder.
@@ -623,6 +680,8 @@ pub(crate) struct RestorePlan {
     pub(crate) problems: Vec<DocError>,
     pub(crate) recent: Vec<PathBuf>,
     pub(crate) next_generation: u64,
+    /// Copies that stay dead until a later launch can remove them.
+    pub(crate) dead: BTreeMap<String, u64>,
 }
 
 fn list_generations(docs_dir: &Path) -> BTreeMap<String, Vec<(u64, PathBuf)>> {
@@ -660,8 +719,7 @@ fn list_generations(docs_dir: &Path) -> BTreeMap<String, Vec<(u64, PathBuf)>> {
     found
 }
 
-fn keep_broken_copy(path: &Path, name: &str) -> Option<PathBuf> {
-    let target = path.with_file_name(name);
+fn keep_broken_copy(path: &Path, target: PathBuf) -> Option<PathBuf> {
     match std::fs::copy(path, &target) {
         Ok(_) => Some(target),
         Err(error) => {
@@ -671,7 +729,8 @@ fn keep_broken_copy(path: &Path, name: &str) -> Option<PathBuf> {
     }
 }
 
-fn read_session(dir: &Path, problems: &mut Vec<DocError>) -> (Vec<WindowMeta>, Vec<DocMeta>) {
+/// `broken_copy`: where a damaged list goes, which stays when this folder is merged away.
+fn read_session(dir: &Path, broken_copy: PathBuf, problems: &mut Vec<DocError>) -> SessionList {
     let path = dir.join(MANIFEST);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -682,13 +741,16 @@ fn read_session(dir: &Path, problems: &mut Vec<DocError>) -> (Vec<WindowMeta>, V
                 &path,
                 &error,
             ));
-            return Default::default();
+            return SessionList {
+                unread: true,
+                ..Default::default()
+            };
         }
     };
-    match std::str::from_utf8(&bytes).ok().and_then(decode_manifest) {
+    match std::str::from_utf8(&bytes).ok().and_then(decode_session) {
         Some(parsed) => parsed,
         None => {
-            let kept = keep_broken_copy(&path, "session.broken.txt");
+            let kept = keep_broken_copy(&path, broken_copy);
             let mut problem = DocError::new(
                 DocErrorKind::SessionDamaged,
                 Some(&path),
@@ -780,13 +842,20 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
     remove_stale_large_files(root, this_process());
     remove_stale_list_temps(&lock.dir, "session.tmp-");
     remove_stale_list_temps(root, "recent.tmp-");
-    let (mut windows, mut docs) = read_session(&lock.dir, &mut problems);
+    let own = read_session(
+        &lock.dir,
+        lock.dir.join("session.broken.txt"),
+        &mut problems,
+    );
+    let (mut windows, mut docs, mut dead) = (own.windows, own.docs, own.dead);
     let docs_dir = lock.dir.join("docs");
 
     // Sessions of other copies that have ended join this one. Their files move first, then
-    // this session's list is written, and only then does their list go. A kill in between
-    // finds the moved files as autosaved copies with no row, which come back all the same.
-    let mut merged: Vec<PathBuf> = Vec::new();
+    // this session's list is written, and only then does their folder go, with its lock held
+    // to the end so that a third launch cannot take it. A kill in between finds the moved
+    // files as autosaved copies with no row, or finds rows this list has already, which a
+    // key tells apart. A file that will not move keeps its row and its folder for next time.
+    let mut merged: Vec<MergedFolder> = Vec::new();
     for other in 1..=64 {
         let dir = session_folder(root, other);
         if dir == lock.dir || !dir.join("session.lock").exists() {
@@ -795,34 +864,50 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
         let Ok(Some(held)) = try_lock(&dir) else {
             continue;
         };
-        let (their_windows, their_docs) = read_session(&dir, &mut problems);
-        let offset = u64::from(other) * 1_000_000;
-        windows.extend(their_windows.into_iter().map(|mut w| {
-            w.id += offset;
-            w
-        }));
-        docs.extend(their_docs.into_iter().map(|mut d| {
-            d.window += offset;
-            d
-        }));
+        let broken = free_name(&lock.dir, &format!("session-{other}.broken"), "txt");
+        let theirs = read_session(&dir, broken, &mut problems);
         if let Err(error) = std::fs::create_dir_all(&docs_dir) {
             problems.push(DocError::io(what, &docs_dir, &error));
         }
-        for list in list_generations(&dir.join("docs")).into_values() {
-            for (_, path) in list {
-                if let Some(name) = path.file_name()
-                    && let Err(error) = std::fs::rename(&path, docs_dir.join(name))
-                {
-                    problems.push(DocError::io(
-                        "QuickEdit could not move the autosaved copy at",
-                        &path,
-                        &error,
-                    ));
-                }
+        let moved = move_session_files(&dir, &docs_dir, &lock.dir, other, &mut problems);
+        let offset = u64::from(other) * 1_000_000;
+        let (stuck, joining): (Vec<DocMeta>, Vec<DocMeta>) = theirs
+            .docs
+            .into_iter()
+            .partition(|d| moved.stuck_keys.contains(&d.key));
+        let joining: Vec<DocMeta> = joining
+            .into_iter()
+            .filter(|d| !docs.iter().any(|mine| mine.key == d.key))
+            .collect();
+        for window in &theirs.windows {
+            let id = window.id + offset;
+            let has_row = joining.iter().any(|d| d.window == window.id);
+            if has_row && !windows.iter().any(|w| w.id == id) {
+                let mut joined = window.clone();
+                joined.id = id;
+                windows.push(joined);
             }
         }
-        drop(held);
-        merged.push(dir);
+        docs.extend(joining.into_iter().map(|mut d| {
+            d.window += offset;
+            d
+        }));
+        for (key, below) in theirs.dead {
+            let entry = dead.entry(key).or_insert(below);
+            *entry = below.max(*entry);
+        }
+        let stuck_windows = theirs
+            .windows
+            .into_iter()
+            .filter(|w| stuck.iter().any(|d| d.window == w.id))
+            .collect();
+        merged.push(MergedFolder {
+            dir,
+            held,
+            whole: moved.whole && !theirs.unread,
+            stuck,
+            stuck_windows,
+        });
     }
 
     let mut generations = list_generations(&docs_dir);
@@ -830,12 +915,13 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
         .values()
         .flat_map(|list| list.iter().map(|(generation, _)| *generation))
         .max()
-        .unwrap_or(0)
-        + 1;
+        .map_or(1, |newest| newest + 1)
+        .max(dead.values().copied().max().unwrap_or(1));
+    let dead = remove_dead_copies(&mut generations, dead, &mut problems);
     let mut out: Vec<RestoreDoc> = Vec::with_capacity(docs.len());
     for meta in docs {
         let files = generations.remove(&meta.key).unwrap_or_default();
-        if meta.has_autosave && files.is_empty() {
+        if meta.has_autosave && files.is_empty() && !dead.contains_key(&meta.key) {
             problems.push(DocError::new(
                 DocErrorKind::AutosaveDamaged,
                 meta.path.as_deref(),
@@ -859,21 +945,8 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
     // A copy with no row: a kill came between its rename and the list, or the list is
     // damaged. Its own description brings it back, in the last window.
     let fallback = windows.last().map(|w| w.id);
-    for (key, files) in generations {
-        let Some(head) = files
-            .iter()
-            .find_map(|(_, path)| read_generation_head(path))
-        else {
-            for (_, path) in &files {
-                problems.push(DocError::new(
-                    DocErrorKind::AutosaveDamaged,
-                    Some(path),
-                    format!(
-                        "The autosaved copy at {} cannot be read. It stays on disk.",
-                        path.display()
-                    ),
-                ));
-            }
+    for (key, mut files) in generations {
+        let Some(head) = usable_head(&mut files, &mut problems) else {
             continue;
         };
         let mut meta = head;
@@ -896,14 +969,14 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
     }
     let doc_rows: Vec<DocMeta> = out.iter().map(|d| d.meta.clone()).collect();
     if !merged.is_empty() {
-        write_manifest(&lock.dir, &encode_manifest(&windows, &doc_rows))?;
-        for dir in merged {
-            if let Err(error) = std::fs::remove_dir_all(&dir) {
-                eprintln!(
-                    "QuickEdit: could not remove the old session folder {}: {error}",
-                    dir.display()
-                );
+        match write_manifest(&lock.dir, &encode_session(&windows, &doc_rows, &dead)) {
+            Ok(()) => {
+                for folder in merged {
+                    finish_merged_folder(folder, &mut problems);
+                }
             }
+            // Every folder stays, and the next launch tells its rows apart by their keys.
+            Err(error) => problems.push(error),
         }
     }
     let recent = read_recent(root, &mut problems);
@@ -914,7 +987,251 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
         problems,
         recent,
         next_generation,
+        dead,
     })
+}
+
+/// A folder this launch has read, with its lock still held.
+struct MergedFolder {
+    dir: PathBuf,
+    held: File,
+    /// Every file left it, so it can go.
+    whole: bool,
+    stuck: Vec<DocMeta>,
+    stuck_windows: Vec<WindowMeta>,
+}
+
+struct MovedFiles {
+    whole: bool,
+    /// The documents that have a file still in the old folder.
+    stuck_keys: std::collections::BTreeSet<String>,
+}
+
+/// A name in `dir` that nothing has yet, so that a move or a copy cannot replace a file.
+fn free_name(dir: &Path, stem: &str, extension: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{extension}"));
+    if !first.exists() {
+        return first;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{stem}-{n}.{extension}")))
+        .find(|path| !path.exists())
+        .unwrap_or(first)
+}
+
+fn could_not_move(path: &Path, error: &std::io::Error) -> DocError {
+    let mut problem = DocError::io("QuickEdit could not move the file at", path, error);
+    problem.message.push_str(
+        " It stays there, and QuickEdit tries again at the next launch. Its text is safe.",
+    );
+    problem.left_on_disk.push(path.to_path_buf());
+    problem
+}
+
+/// Moves all that a folder holds, not only its copies: a `.damaged` file or a damaged list
+/// has been named to the user as staying on disk.
+fn move_session_files(
+    dir: &Path,
+    docs_dir: &Path,
+    main_dir: &Path,
+    index: u32,
+    problems: &mut Vec<DocError>,
+) -> MovedFiles {
+    let mut moved = MovedFiles {
+        whole: true,
+        stuck_keys: Default::default(),
+    };
+    let from = dir.join("docs");
+    match std::fs::read_dir(&from) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // A `.tmp` was never finished. The `.qea` beside it is the last good copy.
+                if name.ends_with(".tmp") {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        moved.whole = false;
+                        eprintln!("QuickEdit: could not remove {}: {error}", path.display());
+                    }
+                    continue;
+                }
+                let target = docs_dir.join(entry.file_name());
+                let result = if target.exists() {
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                } else {
+                    rename_with_retry(&path, &target)
+                };
+                if let Err(error) = result {
+                    problems.push(could_not_move(&path, &error));
+                    moved.whole = false;
+                    if let Some((key, _)) = name.split_once('.') {
+                        moved.stuck_keys.insert(key.to_owned());
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            problems.push(DocError::io(
+                "QuickEdit could not read the autosave folder",
+                &from,
+                &error,
+            ));
+            moved.whole = false;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        moved.whole = false;
+        return moved;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "docs" || name == "session.lock" || name == MANIFEST {
+            continue;
+        }
+        if name.starts_with("session.tmp-") {
+            if let Err(error) = std::fs::remove_file(&path) {
+                moved.whole = false;
+                eprintln!("QuickEdit: could not remove {}: {error}", path.display());
+            }
+            continue;
+        }
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((&name, "kept"));
+        let target = free_name(main_dir, &format!("session-{index}.{stem}"), extension);
+        if let Err(error) = rename_with_retry(&path, &target) {
+            problems.push(could_not_move(&path, &error));
+            moved.whole = false;
+        }
+    }
+    moved
+}
+
+/// Copies below a dead mark go now. One that will not go stays dead for the next launch.
+fn remove_dead_copies(
+    generations: &mut BTreeMap<String, Vec<(u64, PathBuf)>>,
+    dead: BTreeMap<String, u64>,
+    problems: &mut Vec<DocError>,
+) -> BTreeMap<String, u64> {
+    let mut still = BTreeMap::new();
+    for (key, below) in dead {
+        let Some(list) = generations.get_mut(&key) else {
+            continue;
+        };
+        let (gone, live): (Vec<_>, Vec<_>) = std::mem::take(list)
+            .into_iter()
+            .partition(|(generation, _)| *generation < below);
+        *list = live;
+        if list.is_empty() {
+            generations.remove(&key);
+        }
+        for (_, path) in gone {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                still.insert(key.clone(), below);
+                problems.push(DocError::io(
+                    "QuickEdit could not remove an old autosaved copy, and tries again at the next launch. The copy will not come back:",
+                    &path,
+                    &error,
+                ));
+            }
+        }
+    }
+    still
+}
+
+/// The description of a copy with no row. A file with a bad head goes to `.damaged` once and
+/// is named once. A file Windows would not open stays as it is, to be read next time.
+fn usable_head(files: &mut Vec<(u64, PathBuf)>, problems: &mut Vec<DocError>) -> Option<DocMeta> {
+    let mut found = None;
+    files.retain(|(_, path)| {
+        if found.is_some() {
+            return true;
+        }
+        match read_generation_head(path) {
+            Ok(Some(meta)) => {
+                found = Some(meta);
+                true
+            }
+            Ok(None) => {
+                let mut problem = DocError::new(
+                    DocErrorKind::AutosaveDamaged,
+                    Some(path),
+                    format!(
+                        "The autosaved copy at {} is damaged, so it cannot come back. It stays on disk.",
+                        path.display()
+                    ),
+                );
+                let kept = path.with_extension("damaged");
+                match std::fs::rename(path, &kept) {
+                    Ok(()) => problem.left_on_disk.push(kept),
+                    Err(error) => {
+                        eprintln!("QuickEdit: could not rename {}: {error}", path.display());
+                        problem.left_on_disk.push(path.clone());
+                    }
+                }
+                problems.push(problem);
+                false
+            }
+            Err(error) => {
+                let mut problem = DocError::io("QuickEdit could not read the autosaved copy at", path, &error);
+                problem.message.push_str(" It stays on disk, and the next launch tries again.");
+                problem.left_on_disk.push(path.clone());
+                problems.push(problem);
+                false
+            }
+        }
+    });
+    found
+}
+
+fn finish_merged_folder(folder: MergedFolder, problems: &mut Vec<DocError>) {
+    let MergedFolder {
+        dir,
+        held,
+        whole,
+        stuck,
+        stuck_windows,
+    } = folder;
+    if !whole {
+        // Only what did not move stays on its list, so a later launch brings back no row
+        // this launch already took.
+        let text = encode_session(&stuck_windows, &stuck, &BTreeMap::new());
+        if let Err(error) = write_manifest(&dir, &text) {
+            problems.push(error);
+        }
+        return;
+    }
+    // The list goes first: with it gone, no row of this folder can come back.
+    let list = dir.join(MANIFEST);
+    let cleared = match std::fs::remove_file(&list) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err((list, error)),
+        _ => {
+            let docs = dir.join("docs");
+            match std::fs::remove_dir(&docs) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err((docs, error)),
+                _ => Ok(()),
+            }
+        }
+    };
+    drop(held);
+    let cleared = cleared.and_then(|()| {
+        let lock = dir.join("session.lock");
+        std::fs::remove_file(&lock).map_err(|error| (lock, error))?;
+        std::fs::remove_dir(&dir).map_err(|error| (dir.clone(), error))
+    });
+    if let Err((path, error)) = cleared {
+        let mut problem = DocError::io(
+            "QuickEdit could not remove an old session folder at",
+            &path,
+            &error,
+        );
+        problem
+            .message
+            .push_str(" Nothing of yours is lost, and the next launch tries again.");
+        problems.push(problem);
+    }
 }
 
 fn read_recent(root: &Path, problems: &mut Vec<DocError>) -> Vec<PathBuf> {
@@ -953,7 +1270,7 @@ pub(crate) fn write_recent(root: &Path, text: &str) -> Result<(), DocError> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, &target)
+        rename_with_retry(&temp, &target)
     })();
     result.map_err(|e| DocError::io("QuickEdit could not save Open Recent at", &target, &e))
 }
@@ -989,13 +1306,45 @@ mod tests {
                     file: 40,
                 },
                 read_only: true,
+                links: 0,
             }),
             prevent_editing: true,
             wrap_to_page: true,
             read_only: false,
             copy_source: Some(PathBuf::from(r"C:\big file")),
             has_autosave: true,
+            changed_while_away: true,
         }
+    }
+
+    #[test]
+    fn a_dead_mark_comes_back_and_a_bad_one_is_refused() {
+        let dead = BTreeMap::from([("ab12".to_owned(), 7u64)]);
+        let text = encode_session(&[], &[meta()], &dead);
+        assert_eq!(decode_session(&text).unwrap().dead, dead);
+        assert!(decode_session(&text.replace("below=7", "below=x")).is_none());
+        assert!(decode_session(&text.replace("key=ab12 below", "key=a/b below")).is_none());
+    }
+
+    #[test]
+    fn a_short_hold_on_a_file_does_not_stop_its_rename() {
+        let dir = std::env::temp_dir().join(format!("qe-docs-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&from, b"x").unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&from)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(held);
+        });
+        rename_with_retry(&from, &to).unwrap();
+        release.join().unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

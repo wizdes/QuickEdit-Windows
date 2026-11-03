@@ -2,7 +2,7 @@
 //! Each public call runs on the UI thread and does no disk work there.
 use crate::autosave::{
     AutosaveWrite, DocMeta, OpenChoice, RestoreDoc, RestorePlan, SessionLock, WindowMeta,
-    build_restore_plan, encode_manifest, remove_generations, write_generation, write_manifest,
+    build_restore_plan, encode_session, remove_generations, write_generation, write_manifest,
     write_recent,
 };
 pub use crate::autosave::{ShowState, WindowFrame};
@@ -11,7 +11,8 @@ use crate::identity::{FileBase, FileIdentity, file_base, is_in_recycle_bin, loca
 use crate::load::{
     Body, Limits, LoadJob, LoadResult, Loaded, Source, read_all_text, remove_quietly, run_load,
 };
-use crate::recent::{add_recent, encode_recent, same_path_text};
+use crate::paths::{check_open_path, is_network_path};
+use crate::recent::{add_recent, encode_recent, same_name, same_path_text};
 use crate::watch::{FolderNews, FolderWatch, watch_folder};
 use qe_api::{ByteOffset, EncodingChoice, TextEncoding, TextSnapshot, ViewContext, ViewRequest};
 use qe_buffer::Notify;
@@ -34,9 +35,21 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// so a huge text cannot stall a close.
 pub const BLANK_SCAN_LIMIT_UTF16: usize = 1_048_576;
 const MAX_LOADS_AT_ONCE: usize = 4;
+/// A network path can wait a long time, so these have their own slots apart from the four.
+const MAX_REMOTE_LOADS_AT_ONCE: usize = 2;
+/// The most tabs one call or one poll makes. The rest wait in a queue, so the UI stays awake.
+const MAX_OPENS_PER_WAKE: usize = 32;
+/// How long the UI gets for other messages between two groups of tabs.
+const OPEN_SPACING: Duration = Duration::from_millis(5);
+/// The most files that wait in that queue. A list past this is named as too long.
+const MAX_QUEUED_OPENS: usize = 4096;
+/// How long a thread that would not start waits before an autosave tries again.
+const THREAD_RETRY: Duration = Duration::from_secs(5);
 const MAX_FIT_CHECK_ITEMS: usize = 5_000_000;
 /// An inserted text longer than this waits for the Save to learn whether it fits.
 const FIT_CHECK_BYTES: usize = 64 * 1024;
+/// A file gone from its name gets this long before anything is said or followed. Many
+/// editors save by delete then create, or by a rename to a backup then a new file.
 const MISSING_RECHECK: Duration = Duration::from_millis(300);
 const RELOAD_RETRY: Duration = Duration::from_millis(250);
 const RELOAD_TRIES: u32 = 4;
@@ -78,6 +91,16 @@ pub struct Faults {
     pub reload_is_held: AtomicBool,
     /// Called on the worker just before a Save's swap.
     pub before_swap: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called on the worker just after a Save's swap, before its stamp is taken.
+    pub after_swap: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// While true, a restore's read of an autosaved copy waits before it reads.
+    pub hold_restore_load: AtomicBool,
+    pub restore_load_is_held: AtomicBool,
+    /// While true, a load from a network path waits before it reads.
+    pub hold_remote_load: AtomicBool,
+    pub remote_load_is_held: AtomicBool,
+    /// While true, no worker thread can start, as when Windows has no room for one.
+    pub refuse_threads: AtomicBool,
 }
 
 /// What the store needs from the app. `from_settings` fills it from `qe-settings`.
@@ -363,6 +386,20 @@ pub enum DocEvent {
     },
     /// All text is on disk. The app may exit.
     ReadyToQuit,
+    /// The last window has gone, after `RestoreFinished`. `opened_nothing`: a file failed to
+    /// load and its window went with it, so nothing is on screen and the host must call
+    /// `new_window(true)`. Otherwise the user closed it, and the host does as it does then.
+    LastWindowGone {
+        opened_nothing: bool,
+    },
+    /// `discard_leftover` removed the file.
+    LeftoverDeleted {
+        leftover: PathBuf,
+    },
+    LeftoverNotDeleted {
+        leftover: PathBuf,
+        error: DocError,
+    },
 }
 
 /// Which File menu rows are on for a document.
@@ -411,6 +448,9 @@ enum AdoptThen {
     Plain,
     /// A reload from another program's change, so the place stays.
     Reloaded,
+    /// The same file through another door, such as a UTF-8 copy. The place stays, and no
+    /// other program changed anything.
+    SameFile,
     /// Revert: the caret goes to the start, as on the Mac.
     Reverted,
 }
@@ -436,8 +476,15 @@ struct Doc {
     /// Text that disk does not hold, though the view is at its save point: a restored
     /// autosave, a duplicate, or a deleted file.
     forced_dirty: bool,
-    /// The file changed while QuickEdit was not running, so a Save must ask.
+    /// `forced_dirty` came only from the file going away, with no edit behind it. So the
+    /// file's return ends it. A restored copy or a duplicate never has this.
+    dirty_from_delete: bool,
+    /// The file changed behind this text and the person has not answered, so a Save must
+    /// ask. It lasts through a restart until a Save or a reload ends it.
     changed_while_away: bool,
+    /// Moves on with each of this document's own changes to its file or marks. A look at the
+    /// file that began before one of them says nothing about the file now.
+    file_epoch: u64,
     loading: bool,
     hidden: bool,
     transient: bool,
@@ -465,6 +512,9 @@ struct Doc {
     asked_lossy: bool,
     asked_locked: bool,
     asked_fit: bool,
+    /// The open dialog came from the first-edit encoding question, so its Cancel undoes.
+    fit_panel_undoes: bool,
+    unlocking: bool,
     panel_open: bool,
     /// The user said to quit without this document's unsaved text.
     quit_skip: bool,
@@ -523,6 +573,7 @@ enum Completion {
     Load {
         doc: DocId,
         kind: LoadKind,
+        remote: bool,
         result: Box<LoadResult>,
         identity_now: Option<(Option<FileBase>, Option<FileStamp>)>,
         leftovers: Vec<PathBuf>,
@@ -544,9 +595,14 @@ enum Completion {
     },
     AutosaveRemoved {
         doc: DocId,
+        key: String,
+        below: u64,
         result: Result<(), DocError>,
     },
-    Stat(Vec<StatResult>),
+    Stat {
+        remote: bool,
+        results: Vec<StatResult>,
+    },
     Moved {
         doc: DocId,
         path: PathBuf,
@@ -563,6 +619,10 @@ enum Completion {
     },
     Recovered {
         path: PathBuf,
+        result: Result<(), DocError>,
+    },
+    LeftoverGone {
+        leftover: PathBuf,
         result: Result<(), DocError>,
     },
     SessionWritten(Result<(), DocError>),
@@ -586,8 +646,25 @@ enum SaveTrouble {
     },
 }
 
+/// Files waiting to become tabs, in order.
+struct OpenBatch {
+    paths: VecDeque<PathBuf>,
+    target: OpenTarget,
+    choice: Option<EncodingChoice>,
+}
+
+struct StatItem {
+    doc: DocId,
+    epoch: u64,
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+    links: u32,
+    hint: Option<PathBuf>,
+}
+
 struct StatResult {
     doc: DocId,
+    epoch: u64,
     /// `None`: no file at the path.
     now: Option<(FileBase, Option<FileStamp>)>,
     moved_to: Option<(PathBuf, FileBase, Option<FileStamp>)>,
@@ -607,20 +684,31 @@ pub struct DocumentStore {
     requests: Vec<(DocId, ViewRequest)>,
     questions: Vec<OpenQuestion>,
     load_queue: VecDeque<(DocId, LoadKind, LoadJob, bool)>,
+    remote_load_queue: VecDeque<(DocId, LoadKind, LoadJob, bool)>,
     loads_running: usize,
+    remote_loads_running: usize,
+    open_queue: VecDeque<OpenBatch>,
+    open_due: Option<Instant>,
     saves_running: usize,
     stat_running: bool,
+    remote_stat_running: bool,
     stat_waiting: BTreeSet<DocId>,
     close_queue: VecDeque<DocId>,
     panel_queue: VecDeque<DocId>,
     want_focus: Option<DocId>,
     removals_running: usize,
+    /// For each document key, the copies below this generation hold nothing to bring back.
+    /// The list carries this until a removal is seen to finish, so a failed removal or a kill
+    /// cannot bring a stale copy back.
+    dead_copies: BTreeMap<String, u64>,
     /// Closed views that still have a Cut on its way to the clipboard.
     closing_views: Vec<EditorView>,
     session: Option<SessionLock>,
     session_failed: bool,
     restore_started: bool,
     restored: bool,
+    restore_finished_sent: bool,
+    window_gone_by_failure: bool,
     session_dirty: bool,
     session_due: Option<Instant>,
     session_running: bool,
@@ -674,19 +762,27 @@ impl DocumentStore {
             requests: Vec::new(),
             questions: Vec::new(),
             load_queue: VecDeque::new(),
+            remote_load_queue: VecDeque::new(),
             loads_running: 0,
+            remote_loads_running: 0,
+            open_queue: VecDeque::new(),
+            open_due: None,
             saves_running: 0,
             stat_running: false,
+            remote_stat_running: false,
             stat_waiting: BTreeSet::new(),
             close_queue: VecDeque::new(),
             panel_queue: VecDeque::new(),
             want_focus: None,
             removals_running: 0,
+            dead_copies: BTreeMap::new(),
             closing_views: Vec::new(),
             session: None,
             session_failed: false,
             restore_started: false,
             restored: false,
+            restore_finished_sent: false,
+            window_gone_by_failure: false,
             session_dirty: false,
             session_due: None,
             session_running: false,
@@ -708,6 +804,9 @@ impl DocumentStore {
     }
 
     fn spawn(&self, name: &str, work: impl FnOnce() -> Completion + Send + 'static) -> bool {
+        if self.config.faults.refuse_threads.load(Ordering::Relaxed) {
+            return false;
+        }
         let sender = self.sender.clone();
         let wake = self.config.wake.clone();
         let started = std::thread::Builder::new()
@@ -945,6 +1044,11 @@ impl DocumentStore {
         }
         self.events.push(DocEvent::WindowClosed(window));
         self.touch_session();
+        if self.windows.is_empty() && (!self.restore_started || self.restore_finished_sent) {
+            self.events.push(DocEvent::LastWindowGone {
+                opened_nothing: self.window_gone_by_failure,
+            });
+        }
     }
 
     // ---------------------------------------------------------------- reading a document
@@ -1030,7 +1134,10 @@ impl DocumentStore {
         let free = !d.loading && !d.reloading && !d.moving;
         let quiet = free && !d.saving;
         DocCommands {
-            save: free && !d.read_only,
+            // A file too large to edit that has gone can be written again only from a UTF-8
+            // copy. The map of the file itself refuses to read once the file has gone.
+            save: free
+                && (!d.read_only || (d.file_state == FileState::Deleted && d.temp_copy.is_some())),
             save_as: free,
             duplicate: free,
             rename: quiet && d.path.is_some(),
@@ -1108,7 +1215,9 @@ impl DocumentStore {
             stamp: None,
             file_state: FileState::Present,
             forced_dirty: false,
+            dirty_from_delete: false,
             changed_while_away: false,
+            file_epoch: 0,
             loading: false,
             hidden: false,
             transient: false,
@@ -1136,6 +1245,8 @@ impl DocumentStore {
             asked_lossy: false,
             asked_locked: false,
             asked_fit: false,
+            fit_panel_undoes: false,
+            unlocking: false,
             panel_open: false,
             quit_skip: false,
             missing_confirm: false,
@@ -1174,14 +1285,37 @@ impl DocumentStore {
         let Some(entry) = self.docs.get(&doc) else {
             return;
         };
+        let remote = load_is_remote(&kind, &source);
         let job = self.load_job(source, entry.load_cancel.clone());
-        self.load_queue.push_back((doc, kind, job, leftovers));
+        let item = (doc, kind, job, leftovers);
+        if remote {
+            self.remote_load_queue.push_back(item);
+        } else {
+            self.load_queue.push_back(item);
+        }
         self.start_queued_loads();
     }
 
     fn start_queued_loads(&mut self) {
-        while self.loads_running < MAX_LOADS_AT_ONCE {
-            let Some((doc, kind, job, leftovers)) = self.load_queue.pop_front() else {
+        self.start_loads_from(false);
+        self.start_loads_from(true);
+    }
+
+    fn start_loads_from(&mut self, remote: bool) {
+        loop {
+            let (running, limit, queue) = if remote {
+                (
+                    self.remote_loads_running,
+                    MAX_REMOTE_LOADS_AT_ONCE,
+                    &mut self.remote_load_queue,
+                )
+            } else {
+                (self.loads_running, MAX_LOADS_AT_ONCE, &mut self.load_queue)
+            };
+            if running >= limit {
+                return;
+            }
+            let Some((doc, kind, job, leftovers)) = queue.pop_front() else {
                 return;
             };
             if !self.docs.contains_key(&doc) {
@@ -1191,8 +1325,14 @@ impl DocumentStore {
             let failed_kind = kind;
             let faults = self.config.faults.clone();
             let started = self.spawn("load", move || {
-                if matches!(thread_kind, LoadKind::Reload) {
+                if remote {
+                    hold_while(&faults.hold_remote_load, &faults.remote_load_is_held);
+                }
+                if matches!(thread_kind, LoadKind::Reload | LoadKind::Revert) {
                     hold_while(&faults.hold_reload, &faults.reload_is_held);
+                }
+                if matches!(thread_kind, LoadKind::RestoreAutosave { .. }) {
+                    hold_while(&faults.hold_restore_load, &faults.restore_load_is_held);
                 }
                 let result = run_load(&job);
                 let identity_now = match (&thread_kind, &job.source) {
@@ -1226,13 +1366,18 @@ impl DocumentStore {
                 Completion::Load {
                     doc,
                     kind: thread_kind,
+                    remote,
                     result: Box::new(result),
                     identity_now,
                     leftovers: found,
                 }
             });
             if started {
-                self.loads_running += 1;
+                if remote {
+                    self.remote_loads_running += 1;
+                } else {
+                    self.loads_running += 1;
+                }
             } else {
                 let error = DocError::new(
                     DocErrorKind::Other,
@@ -1279,13 +1424,113 @@ impl DocumentStore {
 
     /// Opens files as tabs, in this order. `choice` is what the Open dialog's encoding list
     /// said, and `None` means no dialog. Returns at once. A file already open comes forward.
+    ///
+    /// The list has the tabs made now. Three things keep files waiting, and those tabs show by
+    /// `TabsChanged` later, in order: a restore that has not ended, since a tab opened before
+    /// it would land beside the restored windows; a list longer than one group of tabs; and
+    /// files already waiting. A path that is not a file QuickEdit may open gets `OpenFailed`
+    /// with `PathRefused`. A list that would overflow the queue gets `OpenFailed` with
+    /// `TooManyFiles`, once, and the files past the limit do not open.
     pub fn open_paths(
         &mut self,
         paths: &[PathBuf],
         target: OpenTarget,
         choice: Option<EncodingChoice>,
     ) -> Result<Vec<DocId>, DocError> {
-        let mut opened = Vec::with_capacity(paths.len());
+        let mut good: VecDeque<PathBuf> =
+            VecDeque::with_capacity(paths.len().min(MAX_OPENS_PER_WAKE));
+        for raw in paths {
+            match check_open_path(raw) {
+                Ok(path) => good.push_back(path),
+                Err(error) => self.events.push(DocEvent::OpenFailed {
+                    path: raw.clone(),
+                    error,
+                }),
+            }
+        }
+        if good.is_empty() {
+            return Ok(Vec::new());
+        }
+        let waiting: usize = self.open_queue.iter().map(|b| b.paths.len()).sum();
+        let room = MAX_QUEUED_OPENS.saturating_sub(waiting);
+        if good.len() > room {
+            let first_dropped = good[room].clone();
+            let dropped = good.len() - room;
+            good.truncate(room);
+            let error = DocError::new(
+                DocErrorKind::TooManyFiles,
+                Some(&first_dropped),
+                format!(
+                    "{dropped} files did not open, because more than {MAX_QUEUED_OPENS} were waiting. The first is {}.",
+                    first_dropped.display()
+                ),
+            );
+            self.events.push(DocEvent::OpenFailed {
+                path: first_dropped,
+                error,
+            });
+        }
+        if good.is_empty() {
+            return Ok(Vec::new());
+        }
+        let restoring = self.restore_started && !self.restored;
+        if restoring || !self.open_queue.is_empty() {
+            self.open_queue.push_back(OpenBatch {
+                paths: good,
+                target,
+                choice,
+            });
+            return Ok(Vec::new());
+        }
+        let mut batch = OpenBatch {
+            paths: good,
+            target,
+            choice,
+        };
+        let opened = self.open_group(&mut batch);
+        if !batch.paths.is_empty() {
+            self.open_queue.push_back(batch);
+            self.open_due = Some(Instant::now() + OPEN_SPACING);
+        }
+        Ok(opened)
+    }
+
+    /// One poll's share of the waiting files.
+    fn run_open_queue(&mut self, now: Instant) {
+        if self.restore_started && !self.restored {
+            return;
+        }
+        if self.open_queue.is_empty() {
+            self.open_due = None;
+            return;
+        }
+        if self.open_due.is_some_and(|at| at > now) {
+            return;
+        }
+        let mut budget = MAX_OPENS_PER_WAKE;
+        while budget > 0 {
+            let Some(mut batch) = self.open_queue.pop_front() else {
+                break;
+            };
+            let before = batch.paths.len();
+            self.open_group(&mut batch);
+            budget = budget.saturating_sub(before - batch.paths.len());
+            if !batch.paths.is_empty() {
+                self.open_queue.push_front(batch);
+                break;
+            }
+        }
+        self.open_due = (!self.open_queue.is_empty()).then(|| now + OPEN_SPACING);
+    }
+
+    /// Opens one group from the front of a batch. `paths` have passed `check_open_path`.
+    fn open_group(&mut self, batch: &mut OpenBatch) -> Vec<DocId> {
+        let count = batch.paths.len().min(MAX_OPENS_PER_WAKE);
+        let finishes_batch = count == batch.paths.len();
+        let group: Vec<PathBuf> = batch.paths.drain(..count).collect();
+        let target = batch.target;
+        let choice = batch.choice;
+        let mut opened = Vec::with_capacity(group.len());
         let mut replaces = self.replaceable_transient();
         if let Some(transient) = replaces
             && let Some(doc) = self.docs.get_mut(&transient)
@@ -1294,9 +1539,8 @@ impl DocumentStore {
             doc.transient = false;
         }
         let mut new_window: Option<WindowId> = None;
-        let count = paths.len();
-        for (index, raw) in paths.iter().enumerate() {
-            let path = std::path::absolute(raw).unwrap_or_else(|_| raw.clone());
+        for (index, path) in group.into_iter().enumerate() {
+            let is_last = finishes_batch && index + 1 == count;
             if let Some(existing) = self.find_by_path_text(&path) {
                 self.bring_forward(existing, &path);
                 continue;
@@ -1318,7 +1562,13 @@ impl DocumentStore {
             if replaces.is_some() {
                 new_window = Some(window);
             }
-            let mut doc = self.make_doc(Format::new_document())?;
+            let mut doc = match self.make_doc(Format::new_document()) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    self.events.push(DocEvent::OpenFailed { path, error });
+                    continue;
+                }
+            };
             doc.path = Some(path.clone());
             doc.loading = true;
             doc.view.begin_load();
@@ -1335,9 +1585,9 @@ impl DocumentStore {
                 entry.transient = false;
             }
             if replacing.is_none() {
-                self.attach(window, id, None, index + 1 == count);
+                self.attach(window, id, None, is_last);
             }
-            if index + 1 == count {
+            if is_last {
                 self.want_focus = Some(id);
             }
             self.queue_load(
@@ -1356,7 +1606,11 @@ impl DocumentStore {
             );
             opened.push(id);
         }
-        Ok(opened)
+        // The rest of a list for a new window goes to the window this group made.
+        if let (OpenTarget::NewWindow, Some(window)) = (target, new_window) {
+            batch.target = OpenTarget::Window(window);
+        }
+        opened
     }
 
     fn bring_forward(&mut self, doc: DocId, path: &Path) {
@@ -1414,6 +1668,16 @@ impl DocumentStore {
                     d.stamp = stamp;
                     d.undecodable = None;
                     d.reload_tries = 0;
+                    // Disk holds what the view held at the read, so there is nothing to ask.
+                    d.changed_while_away = false;
+                }
+                // A copy from when the file was gone: its text is on disk again.
+                if self
+                    .docs
+                    .get(&doc)
+                    .is_some_and(|d| !d.is_dirty() && d.autosave.generation.is_some())
+                {
+                    self.remove_autosave(doc);
                 }
                 self.events.push(DocEvent::DocChanged(doc));
                 self.reload_ended(doc);
@@ -1453,6 +1717,11 @@ impl DocumentStore {
                             .get(&doc)
                             .map_or(EncodingChoice::Automatic, |d| self.choice_of(d.open_choice));
                         if let Some(d) = self.docs.get_mut(&doc) {
+                            // The copy may be whole, and only unreadable for now: held, or too
+                            // big for this moment's memory. So nothing this document does may
+                            // touch it. A new key leaves it to the next launch, which finds it
+                            // as a copy with no row and tries again.
+                            d.key = random_key();
                             d.autosave.generation = None;
                         }
                         self.queue_load(
@@ -1508,7 +1777,11 @@ impl DocumentStore {
             return;
         }
         d.undecodable = stamp;
-        d.stamp = stamp.or(d.stamp);
+        // Only bytes that cannot be decoded count as seen, as on the Mac. Any other failure
+        // read nothing, so the stamp stays, and a Save finds the change and asks.
+        if error.kind == DocErrorKind::EncodingDoesNotFit {
+            d.stamp = stamp.or(d.stamp);
+        }
         self.events.push(DocEvent::ReloadFailed { doc, error });
     }
 
@@ -1532,7 +1805,9 @@ impl DocumentStore {
         entry.load_cancel.store(true, Ordering::Release);
         if let Some(window) = window {
             self.detach(window, doc);
+            self.window_gone_by_failure = true;
             self.drop_empty_window(window);
+            self.window_gone_by_failure = false;
         }
         drop(entry);
         self.events.push(DocEvent::DocClosed(doc));
@@ -1575,7 +1850,10 @@ impl DocumentStore {
             LoadKind::RestoreAutosave { path, saved_base } => {
                 self.finish_restore_autosave(doc, body, path, saved_base, identity_now);
             }
-            LoadKind::Reload | LoadKind::LargeRetry | LoadKind::AfterCopy => {
+            LoadKind::LargeRetry | LoadKind::AfterCopy => {
+                self.adopt_body(doc, body, AdoptThen::SameFile);
+            }
+            LoadKind::Reload => {
                 let dirty = self.docs.get(&doc).is_some_and(Doc::is_dirty);
                 if dirty {
                     // Typed into meanwhile: nothing is replaced, and a Save asks.
@@ -1659,11 +1937,19 @@ impl DocumentStore {
         saved_base: Option<FileBase>,
         identity_now: Option<(Option<FileBase>, Option<FileStamp>)>,
     ) {
+        // What the copy knew when it was written, not what a later list says. A list written
+        // after a Save has the new file's marks, and that copy is older than that file.
+        let head = body.copy_head;
+        let saved_base = head.and_then(|h| h.base).or(saved_base);
+        let flagged = head.is_some_and(|h| h.changed_while_away)
+            || self.docs.get(&doc).is_some_and(|d| d.changed_while_away);
         self.adopt_body(doc, body, AdoptThen::Plain);
         let mut newer = None;
         if let Some(d) = self.docs.get_mut(&doc) {
             d.forced_dirty = true;
+            d.dirty_from_delete = false;
             d.was_dirty = true;
+            d.changed_while_away = flagged;
             if let Some(path) = path {
                 let (now_base, now_stamp) = identity_now.unwrap_or((None, None));
                 d.base = now_base.or(saved_base);
@@ -1673,6 +1959,7 @@ impl DocumentStore {
                         // The file went while QuickEdit was not running.
                         d.file_state = FileState::Deleted;
                         d.stamp = None;
+                        d.changed_while_away = false;
                         self.events.push(DocEvent::FileDeleted {
                             doc,
                             path: path.clone(),
@@ -1684,8 +1971,10 @@ impl DocumentStore {
                                 && saved.size == now.size
                                 && saved.written == now.written
                         });
-                        if !same {
+                        if !same || now_stamp.is_none() {
                             d.changed_while_away = true;
+                        }
+                        if d.changed_while_away {
                             newer = Some(path.clone());
                         }
                     }
@@ -1716,6 +2005,14 @@ impl DocumentStore {
             self.forward(doc, ctx);
             return;
         }
+        // The flush above, or a wait for a Cut, may have let an edit in since the read began.
+        // A reload never replaces edits: a Save finds the change and asks.
+        if then == AdoptThen::Reloaded && d.is_dirty() {
+            self.forward(doc, ctx);
+            free_off_thread(Loaded::Body(body));
+            self.reload_ended(doc);
+            return;
+        }
         let Body {
             file,
             format,
@@ -1723,6 +2020,7 @@ impl DocumentStore {
             base,
             stamp,
             temp_copy,
+            copy_head: _,
         } = body;
         // The text in the view goes, by the caller's rule, so the guard against losing it
         // has nothing to guard. A Revert has asked, and a reload runs only when clean.
@@ -1732,7 +2030,7 @@ impl DocumentStore {
         let read_only = matches!(file, LoadedFile::ReadOnly(_));
         let place = match then {
             AdoptThen::Reverted => Some(Place::default()),
-            AdoptThen::Reloaded => Some(d.capture_place()),
+            AdoptThen::Reloaded | AdoptThen::SameFile => Some(d.capture_place()),
             AdoptThen::Plain => d.pending_place.or(d.place_if_restored()),
         };
         if let Err(message) = d.view.adopt(file) {
@@ -1741,23 +2039,38 @@ impl DocumentStore {
                 d.path.as_deref(),
                 format!("The new text could not reach the window: {message}"),
             );
-            d.loading = false;
+            let first_text = d.loading;
+            let path = d.path.clone().unwrap_or_default();
             d.reloading = false;
             d.view.end_load();
             self.forward(doc, ctx);
-            self.events.push(DocEvent::ReloadFailed { doc, error });
+            if first_text {
+                // The view has none of this document's text, so it must not look like a clean
+                // document that a Save could write. A copy stays for the next launch.
+                self.events.push(DocEvent::OpenFailed { path, error });
+                self.discard_failed_doc(doc);
+            } else {
+                self.events.push(DocEvent::ReloadFailed { doc, error });
+            }
             return;
         }
         if let Some(old) = d.temp_copy.take() {
             remove_temp_later(old);
         }
         d.temp_copy = temp_copy;
+        d.file_epoch += 1;
         d.format = format;
         d.byte_count = byte_count;
-        if base.is_some() {
-            d.base = base;
+        if d.path.is_some() {
+            if base.is_some() {
+                d.base = base;
+            }
+            d.stamp = stamp.or(d.stamp);
+        } else {
+            // A copy with no file reads through its source, and it is not that file.
+            d.base = None;
+            d.stamp = None;
         }
-        d.stamp = stamp.or(d.stamp);
         d.read_only = read_only;
         if read_only && d.copy_source.is_none() {
             d.copy_source = d.path.clone();
@@ -1766,6 +2079,7 @@ impl DocumentStore {
             d.copy_source = None;
         }
         d.forced_dirty = false;
+        d.dirty_from_delete = false;
         d.changed_while_away = false;
         d.file_state = FileState::Present;
         d.undecodable = None;
@@ -1777,10 +2091,12 @@ impl DocumentStore {
         d.asked_lossy = false;
         d.asked_locked = false;
         d.asked_fit = false;
+        d.fit_panel_undoes = false;
         d.view.set_prevent_editing(d.prevent_editing && !read_only);
         d.pending_place = place;
         d.autosave.due = None;
-        let had_copy = then != AdoptThen::Plain && d.autosave.generation.is_some();
+        let had_copy = matches!(then, AdoptThen::Reloaded | AdoptThen::Reverted)
+            && d.autosave.generation.is_some();
         self.forward(doc, ctx);
         self.try_apply_place(doc);
         self.events.push(DocEvent::TextReplaced(doc));
@@ -1996,6 +2312,26 @@ impl DocumentStore {
             ));
         }
         let open = self.questions.remove(at);
+        if let Err(error) = self.apply_answer(&open, answer) {
+            // Nothing happened, so nothing may stay half done, and the person can answer again.
+            if let Some(d) = self.docs.get_mut(&open.question.doc) {
+                match (open.question.kind, answer) {
+                    (QuestionKind::SaveBeforeClose, Answer::Save) => d.close_after_save = false,
+                    (QuestionKind::LossyOverwrite, Answer::Overwrite) => d.format.lossy = true,
+                    _ => {}
+                }
+            }
+            let at = at.min(self.questions.len());
+            self.questions.insert(at, open);
+            return Err(error);
+        }
+        if open.usage == QuestionUse::QuitReview {
+            self.advance_quit();
+        }
+        Ok(())
+    }
+
+    fn apply_answer(&mut self, open: &OpenQuestion, answer: Answer) -> Result<(), DocError> {
         let doc = open.question.doc;
         match (open.question.kind, answer) {
             (QuestionKind::SaveBeforeClose, Answer::Save) => {
@@ -2019,10 +2355,7 @@ impl DocumentStore {
                 }
                 self.advance_quit();
             }
-            (QuestionKind::AutosaveFailedAtQuit, _) => {
-                self.quitting = false;
-                self.quit_ready_sent = false;
-            }
+            (QuestionKind::AutosaveFailedAtQuit, _) => self.cancel_quit(),
             (QuestionKind::LossyFirstEdit, Answer::Overwrite) => {
                 if let Some(d) = self.docs.get_mut(&doc) {
                     d.format.lossy = false;
@@ -2032,8 +2365,12 @@ impl DocumentStore {
                 // The copy has the edit, and the edit goes from this one.
                 self.duplicate(doc)?;
                 self.undo(doc);
+                self.ask_lossy_again(doc);
             }
-            (QuestionKind::LossyFirstEdit, _) => self.undo(doc),
+            (QuestionKind::LossyFirstEdit, _) => {
+                self.undo(doc);
+                self.ask_lossy_again(doc);
+            }
             (QuestionKind::LossyOverwrite, Answer::Overwrite) => {
                 if let Some(d) = self.docs.get_mut(&doc) {
                     d.format.lossy = false;
@@ -2045,8 +2382,11 @@ impl DocumentStore {
                 self.cancel_closing(doc);
             }
             (QuestionKind::LossyOverwrite, _) => self.cancel_closing(doc),
-            (QuestionKind::EncodingNoLongerFits { .. }, Answer::ChooseEncoding) => {
+            (QuestionKind::EncodingNoLongerFits { on_edit }, Answer::ChooseEncoding) => {
                 self.ask_for_panel(doc, PanelPurpose::SaveAs);
+                if let Some(d) = self.docs.get_mut(&doc) {
+                    d.fit_panel_undoes = on_edit;
+                }
             }
             (QuestionKind::EncodingNoLongerFits { on_edit }, _) => {
                 if on_edit {
@@ -2058,9 +2398,20 @@ impl DocumentStore {
                 self.cancel_closing(doc);
             }
             (QuestionKind::ChangedOnDisk, Answer::SaveAnyway) => {
-                self.start_save(doc, None, true)?
+                let d = self.docs.get(&doc).ok_or_else(|| self.no_doc())?;
+                if d.loading || d.reloading || d.saving {
+                    return Err(self.busy(doc, "is busy with another file action"));
+                }
+                self.start_save(doc, None, true)?;
             }
-            (QuestionKind::ChangedOnDisk, Answer::Revert) => self.revert_now(doc)?,
+            (QuestionKind::ChangedOnDisk, Answer::Revert) => {
+                self.revert_now(doc)?;
+                // The text it was asked to save has gone, so a close that waited on it ends.
+                if let Some(d) = self.docs.get_mut(&doc) {
+                    d.close_after_save = false;
+                }
+                self.close_queue.clear();
+            }
             (QuestionKind::ChangedOnDisk, _) => self.cancel_closing(doc),
             (QuestionKind::LockedFile { on_edit }, Answer::Unlock) => {
                 self.unlock(doc, !on_edit);
@@ -2084,10 +2435,14 @@ impl DocumentStore {
             (QuestionKind::ConfirmRevert, Answer::Revert) => self.revert_now(doc)?,
             (QuestionKind::ConfirmRevert, _) => {}
         }
-        if open.usage == QuestionUse::QuitReview {
-            self.advance_quit();
-        }
         Ok(())
+    }
+
+    /// The edit that raised the question has gone, so the next edit asks as this one did.
+    fn ask_lossy_again(&mut self, doc: DocId) {
+        if let Some(d) = self.docs.get_mut(&doc) {
+            d.asked_lossy = false;
+        }
     }
 
     fn undo(&mut self, doc: DocId) {
@@ -2109,7 +2464,8 @@ impl DocumentStore {
         let Some(path) = self.docs.get(&doc).and_then(|d| d.path.clone()) else {
             return;
         };
-        self.spawn("unlock", move || {
+        let shown = path.clone();
+        let started = self.spawn("unlock", move || {
             let result = std::fs::metadata(&path)
                 .and_then(|meta| {
                     let mut permissions = meta.permissions();
@@ -2124,6 +2480,13 @@ impl DocumentStore {
                 result,
             }
         });
+        if started {
+            if let Some(d) = self.docs.get_mut(&doc) {
+                d.unlocking = true;
+            }
+        } else {
+            self.finish_unlock(doc, then_save, Err(no_thread("unlock", &shown)));
+        }
     }
 
     // ---------------------------------------------------------------- saving
@@ -2150,16 +2513,16 @@ impl DocumentStore {
     /// the text as it then stands. Typing that follows belongs to the next save.
     pub fn save(&mut self, doc: DocId) -> Result<(), DocError> {
         let d = self.docs.get(&doc).ok_or_else(|| self.no_doc())?;
-        if d.read_only {
+        if d.loading || d.reloading {
+            return Err(self.busy(doc, "is being read again"));
+        }
+        if d.read_only && d.path.is_some() && d.file_state != FileState::Deleted {
             // A file too large to edit already holds its text. It is never written over.
             if d.close_after_save {
                 self.finish_close(doc);
                 self.continue_closing();
             }
             return Ok(());
-        }
-        if d.loading || d.reloading {
-            return Err(self.busy(doc, "is being read again"));
         }
         if d.path.is_none() {
             self.ask_for_panel(doc, PanelPurpose::Save);
@@ -2217,6 +2580,8 @@ impl DocumentStore {
             )
         })?;
         d.panel_open = false;
+        // The dialog has ended, so its Cancel can no longer undo an edit.
+        d.fit_panel_undoes = false;
         let path = std::path::absolute(&path).unwrap_or(path);
         let same_file = d
             .path
@@ -2253,7 +2618,8 @@ impl DocumentStore {
     pub fn panel_cancelled(&mut self, doc: DocId) {
         let was_edit_panel = self.docs.get_mut(&doc).is_some_and(|d| {
             d.panel_open = false;
-            std::mem::take(&mut d.asked_fit)
+            d.asked_fit = false;
+            std::mem::take(&mut d.fit_panel_undoes)
         });
         if was_edit_panel {
             self.undo(doc);
@@ -2268,10 +2634,36 @@ impl DocumentStore {
             d.save_again = false;
         }
         self.close_queue.clear();
-        if self.quitting && self.quit_review.contains(&doc) {
-            self.quit_review.clear();
-            self.quitting = false;
-            self.quit_ready_sent = false;
+        if self.in_quit_review(doc) {
+            self.cancel_quit();
+        }
+    }
+
+    fn in_quit_review(&self, doc: DocId) -> bool {
+        self.quitting && self.quit_review.contains(&doc)
+    }
+
+    /// The person cancelled the quit. No answer given during it counts any more.
+    fn cancel_quit(&mut self) {
+        self.quitting = false;
+        self.quit_ready_sent = false;
+        self.quit_review.clear();
+        self.questions
+            .retain(|q| q.usage != QuestionUse::QuitReview);
+        for d in self.docs.values_mut() {
+            d.quit_skip = false;
+        }
+    }
+
+    /// A Save failed. During a quit review the question comes back, by `advance_quit`.
+    /// Otherwise the close that waited on it ends.
+    fn save_did_not_happen(&mut self, doc: DocId) {
+        if self.in_quit_review(doc) {
+            if let Some(d) = self.docs.get_mut(&doc) {
+                d.save_again = false;
+            }
+        } else {
+            self.cancel_closing(doc);
         }
     }
 
@@ -2356,7 +2748,8 @@ impl DocumentStore {
         let format = encoding.map_or_else(|| d.format.clone(), |e| d.format.changed_to(e));
         let revision = d.view.revision();
         let snapshot = d.view.worker_snapshot();
-        let copy_source = if d.read_only {
+        // A deleted file has no bytes at its name to copy, so the text comes from the view.
+        let copy_source = if d.read_only && d.file_state == FileState::Present {
             d.copy_source.clone()
         } else {
             None
@@ -2452,7 +2845,7 @@ impl DocumentStore {
                         error,
                         offer_save_as: true,
                     });
-                    self.cancel_closing(doc);
+                    self.save_did_not_happen(doc);
                 } else {
                     self.ask(
                         doc,
@@ -2485,11 +2878,14 @@ impl DocumentStore {
                     error,
                     offer_save_as,
                 });
-                self.cancel_closing(doc);
+                self.save_did_not_happen(doc);
                 self.next_panel();
             }
         }
-        self.events.push(DocEvent::DocChanged(doc));
+        // A close at the end of this Save has already said its last word on this document.
+        if self.docs.contains_key(&doc) {
+            self.events.push(DocEvent::DocChanged(doc));
+        }
         self.check_stat_after_save(doc);
         self.advance_quit();
     }
@@ -2515,6 +2911,10 @@ impl DocumentStore {
             return;
         };
         let was_read_only = d.read_only;
+        let was_deleted = d.file_state == FileState::Deleted;
+        // The stamp is taken just after the swap, and it cannot cover that instant. A file of
+        // another size there, or no stamp at all, shows the file is not known to be ours.
+        let not_ours = done.base.is_none_or(|b| b.size != done.written) || done.stamp.is_none();
         if !was_read_only {
             // True when no typing came during the write. Otherwise the view stays dirty.
             d.view.mark_save_point_at(revision);
@@ -2523,10 +2923,12 @@ impl DocumentStore {
         d.path = Some(path.clone());
         d.custom_name = None;
         d.untitled_number = 0;
+        d.file_epoch += 1;
         d.base = done.base.or(d.base);
-        d.stamp = done.stamp;
+        d.stamp = if not_ours { None } else { done.stamp };
         d.forced_dirty = false;
-        d.changed_while_away = false;
+        d.dirty_from_delete = false;
+        d.changed_while_away = not_ours;
         d.file_state = FileState::Present;
         d.missing_recheck_at = None;
         d.panel_open = false;
@@ -2534,6 +2936,7 @@ impl DocumentStore {
         d.asked_locked = false;
         d.asked_lossy = false;
         d.asked_fit = false;
+        d.fit_panel_undoes = false;
         d.format = format;
         // The disk now holds what this text encodes to, so a next save changes nothing else.
         d.format.lossy = false;
@@ -2556,12 +2959,18 @@ impl DocumentStore {
             }
         } else {
             d.autosave.due = None;
+            d.autosave.last_failure = None;
+            d.autosave.last_failure_kind = None;
         }
         let close_after = d.close_after_save && !still_dirty;
         let again = std::mem::take(&mut d.save_again) && still_dirty;
-        let reopen_large = was_read_only && save_as;
+        let reopen_large = was_read_only && (save_as || was_deleted);
         if !still_dirty {
             self.remove_autosave(doc);
+        }
+        if not_ours {
+            // A clean document reads what is there now. A dirty one asks at its next Save.
+            self.stat_waiting.insert(doc);
         }
         if save_as {
             add_recent(&mut self.recent, &path);
@@ -2630,7 +3039,9 @@ impl DocumentStore {
             .map(|d| d.id)
             .collect();
         for doc in dirty {
-            if self.path(doc).is_none() {
+            if self.is_loading(doc) {
+                failed.push((doc, self.busy(doc, "is still being read")));
+            } else if self.path(doc).is_none() {
                 self.panel_queue.push_back(doc);
             } else if let Err(error) = self.save(doc) {
                 failed.push((doc, error));
@@ -2672,7 +3083,7 @@ impl DocumentStore {
             });
             return;
         }
-        self.spawn("fit", move || {
+        let started = self.spawn("fit", move || {
             let mut unfit = Vec::new();
             if let Ok(text) = read_all_text(snapshot.as_ref()) {
                 for encoding in encodings {
@@ -2683,6 +3094,13 @@ impl DocumentStore {
             }
             Completion::Fit { doc, unfit }
         });
+        if !started {
+            // As past the limit: the list stays on, and a Save names any failure.
+            self.events.push(DocEvent::EncodingFit {
+                doc,
+                unfit: Vec::new(),
+            });
+        }
     }
 
     // ---------------------------------------------------------------- other file commands
@@ -2709,6 +3127,8 @@ impl DocumentStore {
         let format = d.format.clone();
         let name = copy_name(&d.display_name());
         let wrap = d.wrap_to_page;
+        let read_as_copy = d.temp_copy.is_some();
+        let source_choice = d.open_choice;
         self.forward(doc, ctx);
         let mut copy = self.make_doc(format.clone())?;
         let mut name = name;
@@ -2723,7 +3143,14 @@ impl DocumentStore {
         copy.view.begin_load();
         copy.copy_source = source.clone();
         copy.wrap_to_page = wrap;
-        copy.open_choice = OpenChoice::Chosen(EncodingChoice::Automatic);
+        copy.open_choice = if read_only {
+            source_choice
+        } else {
+            OpenChoice::Chosen(EncodingChoice::Automatic)
+        };
+        // Its text exists nowhere else if its source goes, from the first moment.
+        copy.forced_dirty = true;
+        copy.was_dirty = true;
         let id = copy.id;
         self.docs.insert(id, copy);
         let window = self.window_of(doc);
@@ -2732,6 +3159,13 @@ impl DocumentStore {
             self.attach(window, id, at.map(|at| at + 1), true);
         }
         let job_source = match (read_only, source) {
+            // The map shows a file's own UTF-8 bytes only, so another encoding needs a copy.
+            (true, Some(path)) if read_as_copy => Source::File {
+                path,
+                choice: self.choice_of(source_choice),
+                compare: None,
+                force_copy: false,
+            },
             (true, Some(path)) => Source::Mapped { path, format },
             _ => Source::Snapshot { snapshot, format },
         };
@@ -2777,12 +3211,21 @@ impl DocumentStore {
         if d.saving {
             return Err(self.busy(doc, "is being saved"));
         }
+        if d.loading || d.reloading {
+            return Err(self.busy(doc, "is being read again"));
+        }
         let Some(path) = d.path.clone() else {
             return Ok(());
         };
+        // The answer covers what was typed up to now. From here the view refuses edits until
+        // the text arrives, as the Mac does during a reload, so none can be lost to it.
+        let mut ctx = ViewContext::default();
+        d.view.flush_input(&mut ctx);
+        d.view.begin_load();
         d.reloading = true;
         let open_choice = d.open_choice;
         let choice = self.choice_of(open_choice);
+        self.forward(doc, ctx);
         self.queue_load(
             doc,
             LoadKind::Revert,
@@ -2848,7 +3291,8 @@ impl DocumentStore {
             return Ok(());
         }
         d.moving = true;
-        self.spawn("move", move || {
+        let shown = to.clone();
+        let started = self.spawn("move", move || {
             let result = move_file(&from, &to, replace).and_then(|()| {
                 let (base, _) = file_base(&to)
                     .map_err(|e| DocError::io("QuickEdit could not read", &to, &e))?;
@@ -2860,6 +3304,12 @@ impl DocumentStore {
                 result,
             }
         });
+        if !started {
+            if let Some(d) = self.docs.get_mut(&doc) {
+                d.moving = false;
+            }
+            return Err(no_thread("move the file to", &shown));
+        }
         Ok(())
     }
 
@@ -2867,13 +3317,46 @@ impl DocumentStore {
     /// that is there. A kill inside the swap of a save can leave the old text only in that
     /// file, for the moment Windows takes between its two renames.
     pub fn recover_leftover(&mut self, leftover: PathBuf, target: PathBuf) {
-        self.spawn("recover", move || {
+        let shown = target.clone();
+        let started = self.spawn("recover", move || {
             let result = move_file(&leftover, &target, false);
             Completion::Recovered {
                 path: target,
                 result,
             }
         });
+        if !started {
+            self.events.push(DocEvent::LeftoverNotRecovered {
+                error: no_thread("recover", &shown),
+                path: shown,
+            });
+        }
+    }
+
+    /// Deletes a file from `LeftoverFound`, when the user says it is not wanted. `path` is the
+    /// document path from that event. The answer is `LeftoverDeleted` or `LeftoverNotDeleted`.
+    pub fn discard_leftover(&mut self, leftover: PathBuf, path: PathBuf) {
+        let shown = leftover.clone();
+        let started = self.spawn("leftover", move || {
+            let what = "QuickEdit could not delete";
+            let result = find_leftovers(&path)
+                .and_then(|list| match list.iter().find(|l| l.path == leftover) {
+                    Some(found) => qe_codec::delete_leftover(
+                        found,
+                        qe_codec::LeftoverDelete::IncludeRecoverable,
+                    ),
+                    // A file no longer listed is one that has gone already.
+                    None => Ok(()),
+                })
+                .map_err(|e| DocError::from_codec(what, &leftover, e));
+            Completion::LeftoverGone { leftover, result }
+        });
+        if !started {
+            self.events.push(DocEvent::LeftoverNotDeleted {
+                error: no_thread("delete", &shown),
+                leftover: shown,
+            });
+        }
     }
 
     // ---------------------------------------------------------------- closing
@@ -2916,6 +3399,9 @@ impl DocumentStore {
     fn finish_close(&mut self, doc: DocId) {
         let window = self.window_of(doc);
         self.questions.retain(|q| q.question.doc != doc);
+        // A question still on its way to the host must not name a document that has gone.
+        self.events
+            .retain(|e| !matches!(e, DocEvent::Question(q) if q.doc == doc));
         self.stat_waiting.remove(&doc);
         self.panel_queue.retain(|d| *d != doc);
         if self.want_focus == Some(doc) {
@@ -2976,6 +3462,7 @@ impl DocumentStore {
             read_only: d.read_only,
             copy_source: d.copy_source.clone(),
             has_autosave: d.autosave.generation.is_some(),
+            changed_while_away: d.changed_while_away,
         }
     }
 
@@ -3033,9 +3520,28 @@ impl DocumentStore {
                 result,
             }
         });
-        if started && let Some(d) = self.docs.get_mut(&doc) {
-            d.autosave.running = Some(cancel);
-            d.autosave.due = None;
+        if started {
+            if let Some(d) = self.docs.get_mut(&doc) {
+                d.autosave.running = Some(cancel);
+                d.autosave.due = None;
+            }
+            return;
+        }
+        let error = DocError::new(
+            DocErrorKind::AutosaveFailed,
+            None,
+            "Windows could not start a thread to write the autosaved copy. The text is still in the window.",
+        );
+        let now = Instant::now();
+        let delay = self.config.autosave_delay;
+        if let Some(d) = self.docs.get_mut(&doc) {
+            d.autosave.due = autosave_time(now, delay.max(THREAD_RETRY));
+            let new_failure = d.autosave.last_failure_kind != Some(error.kind);
+            d.autosave.last_failure_kind = Some(error.kind);
+            d.autosave.last_failure = Some(error.message.clone());
+            if new_failure {
+                self.events.push(DocEvent::AutosaveFailed { doc, error });
+            }
         }
     }
 
@@ -3084,9 +3590,6 @@ impl DocumentStore {
                 d.autosave.last_failure_kind = Some(error.kind);
                 d.autosave.last_failure = Some(error.message.clone());
                 d.autosave.due = autosave_time(now, delay);
-                if self.quitting {
-                    self.review_failed_quit_autosave(doc, &error);
-                }
                 if new_failure {
                     self.events.push(DocEvent::AutosaveFailed { doc, error });
                 }
@@ -3097,7 +3600,9 @@ impl DocumentStore {
 
     fn review_failed_quit_autosave(&mut self, doc: DocId, error: &DocError) {
         let name = self.display_name(doc);
-        self.quit_review.push_back(doc);
+        if !self.quit_review.contains(&doc) {
+            self.quit_review.push_back(doc);
+        }
         self.ask_with(
             doc,
             QuestionKind::AutosaveFailedAtQuit,
@@ -3138,18 +3643,39 @@ impl DocumentStore {
         };
         // A copy this run writes later is newer than this removal, and it stays.
         let below = self.next_generation;
+        // The list carries this before the removal is known to work, so that a failed removal
+        // or a kill cannot bring back a copy whose text is on disk or was discarded.
+        self.dead_copies.insert(key.clone(), below);
+        self.touch_session_now();
         self.removals_running += 1;
+        let job_key = key;
         let started = self.spawn("autosave-remove", move || {
-            let result = remove_generations(&dir, &key, below);
-            Completion::AutosaveRemoved { doc, result }
+            let result = remove_generations(&dir, &job_key, below);
+            Completion::AutosaveRemoved {
+                doc,
+                key: job_key,
+                below,
+                result,
+            }
         });
         if !started {
             self.removals_running -= 1;
+            self.events.push(DocEvent::AutosaveFailed {
+                doc,
+                error: DocError::new(
+                    DocErrorKind::AutosaveFailed,
+                    None,
+                    "Windows could not start a thread to remove an old autosaved copy. The copy will not come back, and the next launch removes it.",
+                ),
+            });
         }
     }
 
     fn run_due_autosaves(&mut self, now: Instant) {
         if self.session.is_none() {
+            if self.restored {
+                self.no_session_for_autosaves(now);
+            }
             return;
         }
         let due: Vec<DocId> = self
@@ -3183,6 +3709,34 @@ impl DocumentStore {
                 continue;
             }
             self.start_autosave(doc);
+        }
+    }
+
+    /// With no session folder no copy can ever be written. So each due time is used up here,
+    /// and the user hears it once.
+    fn no_session_for_autosaves(&mut self, now: Instant) {
+        let mut told = Vec::new();
+        for d in self.docs.values_mut() {
+            if !d.autosave.due.is_some_and(|at| at <= now) {
+                continue;
+            }
+            d.autosave.due = None;
+            if d.is_dirty()
+                && !d.read_only
+                && d.autosave.last_failure_kind != Some(DocErrorKind::AutosaveFailed)
+            {
+                let error = DocError::new(
+                    DocErrorKind::AutosaveFailed,
+                    d.path.as_deref(),
+                    "QuickEdit has no session folder, so unsaved text is not being kept. Save it to keep it.",
+                );
+                d.autosave.last_failure_kind = Some(error.kind);
+                d.autosave.last_failure = Some(error.message.clone());
+                told.push((d.id, error));
+            }
+        }
+        for (doc, error) in told {
+            self.events.push(DocEvent::AutosaveFailed { doc, error });
         }
     }
 
@@ -3244,7 +3798,7 @@ impl DocumentStore {
                 docs.push(meta);
             }
         }
-        encode_manifest(&windows, &docs)
+        encode_session(&windows, &docs, &self.dead_copies)
     }
 
     fn start_session_write(&mut self) {
@@ -3263,6 +3817,12 @@ impl DocumentStore {
         });
         if !started {
             self.session_running = false;
+            self.events.push(DocEvent::SessionWriteFailed(no_thread(
+                "save the list of windows at",
+                &self.config.root,
+            )));
+            // The next change tries again. No time is set here, so a poll does not spin.
+            self.session_dirty = false;
         }
     }
 
@@ -3280,11 +3840,16 @@ impl DocumentStore {
         let text = encode_recent(&self.recent);
         self.recent_dirty = false;
         self.recent_running = true;
+        let shown = root.clone();
         let started = self.spawn("recent", move || {
             Completion::RecentWritten(write_recent(&root, &text))
         });
         if !started {
             self.recent_running = false;
+            self.events.push(DocEvent::SessionWriteFailed(no_thread(
+                "save Open Recent at",
+                &shown,
+            )));
         }
     }
 
@@ -3319,7 +3884,7 @@ impl DocumentStore {
                 None,
                 "Windows could not start a thread to read the last session.",
             )));
-            self.events.push(DocEvent::RestoreFinished { windows: 0 });
+            self.finish_restore();
         }
     }
 
@@ -3330,9 +3895,7 @@ impl DocumentStore {
             Err(error) => {
                 self.session_failed = true;
                 self.events.push(DocEvent::RestoreProblem(error));
-                self.events.push(DocEvent::RestoreFinished {
-                    windows: self.windows.len(),
-                });
+                self.finish_restore();
                 return;
             }
         };
@@ -3343,7 +3906,9 @@ impl DocumentStore {
             problems,
             recent,
             next_generation,
+            dead,
         } = plan;
+        self.dead_copies.extend(dead);
         self.session = Some(lock);
         self.next_generation = self.next_generation.max(next_generation);
         for problem in problems {
@@ -3392,6 +3957,15 @@ impl DocumentStore {
         }
         self.sync_watches();
         self.touch_session();
+        self.finish_restore();
+    }
+
+    /// Files that waited for the restore land now, in the windows it made, so that a request
+    /// from before and one from after share a window, and the count below includes them.
+    fn finish_restore(&mut self) {
+        self.open_due = None;
+        self.run_open_queue(Instant::now());
+        self.restore_finished_sent = true;
         self.events.push(DocEvent::RestoreFinished {
             windows: self.windows.len(),
         });
@@ -3418,6 +3992,9 @@ impl DocumentStore {
         doc.base = meta.base;
         doc.loading = true;
         doc.read_only = meta.read_only;
+        // Set from the start, so that a list written during the load still says it.
+        doc.changed_while_away = meta.changed_while_away;
+        doc.was_dirty = !generations.is_empty();
         doc.view.begin_load();
         let place = Place {
             anchor: meta.anchor,
@@ -3446,9 +4023,12 @@ impl DocumentStore {
             self.queue_load(
                 id,
                 LoadKind::RestoreCopy,
-                Source::Mapped {
+                // Through a file read, since the source may be in another encoding.
+                Source::File {
                     path: path.clone(),
-                    format: meta.format.clone(),
+                    choice,
+                    compare: None,
+                    force_copy: false,
                 },
                 false,
             );
@@ -3481,6 +4061,8 @@ impl DocumentStore {
             .map(|d| d.id)
             .collect();
         self.stat_waiting.extend(docs);
+        // A folder made again since its watch ended gets a new one.
+        self.sync_watches();
         self.start_stat();
     }
 
@@ -3497,8 +4079,10 @@ impl DocumentStore {
                 );
             }
         }
-        self.watches
-            .retain(|w| wanted.contains_key(&w.folder.to_string_lossy().to_lowercase()));
+        self.watches.retain(|w| {
+            !w.ended.load(Ordering::Acquire)
+                && wanted.contains_key(&w.folder.to_string_lossy().to_lowercase())
+        });
         let have: BTreeSet<String> = self
             .watches
             .iter()
@@ -3542,16 +4126,18 @@ impl DocumentStore {
             names.is_empty()
                 || path
                     .file_name()
-                    .is_some_and(|own| names.iter().any(|n| own.eq_ignore_ascii_case(n)))
+                    .is_some_and(|own| names.iter().any(|n| same_name(own, n)))
         };
         let mut hit = Vec::new();
         match news {
-            FolderNews::Names(names) => {
-                let names: Vec<&std::ffi::OsStr> = names.iter().map(|n| n.as_os_str()).collect();
+            // Every open file here gets a look, not only the names heard. A new name may be a
+            // hard link to one of them, and a later deletion must know it had two names.
+            // A look reloads nothing unless that file's own stamp moved.
+            FolderNews::Names => {
                 hit.extend(
                     self.docs
                         .values()
-                        .filter(|d| in_folder(d, &names))
+                        .filter(|d| in_folder(d, &[]))
                         .map(|d| d.id),
                 );
             }
@@ -3567,6 +4153,8 @@ impl DocumentStore {
                 }
             }
             FolderNews::Everything => {
+                // A watch stands here, so a later failure is news again.
+                self.watch_failed.remove(folder);
                 hit.extend(
                     self.docs
                         .values()
@@ -3588,10 +4176,11 @@ impl DocumentStore {
     }
 
     fn start_stat(&mut self) {
-        if self.stat_running || self.stat_waiting.is_empty() {
+        if (self.stat_running && self.remote_stat_running) || self.stat_waiting.is_empty() {
             return;
         }
-        let mut items = Vec::new();
+        let mut local = Vec::new();
+        let mut remote = Vec::new();
         let waiting = std::mem::take(&mut self.stat_waiting);
         for id in waiting {
             let Some(d) = self.docs.get(&id) else {
@@ -3602,23 +4191,51 @@ impl DocumentStore {
                 self.stat_waiting.insert(id);
                 continue;
             }
-            if let Some(path) = d.path.clone() {
-                items.push((id, path, d.base.map(|b| b.identity), d.rename_hint.clone()));
+            let Some(path) = d.path.clone() else {
+                continue;
+            };
+            let is_remote = is_network_path(&path);
+            if (is_remote && self.remote_stat_running) || (!is_remote && self.stat_running) {
+                self.stat_waiting.insert(id);
+                continue;
+            }
+            let item = StatItem {
+                doc: id,
+                epoch: d.file_epoch,
+                path,
+                identity: d.base.map(|b| b.identity),
+                links: d.base.map_or(0, |b| b.links),
+                hint: d.rename_hint.clone(),
+            };
+            if is_remote {
+                remote.push(item);
+            } else {
+                local.push(item);
             }
         }
+        self.start_stat_batch(local, false);
+        // A share that does not answer holds up only the other shares.
+        self.start_stat_batch(remote, true);
+    }
+
+    fn start_stat_batch(&mut self, items: Vec<StatItem>, remote: bool) {
         if items.is_empty() {
             return;
         }
-        self.stat_running = true;
-        let started = self.spawn("check", move || {
-            let results = items
-                .into_iter()
-                .map(|(doc, path, identity, hint)| check_file(doc, &path, identity, hint))
-                .collect();
-            Completion::Stat(results)
+        let ids: Vec<DocId> = items.iter().map(|item| item.doc).collect();
+        let started = self.spawn("check", move || Completion::Stat {
+            remote,
+            results: items.iter().map(check_file).collect(),
         });
-        if !started {
-            self.stat_running = false;
+        if started {
+            if remote {
+                self.remote_stat_running = true;
+            } else {
+                self.stat_running = true;
+            }
+        } else {
+            // These wait for the next look, as a window coming forward asks for one.
+            self.stat_waiting.extend(ids);
         }
     }
 
@@ -3630,19 +4247,29 @@ impl DocumentStore {
             let Some(d) = self.docs.get_mut(&doc) else {
                 continue;
             };
-            d.rename_hint = None;
-            if d.saving || d.moving || d.loading {
+            if d.saving || d.moving || d.loading || result.epoch != d.file_epoch {
+                d.rename_hint = None;
                 self.stat_waiting.insert(doc);
                 continue;
             }
             if let Some((new_path, base, stamp)) = result.moved_to {
+                // An editor may have moved the old file aside to save a new one in its place.
+                // A real rename is still a rename a moment later.
+                if !d.missing_confirm {
+                    if d.missing_recheck_at.is_none() {
+                        d.missing_recheck_at = Some(now_time + MISSING_RECHECK);
+                    }
+                    continue;
+                }
+                d.missing_confirm = false;
+                d.rename_hint = None;
                 // Another program moved it. The document follows, with its state as it was.
                 let old = d.path.replace(new_path.clone());
                 d.base = Some(base);
                 d.stamp = stamp;
                 d.missing_recheck_at = None;
                 if d.file_state == FileState::Deleted {
-                    d.file_state = FileState::Present;
+                    d.file_state_is_present(now_time);
                 }
                 if let Some(old) = old {
                     for row in &mut self.recent {
@@ -3675,10 +4302,13 @@ impl DocumentStore {
                         continue;
                     }
                     d.missing_confirm = false;
+                    d.rename_hint = None;
+                    d.dirty_from_delete = !d.is_dirty();
                     d.file_state = FileState::Deleted;
                     d.forced_dirty = true;
                     d.was_dirty = true;
                     d.stamp = None;
+                    d.changed_while_away = false;
                     if d.autosave.due.is_none() {
                         d.autosave.due = autosave_time(now_time, delay);
                     }
@@ -3689,33 +4319,41 @@ impl DocumentStore {
                     self.touch_session();
                 }
                 Some((base, stamp)) => {
+                    d.rename_hint = None;
                     d.missing_recheck_at = None;
                     d.missing_confirm = false;
-                    let lock_changed = d.base.is_some_and(|b| b.read_only != base.read_only);
                     let came_back = d.file_state == FileState::Deleted;
                     if came_back {
-                        d.file_state = FileState::Present;
-                        if d.view.is_at_save_point() {
-                            d.forced_dirty = false;
-                            d.was_dirty = false;
+                        if d.dirty_from_delete && d.view.is_at_save_point() {
+                            // Nothing but the file's absence made this document unsaved.
+                            d.file_state_is_present(now_time);
                         } else {
-                            // It holds another program's bytes now, so a Save must ask.
+                            // It holds another program's bytes now, and this text is not on
+                            // disk: a restored copy, or edits. Both stay, and a Save must ask.
+                            d.file_state = FileState::Present;
                             d.changed_while_away = true;
                             d.stamp = stamp;
+                            d.base = Some(base);
                         }
                         self.events.push(DocEvent::DocChanged(doc));
+                        self.touch_session();
                     }
+                    let Some(d) = self.docs.get_mut(&doc) else {
+                        continue;
+                    };
                     if !came_back && stamp.is_some() && d.stamp == stamp {
-                        if lock_changed && let Some(own) = &mut d.base {
-                            own.read_only = base.read_only;
-                        }
+                        // Nothing to read. A mark or another name may still be news.
+                        d.base = Some(base);
                         continue;
                     }
                     if d.is_dirty() {
                         // The Mac's rule: an edited document does not reload. The next Save
-                        // finds the changed stamp and asks. The lock mark is simply news.
-                        if lock_changed && let Some(own) = &mut d.base {
-                            own.read_only = base.read_only;
+                        // asks, also after a restart. The file itself is news, so a later
+                        // deletion or Save concerns this file and not an old one moved aside.
+                        d.base = Some(base);
+                        if !d.changed_while_away {
+                            d.changed_while_away = true;
+                            self.touch_session();
                         }
                         continue;
                     }
@@ -3770,8 +4408,14 @@ impl DocumentStore {
                 soonest = Some(at);
             }
         };
+        if !self.open_queue.is_empty() && (!self.restore_started || self.restored) {
+            consider(self.open_due);
+        }
         for d in self.docs.values() {
-            consider(d.autosave.due);
+            // During a restore no copy can start, and its end wakes the host.
+            if self.session.is_some() || self.restored {
+                consider(d.autosave.due);
+            }
             consider(d.reload_retry_at);
             consider(d.missing_recheck_at);
         }
@@ -3789,6 +4433,7 @@ impl DocumentStore {
         if self.session_dirty && self.session_due.is_some_and(|at| at <= now) {
             self.start_session_write();
         }
+        self.run_open_queue(now);
         self.start_queued_loads();
         self.start_stat();
         self.advance_quit();
@@ -3878,11 +4523,16 @@ impl DocumentStore {
             Completion::Load {
                 doc,
                 kind,
+                remote,
                 result,
                 identity_now,
                 leftovers,
             } => {
-                self.loads_running = self.loads_running.saturating_sub(1);
+                if remote {
+                    self.remote_loads_running = self.remote_loads_running.saturating_sub(1);
+                } else {
+                    self.loads_running = self.loads_running.saturating_sub(1);
+                }
                 self.finish_load(doc, kind, *result, identity_now, leftovers);
             }
             Completion::Save {
@@ -3900,14 +4550,31 @@ impl DocumentStore {
                 revision,
                 result,
             } => self.finish_autosave(doc, &key, generation, revision, result),
-            Completion::AutosaveRemoved { doc, result } => {
+            Completion::AutosaveRemoved {
+                doc,
+                key,
+                below,
+                result,
+            } => {
                 self.removals_running = self.removals_running.saturating_sub(1);
-                if let Err(error) = result {
-                    self.events.push(DocEvent::AutosaveFailed { doc, error });
+                match result {
+                    Ok(()) => {
+                        // A later removal has its own mark and its own end.
+                        if self.dead_copies.get(&key) == Some(&below) {
+                            self.dead_copies.remove(&key);
+                            self.touch_session();
+                        }
+                    }
+                    // The mark stays, so the next launch does not bring the copy back.
+                    Err(error) => self.events.push(DocEvent::AutosaveFailed { doc, error }),
                 }
             }
-            Completion::Stat(results) => {
-                self.stat_running = false;
+            Completion::Stat { remote, results } => {
+                if remote {
+                    self.remote_stat_running = false;
+                } else {
+                    self.stat_running = false;
+                }
                 self.apply_stat(results);
             }
             Completion::Moved { doc, path, result } => self.finish_move(doc, path, result),
@@ -3919,6 +4586,10 @@ impl DocumentStore {
             Completion::Recovered { path, result } => self.events.push(match result {
                 Ok(()) => DocEvent::LeftoverRecovered { path },
                 Err(error) => DocEvent::LeftoverNotRecovered { path, error },
+            }),
+            Completion::LeftoverGone { leftover, result } => self.events.push(match result {
+                Ok(()) => DocEvent::LeftoverDeleted { leftover },
+                Err(error) => DocEvent::LeftoverNotDeleted { leftover, error },
             }),
             Completion::Fit { doc, unfit } => {
                 self.events.push(DocEvent::EncodingFit { doc, unfit });
@@ -3953,6 +4624,7 @@ impl DocumentStore {
         d.moving = false;
         match result {
             Ok((base, stamp)) => {
+                d.file_epoch += 1;
                 let old = d.path.replace(path.clone());
                 d.base = Some(base);
                 d.stamp = stamp;
@@ -3974,11 +4646,12 @@ impl DocumentStore {
     }
 
     fn finish_unlock(&mut self, doc: DocId, then_save: bool, result: Result<(), DocError>) {
+        let Some(d) = self.docs.get_mut(&doc) else {
+            return;
+        };
+        d.unlocking = false;
         match result {
             Ok(()) => {
-                let Some(d) = self.docs.get_mut(&doc) else {
-                    return;
-                };
                 if let Some(base) = &mut d.base {
                     base.read_only = false;
                 }
@@ -3989,10 +4662,15 @@ impl DocumentStore {
                         error,
                         offer_save_as: true,
                     });
+                    self.save_did_not_happen(doc);
                 }
             }
-            Err(error) => self.events.push(DocEvent::UnlockFailed { doc, error }),
+            Err(error) => {
+                self.events.push(DocEvent::UnlockFailed { doc, error });
+                self.save_did_not_happen(doc);
+            }
         }
+        self.advance_quit();
     }
 
     /// What happened since the last call.
@@ -4015,6 +4693,10 @@ impl DocumentStore {
         self.quit_ready_sent = false;
         self.close_queue.clear();
         self.panel_queue.clear();
+        self.quit_review.clear();
+        for d in self.docs.values_mut() {
+            d.quit_skip = false;
+        }
         let ids: Vec<DocId> = self.docs.keys().copied().collect();
         for doc in ids {
             let mut ctx = ViewContext::default();
@@ -4070,7 +4752,7 @@ impl DocumentStore {
             || !self.closing_views.is_empty();
         let ids: Vec<DocId> = self.docs.keys().copied().collect();
         for doc in ids {
-            let Some(d) = self.docs.get_mut(&doc) else {
+            let Some(d) = self.docs.get(&doc) else {
                 continue;
             };
             if d.autosave.running.is_some() || d.view.cut_is_running() {
@@ -4088,29 +4770,31 @@ impl DocumentStore {
             if !wants_copy {
                 continue;
             }
-            if self.restored && self.session.is_none() {
-                let error = DocError::new(
-                    DocErrorKind::AutosaveFailed,
-                    None,
-                    "QuickEdit has no session folder, so nothing could be kept.",
-                );
-                self.review_failed_quit_autosave(doc, &error);
-                return;
-            }
-            if self.session.is_none() {
+            let no_session = self.session.is_none();
+            if no_session && !self.restored {
                 busy = true;
-            } else if d.autosave.last_failure.is_none() {
+                continue;
+            }
+            if !no_session && d.autosave.last_failure.is_none() {
                 busy = true;
                 self.start_autosave(doc);
-            } else if !self.quit_review.contains(&doc) {
-                let error = DocError::new(
-                    DocErrorKind::AutosaveFailed,
-                    d.path.as_deref(),
-                    d.autosave.last_failure.clone().unwrap_or_default(),
-                );
-                self.review_failed_quit_autosave(doc, &error);
-                return;
+                continue;
             }
+            // The text has no copy, so nothing ends this quit but the person's answer. A Save
+            // they chose counts until it ends. If it fails, this asks again.
+            if self.save_is_under_way(doc) {
+                busy = true;
+                continue;
+            }
+            let error = DocError::new(
+                DocErrorKind::AutosaveFailed,
+                d.path.as_deref(),
+                d.autosave.last_failure.clone().unwrap_or_else(|| {
+                    "QuickEdit has no session folder, so nothing could be kept.".to_owned()
+                }),
+            );
+            self.review_failed_quit_autosave(doc, &error);
+            return;
         }
         if busy {
             return;
@@ -4129,6 +4813,39 @@ impl DocumentStore {
         self.events.push(DocEvent::ReadyToQuit);
     }
 
+    /// A Save of this document is running, or waits on a dialog or on a question it raised.
+    fn save_is_under_way(&self, doc: DocId) -> bool {
+        let raised_by_save = self.questions.iter().any(|q| {
+            q.question.doc == doc
+                && matches!(
+                    q.question.kind,
+                    QuestionKind::LossyOverwrite
+                        | QuestionKind::ChangedOnDisk
+                        | QuestionKind::EncodingNoLongerFits { on_edit: false }
+                        | QuestionKind::LockedFile { on_edit: false }
+                )
+        });
+        raised_by_save
+            || self
+                .docs
+                .get(&doc)
+                .is_some_and(|d| d.saving || d.reloading || d.unlocking || d.panel_open)
+    }
+
+    /// Writes that a process end would cut short.
+    fn writes_are_running(&self) -> bool {
+        self.saves_running > 0
+            || self.session_running
+            || self.recent_running
+            || self.removals_running > 0
+            || !self.closing_views.is_empty()
+            || (self.restore_started && !self.restored)
+            || self
+                .docs
+                .values()
+                .any(|d| d.autosave.running.is_some() || d.view.cut_is_running())
+    }
+
     /// Runs the quit to its end on this thread, for `WM_ENDSESSION`, where Windows ends the
     /// process when the handler returns. This is the only call here that waits. True when
     /// `ReadyToQuit` came within `limit`.
@@ -4140,9 +4857,18 @@ impl DocumentStore {
             if self.quit_ready_sent {
                 return true;
             }
-            if !self.questions.is_empty() {
-                // Nobody can answer during the end of a session.
-                return false;
+            let needs_a_person =
+                !self.questions.is_empty() || self.docs.values().any(|d| d.panel_open);
+            if needs_a_person && !self.writes_are_running() {
+                // Nobody can answer during the end of a session, so what can be written is
+                // written, and then this stops. An ordinary question stops nothing by itself:
+                // with every copy written, `ReadyToQuit` has come by now.
+                if self.session_dirty {
+                    self.start_session_write();
+                }
+                if !self.session_running {
+                    return false;
+                }
             }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -4159,11 +4885,29 @@ impl DocumentStore {
 }
 
 impl Doc {
+    /// Does this document hold text not on disk? A close, a quit and a reload decide by this.
+    /// While it restores, its text is in the copy, and the view does not have it yet.
     fn is_dirty(&self) -> bool {
-        if self.forced_dirty {
+        if self.forced_dirty || (self.loading && self.autosave.generation.is_some()) {
             return true;
         }
         !self.read_only && !self.loading && !self.view.is_at_save_point()
+    }
+
+    /// The file is back, and this document had nothing unsaved but the file's absence.
+    fn file_state_is_present(&mut self, now: Instant) {
+        self.file_state = FileState::Present;
+        if self.dirty_from_delete {
+            self.dirty_from_delete = false;
+            self.forced_dirty = false;
+            self.was_dirty = false;
+            // A copy written meanwhile holds what the file holds, so the next poll removes it.
+            if self.autosave.generation.is_some() {
+                self.autosave.due = Some(now);
+            } else {
+                self.autosave.due = None;
+            }
+        }
     }
 
     fn is_blank_untitled(&self) -> bool {
@@ -4213,6 +4957,26 @@ impl Doc {
     fn place_if_restored(&self) -> Option<Place> {
         (self.place != Place::default()).then_some(self.place)
     }
+}
+
+fn no_thread(what: &str, path: &Path) -> DocError {
+    DocError::new(
+        DocErrorKind::Other,
+        Some(path),
+        format!(
+            "Windows could not start a thread to {what} {}.",
+            path.display()
+        ),
+    )
+}
+
+/// Does this load reach a network share? It may wait there for a long time.
+fn load_is_remote(kind: &LoadKind, source: &Source) -> bool {
+    let named = match kind {
+        LoadKind::RestoreAutosave { path, .. } => path.as_deref(),
+        _ => None,
+    };
+    named.or(source.file()).is_some_and(is_network_path)
 }
 
 fn no_window() -> DocError {
@@ -4323,6 +5087,14 @@ fn remove_save_temp(target: &Path, temp: PathBuf) {
     }
 }
 
+fn run_hook(slot: &Mutex<Option<Box<dyn Fn() + Send>>>) {
+    if let Ok(mut hook) = slot.lock()
+        && let Some(hook) = hook.take()
+    {
+        hook();
+    }
+}
+
 fn hold_while(hold: &AtomicBool, reached: &AtomicBool) {
     if hold.load(Ordering::Acquire) {
         reached.store(true, Ordering::Release);
@@ -4375,13 +5147,26 @@ fn encoded_bytes(job: &SaveJob<'_>) -> Result<Vec<u8>, SaveTrouble> {
             bytes.extend_from_slice(chunk.as_bytes());
         });
         if !whole {
-            return Err(SaveTrouble::Other {
-                offer_save_as: false,
-                error: DocError::new(
+            // The map of a file too large to edit refuses to read once the file has gone.
+            let error = if snapshot.is_read_only() {
+                DocError::new(
+                    DocErrorKind::FileNotFound,
+                    Some(job.path),
+                    format!(
+                        "{} has gone, and a file this large is read from its own bytes, so QuickEdit cannot write it again. If it is in the Recycle Bin, restore it there.",
+                        job.path.display()
+                    ),
+                )
+            } else {
+                DocError::new(
                     DocErrorKind::Other,
                     Some(job.path),
                     "The text could not be read back from memory.",
-                ),
+                )
+            };
+            return Err(SaveTrouble::Other {
+                offer_save_as: false,
+                error,
             });
         }
         return Ok(bytes);
@@ -4390,6 +5175,12 @@ fn encoded_bytes(job: &SaveJob<'_>) -> Result<Vec<u8>, SaveTrouble> {
         error,
         offer_save_as: false,
     })?;
+    // `encode` cannot report a failed allocation, so this asks for the most it may need.
+    let mut probe: Vec<u8> = Vec::new();
+    probe
+        .try_reserve_exact(text.len().saturating_mul(2).saturating_add(16))
+        .map_err(|_| memory())?;
+    drop(probe);
     encode(&text, job.format).map_err(trouble)
 }
 
@@ -4430,7 +5221,9 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
         ));
     }
     let written;
-    let written_result = if let Some(source) = job.copy_source {
+    // A source that has gone leaves only the view's own text to write.
+    let source = job.copy_source.filter(|source| source.exists());
+    let written_result = if let Some(source) = source {
         // A file too large to edit: its bytes as they are, never its text encoded again.
         let copy = prepare_large_copy(source, job.path, |_, _| {}, || false)
             .map_err(|e| map_save_error(job, e))?;
@@ -4440,11 +5233,7 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
         let bytes = encoded_bytes(job)?;
         written = bytes.len() as u64;
         hold_while(&job.faults.hold_save, &job.faults.save_is_held);
-        if let Ok(mut hook) = job.faults.before_swap.lock()
-            && let Some(hook) = hook.take()
-        {
-            hook();
-        }
+        run_hook(&job.faults.before_swap);
         let saved = match job.expected {
             Some(stamp) => atomic_write_if_unchanged(job.path, &bytes, stamp),
             None => atomic_write(job.path, &bytes),
@@ -4468,6 +5257,7 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
             Err(error) => return Err(map_save_error(job, error)),
         }
     };
+    run_hook(&job.faults.after_swap);
     let (base, stamp) = marks(job.path);
     let backup_kept = match written_result {
         AtomicWriteResult::Replaced => None,
@@ -4516,36 +5306,92 @@ fn map_save_error(job: &SaveJob<'_>, error: CodecError) -> SaveTrouble {
     }
 }
 
-fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), DocError> {
+fn move_file_on_volume(from: &Path, to: &Path, replace: bool) -> Result<(), std::io::Error> {
     use windows::Win32::Storage::FileSystem::{
-        MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
     use windows::core::PCWSTR;
     let (source, target) = (crate::identity::wide(from), crate::identity::wide(to));
-    let mut flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
+    let mut flags = MOVEFILE_WRITE_THROUGH;
     if replace {
         flags |= MOVEFILE_REPLACE_EXISTING;
     }
     // SAFETY: both names end in a zero and outlive the call.
-    unsafe { MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr()), flags) }.map_err(|e| {
-        let error = crate::identity::os_error(&e);
-        if matches!(error.raw_os_error(), Some(80 | 183)) {
-            return DocError::new(
-                DocErrorKind::TargetExists,
-                Some(to),
-                format!("A file named {} already exists.", to.display()),
-            );
+    unsafe { MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr()), flags) }
+        .map_err(|e| crate::identity::os_error(&e))
+}
+
+fn move_error(to: &Path, error: &std::io::Error) -> DocError {
+    if matches!(error.raw_os_error(), Some(80 | 183)) {
+        return DocError::new(
+            DocErrorKind::TargetExists,
+            Some(to),
+            format!("A file named {} already exists.", to.display()),
+        );
+    }
+    DocError::io("QuickEdit could not move the file to", to, error)
+}
+
+fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), DocError> {
+    const NOT_SAME_DEVICE: i32 = 17;
+    match move_file_on_volume(from, to, replace) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(NOT_SAME_DEVICE) => {
+            move_across_volumes(from, to, replace, &|a, b| std::fs::copy(a, b).map(drop))
         }
-        DocError::io("QuickEdit could not move the file to", to, &error)
+        Err(error) => Err(move_error(to, &error)),
+    }
+}
+
+/// Windows's own copy across volumes writes over the target as it goes, so a full disk could
+/// lose the file being replaced. This copies under a temp name first, so the old target stays
+/// whole until the new bytes are safe. The source goes last.
+fn move_across_volumes(
+    from: &Path,
+    to: &Path,
+    replace: bool,
+    copy: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), DocError> {
+    if !replace && to.exists() {
+        return Err(move_error(to, &std::io::Error::from_raw_os_error(183)));
+    }
+    let name = to.file_name().map_or_else(
+        || "file".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temp = to.with_file_name(format!(".{name}.qe-move-{}", std::process::id()));
+    let placed = copy(from, &temp)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temp)?
+                .sync_all()
+        })
+        .and_then(|()| move_file_on_volume(&temp, to, replace));
+    if let Err(error) = placed {
+        remove_quietly(&temp);
+        return Err(move_error(to, &error));
+    }
+    std::fs::remove_file(from).map_err(|error| {
+        let mut problem = DocError::io(
+            "QuickEdit copied the file but could not remove",
+            from,
+            &error,
+        );
+        problem.left_on_disk.push(to.to_path_buf());
+        problem
     })
 }
 
-fn check_file(
-    doc: DocId,
-    path: &Path,
-    identity: Option<FileIdentity>,
-    hint: Option<PathBuf>,
-) -> StatResult {
+fn check_file(item: &StatItem) -> StatResult {
+    let StatItem {
+        doc,
+        epoch,
+        path,
+        identity,
+        links,
+        hint,
+    } = item;
     let moved = |to: PathBuf| -> Option<(PathBuf, FileBase, Option<FileStamp>)> {
         if is_in_recycle_bin(&to) {
             return None;
@@ -4554,40 +5400,63 @@ fn check_file(
         Some((to.clone(), base, file_stamp(&to).ok().flatten()))
     };
     match file_base(path) {
-        Ok((base, false)) => {
-            // Another file may hold this name after a rename away, and the hint says where
-            // this document's own file went.
-            if let (Some(hint), Some(own)) = (hint, identity)
-                && base.identity != own
-                && let Some(found) = moved(hint)
-                && found.1.identity == own
-            {
-                return StatResult {
-                    doc,
-                    now: None,
-                    moved_to: Some(found),
-                };
-            }
-            StatResult {
-                doc,
-                now: Some((base, file_stamp(path).ok().flatten())),
-                moved_to: None,
-            }
-        }
+        // A file at this name is this document's file, whatever else has moved: an editor that
+        // saves by moving the old file aside leaves the new one here.
+        Ok((base, false)) => StatResult {
+            doc: *doc,
+            epoch: *epoch,
+            now: Some((base, file_stamp(path).ok().flatten())),
+            moved_to: None,
+        },
         _ => {
             let from_hint = hint
+                .clone()
                 .and_then(moved)
                 .filter(|found| identity.is_some_and(|own| found.1.identity == own));
+            // The number finds any name of the file, so another hard link answers too. That is
+            // no move: a name lost with the count of names falling was a deletion.
             let from_number = || {
                 identity
                     .and_then(|own| locate_by_identity(own, path))
                     .and_then(moved)
+                    .filter(|found| *links == 0 || found.1.links >= *links)
             };
             StatResult {
-                doc,
+                doc: *doc,
+                epoch: *epoch,
                 now: None,
                 moved_to: from_hint.or_else(from_number),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_copy_across_volumes_keeps_the_old_target_and_the_source() {
+        let dir = std::env::temp_dir().join(format!("qe-docs-move-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) = (dir.join("from.txt"), dir.join("to.txt"));
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old target").unwrap();
+        let full_disk = |_: &Path, partial: &Path| {
+            std::fs::write(partial, b"part")?;
+            Err(std::io::Error::from_raw_os_error(112))
+        };
+        let error = move_across_volumes(&from, &to, true, &full_disk).unwrap_err();
+        assert_eq!(error.kind, DocErrorKind::DiskFull);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old target");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp stays");
+        let plain = |a: &Path, b: &Path| std::fs::copy(a, b).map(drop);
+        let exists = move_across_volumes(&from, &to, false, &plain).unwrap_err();
+        assert_eq!(exists.kind, DocErrorKind::TargetExists);
+        move_across_volumes(&from, &to, true, &plain).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

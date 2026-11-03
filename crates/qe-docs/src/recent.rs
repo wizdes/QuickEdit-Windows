@@ -1,5 +1,7 @@
 //! The Open Recent list: `recent.txt`, next to the settings file. Newest first.
 use crate::escape::{escape_path, unescape_path};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// AppKit's list holds 10 unless the Mac's own setting says otherwise.
@@ -13,7 +15,26 @@ pub(crate) fn add_recent(list: &mut Vec<PathBuf>, path: &Path) {
 }
 
 pub(crate) fn same_path_text(a: &Path, b: &Path) -> bool {
-    a == b || a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+    a == b || same_name(a.as_os_str(), b.as_os_str())
+}
+
+/// Windows compares names by one upper-case letter for one letter, past ASCII as well. So a
+/// letter whose upper case is longer, such as a sharp s, stays itself.
+pub(crate) fn same_name(a: &OsStr, b: &OsStr) -> bool {
+    fn letters(name: &OsStr) -> impl Iterator<Item = u32> + '_ {
+        char::decode_utf16(name.encode_wide()).map(|unit| match unit {
+            Ok(letter) => {
+                let mut upper = letter.to_uppercase();
+                match (upper.next(), upper.next()) {
+                    (Some(one), None) => one as u32,
+                    _ => letter as u32,
+                }
+            }
+            // A lone half of a pair is allowed in a Windows name. Above any real letter.
+            Err(lone) => 0x11_0000 + u32::from(lone.unpaired_surrogate()),
+        })
+    }
+    a.eq_ignore_ascii_case(b) || letters(a).eq(letters(b))
 }
 
 pub(crate) fn encode_recent(list: &[PathBuf]) -> String {
@@ -83,6 +104,16 @@ mod tests {
         assert_eq!(tens, 1);
         let (back, bad) = decode_recent(&encode_recent(&list));
         assert_eq!((back, bad), (list, 0));
+    }
+    #[test]
+    fn letter_case_is_ignored_past_ascii_one_letter_for_one() {
+        assert!(same_path_text(
+            Path::new("C:\\\u{c9}.txt"),
+            Path::new("c:\\\u{e9}.TXT")
+        ));
+        assert!(same_path_text(Path::new("\u{416}"), Path::new("\u{436}")));
+        assert!(!same_path_text(Path::new("a"), Path::new("b")));
+        assert!(!same_path_text(Path::new("\u{df}"), Path::new("SS")));
     }
     #[test]
     fn a_damaged_list_is_counted_and_not_silently_dropped() {

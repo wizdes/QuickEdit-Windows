@@ -30,6 +30,15 @@ pub(crate) struct Body {
     pub(crate) stamp: Option<FileStamp>,
     /// A UTF-8 copy of a large file in another encoding, removed with the document.
     pub(crate) temp_copy: Option<PathBuf>,
+    /// What an autosaved copy says of itself, when the text came from one.
+    pub(crate) copy_head: Option<CopyHead>,
+}
+
+/// What an autosaved copy knew about the file when it was written.
+#[derive(Clone, Copy)]
+pub(crate) struct CopyHead {
+    pub(crate) base: Option<FileBase>,
+    pub(crate) changed_while_away: bool,
 }
 
 pub(crate) enum Loaded {
@@ -62,6 +71,16 @@ pub(crate) enum Source {
     },
     /// The same large file again, for a copy with no file of its own.
     Mapped { path: PathBuf, format: Format },
+}
+
+impl Source {
+    /// The file this reads from disk, if it is one the user named.
+    pub(crate) fn file(&self) -> Option<&Path> {
+        match self {
+            Self::File { path, .. } | Self::Mapped { path, .. } => Some(path),
+            Self::Autosave { .. } | Self::Snapshot { .. } => None,
+        }
+    }
 }
 
 pub(crate) struct LoadJob {
@@ -199,6 +218,7 @@ fn load_large(
             base,
             stamp,
             temp_copy: None,
+            copy_head: None,
         });
     }
     // Another encoding, or a BOM: the mapped store shows a file's own UTF-8 bytes only, so
@@ -219,6 +239,7 @@ fn load_large(
         base,
         stamp,
         temp_copy: Some(copy),
+        copy_head: None,
     })
 }
 
@@ -297,6 +318,7 @@ fn load_file(
         base: Some(base),
         stamp,
         temp_copy: None,
+        copy_head: None,
     }))
 }
 
@@ -320,6 +342,10 @@ fn load_autosave(
                     base: None,
                     stamp: None,
                     temp_copy: None,
+                    copy_head: Some(CopyHead {
+                        base: meta.base,
+                        changed_while_away: meta.changed_while_away,
+                    }),
                 }));
             }
             Err(mut problem) => {
@@ -371,6 +397,17 @@ pub(crate) fn read_all_text(snapshot: &dyn TextSnapshot) -> Result<String, DocEr
 
 pub(crate) fn run_load(job: &LoadJob) -> LoadResult {
     let mut problems = Vec::new();
+    // Closed while it waited: no disk and no network for a document nobody will see.
+    if job.cancel.load(Ordering::Acquire) {
+        return LoadResult {
+            loaded: Err(DocError::new(
+                DocErrorKind::Cancelled,
+                None,
+                "The document closed before its text was read.",
+            )),
+            problems,
+        };
+    }
     let loaded = match &job.source {
         Source::File {
             path,
@@ -393,6 +430,7 @@ pub(crate) fn run_load(job: &LoadJob) -> LoadResult {
                     base: None,
                     stamp: None,
                     temp_copy: None,
+                    copy_head: None,
                 }))
             })
         }
@@ -405,6 +443,7 @@ pub(crate) fn run_load(job: &LoadJob) -> LoadResult {
                 base: None,
                 stamp: None,
                 temp_copy: None,
+                copy_head: None,
             })
         }),
     };

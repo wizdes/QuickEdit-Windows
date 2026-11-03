@@ -3,8 +3,8 @@
 mod support;
 
 use qe_docs::handoff::{
-    HandoffError, HandoffServer, IntegrityLevel, LaunchRole, PipeNames, hand_off, listen, start,
-    start_with,
+    HandoffError, HandoffEvent, HandoffServer, IntegrityLevel, LaunchRole, MAX_PATHS, PipeNames,
+    hand_off, listen, start, start_with,
 };
 use qe_docs::{DocEvent, OpenTarget};
 use std::io::{BufRead, BufReader, Write as _};
@@ -386,4 +386,219 @@ fn a_launch_that_loses_the_race_hands_off_to_the_winner() {
     assert!(matches!(role, LaunchRole::HandedOff));
     let winner = winner.lock().unwrap().take().expect("the other launch won");
     assert_eq!(winner.take_requests()[0].paths, vec![path]);
+}
+
+/// The bytes of a whole message, as a launch sends them.
+fn raw_message(paths: &[&str]) -> Vec<u8> {
+    let mut units: Vec<u16> = Vec::new();
+    for path in paths {
+        units.extend(path.encode_utf16());
+        units.push(0);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x3145_5551u32.to_le_bytes());
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+fn open_client(names: &PipeNames) -> std::fs::File {
+    let end = Instant::now() + WAIT;
+    loop {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!(r"\\.\pipe\{}-medium", names.base));
+        match opened {
+            Ok(file) => return file,
+            // The server makes its next pipe a moment after each connect.
+            Err(error) if error.raw_os_error() == Some(231) && Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+#[test]
+fn f14_a_client_that_never_reads_its_answer_does_not_block_the_next_launch() {
+    let names = names("never-reads");
+    let (server, _) = server(&names);
+    let mut stalled = open_client(&names);
+    stalled
+        .write_all(&raw_message(&[r"C:\stalled.txt"]))
+        .unwrap();
+    for round in 0..3 {
+        let began = Instant::now();
+        assert_eq!(
+            hand_off(&names, &[PathBuf::from(r"C:\next.txt")]),
+            Ok(true),
+            "round {round}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "round {round}: {:?}",
+            began.elapsed()
+        );
+    }
+    drop(stalled);
+    let total: usize = server.take_requests().iter().map(|r| r.paths.len()).sum();
+    assert_eq!(total, 4);
+}
+
+#[test]
+fn f14_a_client_that_trickles_is_dropped_by_a_limit_on_the_whole_message() {
+    let names = names("trickle");
+    let (server, _) = server(&names);
+    let mut slow = open_client(&names);
+    let message = raw_message(&[r"C:\slow.txt"]);
+    let began = Instant::now();
+    let trickle = std::thread::spawn(move || {
+        for byte in &message {
+            if slow.write_all(&[*byte]).is_err() {
+                return Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        Instant::now()
+    });
+    // A later launch is served while the slow one is still going.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(hand_off(&names, &[PathBuf::from(r"C:\next.txt")]), Ok(true));
+    let refused_at = trickle.join().unwrap();
+    assert!(
+        refused_at.duration_since(began) < Duration::from_secs(4),
+        "one byte in 800 ms must not hold it open: {:?}",
+        refused_at.duration_since(began)
+    );
+    let all: Vec<PathBuf> = server
+        .take_requests()
+        .into_iter()
+        .flat_map(|r| r.paths)
+        .collect();
+    assert_eq!(all, vec![PathBuf::from(r"C:\next.txt")]);
+}
+
+#[test]
+fn f14_many_stalled_clients_at_once_do_not_make_a_later_launch_run_alone() {
+    let names = names("many-stalled");
+    let (_server, _) = server(&names);
+    let stalled: Vec<_> = (0..20).map(|_| open_client(&names)).collect();
+    assert_eq!(hand_off(&names, &[PathBuf::from(r"C:\next.txt")]), Ok(true));
+    drop(stalled);
+}
+
+#[test]
+fn f16_a_failed_server_says_so_restarts_once_and_then_says_it_stopped() {
+    let names = names("restart");
+    let (server, wakes) = server(&names);
+    assert_eq!(hand_off(&names, &[]), Ok(true));
+    let before = wakes.load(Ordering::Relaxed);
+    server.break_for_test();
+    let end = Instant::now() + WAIT;
+    let mut events = Vec::new();
+    while events.is_empty() && Instant::now() < end {
+        events = server.take_events();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        matches!(events.as_slice(), [HandoffEvent::ServerRestarted { .. }]),
+        "{events:?}"
+    );
+    assert!(wakes.load(Ordering::Relaxed) > before, "the UI is told");
+    // It works again, and a launch is not left to run alone.
+    assert_eq!(hand_off(&names, &[PathBuf::from(r"C:\a.txt")]), Ok(true));
+    assert_eq!(server.take_requests().len(), 2);
+    server.break_for_test();
+    let mut events = Vec::new();
+    while events.is_empty() && Instant::now() < end {
+        events = server.take_events();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        matches!(events.as_slice(), [HandoffEvent::ServerStopped { .. }]),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn f15_a_message_past_the_limit_is_refused_and_the_instance_goes_on() {
+    let names = names("too-many");
+    let (server, _) = server(&names);
+    let many: Vec<PathBuf> = (0..MAX_PATHS + 1)
+        .map(|i| PathBuf::from(format!(r"C:\{i}.txt")))
+        .collect();
+    assert!(matches!(
+        hand_off(&names, &many),
+        Err(HandoffError::Failed { .. })
+    ));
+    // A launch that ignores the limit is dropped by the server.
+    let words: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let mut raw = open_client(&names);
+    raw.write_all(&raw_message(&refs)).unwrap();
+    drop(raw);
+    assert_eq!(hand_off(&names, &[PathBuf::from(r"C:\a.txt")]), Ok(true));
+    let all: Vec<PathBuf> = server
+        .take_requests()
+        .into_iter()
+        .flat_map(|r| r.paths)
+        .collect();
+    assert_eq!(all, vec![PathBuf::from(r"C:\a.txt")]);
+}
+
+#[test]
+fn f15_odd_names_in_a_message_are_named_and_never_reach_the_paths() {
+    let names = names("odd-names");
+    let (server, _) = server(&names);
+    let good = PathBuf::from(r"\\host\share\a.txt");
+    let list = [
+        good.clone(),
+        PathBuf::from(r"\\.\pipe\x"),
+        PathBuf::from(r"\\.\NUL"),
+        PathBuf::from(r"\\?\GLOBALROOT\Device\x"),
+        PathBuf::from(r"C:\a.txt:stream"),
+        PathBuf::from(r"C:\folder\NUL.txt"),
+    ];
+    assert_eq!(hand_off(&names, &list), Ok(true));
+    let requests = server.take_requests();
+    assert_eq!(requests[0].paths, vec![good]);
+    assert_eq!(requests[0].refused.len(), 5, "{:?}", requests[0].refused);
+    assert!(
+        requests[0]
+            .refused
+            .iter()
+            .all(|e| e.kind == qe_docs::DocErrorKind::PathRefused)
+    );
+    // One with no folder of its own would mean this server's folder, so it is refused too.
+    let mut raw = open_client(&names);
+    raw.write_all(&raw_message(&["relative.txt"])).unwrap();
+    let mut answer = [0u8; 1];
+    std::io::Read::read_exact(&mut raw, &mut answer).unwrap();
+    drop(raw);
+    let requests = server.take_requests();
+    assert!(requests[0].paths.is_empty());
+    assert_eq!(requests[0].refused.len(), 1);
+}
+
+#[test]
+fn f15_the_queue_for_the_ui_has_a_limit_and_a_launch_past_it_is_told() {
+    let names = names("queue-limit");
+    let (server, _) = server(&names);
+    let batch: Vec<PathBuf> = (0..MAX_PATHS)
+        .map(|i| PathBuf::from(format!(r"C:\{i}.txt")))
+        .collect();
+    for _ in 0..4 {
+        assert_eq!(hand_off(&names, &batch), Ok(true));
+    }
+    assert!(matches!(
+        hand_off(&names, &[PathBuf::from(r"C:\late.txt")]),
+        Err(HandoffError::Failed { .. })
+    ));
+    let total: usize = server.take_requests().iter().map(|r| r.paths.len()).sum();
+    assert_eq!(total, 4 * MAX_PATHS);
+    assert_eq!(hand_off(&names, &batch), Ok(true), "room again");
 }

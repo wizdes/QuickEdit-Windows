@@ -9,16 +9,21 @@
 //! level has its own. A launch at one level that finds only another level's instance gets
 //! [`HandoffError::DifferentIntegrity`]. The server thread never waits for the UI, and nothing
 //! here runs a timer at idle.
+//!
+//! Each launch that connects gets a short-lived thread of its own, so one that stalls holds up
+//! nobody else, and a limit on the whole exchange ends that thread.
+use crate::error::DocError;
 use crate::identity::wide;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
     ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
@@ -27,7 +32,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -37,20 +42,28 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentProcessId, INFINITE, OpenProcessToken, SetEvent,
-    WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, INFINITE, OpenProcessToken, ResetEvent,
+    SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use windows::core::{PCWSTR, PWSTR};
 
 const MAGIC: u32 = 0x3145_5551; // "QUE1"
 const MAX_MESSAGE_UNITS: usize = 1 << 20;
-const MAX_PATHS: usize = 4096;
+/// The most files one launch can hand over. Explorer starts one process for a few files, and
+/// a long list goes through its own launch's queue instead.
+pub const MAX_PATHS: usize = 1024;
+/// The most files that wait for the UI. A launch past this runs on its own, and says so.
+const MAX_QUEUED_PATHS: usize = 4096;
+/// The most requests that wait for the UI, since one with no files still takes a place.
+const MAX_QUEUED_REQUESTS: usize = 256;
+/// The most launches served at once. Each one ends within two `SERVER_READ_WAIT`s.
+const MAX_CLIENT_THREADS: usize = 64;
 const TAKEN: u8 = 0x51;
 /// A running instance answers in far less. Past this it counts as hung.
 const CONNECT_WAIT: Duration = Duration::from_millis(1500);
 const ANSWER_WAIT: Duration = Duration::from_millis(3000);
-/// Less than `ANSWER_WAIT`, so a launch that stalls cannot make the next one give up.
+/// How long one launch has for its whole message, and again for reading its answer.
 const SERVER_READ_WAIT: Duration = Duration::from_millis(1000);
 
 /// What a launch can learn. Each one says what the launch should do next.
@@ -90,6 +103,19 @@ impl std::error::Error for HandoffError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffRequest {
     pub paths: Vec<PathBuf>,
+    /// Paths that are not files QuickEdit may open, each with its named error. Show them.
+    pub refused: Vec<DocError>,
+}
+
+/// What happened to the server itself. Take these on each wake with
+/// [`HandoffServer::take_events`], and show them: while the server is down, the next launch
+/// runs as an instance of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HandoffEvent {
+    /// The server failed, with the reason, and it runs again. It restarts once.
+    ServerRestarted { reason: String },
+    /// The server failed and did not come back, with the reason. Later launches each run alone.
+    ServerStopped { reason: String },
 }
 
 /// What [`start`] found out.
@@ -281,6 +307,14 @@ fn windows_failure(what: &str, error: &windows::core::Error) -> HandoffError {
 /// none is running at any level. Up to about 4.5 seconds when an instance hangs; a launch
 /// has no UI to hold up yet.
 pub fn hand_off(names: &PipeNames, paths: &[PathBuf]) -> Result<bool, HandoffError> {
+    if paths.len() > MAX_PATHS {
+        return Err(HandoffError::Failed {
+            what: format!(
+                "{} files are too many to pass at once. The limit is {MAX_PATHS}",
+                paths.len()
+            ),
+        });
+    }
     let pipe = names.pipe(names.level);
     let started = Instant::now();
     let file = loop {
@@ -462,7 +496,9 @@ fn overlapped_read(handle: HANDLE, bytes: &mut [u8], limit: Duration) -> Result<
 /// The running instance's end of the pipe. Dropping it stops the thread with no wait.
 pub struct HandoffServer {
     queue: Arc<Mutex<Vec<HandoffRequest>>>,
+    events: Arc<Mutex<Vec<HandoffEvent>>>,
     stop: Arc<Owned>,
+    broken: Arc<Owned>,
 }
 
 impl HandoffServer {
@@ -471,6 +507,21 @@ impl HandoffServer {
         match self.queue.lock() {
             Ok(mut queue) => std::mem::take(&mut *queue),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+    /// What happened to the server since the last call. See [`HandoffEvent`].
+    pub fn take_events(&self) -> Vec<HandoffEvent> {
+        match self.events.lock() {
+            Ok(mut events) => std::mem::take(&mut *events),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+    /// Makes the server fail as a Windows error would, for a test.
+    #[doc(hidden)]
+    pub fn break_for_test(&self) {
+        // SAFETY: the event is open while this `Arc` lives.
+        if let Err(error) = unsafe { SetEvent(self.broken.0) } {
+            eprintln!("QuickEdit: breaking the handoff thread failed: {error}");
         }
     }
 }
@@ -524,15 +575,34 @@ pub fn listen(
         unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
             .map_err(|e| windows_failure("making an event", &e))?,
     ));
+    // SAFETY: no name and no attributes.
+    let broken = Arc::new(Owned(
+        unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(|e| windows_failure("making an event", &e))?,
+    ));
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let (thread_queue, thread_stop) = (queue.clone(), stop.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let shared = Shared {
+        pipe,
+        queue: queue.clone(),
+        events: events.clone(),
+        stop: stop.clone(),
+        broken: broken.clone(),
+        wake,
+        clients: Arc::new(AtomicUsize::new(0)),
+    };
     std::thread::Builder::new()
         .name("qe-docs-handoff".into())
-        .spawn(move || serve(first, pipe, &thread_queue, &thread_stop, wake.as_ref()))
+        .spawn(move || supervise(first, &shared))
         .map_err(|e| HandoffError::Failed {
             what: format!("starting the handoff thread: {e}"),
         })?;
-    Ok(Some(HandoffServer { queue, stop }))
+    Ok(Some(HandoffServer {
+        queue,
+        events,
+        stop,
+        broken,
+    }))
 }
 
 /// A launch's whole job: hand off, or become the instance. Two launches at once are safe,
@@ -581,22 +651,73 @@ pub fn start_with(
     }
 }
 
-fn serve(
-    mut listening: Owned,
+/// What the server's threads share.
+struct Shared {
     pipe: Vec<u16>,
-    queue: &Mutex<Vec<HandoffRequest>>,
-    stop: &Owned,
-    wake: &(dyn Fn() + Send + Sync),
-) {
+    queue: Arc<Mutex<Vec<HandoffRequest>>>,
+    events: Arc<Mutex<Vec<HandoffEvent>>>,
+    stop: Arc<Owned>,
+    broken: Arc<Owned>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    clients: Arc<AtomicUsize>,
+}
+
+impl Shared {
+    fn tell(&self, event: HandoffEvent) {
+        match self.events.lock() {
+            Ok(mut events) => events.push(event),
+            Err(poisoned) => poisoned.into_inner().push(event),
+        }
+        (self.wake)();
+    }
+}
+
+/// Runs the server. The first failure brings it back once. A failure then reaches the user.
+fn supervise(first: Owned, shared: &Shared) {
+    let mut listening = first;
+    let mut restarted = false;
+    loop {
+        let reason = match serve(listening, shared) {
+            Ok(()) => return,
+            Err(reason) => reason,
+        };
+        if restarted {
+            shared.tell(HandoffEvent::ServerStopped { reason });
+            return;
+        }
+        restarted = true;
+        // A launch being served still holds the name, so then no other process can have taken
+        // it, and only then may the new pipe skip the first-instance rule.
+        let first = shared.clients.load(Ordering::Acquire) == 0;
+        match create_pipe(&shared.pipe, first) {
+            Ok(pipe) => {
+                listening = pipe;
+                shared.tell(HandoffEvent::ServerRestarted { reason });
+            }
+            Err(error) => {
+                shared.tell(HandoffEvent::ServerStopped {
+                    reason: format!("{reason}. It could not start again: {error}"),
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// `Ok` when asked to stop. An error says why this thread cannot go on.
+fn serve(mut listening: Owned, shared: &Shared) -> Result<(), String> {
     // SAFETY: no name and no attributes.
     let ready = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
         Ok(event) => Owned(event),
         Err(error) => {
-            eprintln!("QuickEdit: the handoff thread could not make an event: {error}");
-            return;
+            return Err(format!(
+                "the handoff thread could not make an event: {error}"
+            ));
         }
     };
     loop {
+        // SAFETY: the event is open. It is set again when the next launch connects.
+        unsafe { ResetEvent(ready.0) }.map_err(|e| format!("the handoff event failed: {e}"))?;
         let mut overlapped = OVERLAPPED {
             hEvent: ready.0,
             ..Default::default()
@@ -610,20 +731,15 @@ fn serve(
             // A launch came and went before this call. The pipe must be reset for the next.
             Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => {
                 // SAFETY: the handle is open.
-                if let Err(error) = unsafe { DisconnectNamedPipe(listening.0) } {
-                    eprintln!("QuickEdit: the handoff pipe could not reset: {error}");
-                    return;
-                }
+                unsafe { DisconnectNamedPipe(listening.0) }
+                    .map_err(|e| format!("the handoff pipe could not reset: {e}"))?;
                 continue;
             }
-            Err(error) => {
-                eprintln!("QuickEdit: the handoff pipe failed: {error}");
-                return;
-            }
+            Err(error) => return Err(format!("the handoff pipe failed: {error}")),
         };
         if !connected {
-            let handles = [ready.0, stop.0];
-            // SAFETY: both are open. No timeout: this thread sleeps until a launch comes.
+            let handles = [ready.0, shared.stop.0, shared.broken.0];
+            // SAFETY: all are open. No timeout: this thread sleeps until a launch comes.
             let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
             if woke != WAIT_OBJECT_0 {
                 // SAFETY: the handle is open. The wait lets the kernel drop `overlapped`.
@@ -634,68 +750,148 @@ fn serve(
                         unsafe { GetOverlappedResult(listening.0, &overlapped, &mut count, true) };
                     drop(ended);
                 }
-                return;
+                if woke == WAIT_EVENT(WAIT_OBJECT_0.0 + 2) {
+                    // SAFETY: the event is open.
+                    unsafe { ResetEvent(shared.broken.0) }
+                        .map_err(|e| format!("the handoff event failed: {e}"))?;
+                    return Err("the handoff pipe was told to fail".to_owned());
+                }
+                return Ok(());
             }
         }
         // A new instance must exist before this one is busy, or a launch would find no pipe
         // and think it is the first.
-        let next = match create_pipe(&pipe, false) {
-            Ok(next) => next,
-            Err(error) => {
-                eprintln!("QuickEdit: the handoff pipe could not grow: {error}");
-                return;
-            }
-        };
+        let next = create_pipe(&shared.pipe, false)
+            .map_err(|e| format!("the handoff pipe could not grow: {e}"))?;
         let client = std::mem::replace(&mut listening, next);
-        match read_request(client.0) {
-            Some(paths) => {
-                match queue.lock() {
-                    Ok(mut list) => list.push(HandoffRequest { paths }),
-                    Err(poisoned) => poisoned.into_inner().push(HandoffRequest { paths }),
-                }
-                wake();
-                if let Err(_failure) = overlapped_write(client.0, &[TAKEN], SERVER_READ_WAIT) {
-                    eprintln!("QuickEdit: a launch left before it heard the answer");
-                }
-                // SAFETY: the handle is open. This waits only for the client to read.
-                if let Err(error) = unsafe { FlushFileBuffers(client.0) } {
-                    eprintln!("QuickEdit: the handoff answer did not flush: {error}");
-                }
-            }
-            None => eprintln!("QuickEdit: a bad or slow handoff message was dropped"),
-        }
-        // SAFETY: the handle is open.
-        if let Err(error) = unsafe { DisconnectNamedPipe(client.0) } {
-            eprintln!("QuickEdit: disconnecting a launch failed: {error}");
-        }
-        drop(client);
+        serve_on_its_own_thread(client, shared);
     }
 }
 
-fn read_request(client: HANDLE) -> Option<Vec<PathBuf>> {
-    let mut head = [0u8; 12];
-    let mut got = 0;
-    while got < head.len() {
-        let count = overlapped_read(client, &mut head[got..], SERVER_READ_WAIT).ok()?;
-        if count == 0 {
-            return None;
-        }
-        got += count;
+struct ClientCount(Arc<AtomicUsize>);
+impl Drop for ClientCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+fn serve_on_its_own_thread(client: Owned, shared: &Shared) {
+    let running = shared.clients.fetch_add(1, Ordering::AcqRel);
+    let count = ClientCount(shared.clients.clone());
+    if running >= MAX_CLIENT_THREADS {
+        eprintln!("QuickEdit: too many launches at once, so one was dropped");
+        return;
+    }
+    let (queue, wake) = (shared.queue.clone(), shared.wake.clone());
+    let started = std::thread::Builder::new()
+        .name("qe-docs-handoff-client".into())
+        .spawn(move || {
+            let _count = count;
+            serve_client(&client, &queue, wake.as_ref());
+        });
+    if let Err(error) = started {
+        eprintln!("QuickEdit: a launch was dropped, as no thread started for it: {error}");
+    }
+}
+
+/// Paths that are not files a document may hold are named, not opened. Nothing here reads a
+/// disk or a network.
+fn split_request(paths: Vec<PathBuf>) -> HandoffRequest {
+    let mut request = HandoffRequest {
+        paths: Vec::with_capacity(paths.len()),
+        refused: Vec::new(),
+    };
+    for path in paths {
+        // This server's folder is not the launch's, so a relative path has no meaning here.
+        if !path.is_absolute() {
+            request.refused.push(DocError::new(
+                crate::error::DocErrorKind::PathRefused,
+                Some(&path),
+                format!(
+                    "QuickEdit cannot open {}: this is not a complete file path.",
+                    path.display()
+                ),
+            ));
+            continue;
+        }
+        match crate::paths::check_open_path(&path) {
+            Ok(_) => request.paths.push(path),
+            Err(error) => request.refused.push(error),
+        }
+    }
+    request
+}
+
+/// False when the queue is full, so the launch must not hear that it was taken.
+fn queue_request(queue: &Mutex<Vec<HandoffRequest>>, request: HandoffRequest) -> bool {
+    let mut list = match queue.lock() {
+        Ok(list) => list,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let waiting: usize = list.iter().map(|r| r.paths.len()).sum();
+    if list.len() >= MAX_QUEUED_REQUESTS || waiting + request.paths.len() > MAX_QUEUED_PATHS {
+        return false;
+    }
+    list.push(request);
+    true
+}
+
+fn serve_client(
+    client: &Owned,
+    queue: &Mutex<Vec<HandoffRequest>>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    match read_request(client.0) {
+        Some(paths) => {
+            if queue_request(queue, split_request(paths)) {
+                wake();
+                if overlapped_write(client.0, &[TAKEN], SERVER_READ_WAIT).is_err() {
+                    eprintln!("QuickEdit: a launch left before it heard the answer");
+                }
+                // A disconnect would drop an answer not yet read. The launch reads it and
+                // closes, which ends this read. A launch that does neither has this long.
+                let mut gone = [0u8; 1];
+                let waited = overlapped_read(client.0, &mut gone, SERVER_READ_WAIT);
+                drop(waited);
+            } else {
+                eprintln!("QuickEdit: too many files wait to open, so a launch was refused");
+            }
+        }
+        None => eprintln!("QuickEdit: a bad or slow handoff message was dropped"),
+    }
+    // SAFETY: the handle is open.
+    if let Err(error) = unsafe { DisconnectNamedPipe(client.0) } {
+        eprintln!("QuickEdit: disconnecting a launch failed: {error}");
+    }
+}
+
+/// The whole message within `SERVER_READ_WAIT`, however it is cut into pieces.
+fn read_request(client: HANDLE) -> Option<Vec<PathBuf>> {
+    let deadline = Instant::now() + SERVER_READ_WAIT;
+    let read_all = |bytes: &mut [u8]| -> Option<()> {
+        let mut got = 0;
+        while got < bytes.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let count = overlapped_read(client, &mut bytes[got..], left).ok()?;
+            if count == 0 {
+                return None;
+            }
+            got += count;
+        }
+        Some(())
+    };
+    let mut head = [0u8; 12];
+    read_all(&mut head)?;
     let units = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
     if units > MAX_MESSAGE_UNITS {
         return None;
     }
     let mut message = head.to_vec();
     message.resize(12 + units * 2, 0);
-    let mut got = 12;
-    while got < message.len() {
-        let count = overlapped_read(client, &mut message[got..], SERVER_READ_WAIT).ok()?;
-        if count == 0 {
-            return None;
-        }
-        got += count;
-    }
+    read_all(&mut message[12..])?;
     decode_message(&message)
 }
 

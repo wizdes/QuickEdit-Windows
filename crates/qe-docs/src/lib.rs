@@ -11,12 +11,14 @@ mod escape;
 pub mod handoff;
 mod identity;
 mod load;
+mod paths;
 mod recent;
 mod store;
 mod watch;
 
 pub use error::{DocError, DocErrorKind};
 pub use identity::FileIdentity;
+pub use paths::check_open_path;
 pub use recent::{RECENT_LIMIT, recent_menu_rows};
 pub use store::{
     Answer, BLANK_SCAN_LIMIT_UTF16, DocCommands, DocEvent, DocId, DocumentStore, Faults,

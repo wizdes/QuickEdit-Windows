@@ -26,8 +26,8 @@ use windows::core::PCWSTR;
 /// What a folder's thread heard.
 #[derive(Debug)]
 pub(crate) enum FolderNews {
-    /// These names in the folder changed.
-    Names(Vec<OsString>),
+    /// Names in the folder changed.
+    Names,
     /// A name changed to another name in the folder.
     Renamed { old: OsString, new: OsString },
     /// Too much happened to list. Check every open file there.
@@ -59,6 +59,8 @@ fn new_event() -> std::io::Result<Event> {
 /// Dropping this stops the thread, which does not make the UI thread wait.
 pub(crate) struct FolderWatch {
     pub(crate) folder: PathBuf,
+    /// The thread has ended, so this folder hears nothing until a new watch starts.
+    pub(crate) ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop: std::sync::Arc<Event>,
 }
 impl Drop for FolderWatch {
@@ -79,16 +81,22 @@ pub(crate) fn watch_folder(
     let stop = std::sync::Arc::new(new_event()?);
     let thread_stop = stop.clone();
     let path = folder.to_path_buf();
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_ended = ended.clone();
     std::thread::Builder::new()
         .name("qe-docs-watch".into())
         .spawn(move || {
             before_listening();
-            if let Err(error) = run(&path, &thread_stop, &news) {
+            let result = run(&path, &thread_stop, &news);
+            // Before the news, so that the news's wake finds it ended.
+            thread_ended.store(true, std::sync::atomic::Ordering::Release);
+            if let Err(error) = result {
                 news(&path, FolderNews::CannotWatch(error.to_string()));
             }
         })?;
     Ok(FolderWatch {
         folder: folder.to_path_buf(),
+        ended,
         stop,
     })
 }
@@ -178,7 +186,7 @@ fn run(folder: &Path, stop: &Event, news: &impl Fn(&Path, FolderNews)) -> std::i
 fn report(folder: &Path, buffer: &[u32], count: usize, news: &impl Fn(&Path, FolderNews)) {
     let base = buffer.as_ptr().cast::<u8>();
     let mut at = 0usize;
-    let mut names = Vec::new();
+    let mut any_name = false;
     let mut old_name: Option<OsString> = None;
     let header = std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
     while at + header <= count {
@@ -200,10 +208,10 @@ fn report(folder: &Path, buffer: &[u32], count: usize, news: &impl Fn(&Path, Fol
             if let Some(old) = old_name.take() {
                 news(folder, FolderNews::Renamed { old, new: name });
             } else {
-                names.push(name);
+                any_name = true;
             }
         } else {
-            names.push(name);
+            any_name = true;
         }
         if record.NextEntryOffset == 0 {
             break;
@@ -211,10 +219,7 @@ fn report(folder: &Path, buffer: &[u32], count: usize, news: &impl Fn(&Path, Fol
         at += record.NextEntryOffset as usize;
     }
     // A rename out of this folder has no new name here.
-    names.extend(old_name);
-    if !names.is_empty() {
-        names.sort();
-        names.dedup();
-        news(folder, FolderNews::Names(names));
+    if any_name || old_name.is_some() {
+        news(folder, FolderNews::Names);
     }
 }

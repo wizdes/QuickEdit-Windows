@@ -499,6 +499,8 @@ pub struct HandoffServer {
     events: Arc<Mutex<Vec<HandoffEvent>>>,
     stop: Arc<Owned>,
     broken: Arc<Owned>,
+    clients: Arc<AtomicUsize>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl HandoffServer {
@@ -515,6 +517,34 @@ impl HandoffServer {
             Ok(mut events) => std::mem::take(&mut *events),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         }
+    }
+    /// The app is about to end. The pipe closes, the launches being served finish, and what
+    /// they asked comes back here. After this, a new launch finds no pipe and starts as the
+    /// instance. A launch that heard "taken" is in the answer, so its files are never lost.
+    /// This waits up to `limit`, so call it only when no window waits on this thread.
+    pub fn stop_and_take(&self, limit: Duration) -> Vec<HandoffRequest> {
+        // SAFETY: the event is open while this `Arc` lives.
+        if let Err(error) = unsafe { SetEvent(self.stop.0) } {
+            eprintln!("QuickEdit: stopping the handoff thread failed: {error}");
+        }
+        let thread = match self.thread.lock() {
+            Ok(mut thread) => thread.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(thread) = thread
+            && thread.join().is_err()
+        {
+            eprintln!("QuickEdit: the handoff thread stopped with a failure");
+        }
+        let end = Instant::now() + limit;
+        while self.clients.load(Ordering::Acquire) > 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let left = self.clients.load(Ordering::Acquire);
+        if left > 0 {
+            eprintln!("QuickEdit: {left} launch(es) were still being served when the app ended");
+        }
+        self.take_requests()
     }
     /// Makes the server fail as a Windows error would, for a test.
     #[doc(hidden)]
@@ -582,6 +612,7 @@ pub fn listen(
     ));
     let queue = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
     let shared = Shared {
         pipe,
         queue: queue.clone(),
@@ -589,9 +620,9 @@ pub fn listen(
         stop: stop.clone(),
         broken: broken.clone(),
         wake,
-        clients: Arc::new(AtomicUsize::new(0)),
+        clients: clients.clone(),
     };
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("qe-docs-handoff".into())
         .spawn(move || supervise(first, &shared))
         .map_err(|e| HandoffError::Failed {
@@ -602,6 +633,8 @@ pub fn listen(
         events,
         stop,
         broken,
+        clients,
+        thread: Mutex::new(Some(thread)),
     }))
 }
 

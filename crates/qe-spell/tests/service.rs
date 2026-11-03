@@ -1351,3 +1351,17 @@ fn a_key_with_full_lists_stays_under_the_key_budget_in_release() {
         assert!(p99 < Duration::from_millis(2), "p99 {p99:?}");
     }
 }
+
+#[test]
+fn with_underlines_off_the_service_keeps_its_marks_and_shows_none() {
+    let mut view = laid_out("speling here");
+    let (mut service, _log) = fake_service(&view, &["speling"]);
+    let mut ctx = ViewContext::default();
+    finish(&mut service, &mut view, &mut ctx);
+    assert_eq!(marks(&view).len(), 1);
+    service.set_underlines(false, &mut view, &mut ctx);
+    assert!(marks(&view).is_empty());
+    assert_eq!(service.marks().len(), 1, "correction still sees the word");
+    service.set_underlines(true, &mut view, &mut ctx);
+    assert_eq!(marks(&view).len(), 1);
+}

@@ -444,8 +444,9 @@ impl ToolsHost {
             C::UseSelectionForFind => (selected, false),
             C::Complete | C::UpperCase | C::LowerCase | C::Capitalize => (view.can_edit(), false),
             C::SmartCopyPaste => (true, self.substitutions.smart_copy),
-            C::SmartQuotes => (!large, self.substitutions.quotes),
-            C::SmartDashes => (!large, self.substitutions.dashes),
+            // A row that is off shows no check: over the limit these do nothing.
+            C::SmartQuotes => (!large, !large && self.substitutions.quotes),
+            C::SmartDashes => (!large, !large && self.substitutions.dashes),
             _ => return None,
         })
     }

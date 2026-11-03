@@ -10,7 +10,9 @@ QuickEdit [options] [files]
   --data-root DIR    settings, session and pipe name under this folder
   --bench-keys N     hidden window: sends N keys and prints the timers
   --bench-middle     with --bench-keys: the keys go to the middle of the text
-  --timings          prints the timers when the app ends
+  --timings          prints the timers when the app ends, with real keys
+  --watchdog MS      test channel: ends with code 99 if the UI thread stops answering
+  --test-fail-windows N  the next N windows fail to open, for tests
   --help             prints this and opens nothing";
 
 #[derive(Debug, Default)]
@@ -25,6 +27,8 @@ pub struct Args {
     pub bench_keys: usize,
     pub bench_middle: bool,
     pub help: bool,
+    pub watchdog_ms: u64,
+    pub fail_windows: usize,
 }
 
 impl Args {
@@ -55,6 +59,18 @@ impl Args {
                         .ok_or("--bench-keys needs a number")?;
                     args.hidden = true;
                     args.timings = true;
+                }
+                Some("--watchdog") => {
+                    args.watchdog_ms = items
+                        .next()
+                        .and_then(|n| n.to_str().and_then(|n| n.parse().ok()))
+                        .ok_or("--watchdog needs a number")?;
+                }
+                Some("--test-fail-windows") => {
+                    args.fail_windows = items
+                        .next()
+                        .and_then(|n| n.to_str().and_then(|n| n.parse().ok()))
+                        .ok_or("--test-fail-windows needs a number")?;
                 }
                 Some("--data-root") => {
                     args.root = Some(PathBuf::from(

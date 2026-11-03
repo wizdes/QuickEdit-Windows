@@ -670,3 +670,39 @@ fn a_wheel_turn_ends_the_wait_of_a_reveal() {
     assert_ne!(top_row(&e).0, 500);
     assert!(after_wheel > 0.0);
 }
+
+#[test]
+fn a_hold_refuses_every_edit_and_lifting_it_gives_edits_back() {
+    let mut e = EditorView::from_text("abc").unwrap();
+    let mut ctx = ViewContext::default();
+    e.set_hold_edits(true);
+    assert!(!e.can_edit());
+    type_text(&mut e, "x");
+    e.run(EditorCommand::DeleteBackward, &mut ctx);
+    e.replace_range(ByteOffset(0)..ByteOffset(1), "z", &mut ctx);
+    assert!(e.refused_edits() >= 2);
+    assert_eq!(e.worker_snapshot().len_bytes().0, 3);
+    e.set_hold_edits(false);
+    assert!(e.can_edit());
+    e.replace_range(ByteOffset(0)..ByteOffset(1), "z", &mut ctx);
+    assert_eq!(e.worker_snapshot().len_bytes().0, 3);
+}
+
+#[test]
+fn a_host_that_runs_command_keys_leaves_the_view_only_the_moving_and_editing_keys() {
+    let mut e = EditorView::from_text("abc").unwrap();
+    let mut ctx = ViewContext::default();
+    e.run(EditorCommand::SelectAll, &mut ctx);
+    e.run(EditorCommand::DeleteForward, &mut ctx);
+    assert_eq!(e.worker_snapshot().len_bytes().0, 0);
+    e.set_host_runs_command_keys(true);
+    ctrl_key(&mut e, 0x5a); // Z
+    assert_eq!(e.worker_snapshot().len_bytes().0, 0, "the view's own Undo");
+    e.set_host_runs_command_keys(false);
+    ctrl_key(&mut e, 0x5a);
+    assert_eq!(
+        e.worker_snapshot().len_bytes().0,
+        3,
+        "a view on its own keeps them"
+    );
+}

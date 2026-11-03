@@ -216,6 +216,7 @@ pub struct SpellService {
     max_marks: usize,
     keep_near_bytes: usize,
     max_checked_ranges: usize,
+    hide_underlines: bool,
 }
 impl Drop for SpellService {
     /// The worker must not go on with a long check for a tab that has closed. A search stops
@@ -275,6 +276,7 @@ impl SpellService {
             max_marks: MAX_MARKS,
             keep_near_bytes: KEEP_NEAR_BYTES,
             max_checked_ranges: MAX_CHECKED_RANGES,
+            hide_underlines: false,
         };
         if let Err(e) = spawned {
             service.failed = true;
@@ -684,8 +686,19 @@ impl SpellService {
         }
         true
     }
+    /// With underlines off the service still finds words, for automatic correction alone.
+    pub fn set_underlines(&mut self, on: bool, view: &mut EditorView, ctx: &mut ViewContext) {
+        if self.hide_underlines != !on {
+            self.hide_underlines = !on;
+            self.show_marks(view, ctx);
+        }
+    }
     fn show_marks(&mut self, view: &mut EditorView, ctx: &mut ViewContext) {
-        let ranges: Vec<Range<ByteOffset>> = self.marks.iter().map(|m| m.range.clone()).collect();
+        let ranges: Vec<Range<ByteOffset>> = if self.hide_underlines {
+            Vec::new()
+        } else {
+            self.marks.iter().map(|m| m.range.clone()).collect()
+        };
         if ranges != view.decorations(DecorationKind::SpellingUnderline) {
             view.set_decorations(DecorationKind::SpellingUnderline, ranges, ctx);
         }

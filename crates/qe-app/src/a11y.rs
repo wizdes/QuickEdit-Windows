@@ -22,7 +22,7 @@ pub fn make_host(shared: Weak<Shared>, window: WindowId) -> Arc<dyn UiaHost> {
     })
 }
 
-fn find(widget: &Widget, id: WidgetId) -> Option<&Widget> {
+pub fn find(widget: &Widget, id: WidgetId) -> Option<&Widget> {
     if widget.id == id {
         return Some(widget);
     }

@@ -37,8 +37,9 @@ impl Drop for Folder {
     }
 }
 
-pub fn exe() -> &'static str {
-    env!("CARGO_BIN_EXE_QuickEdit")
+/// The app under test. `QE_TEST_EXE` points the stress test at another build.
+pub fn exe() -> String {
+    std::env::var("QE_TEST_EXE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_QuickEdit").to_owned())
 }
 
 pub fn encode(text: &str) -> String {
@@ -95,6 +96,22 @@ impl App {
         Self::start_with(root, files, &[])
     }
     pub fn start_with(root: &Path, files: &[&Path], flags: &[&str]) -> Self {
+        Self::start_logged(root, files, flags, None)
+    }
+    /// As `start_with`, with the app's error stream in this file.
+    pub fn start_logged(root: &Path, files: &[&Path], flags: &[&str], log: Option<&Path>) -> Self {
+        let mut app = Self::launch(root, files, flags, log);
+        app.wait_for("the first window", |app| {
+            app.ask("restored") == "true" && !app.ask("windows").is_empty()
+        });
+        app
+    }
+    /// Starts the app, and does not wait for a window.
+    pub fn launch(root: &Path, files: &[&Path], flags: &[&str], log: Option<&Path>) -> Self {
+        let errors = match log {
+            Some(path) => Stdio::from(std::fs::File::create(path).expect("a log file")),
+            None => Stdio::inherit(),
+        };
         let mut child = Command::new(exe())
             .arg("--test-channel")
             .arg("--stub-spell")
@@ -104,21 +121,44 @@ impl App {
             .args(files)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(errors)
             .spawn()
             .expect("the app starts");
         let input = child.stdin.take().expect("stdin");
         let output = read_lines(child.stdout.take().expect("stdout"));
-        let mut app = Self {
+        Self {
             child,
             input,
             output,
             root: root.to_path_buf(),
-        };
-        app.wait_for("the first window", |app| {
-            app.ask("restored") == "true" && !app.ask("windows").is_empty()
-        });
-        app
+        }
+    }
+    /// One command and its answer, or the reason there was none in this time. A write to a
+    /// process that has ended counts as no answer.
+    pub fn try_ask(&mut self, line: &str, limit: Duration) -> Result<String, String> {
+        if writeln!(self.input, "{line}")
+            .and_then(|()| self.input.flush())
+            .is_err()
+        {
+            return Err(format!("the app has ended, before {line}"));
+        }
+        self.output
+            .recv_timeout(limit)
+            .map(|answer| answer.trim_end().to_owned())
+            .map_err(|e| format!("no answer to {line} in {limit:?}: {e}"))
+    }
+    /// The exit code, once the process has ended.
+    pub fn wait_code(&mut self, limit: Duration) -> Option<i32> {
+        let end = Instant::now() + limit;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status.code();
+            }
+            if Instant::now() >= end {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     /// One command and its one line of answer.
     pub fn ask(&mut self, line: &str) -> String {

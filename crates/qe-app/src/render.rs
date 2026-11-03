@@ -72,7 +72,10 @@ impl Renderer for AppRenderer {
     }
     fn present(&mut self, window: *mut std::ffi::c_void) -> Result<(), RenderError> {
         let result = <BitmapRenderer as Renderer>::present(&mut self.inner, window);
-        self.timing.after_present();
+        // A present that failed showed nothing, so it ends no timer.
+        if result.is_ok() {
+            self.timing.after_present();
+        }
         result
     }
     fn present_rect(
@@ -81,7 +84,9 @@ impl Renderer for AppRenderer {
         rect: PixelRect,
     ) -> Result<(), RenderError> {
         let result = <BitmapRenderer as Renderer>::present_rect(&mut self.inner, dc, rect);
-        self.timing.after_present();
+        if result.is_ok() {
+            self.timing.after_present();
+        }
         result
     }
 }

@@ -1958,3 +1958,58 @@ fn a_check_that_began_before_a_save_does_not_read_as_an_outside_change() {
         );
     }
 }
+
+// ---- The review of the real app ----
+
+#[test]
+fn a_second_close_asks_nothing_new_and_one_cancel_ends_it() {
+    let folder = test_folder("app-close-twice");
+    let mut h = quick(&folder);
+    let path = folder.join("a.txt");
+    write(&path, b"text");
+    let doc = h.open(&path);
+    h.type_text(doc, "more");
+    h.store.request_close(doc);
+    h.store.request_close(doc);
+    let questions = h.store.open_questions();
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    h.store.answer(questions[0].id, Answer::Cancel).unwrap();
+    assert!(h.store.open_questions().is_empty());
+    assert!(h.store.view(doc).is_some());
+}
+
+#[test]
+fn a_tab_that_moves_makes_its_new_window_the_one_in_use() {
+    let folder = test_folder("app-move-tab");
+    let mut h = quick(&folder);
+    let (first, one) = h.store.new_window(false).unwrap();
+    let (second, _) = h.store.new_window(false).unwrap();
+    let _keep = h.store.new_tab(first).unwrap();
+    h.store.window_activated(first);
+    h.store.move_tab(one, second, 0);
+    assert_eq!(h.store.last_used_window(), Some(second));
+}
+
+#[test]
+fn a_failed_copy_stays_known_until_a_copy_succeeds() {
+    let folder = test_folder("app-autosave-state");
+    let mut h = quick(&folder);
+    let path = folder.join("a.txt");
+    write(&path, b"text");
+    let doc = h.open(&path);
+    let docs = folder.join("session").join("docs");
+    h.type_text(doc, "one");
+    h.until("a first copy", |_| {
+        std::fs::read_dir(&docs).is_ok_and(|mut dir| dir.next().is_some())
+    });
+    std::fs::remove_dir_all(&docs).unwrap();
+    std::fs::write(&docs, b"not a folder").unwrap();
+    h.type_text(doc, "two");
+    h.until("the failure", |h| h.store.autosave_failure(doc).is_some());
+    h.type_text(doc, "three");
+    assert!(h.store.autosave_failure(doc).is_some());
+    std::fs::remove_file(&docs).unwrap();
+    std::fs::create_dir_all(&docs).unwrap();
+    h.type_text(doc, "four");
+    h.until("a good copy", |h| h.store.autosave_failure(doc).is_none());
+}

@@ -12,6 +12,7 @@ mod commands;
 mod docs;
 mod events;
 mod ime;
+mod notices;
 mod panels;
 mod platform;
 mod render;

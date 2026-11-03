@@ -43,13 +43,40 @@ use windows::Win32::{
     },
     UI::{
         TextServices::{
-            CLSID_TF_ThreadMgr, ITfContext, ITfDocumentMgr, ITfKeystrokeMgr, ITfMessagePump,
-            ITfSource, ITfTextEditSink, ITfThreadMgr, TF_POPF_ALL,
+            CLSID_TF_ThreadMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
+            ITfContext, ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl,
+            ITfInsertAtSelection, ITfKeystrokeMgr, ITfMessagePump, ITfSource, ITfTextEditSink,
+            ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC,
+            TF_IAS_QUERYONLY, TF_POPF_ALL,
         },
         WindowsAndMessaging::{IsIconic, IsWindowVisible, MSG, WM_KEYDOWN, WM_KEYUP},
     },
 };
-use windows::core::{BOOL, Interface};
+use windows::core::{BOOL, Interface, Ref, implement};
+
+type TestSessionBody = Box<dyn FnOnce(u32) -> windows::core::Result<()>>;
+/// One edit session for `TsfDocument::compose_for_test`.
+#[implement(ITfEditSession)]
+struct TestSession(RefCell<Option<TestSessionBody>>);
+impl ITfEditSession_Impl for TestSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        match self.0.borrow_mut().take() {
+            Some(body) => body(ec),
+            None => Ok(()),
+        }
+    }
+}
+#[implement(ITfCompositionSink)]
+struct TestCompositionSink;
+impl ITfCompositionSink_Impl for TestCompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ec: u32,
+        _composition: Ref<ITfComposition>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
 
 /// A failure with its reason in plain words.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,6 +364,7 @@ impl TsfThread {
                 store,
                 edit_sink,
                 closed: false,
+                test_composition: Rc::default(),
                 core: self.core.clone(),
             })
         }
@@ -375,6 +403,7 @@ pub struct TsfDocument {
     store: TextStoreHandle,
     edit_sink: u32,
     closed: bool,
+    test_composition: Rc<RefCell<Option<ITfComposition>>>,
     // Last, so that this document's COM objects go before TSF and COM can stop.
     core: Rc<ThreadCore>,
 }
@@ -394,6 +423,77 @@ impl TsfDocument {
                 .SetFocus(&self.doc)
                 .map_err(|e| failed("setting TSF's focus", e))
         }
+    }
+    /// Call when the keyboard moves from this text to a field beside it, such as Find. A
+    /// composition ends with its text. Then no document of this window holds TSF's focus, so a
+    /// text service stops writing here, and the field's own input path takes over.
+    pub fn leave_focus(&self) -> Result<(), ImeError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.store.complete_composition();
+        self.store.sync();
+        let hwnd = self.store.hwnd();
+        // SAFETY: plain COM calls on this apartment's thread, with live interfaces.
+        unsafe {
+            associate_focus(&self.core.thread, hwnd, None)
+                .map_err(|e| failed("AssociateFocus", e))?;
+            if self.has_tsf_focus() {
+                let empty = self
+                    .core
+                    .thread
+                    .CreateDocumentMgr()
+                    .map_err(|e| failed("CreateDocumentMgr", e))?;
+                self.core
+                    .thread
+                    .SetFocus(&empty)
+                    .map_err(|e| failed("setting TSF's focus", e))?;
+            }
+        }
+        Ok(())
+    }
+    /// True while TSF's focus is on this document.
+    pub fn has_tsf_focus(&self) -> bool {
+        // SAFETY: a plain COM call on this apartment's thread. No focus comes back as an error.
+        match unsafe { self.core.thread.GetFocus() } {
+            Ok(focused) => focused == self.doc,
+            Err(_) => false,
+        }
+    }
+    /// Starts a real composition with this text, as a text service does, for a host's tests.
+    /// The composition goes on until a commit ends it.
+    #[doc(hidden)]
+    pub fn compose_for_test(&self, text: &str) -> Result<(), ImeError> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let context = self.context.clone();
+        let held = self.test_composition.clone();
+        let session: ITfEditSession = TestSession(RefCell::new(Some(Box::new(move |ec| {
+            // SAFETY: TSF runs this inside its write lock, on this thread.
+            unsafe {
+                let insert: ITfInsertAtSelection = context.cast()?;
+                let range = insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
+                let composing: ITfContextComposition = context.cast()?;
+                let sink: ITfCompositionSink = TestCompositionSink.into();
+                let composition = composing.StartComposition(ec, &range, &sink)?;
+                let range = composition.GetRange()?;
+                range.SetText(ec, 0, &wide)?;
+                *held.borrow_mut() = Some(composition);
+                Ok(())
+            }
+        }))))
+        .into();
+        self.store.sync();
+        // SAFETY: a plain COM call on this apartment's thread, with live interfaces.
+        let answer = unsafe {
+            self.context.RequestEditSession(
+                self.core.client,
+                &session,
+                TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0),
+            )
+        }
+        .map_err(|e| failed("RequestEditSession", e))?;
+        self.store.sync();
+        answer.ok().map_err(|e| failed("starting a composition", e))
     }
     pub fn store(&self) -> &TextStoreHandle {
         &self.store

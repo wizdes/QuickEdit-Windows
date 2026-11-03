@@ -1,6 +1,11 @@
 //! Questions and errors, one at a time, in qe-ui's painted alert. Nothing here waits: the alert
 //! disables its owner, the normal message loop runs it, and its answer joins the app's queue.
-use crate::app::{App, Incoming, Shared, push, queue_note};
+//!
+//! An alert's owner is chosen when it opens, from its document's window at that moment. Every
+//! way an alert can end comes through here. Its window going away for any reason reaches
+//! `window_died`: by the person's X it counts as Cancel or as read, and by losing its owner it
+//! shows again. An alert that cannot show answers Cancel, and its text becomes a note.
+use crate::app::{App, Effect, Incoming, Shared, post_later, push};
 use qe_a11y::{UiThreadOnly, UiaHost, UiaSlot, WidgetAction};
 use qe_api::Widget;
 use qe_api::{
@@ -10,7 +15,7 @@ use qe_api::{
 use qe_docs::{Answer, DocId, QuestionId};
 use qe_render::BitmapRenderer;
 use qe_ui::{AlertModel, DialogFrame, DialogResult, DialogWindow, TextField, UiTokens};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -57,7 +62,8 @@ pub struct AlertRequest {
     pub purpose: AlertPurpose,
     /// A text box with this text, for a name.
     pub field: Option<String>,
-    pub owner: Option<HWND>,
+    /// The document it is about. Its window owns the alert. With none, the window in use does.
+    pub doc: Option<DocId>,
 }
 
 /// How an alert ended.
@@ -76,17 +82,27 @@ struct Open {
     theme: Theme,
     scale: f32,
     measure: std::sync::Arc<qe_layout::DirectWriteLayout>,
-    purpose: AlertPurpose,
     has_field: bool,
     title: String,
     message: String,
     buttons: Vec<String>,
 }
 
+struct Current {
+    open: Rc<RefCell<Open>>,
+    hwnd: HWND,
+    request: AlertRequest,
+}
+
 #[derive(Default)]
 pub struct Alerts {
-    current: RefCell<Option<Rc<RefCell<Open>>>>,
+    current: RefCell<Option<Current>>,
     waiting: RefCell<VecDeque<AlertRequest>>,
+    /// An alert is on its way up: a message sent during that must not start a second one.
+    opening: Cell<bool>,
+    /// Alerts whose windows are going away. The last reference must not go inside their own
+    /// `WM_DESTROY`.
+    dying: RefCell<Vec<Rc<RefCell<Open>>>>,
 }
 
 fn modifiers() -> Modifiers {
@@ -108,6 +124,44 @@ fn dips(scale: f32, l: isize) -> Point {
 }
 
 impl Open {
+    /// The alert moved to a monitor with another scale. Clicks and paint follow.
+    fn dpi_changed(&mut self, dpi: u32, suggested: isize) {
+        self.scale = dpi.max(1) as f32 / 96.0;
+        if suggested != 0 {
+            // SAFETY: for this message the rectangle lives through the call.
+            let rect = unsafe { *(suggested as *const windows::Win32::Foundation::RECT) };
+            // SAFETY: a plain call on a window of this thread.
+            if let Err(e) = unsafe {
+                SetWindowPos(
+                    self.window.hwnd(),
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            } {
+                eprintln!("An alert could not move with its scale: {e}");
+            }
+        }
+        let width = (self.frame.bounds.width.0 * self.scale).round() as i32;
+        let height = (self.frame.bounds.height.0 * self.scale).round() as i32;
+        let size = self
+            .window
+            .client_size()
+            .map_or((width.max(1) as u32, height.max(1) as u32), |(w, h)| {
+                (w.max(1) as u32, h.max(1) as u32)
+            });
+        let done = self
+            .renderer
+            .resize(size.0, size.1)
+            .and_then(|()| self.renderer.set_dpi(dpi));
+        if let Err(e) = done {
+            eprintln!("An alert could not change its scale: {e}");
+        }
+        self.paint();
+    }
     fn paint(&mut self) {
         let mut list = DisplayList::default();
         list.push(DrawCommand::FillRect {
@@ -145,31 +199,73 @@ impl Alerts {
         self.waiting.borrow_mut().push_back(request);
         self.next(shared);
     }
-    /// Opens the next one, if none is open.
-    fn next(&self, shared: &Rc<Shared>) {
-        if self.current.borrow().is_some() {
+    /// Opens the next one, if none is open. An alert that cannot show still answers.
+    pub fn next(&self, shared: &Rc<Shared>) {
+        if self.opening.get() {
             return;
         }
-        let Some(request) = self.waiting.borrow_mut().pop_front() else {
-            return;
-        };
-        let purpose = request.purpose.clone();
-        if let Err(problem) = self.open(shared, request) {
-            queue_note(shared, format!("A question could not show: {problem}"));
-            // Without its window, a question still needs its safe answer.
-            push(
+        self.dying
+            .borrow_mut()
+            .retain(|open| open.try_borrow().map_or(true, |o| o.window.is_alive()));
+        loop {
+            if self.current.borrow().is_some() {
+                return;
+            }
+            let Some(request) = self.waiting.borrow_mut().pop_front() else {
+                return;
+            };
+            // A rename or a spelling question about a tab that has gone has nothing to ask.
+            let about_nothing = matches!(
+                request.purpose,
+                AlertPurpose::Rename(_) | AlertPurpose::SpellWord { .. }
+            ) && request.doc.is_some_and(|doc| {
+                shared
+                    .state
+                    .try_borrow()
+                    .is_ok_and(|app| app.store.view(doc).is_none())
+            });
+            if about_nothing {
+                continue;
+            }
+            self.opening.set(true);
+            let opened = self.open(shared, request.clone());
+            self.opening.set(false);
+            let Err(problem) = opened else {
+                return;
+            };
+            // The text is never lost. The answer comes after a turn of the message loop, so a
+            // question that keeps failing can never hold this pump.
+            post_later(
+                shared,
+                Incoming::Note(format!(
+                    "{}: {} (This could not show as a question: {problem})",
+                    request.title, request.message
+                )),
+            );
+            post_later(
                 shared,
                 Incoming::Alert(AlertDone {
-                    purpose,
+                    purpose: request.purpose,
                     button: None,
                     field: None,
                 }),
             );
-            self.next(shared);
         }
     }
+    /// The owner: the window of the alert's document, or else the window in use. It is worked
+    /// out now, not when the alert was queued, because that window may have gone since.
+    fn owner_for(shared: &Rc<Shared>, doc: Option<DocId>) -> Option<HWND> {
+        let app = shared.state.try_borrow().ok()?;
+        let window = doc
+            .and_then(|doc| app.store.window_of(doc))
+            .or_else(|| app.store.last_used_window())
+            .filter(|window| app.windows.contains_key(window))
+            .or_else(|| app.windows.keys().next().copied())?;
+        app.windows.get(&window).map(|win| win.hwnd)
+    }
     fn open(&self, shared: &Rc<Shared>, request: AlertRequest) -> Result<(), String> {
-        let scale = request.owner.map_or(1.0, |owner| {
+        let owner = Self::owner_for(shared, request.doc);
+        let scale = owner.map_or(1.0, |owner| {
             // SAFETY: a plain query. A dead handle gives 0.
             let dpi = unsafe { GetDpiForWindow(owner) };
             if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
@@ -194,9 +290,9 @@ impl Alerts {
             &request.title,
             (ALERT_WIDTH * scale).round() as i32,
             (height * scale).round() as i32,
-            request.owner.is_some(),
+            owner.is_some(),
             false,
-            request.owner,
+            owner,
         )
         .map_err(|e| e.to_string())?;
         let hwnd = window.hwnd();
@@ -207,6 +303,7 @@ impl Alerts {
             .set_dpi((scale * 96.0).round() as u32)
             .map_err(|e| e.message)?;
         let theme = shared_theme(shared);
+        let kept = request.clone();
         let has_field = request.field.is_some();
         if let Some(text) = &request.field {
             let mut field = TextField::new(WidgetId(ALERT_ID + 50), "Name");
@@ -248,7 +345,6 @@ impl Alerts {
             theme,
             scale,
             measure: shared.measure.clone(),
-            purpose: request.purpose,
             has_field,
             title: request.title,
             message: request.message,
@@ -283,10 +379,13 @@ impl Alerts {
         window_ref
             .window
             .set_message_handler(Box::new(move |hwnd, message, w, l| {
-                if message == WM_DESTROY
-                    && let Err(e) = slot.shutdown()
-                {
-                    eprintln!("A screen reader's link to a question would not end: {e}");
+                if message == WM_DESTROY {
+                    if let Err(e) = slot.shutdown() {
+                        eprintln!("A screen reader's link to a question would not end: {e}");
+                    }
+                    if let Some(shared) = weak.upgrade() {
+                        shared.alerts.window_died(&shared, hwnd);
+                    }
                 }
                 let host = for_host.clone();
                 if let Some(answer) = slot.on_window_message(hwnd, message, w, l, move || {
@@ -311,37 +410,83 @@ impl Alerts {
                 let _ = SetFocus(Some(hwnd));
             }
         }
-        *self.current.borrow_mut() = Some(open);
+        *self.current.borrow_mut() = Some(Current {
+            open,
+            hwnd,
+            request: kept,
+        });
         Ok(())
     }
-    /// The window's own close button closed the alert.
-    pub fn closed_by_window(&self, shared: &Rc<Shared>) {
-        self.finish(shared, None);
+    /// The open alert's window is going away, and not by `finish` or `drop_question`, which
+    /// have already let go of it. This runs inside its `WM_DESTROY`, so the work goes through
+    /// the queue. A wake makes sure that someone reads the queue.
+    fn window_died(&self, shared: &Rc<Shared>, hwnd: HWND) {
+        let is_it = self
+            .current
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.hwnd == hwnd);
+        if !is_it {
+            return;
+        }
+        let Some(current) = self.current.borrow_mut().take() else {
+            return;
+        };
+        let (by_person, field) = current.open.try_borrow().map_or((false, None), |state| {
+            (state.window.closed_by_user(), state.field_text())
+        });
+        if by_person {
+            shared
+                .queue
+                .borrow_mut()
+                .push_back(Incoming::Alert(AlertDone {
+                    purpose: current.request.purpose.clone(),
+                    button: None,
+                    field,
+                }));
+        } else {
+            // Its owner went, as in a merge of windows. The person never answered, so it asks
+            // again in the window that has the document now.
+            let mut request = current.request.clone();
+            if field.is_some() {
+                request.field = field;
+            }
+            self.waiting.borrow_mut().push_front(request);
+        }
+        self.dying.borrow_mut().push(current.open);
+        shared.queue.borrow_mut().push_back(Incoming::AlertNext);
+        (shared.wake)();
     }
     /// Ends the open alert with this answer, and goes on to the next.
     pub fn finish(&self, shared: &Rc<Shared>, button: Option<usize>) {
-        let Some(open) = self.current.borrow_mut().take() else {
+        let Some(current) = self.current.borrow_mut().take() else {
             return;
         };
-        let done = {
-            let Ok(state) = open.try_borrow() else {
-                return;
-            };
-            AlertDone {
-                purpose: state.purpose.clone(),
-                button,
-                field: state.field_text(),
-            }
-        };
-        // The window goes when the last reference does. A message on its way finds it gone.
-        if let Ok(state) = open.try_borrow()
-            && state.window.is_alive()
-        {
+        let field = current
+            .open
+            .try_borrow()
+            .ok()
+            .and_then(|state| state.field_text());
+        let alive = current
+            .open
+            .try_borrow()
+            .ok()
+            .filter(|state| state.window.is_alive())
+            .map(|state| state.window.hwnd());
+        if let Some(hwnd) = alive {
             // SAFETY: a window of this thread. Failure means it has gone already.
-            let _ = unsafe { DestroyWindow(state.window.hwnd()) };
+            let _ = unsafe { DestroyWindow(hwnd) };
         }
-        push(shared, Incoming::Alert(done));
-        self.next(shared);
+        self.dying.borrow_mut().push(current.open);
+        push(
+            shared,
+            Incoming::Alert(AlertDone {
+                purpose: current.request.purpose,
+                button,
+                field,
+            }),
+        );
+        push(shared, Incoming::AlertNext);
     }
     /// This question has gone from the store, as when its document closed. It needs no answer.
     pub fn drop_question(&self, shared: &Rc<Shared>, gone: QuestionId) {
@@ -349,27 +494,26 @@ impl Alerts {
         self.waiting
             .borrow_mut()
             .retain(|request| !is_it(&request.purpose));
-        let open = self.current.borrow().clone();
-        let Some(open) = open else {
+        let current_is_it = self
+            .current
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| is_it(&current.request.purpose));
+        if !current_is_it {
             return;
-        };
-        let Ok(state) = open.try_borrow() else {
-            return;
-        };
-        if is_it(&state.purpose) {
-            if state.window.is_alive() {
-                // SAFETY: a window of this thread. Failure means it has gone already.
-                let _ = unsafe { DestroyWindow(state.window.hwnd()) };
-            }
-            drop(state);
-            *self.current.borrow_mut() = None;
-            self.next(shared);
         }
+        let Some(current) = self.current.borrow_mut().take() else {
+            return;
+        };
+        // SAFETY: a window of this thread. Failure means it has gone already.
+        let _ = unsafe { DestroyWindow(current.hwnd) };
+        self.dying.borrow_mut().push(current.open);
+        self.next(shared);
     }
     /// What is open now, for the test channel: title, message and buttons.
     pub fn describe(&self) -> Option<(String, String, Vec<String>)> {
         let current = self.current.borrow();
-        let open = current.as_ref()?.try_borrow().ok()?;
+        let open = current.as_ref()?.open.try_borrow().ok()?;
         Some((
             open.title.clone(),
             open.message.clone(),
@@ -378,16 +522,33 @@ impl Alerts {
     }
     /// The open alert's window, for the test channel's real key messages.
     pub fn window(&self) -> Option<HWND> {
+        Some(self.current.borrow().as_ref()?.hwnd)
+    }
+    /// The open alert's scale and theme, for the test channel.
+    pub fn look(&self) -> Option<(f32, Theme)> {
         let current = self.current.borrow();
-        Some(current.as_ref()?.try_borrow().ok()?.window.hwnd())
+        let open = current.as_ref()?.open.try_borrow().ok()?;
+        Some((open.scale, open.theme))
+    }
+    /// The middle of a button of the open alert, in the window's pixels.
+    pub fn button_center(&self, index: usize) -> Option<(i32, i32)> {
+        let current = self.current.borrow();
+        let open = current.as_ref()?.open.try_borrow().ok()?;
+        let tree = open.frame.widgets()?;
+        let id = WidgetId(ALERT_ID + 2 + index as u64);
+        let button = crate::a11y::find(&tree, id)?;
+        Some((
+            ((button.bounds.x.0 + button.bounds.width.0 / 2.0) * open.scale) as i32,
+            ((button.bounds.y.0 + button.bounds.height.0 / 2.0) * open.scale) as i32,
+        ))
     }
     /// Sets the text box of the open alert, for the test channel.
     pub fn set_field(&self, text: &str) -> bool {
         let current = self.current.borrow();
-        let Some(open) = current.as_ref() else {
+        let Some(current) = current.as_ref() else {
             return false;
         };
-        let Ok(mut open) = open.try_borrow_mut() else {
+        let Ok(mut open) = current.open.try_borrow_mut() else {
             return false;
         };
         let last = open.frame.children.len().saturating_sub(1);
@@ -445,8 +606,13 @@ fn shared_theme(shared: &Rc<Shared>) -> Theme {
             let window = app.store.last_used_window()?;
             app.windows.get(&window)?.handle.theme().ok()
         })
+        .or_else(|| shared.last_theme.get())
         .unwrap_or_else(|| Theme::new(ThemeKind::Light))
 }
+
+/// A system color change reached the alert, and its text windows may hear after it. This comes
+/// back once those sends have ended.
+const WM_APP_THEME: u32 = WM_APP + 0x72;
 
 fn alert_message(
     open: &Rc<RefCell<Open>>,
@@ -456,6 +622,32 @@ fn alert_message(
     l: isize,
 ) -> Option<LRESULT> {
     let mut state = open.try_borrow_mut().ok()?;
+    match message {
+        WM_DPICHANGED => {
+            state.dpi_changed((w & 0xffff) as u32, l);
+            return Some(LRESULT(0));
+        }
+        WM_THEMECHANGED | WM_SETTINGCHANGE => {
+            // SAFETY: a window of this thread.
+            if let Err(e) = unsafe {
+                PostMessageW(
+                    Some(state.window.hwnd()),
+                    WM_APP_THEME,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                )
+            } {
+                eprintln!("An alert could not follow the system's colors: {e}");
+            }
+            return None;
+        }
+        WM_APP_THEME => {
+            state.theme = shared_theme(shared);
+            state.paint();
+            return Some(LRESULT(0));
+        }
+        _ => {}
+    }
     let at = |l| dips(state.scale, l);
     let kind = match message {
         WM_KEYDOWN => InputKind::KeyDown {
@@ -510,6 +702,31 @@ impl App {
         match purpose {
             AlertPurpose::Note => {}
             AlertPurpose::Question { id, choices } => {
+                let doc = self
+                    .store
+                    .open_questions()
+                    .iter()
+                    .find(|question| question.id == id)
+                    .map(|question| question.doc);
+                // A composition is not in the text yet, and this answer may save the text.
+                if let Some(doc) = doc {
+                    if self.ime.is_composing(doc) {
+                        self.effects.push(Effect::CommitThen(
+                            vec![doc],
+                            Box::new(Incoming::Alert(AlertDone {
+                                purpose: AlertPurpose::Question { id, choices },
+                                button,
+                                field,
+                            })),
+                        ));
+                        return;
+                    }
+                    // The answer's own work may edit, as a Cancel undoes. `sync_questions`
+                    // holds the view again if another question stays open.
+                    if let Some(view) = self.store.view_mut(doc) {
+                        view.set_hold_edits(false);
+                    }
+                }
                 // No button means the safe way out. Every question has Cancel, or its first
                 // choice is the one that keeps the text.
                 let answer = button

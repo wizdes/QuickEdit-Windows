@@ -1,16 +1,38 @@
-//! `--bench-keys N`: real keys through the app's own input path, in a hidden window, with the
-//! same timer as `qe-editor`'s `editor` example. It runs on the UI thread with no borrow held.
+//! `--bench-keys N`: real key messages, posted to the hidden window, through the real message
+//! loop, `TranslateMessage` and the shell, with TSF running. Each key's timer starts when the
+//! message loop takes the message, and ends at the first present of a frame that shows it.
+//!
+//! What a hidden run cannot measure: a hidden window has an empty paint rectangle, so the last
+//! step, the copy of the pixels to the screen, does not happen. `--timings` in a visible run
+//! measures that too, with real keys.
 use crate::app::{App, Effect, Shared, pump};
-use qe_api::{ByteOffset, InputKind, Modifiers, ViewContext};
+use qe_api::{ByteOffset, InputKind, ViewContext};
+use qe_docs::WindowId;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_PAINT};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP};
+
+/// How long one key may take before the bench goes on without it.
+const KEY_LIMIT: Duration = Duration::from_secs(1);
+/// The gap between keys. Workers run while a person's fingers move.
+const KEY_GAP: Duration = Duration::from_millis(3);
 
 pub struct Bench {
     pub keys: usize,
     pub middle: bool,
     pub started: bool,
+    sent: usize,
+    run: Option<Run>,
+}
+struct Run {
+    window: WindowId,
+    hwnd: HWND,
+    can_edit: bool,
+    /// The middle of the text is not known until the whole index is.
+    waiting_for_index: Option<Instant>,
+    /// The key on its way, and when the bench stops waiting for it.
+    key_limit: Option<Instant>,
 }
 impl Bench {
     pub fn new(keys: usize, middle: bool) -> Self {
@@ -18,6 +40,8 @@ impl Bench {
             keys,
             middle,
             started: false,
+            sent: 0,
+            run: None,
         }
     }
 }
@@ -46,101 +70,142 @@ impl App {
     }
 }
 
+/// Starts the bench. The message loop runs it from here on.
 pub fn run(shared: &Rc<Shared>) {
-    let found = shared.state.try_borrow().ok().and_then(|app| {
-        let window = app.store.last_used_window()?;
-        let bench = app.bench.as_ref()?;
-        Some((
-            window,
-            app.windows.get(&window)?.hwnd,
-            bench.keys,
-            bench.middle,
-        ))
-    });
-    let Some((window, hwnd, keys, middle)) = found else {
+    let Ok(mut app) = shared.state.try_borrow_mut() else {
         return;
     };
-    // SAFETY: a window of this thread.
-    let paint = || unsafe {
-        SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+    let Some(window) = app.store.last_used_window() else {
+        return;
     };
-    let can_edit = shared
-        .state
-        .try_borrow()
-        .ok()
-        .and_then(|app| {
-            let doc = app.store.active_tab(window)?;
-            Some(app.store.view(doc)?.can_edit())
-        })
-        .unwrap_or(false);
-    if middle && let Ok(mut app) = shared.state.try_borrow_mut() {
-        let limit = Instant::now() + Duration::from_secs(60);
-        while Instant::now() < limit {
-            let done = app
-                .store
-                .active_tab(window)
-                .and_then(|doc| app.store.view(doc))
-                .is_none_or(|view| view.store_status().complete);
-            if done {
-                break;
-            }
+    let Some(hwnd) = app.windows.get(&window).map(|win| win.hwnd) else {
+        return;
+    };
+    let can_edit = app
+        .store
+        .active_tab(window)
+        .and_then(|doc| app.store.view(doc))
+        .is_some_and(qe_editor::EditorView::can_edit);
+    let middle = app.bench.as_ref().is_some_and(|bench| bench.middle);
+    // The keyboard comes to this window, so TSF and the caret run as they do for a person.
+    app.send_input(window, InputKind::Focus);
+    if let Some(bench) = &mut app.bench {
+        bench.run = Some(Run {
+            window,
+            hwnd,
+            can_edit,
+            waiting_for_index: middle.then(|| Instant::now() + Duration::from_secs(60)),
+            key_limit: None,
+        });
+    }
+    drop(app);
+    pump(shared);
+    shared.wake_window.post_bench_step();
+}
+
+/// One turn. It always gives the message loop its own turn before the next.
+pub fn step(shared: &Rc<Shared>) {
+    let Ok(mut app) = shared.state.try_borrow_mut() else {
+        shared.wake_window.post_bench_step();
+        return;
+    };
+    let App { bench, store, .. } = &mut *app;
+    let Some(bench) = bench else {
+        return;
+    };
+    let keys = bench.keys;
+    let sent = bench.sent;
+    let Some(run) = &mut bench.run else {
+        return;
+    };
+    let window = run.window;
+    if let Some(limit) = run.waiting_for_index {
+        let doc = store.active_tab(window);
+        let done = doc
+            .and_then(|doc| store.view(doc))
+            .is_none_or(|view| view.store_status().complete);
+        if !done && Instant::now() < limit {
+            drop(app);
             std::thread::sleep(Duration::from_millis(5));
+            shared.wake_window.post_bench_step();
+            return;
         }
-        if let Some(doc) = app.store.active_tab(window) {
+        run.waiting_for_index = None;
+        if let Some(doc) = doc {
             let mut ctx = ViewContext::default();
-            if let Some(view) = app.store.view_mut(doc) {
+            if let Some(view) = store.view_mut(doc) {
                 let at = ByteOffset(view.store_status().known_bytes.0 / 2);
                 view.select(at..at, &mut ctx);
             }
             app.apply(window, ctx.requests);
         }
+        drop(app);
+        pump(shared);
+        shared.wake_window.post_bench_step();
+        return;
     }
-    pump(shared);
-    paint();
-    let down = |code: u16| InputKind::KeyDown {
-        virtual_key: code,
-        modifiers: Modifiers::default(),
-        repeat: false,
-    };
-    for index in 0..keys {
-        let kind = match (can_edit, index % 2 == 0) {
-            (true, true) => InputKind::Char('q'),
-            (true, false) => down(0x08),
-            (false, true) => down(0x28),
-            (false, false) => down(0x26),
+    // The key on its way is done when a frame has shown it, or when its time is up.
+    if let Some(limit) = run.key_limit
+        && shared.timing.keys_done() < sent
+        && Instant::now() < limit
+    {
+        drop(app);
+        std::thread::sleep(Duration::from_micros(100));
+        shared.wake_window.post_bench_step();
+        return;
+    }
+    run.key_limit = None;
+    if sent >= keys {
+        let can_edit = run.can_edit;
+        let label = if can_edit {
+            "typing and Backspace, editable file"
+        } else {
+            "Down and Up, read-only file"
         };
-        if let Ok(mut app) = shared.state.try_borrow_mut() {
-            app.send_input(window, kind);
-        }
-        pump(shared);
-        paint();
-        // A key on a shaped line ends when its worker's result is on screen.
-        let limit = Instant::now() + Duration::from_secs(1);
-        while !shared.timing.keys_waiting.borrow().is_empty() && Instant::now() < limit {
-            std::thread::sleep(Duration::from_micros(100));
-            if let Ok(mut app) = shared.state.try_borrow_mut() {
-                app.tick_window(window);
-            }
-            pump(shared);
-            paint();
-        }
-        // Workers run while a person's fingers move. Their results are not key work.
-        std::thread::sleep(Duration::from_millis(3));
-        if let Ok(mut app) = shared.state.try_borrow_mut() {
-            app.tick_window(window);
-        }
-        pump(shared);
-    }
-    let label = if can_edit {
-        "typing and Backspace, editable file"
-    } else {
-        "Down and Up, read-only file"
-    };
-    shared.timing.report(label, shared.process_start);
-    if let Ok(mut app) = shared.state.try_borrow_mut() {
+        shared.timing.report(label, shared.process_start);
         // The bench types text that no one asked to keep.
         app.bench = None;
         app.effects.push(Effect::Exit);
+        drop(app);
+        pump(shared);
+        return;
     }
-    pump(shared);
+    let code: usize = match (run.can_edit, sent % 2 == 0) {
+        (true, true) => 0x51, // Q
+        (true, false) => 0x08,
+        (false, true) => 0x28,
+        (false, false) => 0x26,
+    };
+    run.key_limit = Some(Instant::now() + KEY_LIMIT);
+    let hwnd = run.hwnd;
+    bench.sent += 1;
+    drop(app);
+    std::thread::sleep(KEY_GAP);
+    // SAFETY: a window of this thread. The scan code in the high bits lets TranslateMessage
+    // make its character, as for a real key.
+    let posted = unsafe {
+        let scan = isize::try_from(windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(
+            code as u32,
+            windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VK_TO_VSC,
+        ))
+        .unwrap_or(0);
+        PostMessageW(
+            Some(hwnd),
+            WM_KEYDOWN,
+            WPARAM(code),
+            LPARAM(1 | (scan << 16)),
+        )
+        .and_then(|()| {
+            PostMessageW(
+                Some(hwnd),
+                WM_KEYUP,
+                WPARAM(code),
+                LPARAM(1 | (scan << 16) | (1 << 30) | (1 << 31)),
+            )
+        })
+    };
+    if let Err(e) = posted {
+        eprintln!("The bench could not post a key: {e}");
+    }
+    shared.wake_window.post_bench_step();
 }

@@ -602,3 +602,18 @@ fn f15_the_queue_for_the_ui_has_a_limit_and_a_launch_past_it_is_told() {
     assert_eq!(total, 4 * MAX_PATHS);
     assert_eq!(hand_off(&names, &batch), Ok(true), "room again");
 }
+
+#[test]
+fn stopping_the_server_gives_back_what_came_and_the_next_launch_becomes_the_instance() {
+    let names = names("stop-and-take");
+    let (server, _) = server(&names);
+    let path = std::env::current_exe().unwrap();
+    assert_eq!(hand_off(&names, std::slice::from_ref(&path)), Ok(true));
+    let requests = server.stop_and_take(Duration::from_secs(5));
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].paths, [path]);
+    assert!(matches!(
+        start(&names, &[], no_wake()),
+        LaunchRole::Primary(_)
+    ));
+}

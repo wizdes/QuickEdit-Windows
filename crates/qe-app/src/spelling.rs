@@ -66,13 +66,18 @@ impl App {
 
     /// After an edit, a scroll or a new layout.
     pub fn spell_refresh(&mut self, doc: DocId) {
-        let wanted = self.docs.get(&doc).is_some_and(|ui| ui.spell_on);
+        // Correct alone works with no underlines, as on the Mac.
+        let wanted = self
+            .docs
+            .get(&doc)
+            .is_some_and(|ui| ui.spell_on || ui.correct_on);
         let shown = self
             .store
             .window_of(doc)
             .and_then(|window| self.windows.get(&window))
             .is_some_and(|win| win.shown == Some(doc));
-        if !wanted || !shown {
+        // A held view counts as read-only, and a look now would throw its marks away.
+        if !wanted || !shown || self.asking.contains(&doc) {
             return;
         }
         if let Err(off) = self.spell_service(doc) {
@@ -85,6 +90,7 @@ impl App {
         if let (Some(ui), Some(view)) = (self.docs.get_mut(&doc), self.store.view_mut(doc))
             && let Some(service) = &mut ui.spell
         {
+            service.set_underlines(ui.spell_on, view, &mut ctx);
             ui.spell_waiting = service.refresh(view, &mut ctx) == SpellState::WaitingForLayout;
         }
         if let Some(window) = self.store.window_of(doc) {
@@ -122,9 +128,7 @@ impl App {
                     }
                     if poll.marks_changed {
                         self.try_correct(doc);
-                        if self.docs.get(&doc).is_some_and(|ui| ui.spell_on) {
-                            self.spell_refresh(doc);
-                        }
+                        self.spell_refresh(doc);
                     }
                 }
                 Err(problem) => self.note(problem),
@@ -144,7 +148,8 @@ impl App {
         {
             self.note(format!("The setting could not change: {e}"));
         }
-        if on {
+        let correct = self.docs.get(&doc).is_some_and(|ui| ui.correct_on);
+        if on || correct {
             self.spell_refresh(doc);
         } else {
             self.spell_stop(doc);
@@ -169,16 +174,21 @@ impl App {
         };
         ui.correct_on = !ui.correct_on;
         let on = ui.correct_on;
-        if on && !ui.spell_on {
-            ui.spell_on = true;
+        if !on {
+            ui.correct_at = None;
         }
+        let check = ui.spell_on;
         if let Err(e) = self
             .settings
             .set_bool(qe_api::SettingKey::CorrectSpellingAutomatically, on)
         {
             self.note(format!("The setting could not change: {e}"));
         }
-        self.spell_refresh(doc);
+        if on || check {
+            self.spell_refresh(doc);
+        } else {
+            self.spell_stop(doc);
+        }
     }
 
     /// Check Document Now, and Show Spelling, which asks about each word it finds.
@@ -233,7 +243,7 @@ impl App {
                         buttons,
                         purpose: AlertPurpose::SpellWord { doc, suggestion },
                         field: None,
-                        owner: None,
+                        doc: Some(doc),
                     });
                 }
             }

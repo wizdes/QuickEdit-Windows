@@ -65,6 +65,8 @@ UIA calls a provider on its own worker thread, not on the window's thread. `src/
 
 4. **Report input.** After each input batch, and after `poll_layout` changes the text, call `slot.after_input()?`. After any change a client can read in a widget, call `slot.widgets_changed()?`. See "For M14" for the list. With no client ever, each reads one `Option`. With a provider and no listener, each makes one system call. Neither needs a timer.
 
+A window whose popups forward `WM_GETOBJECT` uses `on_message_for_home(home, hwnd, ...)` in place of `on_window_message`. The provider then belongs to `home`, whose procedure runs this crate's work, even when a client asks a popup first.
+
 5. **Close.** In WM_DESTROY, call `slot.shutdown()?`, and show its error if it gives one. It must run while the window still exists. After it, every object a client holds says `UIA_E_ELEMENTNOTAVAILABLE`, and WM_GETOBJECT falls through to `DefWindowProcW`. It works inside a sent message too. It first calls `ReplyMessage(0)`, because UIA refuses to disconnect while a sender waits, so that sender then hears 0 or "gone". If it still fails, it keeps what it needs, and a later call tries again.
 
 `tests/support/mod.rs` is a working copy of steps 1 to 5 on a hidden window, and `tests/recipe.rs` runs it with actions that report input, close the window and act as a modal dialog.

@@ -20,6 +20,14 @@ fn main() {
     if env("CARGO_CFG_TARGET_OS") != "windows" {
         return;
     }
+    // UI Automation and the shell are slow to load, and most runs reach for them late or never.
+    // The linker loads them at their first call, so the first frame does not wait for them.
+    if env("CARGO_CFG_TARGET_ENV") == "msvc" {
+        for library in ["UIAutomationCore.dll", "SHELL32.dll", "PROPSYS.dll"] {
+            println!("cargo:rustc-link-arg-bin=QuickEdit=/DELAYLOAD:{library}");
+        }
+        println!("cargo:rustc-link-arg-bin=QuickEdit=delayimp.lib");
+    }
     let release = env("PROFILE") == "release";
     let compiler = match find_rc() {
         Ok(path) => path,

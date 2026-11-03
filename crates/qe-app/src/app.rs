@@ -35,6 +35,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_OK, MessageBoxW, SW_MAXIMIZE, SendMessageW, ShowWindow, WM_PAINT,
+    WM_THEMECHANGED,
 };
 use windows::core::HSTRING;
 
@@ -49,13 +50,26 @@ pub enum Incoming {
     Dropped(WindowId, Vec<PathBuf>),
     EndSession,
     SystemSetting,
-    TabDrop { doc: DocId, at: POINT },
+    TabDrop {
+        doc: DocId,
+        at: POINT,
+    },
     Alert(AlertDone),
     Panel(PanelJob, Option<PanelChoice>),
     Run(WindowId, CommandId),
     Quit,
     Note(String),
     Action(WindowId, qe_api::WidgetId, qe_a11y::WidgetAction),
+    /// The next alert may open, now that no call is on its way through an old one.
+    AlertNext,
+    /// A system color change has reached the text windows, so Settings can copy their theme.
+    SettingsTheme,
+    /// A file dialog waits for the test channel.
+    TestPanel(PanelJob),
+    CloseDoc(DocId),
+    CloseWindow(WindowId),
+    /// Launches that handed off while the app was ending. It stays open for them.
+    StayFor(Vec<qe_docs::handoff::HandoffRequest>),
 }
 
 /// Work that may send messages, run a dialog or paint, so it runs with no borrow of `App`.
@@ -70,8 +84,16 @@ pub enum Effect {
     ImeSync(DocId),
     ImeCancel(DocId),
     ImeClose(DocId),
-    ImeCommitThenRun(WindowId, DocId, CommandId),
+    /// The keyboard left this document's text for a field beside it.
+    ImeLeave(DocId),
+    /// Ends these compositions with their text, and then does this. A composition that cannot
+    /// end yet goes back to the message loop, and tries again at the next wake.
+    CommitThen(Vec<DocId>, Box<Incoming>),
     Exit,
+    /// `WM_ENDSESSION`: every composition goes in, then the copies are written, then the end.
+    EndSession,
+    AlertNext,
+    SettingsTheme,
     Beep,
     Reply(String),
     Picture {
@@ -82,12 +104,13 @@ pub enum Effect {
     FinishSmoke,
     RunBench,
     ImeSyncAll,
-    ImeCommitThenQuit,
     ReportWidgets(WindowId),
     ReportInput(WindowId),
     Announce(WindowId, String),
     DropQuestion(qe_docs::QuestionId),
     ChannelAlert(String, Option<String>),
+    ChannelIme(String, Option<String>),
+    ChannelFrameText(WindowId),
     ChannelSettingsOpen,
     ChannelPumps,
 }
@@ -103,6 +126,19 @@ pub struct Shared {
     pub missed_paint: RefCell<Vec<WindowId>>,
     pub ime_after_frame: Cell<Option<(WindowId, DocId)>>,
     pub pumps: Cell<u64>,
+    /// Compositions that could not end yet, and what waits for them.
+    pub commits_waiting: RefCell<Vec<(Vec<DocId>, Incoming)>>,
+    /// Items for the next wake, after a turn of the message loop.
+    pub later: RefCell<Vec<Incoming>>,
+    pub wake: Wake,
+    pub wake_window: Rc<WakeWindow>,
+    pub names: PipeNames,
+    /// The theme of the last painted frame.
+    pub last_theme: Rc<Cell<Option<qe_api::Theme>>>,
+    /// A test's request that the message loop fail.
+    pub loop_broken: Cell<bool>,
+    /// A test's pauses around the moment the pipe closes at exit, in milliseconds.
+    pub exit_pauses: Cell<(u64, u64)>,
     pub hidden: bool,
     pub channel: bool,
     pub measure: Arc<DirectWriteLayout>,
@@ -146,6 +182,19 @@ pub struct App {
     pub shown_questions: std::collections::HashSet<qe_docs::QuestionId>,
     /// Documents with an open question.
     pub asking: std::collections::HashSet<DocId>,
+    /// Documents with a question whose composition has been asked to end.
+    pub commit_asked: std::collections::HashSet<DocId>,
+    /// Documents with no good copy on disk, shown until one succeeds.
+    pub autosave_failing: std::collections::HashSet<DocId>,
+    /// `--timings` or the bench: each key's time is kept.
+    pub timing_on: bool,
+    /// The theme of the last painted frame, for what opens later.
+    pub last_theme: Rc<Cell<Option<qe_api::Theme>>>,
+    /// `--test-fail-windows`.
+    pub fail_windows: usize,
+    pub exit_code: i32,
+    /// The window that `bring_forward` last chose, for tests of a hidden run.
+    pub forward_window: Option<WindowId>,
 }
 
 /// A hidden run with no folder of its own must not touch the user's session or hand files to
@@ -263,6 +312,8 @@ fn start(mut args: Args) -> Result<i32, String> {
         memory
     });
     let channel_on = args.channel;
+    let bench_run = args.bench_keys > 0;
+    let last_theme = Rc::new(Cell::new(None));
     let shared = Rc::new_cyclic(|me: &Weak<Shared>| Shared {
         state: RefCell::new(App {
             store,
@@ -296,6 +347,13 @@ fn start(mut args: Args) -> Result<i32, String> {
             tab_drag: Rc::new(Cell::new(None)),
             shown_questions: std::collections::HashSet::new(),
             asking: std::collections::HashSet::new(),
+            commit_asked: std::collections::HashSet::new(),
+            autosave_failing: std::collections::HashSet::new(),
+            timing_on: args.timings,
+            last_theme: last_theme.clone(),
+            fail_windows: args.fail_windows,
+            exit_code: 0,
+            forward_window: None,
         }),
         queue: RefCell::new(VecDeque::new()),
         settings: settings.clone(),
@@ -306,6 +364,14 @@ fn start(mut args: Args) -> Result<i32, String> {
         missed_paint: RefCell::new(Vec::new()),
         ime_after_frame: Cell::new(None),
         pumps: Cell::new(0),
+        commits_waiting: RefCell::new(Vec::new()),
+        later: RefCell::new(Vec::new()),
+        wake: wake.clone(),
+        wake_window: wake_window.clone(),
+        names: names.clone(),
+        last_theme,
+        loop_broken: Cell::new(false),
+        exit_pauses: Cell::new((0, 0)),
         hidden: args.hidden,
         channel: args.channel,
         measure: measure.clone(),
@@ -316,8 +382,20 @@ fn start(mut args: Args) -> Result<i32, String> {
     // Wakes from any thread reach one handler.
     let weak = Rc::downgrade(&shared);
     wake_window.set_handler(Rc::new(move |signal| {
-        if let Some(shared) = weak.upgrade() {
-            push(&shared, Incoming::Signal(signal));
+        let Some(shared) = weak.upgrade() else {
+            return;
+        };
+        if signal == Signal::BenchStep {
+            crate::bench::step(&shared);
+            return;
+        }
+        if signal == Signal::Wake {
+            let later = std::mem::take(&mut *shared.later.borrow_mut());
+            shared.queue.borrow_mut().extend(later);
+        }
+        push(&shared, Incoming::Signal(signal));
+        if signal == Signal::Wake {
+            retry_commits(&shared);
         }
     }));
 
@@ -338,14 +416,19 @@ fn start(mut args: Args) -> Result<i32, String> {
     settings.add_write_wake(Arc::new(move || write_wake()));
 
     if args.channel {
-        channel::start(&shared);
+        channel::start(&shared, args.watchdog_ms);
     }
     // The session read has probably ended by now, and its wake is in the queue.
     pump(&shared);
-    let code = message_loop(&shared.ime.thread)?;
-    if shared.timings {
+    let code = match message_loop(&shared.ime.thread, &shared.timing, &shared.loop_broken) {
+        Ok(code) => code,
+        Err(problem) => loop_failed(&shared, &problem),
+    };
+    // The bench has printed its own report.
+    if shared.timings && !bench_run {
         shared.timing.report("this run", process_start);
     }
+    close_windows(&shared);
     if throwaway {
         drop(shared);
         if let Err(e) = std::fs::remove_dir_all(&root) {
@@ -353,6 +436,86 @@ fn start(mut args: Args) -> Result<i32, String> {
         }
     }
     Ok(code)
+}
+
+/// The windows end while `Shared` lives, as a screen reader's link needs it to close cleanly.
+fn close_windows(shared: &Rc<Shared>) {
+    let windows = shared.state.try_borrow_mut().map_or_else(
+        |_| BTreeMap::new(),
+        |mut app| std::mem::take(&mut app.windows),
+    );
+    for win in windows.into_values() {
+        win.close();
+    }
+}
+
+/// The message loop itself failed, so nothing more can run. What can be kept is kept, and the
+/// message says what happened to the text.
+fn loop_failed(shared: &Rc<Shared>, problem: &str) -> i32 {
+    shared.ime.commit_all();
+    let kept = match shared.state.try_borrow_mut() {
+        Ok(mut app) => app.store.wait_for_quit(std::time::Duration::from_secs(4)),
+        Err(_) => false,
+    };
+    pump_settings_out(shared);
+    let told = if kept {
+        "Your unsaved text was kept, and it comes back at the next launch."
+    } else {
+        "Some unsaved text may not have been kept."
+    };
+    fatal_box(
+        shared.hidden,
+        &format!("QuickEdit has to stop, because its message loop failed: {problem}. {told}"),
+    );
+    1
+}
+
+/// Settings closes first, because closing commits a typed size. The window comes out of its
+/// slot first, as closing it can send messages that look at the slot.
+fn pump_settings_out(shared: &Rc<Shared>) {
+    let window = shared.settings_window.borrow_mut().take();
+    if let Some(mut window) = window {
+        window.close();
+    }
+    if let Err(problem) = shared.settings.flush() {
+        fatal_box(shared.hidden, &problem);
+    } else if let Some(problem) = shared.settings.write_error() {
+        fatal_box(shared.hidden, &problem);
+    }
+}
+
+/// Holds an item for the next wake, so that the message loop has its turn first.
+pub fn post_later(shared: &Rc<Shared>, item: Incoming) {
+    shared.later.borrow_mut().push(item);
+    (shared.wake)();
+}
+
+/// A wake has come, so a key that waited for layout may have gone. Compositions that ended
+/// release what waited for them. The rest wait for another wake, and nothing here runs again
+/// until one comes.
+fn retry_commits(shared: &Rc<Shared>) {
+    let waiting = std::mem::take(&mut *shared.commits_waiting.borrow_mut());
+    if waiting.is_empty() {
+        return;
+    }
+    for (docs, then) in waiting {
+        shared.ime.commit_docs(&docs);
+        if shared.ime.any_composing_in(&docs) {
+            shared.commits_waiting.borrow_mut().push((docs, then));
+        } else {
+            shared.queue.borrow_mut().push_back(then);
+        }
+    }
+    pump(shared);
+}
+
+/// A dialog runs its own message loop, so the rest of its batch goes first. Newer work must not
+/// pass a window's end or a change of TSF's focus.
+fn modal_last(effects: Vec<Effect>) -> Vec<Effect> {
+    let (modal, plain): (Vec<Effect>, Vec<Effect>) = effects
+        .into_iter()
+        .partition(|effect| matches!(effect, Effect::Panel(_)));
+    plain.into_iter().chain(modal).collect()
 }
 
 /// Adds an item and works through the queue, unless the queue's owner is already at work.
@@ -381,7 +544,7 @@ pub fn pump(shared: &Rc<Shared>) {
         if effects.is_empty() && shared.queue.borrow().is_empty() {
             break;
         }
-        for effect in effects {
+        for effect in modal_last(effects) {
             run_effect(shared, effect);
         }
     }
@@ -453,6 +616,9 @@ fn run_effect(shared: &Rc<Shared>, effect: Effect) {
                 .ok()
                 .and_then(|mut app| app.windows.remove(&window));
             if let Some(win) = win {
+                // TSF's calls need the window, so its stores close first. A document that is
+                // staying gets a new store on its next focus.
+                shared.ime.close_for_window(win.hwnd);
                 win.close();
             }
         }
@@ -464,21 +630,38 @@ fn run_effect(shared: &Rc<Shared>, effect: Effect) {
             // The first frame comes before TSF loads. Showing the window ends with that frame.
             if shared.timing.first_frame.get().is_none() {
                 shared.ime_after_frame.set(Some((window, doc)));
-            } else {
+            } else if tools_leave_keys_to_the_text(shared, window) {
                 shared.ime.focus(shared, window, doc);
             }
         }
+        Effect::ImeLeave(doc) => shared.ime.leave(shared, doc),
         Effect::ImeSync(doc) => shared.ime.sync(doc),
         Effect::ImeCancel(doc) => shared.ime.cancel(doc),
         Effect::ImeClose(doc) => shared.ime.close(doc),
-        Effect::ImeCommitThenRun(window, doc, command) => {
-            shared.ime.commit(doc);
-            shared
-                .queue
-                .borrow_mut()
-                .push_back(Incoming::Run(window, command));
+        Effect::CommitThen(docs, then) => {
+            shared.ime.commit_docs(&docs);
+            if shared.ime.any_composing_in(&docs) {
+                shared.commits_waiting.borrow_mut().push((docs, *then));
+            } else {
+                shared.queue.borrow_mut().push_back(*then);
+            }
         }
-        Effect::Exit => exit(shared),
+        Effect::Exit => exit(shared, true),
+        Effect::EndSession => end_session(shared),
+        Effect::AlertNext => shared.alerts.next(shared),
+        Effect::SettingsTheme => {
+            let hwnd = shared
+                .settings_window
+                .try_borrow()
+                .ok()
+                .and_then(|slot| slot.as_ref()?.hwnd());
+            if let Some(hwnd) = hwnd {
+                // SAFETY: a window of this thread. This is the message it reads a theme on.
+                unsafe {
+                    SendMessageW(hwnd, WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            }
+        }
         Effect::Beep => {
             // SAFETY: a plain call. A failed beep has nothing to report to.
             let _ = unsafe { windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK) };
@@ -490,10 +673,6 @@ fn run_effect(shared: &Rc<Shared>, effect: Effect) {
             theme,
         } => channel::picture(shared, window, &path, &theme),
         Effect::RunBench => crate::bench::run(shared),
-        Effect::ImeCommitThenQuit => {
-            shared.ime.commit_all();
-            shared.queue.borrow_mut().push_back(Incoming::Quit);
-        }
         Effect::ReportWidgets(window) => {
             if let Some(slot) = window_slot(shared, window)
                 && let Err(e) = slot.widgets_changed()
@@ -525,14 +704,15 @@ fn run_effect(shared: &Rc<Shared>, effect: Effect) {
             }
         }
         Effect::DropQuestion(id) => shared.alerts.drop_question(shared, id),
-        Effect::ImeSyncAll => shared.ime.sync_all(),
+        Effect::ImeSyncAll => shared.ime.sync_all(shared),
         Effect::ChannelAlert(verb, word) => channel::alert_verb(shared, &verb, word.as_deref()),
+        Effect::ChannelIme(verb, word) => channel::ime_verb(shared, &verb, word.as_deref()),
+        Effect::ChannelFrameText(window) => channel::frame_text(shared, window),
         Effect::ChannelSettingsOpen => {
             let open = shared
                 .settings_window
-                .borrow()
-                .as_ref()
-                .is_some_and(SettingsWindow::is_open);
+                .try_borrow()
+                .is_ok_and(|slot| slot.as_ref().is_some_and(SettingsWindow::is_open));
             channel::reply(&open.to_string());
         }
         Effect::ChannelPumps => channel::reply(&format!(
@@ -547,9 +727,19 @@ fn run_effect(shared: &Rc<Shared>, effect: Effect) {
     }
 }
 
+/// True when the keyboard belongs to the text, not to a field of the tools.
+fn tools_leave_keys_to_the_text(shared: &Rc<Shared>, window: WindowId) -> bool {
+    shared.state.try_borrow().is_ok_and(|app| {
+        app.windows
+            .get(&window)
+            .is_some_and(|win| win.tools.focus() == qe_tools::ToolsFocus::Editor)
+    })
+}
+
 fn open_settings(shared: &Rc<Shared>) {
-    let mut slot = shared.settings_window.borrow_mut();
-    let window = slot.get_or_insert_with(|| {
+    // The window stays out of its slot while it opens, as opening sends messages.
+    let taken = shared.settings_window.borrow_mut().take();
+    let mut window = taken.unwrap_or_else(|| {
         SettingsWindow::new(
             shared.settings.clone(),
             Rc::new(AppSettingsHost {
@@ -563,22 +753,134 @@ fn open_settings(shared: &Rc<Shared>) {
         Presentation::Shown
     };
     let opened = window.open_as(presentation);
-    drop(slot);
+    *shared.settings_window.borrow_mut() = Some(window);
     if let Err(problem) = opened {
         queue_note(shared, format!("Settings could not open: {problem}"));
     }
 }
 
-/// The end of the app. Settings closes first, because closing commits a typed size.
-fn exit(shared: &Rc<Shared>) {
-    if let Some(mut window) = shared.settings_window.borrow_mut().take() {
-        window.close();
+/// Closes the pipe, and returns what launches asked up to that moment. A launch after this
+/// finds no pipe, and starts as the instance.
+fn stop_handoff(shared: &Rc<Shared>) -> Vec<qe_docs::handoff::HandoffRequest> {
+    let (before, after) = shared.exit_pauses.get();
+    if before > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(before));
     }
-    if let Err(problem) = shared.settings.flush() {
-        fatal_box(shared.hidden, &problem);
-    } else if let Some(problem) = shared.settings.write_error() {
-        fatal_box(shared.hidden, &problem);
+    let server = shared
+        .state
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut app| app.server.take());
+    let requests = server.map_or_else(Vec::new, |server| {
+        server.stop_and_take(std::time::Duration::from_secs(3))
+    });
+    if after > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(after));
     }
+    requests
+}
+
+/// The app stays open for launches that heard their files were taken. It listens again.
+fn listen_again(shared: &Rc<Shared>) {
+    match handoff::listen(&shared.names, shared.wake.clone()) {
+        Ok(server) => {
+            if let Ok(mut app) = shared.state.try_borrow_mut() {
+                app.server = server;
+            }
+        }
+        Err(e) => queue_note(
+            shared,
+            format!("Files from other launches will open in their own windows: {e}"),
+        ),
+    }
+}
+
+/// The end of the app. Files from a launch come first: with any, the app stays open.
+fn exit(shared: &Rc<Shared>, may_stay: bool) {
+    let requests = stop_handoff(shared);
+    if may_stay && !requests.is_empty() {
+        listen_again(shared);
+        shared
+            .queue
+            .borrow_mut()
+            .push_back(Incoming::StayFor(requests));
+        return;
+    }
+    stop_exports(shared);
+    pump_settings_out(shared);
     shared.ime.close_all();
-    quit_message_loop(0);
+    let code = shared.state.try_borrow().map_or(0, |app| app.exit_code);
+    quit_message_loop(code);
+}
+
+/// An export cannot outlive the app. It stops, it leaves no file behind, and the user hears.
+fn stop_exports(shared: &Rc<Shared>) {
+    let runs = shared
+        .state
+        .try_borrow_mut()
+        .map_or_else(|_| Vec::new(), |mut app| std::mem::take(&mut app.pdf_runs));
+    for mut run in runs {
+        let Some(job) = run.job.take() else {
+            continue;
+        };
+        job.cancel();
+        match job.join() {
+            Ok(_) => {}
+            Err(qe_pdf::PdfError::Cancelled) => fatal_box(
+                shared.hidden,
+                &format!(
+                    "The PDF {} was not finished, because QuickEdit closed. Export it again.",
+                    run.path.display()
+                ),
+            ),
+            Err(e) => fatal_box(
+                shared.hidden,
+                &format!("The PDF {} could not be made: {e}", run.path.display()),
+            ),
+        }
+    }
+}
+
+/// Windows ends the process when this returns, so all of it runs here, in order: keys that
+/// wait, then every composition, then the copies. No one can answer a question now.
+fn end_session(shared: &Rc<Shared>) {
+    if let Ok(mut app) = shared.state.try_borrow_mut() {
+        for doc in app.store.all_documents() {
+            if !app.store.is_loading(doc)
+                && let Some(view) = app.store.view_mut(doc)
+            {
+                view.flush_input(&mut qe_api::ViewContext::default());
+            }
+        }
+    }
+    shared.ime.commit_all();
+    pump(shared);
+    if let Ok(mut app) = shared.state.try_borrow_mut() {
+        app.ready_to_quit = true;
+        if !app.store.wait_for_quit(std::time::Duration::from_secs(4)) {
+            eprintln!("The session ended before every copy could be written.");
+        }
+    }
+    exit(shared, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dialog_goes_after_the_rest_of_its_batch() {
+        let job = crate::panels::PanelJob {
+            kind: crate::panels::PanelKind::MoveTo { doc: DocId(1) },
+            options: qe_ui::FileDialogOptions::default(),
+            save: true,
+            owner: None,
+        };
+        let batch = vec![Effect::Panel(job), Effect::Beep, Effect::ImeClose(DocId(1))];
+        let order: Vec<bool> = modal_last(batch)
+            .iter()
+            .map(|effect| matches!(effect, Effect::Panel(_)))
+            .collect();
+        assert_eq!(order, [false, false, true]);
+    }
 }

@@ -4,7 +4,11 @@
 //! The views live in the store, so this host borrows them through `App`, with `try_borrow_mut`.
 //! `SharedViewHost` needs an `Rc<RefCell<EditorView>>`, which the store does not have. This does
 //! the same work: a busy view answers false, and the store asks for a `sync` once it is free.
-use crate::app::{Incoming, Shared, pump, queue_note};
+//!
+//! A call into TSF can reach the pump and so run any effect, including one that closes a
+//! document. So `Ime.docs` is never borrowed across a TSF call: each call works on its own
+//! reference, and a document taken out of the list closes when the last reference goes.
+use crate::app::{Shared, pump, queue_note};
 use qe_api::{Point, Rect, ViewContext};
 use qe_docs::{DocId, WindowId};
 use qe_editor::EditorView;
@@ -19,10 +23,14 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 #[derive(Default)]
 pub struct Ime {
     pub thread: RefCell<Option<Rc<TsfThread>>>,
-    docs: RefCell<HashMap<DocId, (TsfDocument, HWND)>>,
+    docs: RefCell<HashMap<DocId, (Rc<TsfDocument>, HWND)>>,
     failed: Cell<bool>,
-    /// A store asked for a sync while the view was busy.
+    /// A store asked for a sync while the view was busy. The next wake serves it.
     pub owed: Cell<bool>,
+    /// The document whose store is being made, which a nested call must not make again.
+    opening: Cell<Option<DocId>>,
+    /// That document closed while its store was being made.
+    opening_closed: Cell<bool>,
 }
 
 struct AppImeHost {
@@ -48,10 +56,14 @@ impl ImeHost for AppImeHost {
             app.apply(window, ctx.requests);
             app.after_view_call(window, self.doc);
         }
+        let quiet = app.effects.is_empty() && shared.queue.borrow().is_empty();
         drop(app);
-        // Effects and events from the call wait in the queue, and the pump reaches them. It
-        // returns at once when an outer call is at work.
-        pump(&shared);
+        // TSF reads through here many times in a row, and a read leaves nothing to do. Effects
+        // and events from a call that changed something wait in the queue. The pump returns at
+        // once when an outer call is at work.
+        if !quiet {
+            pump(&shared);
+        }
         true
     }
     fn to_screen(&self, rect: Rect) -> Option<RECT> {
@@ -72,12 +84,16 @@ impl ImeHost for AppImeHost {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        // The view is busy now. A posted wake comes back with no borrow held, and then syncs.
-        shared
-            .queue
-            .borrow_mut()
-            .push_back(Incoming::Note(String::new()));
+        // A document that has gone has nothing to catch up on. Asking again would never end.
+        if let Ok(app) = shared.state.try_borrow()
+            && app.store.view(self.doc).is_none()
+        {
+            return;
+        }
+        // The view is busy now. A posted wake comes back through the message loop, with no
+        // borrow held, and then syncs. It never runs in this same pump.
         shared.ime.owed.set(true);
+        (shared.wake)();
     }
     fn is_shown(&self) -> bool {
         window_is_shown(self.hwnd)
@@ -88,28 +104,46 @@ impl Ime {
     pub fn started(&self) -> bool {
         self.thread.borrow().is_some()
     }
-    pub fn is_composing(&self, doc: DocId) -> bool {
-        self.docs
-            .borrow()
-            .get(&doc)
-            .is_some_and(|(document, _)| document.store().is_composing())
+    fn document(&self, doc: DocId) -> Option<Rc<TsfDocument>> {
+        self.docs.borrow().get(&doc).map(|(found, _)| found.clone())
     }
-    pub fn any_composing(&self) -> bool {
+    fn all(&self) -> Vec<Rc<TsfDocument>> {
         self.docs
             .borrow()
             .values()
-            .any(|(document, _)| document.store().is_composing())
+            .map(|(found, _)| found.clone())
+            .collect()
+    }
+    pub fn is_composing(&self, doc: DocId) -> bool {
+        self.document(doc)
+            .is_some_and(|document| document.store().is_composing())
+    }
+    pub fn any_composing(&self) -> bool {
+        self.all()
+            .iter()
+            .any(|document| document.store().is_composing())
+    }
+    pub fn any_composing_in(&self, docs: &[DocId]) -> bool {
+        docs.iter().any(|doc| self.is_composing(*doc))
     }
     pub fn commit_all(&self) {
-        let docs = self.docs.borrow();
-        for (document, _) in docs.values() {
+        for document in self.all() {
             document.complete_composition();
             document.sync();
         }
     }
+    /// Asks TSF to end these compositions with their text, before the text leaves.
+    pub fn commit_docs(&self, docs: &[DocId]) {
+        for doc in docs {
+            if let Some(document) = self.document(*doc) {
+                document.complete_composition();
+                document.sync();
+            }
+        }
+    }
     /// Gives this document the keyboard, starting TSF and its text store if they have not.
     pub fn focus(&self, shared: &Rc<Shared>, window: WindowId, doc: DocId) {
-        if self.failed.get() {
+        if self.failed.get() || self.opening.get().is_some() {
             return;
         }
         if self.thread.borrow().is_none() {
@@ -123,6 +157,7 @@ impl Ime {
             }
         }
         let place = shared.state.try_borrow().ok().and_then(|app| {
+            app.store.view(doc)?;
             let win = app.windows.get(&window)?;
             Some((win.hwnd, win.dpi.clone()))
         });
@@ -148,9 +183,25 @@ impl Ime {
                 hwnd,
                 dpi,
             });
-            match thread.open_document(host) {
+            self.opening.set(Some(doc));
+            self.opening_closed.set(false);
+            let opened = thread.open_document(host);
+            self.opening.set(None);
+            match opened {
                 Ok(document) => {
-                    self.docs.borrow_mut().insert(doc, (document, hwnd));
+                    // The call can reach the pump, and the document may have closed there. A
+                    // dead entry is never kept.
+                    let alive = !self.opening_closed.take()
+                        && shared
+                            .state
+                            .try_borrow()
+                            .is_ok_and(|app| app.store.view(doc).is_some());
+                    if !alive {
+                        return;
+                    }
+                    self.docs
+                        .borrow_mut()
+                        .insert(doc, (Rc::new(document), hwnd));
                 }
                 Err(e) => {
                     queue_note(shared, e.to_string());
@@ -158,40 +209,60 @@ impl Ime {
                 }
             }
         }
-        let focus = self
-            .docs
-            .borrow()
-            .get(&doc)
-            .map(|(document, _)| document.focus());
-        if let Some(Err(e)) = focus {
+        if let Some(document) = self.document(doc)
+            && let Err(e) = document.focus()
+        {
             queue_note(shared, e.to_string());
         }
     }
+    /// The keyboard moved to a field beside this document's text.
+    pub fn leave(&self, shared: &Rc<Shared>, doc: DocId) {
+        if let Some(document) = self.document(doc)
+            && let Err(e) = document.leave_focus()
+        {
+            queue_note(shared, e.to_string());
+        }
+    }
+    /// True while TSF's focus is on this document's store.
+    pub fn has_focus(&self, doc: DocId) -> bool {
+        self.document(doc)
+            .is_some_and(|document| document.has_tsf_focus())
+    }
+    /// A real composition, as a text service starts one, for the test channel.
+    pub fn compose_for_test(&self, doc: DocId, text: &str) -> Result<(), String> {
+        let document = self.document(doc).ok_or("this tab has no text store")?;
+        document.compose_for_test(text).map_err(|e| e.to_string())
+    }
     pub fn sync(&self, doc: DocId) {
-        let docs = self.docs.borrow();
-        if let Some((document, _)) = docs.get(&doc) {
+        if let Some(document) = self.document(doc) {
             document.sync();
         }
     }
     pub fn cancel(&self, doc: DocId) {
-        let docs = self.docs.borrow();
-        if let Some((document, _)) = docs.get(&doc) {
+        if let Some(document) = self.document(doc) {
             document.cancel_composition();
             document.sync();
         }
     }
-    /// Asks TSF to end a composition with its text, before the text leaves for a file.
-    pub fn commit(&self, doc: DocId) {
-        let docs = self.docs.borrow();
-        if let Some((document, _)) = docs.get(&doc) {
-            document.complete_composition();
-            document.sync();
-        }
-    }
+    /// The last reference closes it, with any composition's text going in if the view lives.
     pub fn close(&self, doc: DocId) {
+        if self.opening.get() == Some(doc) {
+            self.opening_closed.set(true);
+        }
         let taken = self.docs.borrow_mut().remove(&doc);
-        if let Some((mut document, _)) = taken {
-            document.close();
+        drop(taken);
+    }
+    /// Closes every store made for this window, while the window still lives for TSF's calls.
+    pub fn close_for_window(&self, hwnd: HWND) {
+        let docs: Vec<DocId> = self
+            .docs
+            .borrow()
+            .iter()
+            .filter(|(_, (_, known))| *known == hwnd)
+            .map(|(doc, _)| *doc)
+            .collect();
+        for doc in docs {
+            self.close(doc);
         }
     }
     pub fn close_all(&self) {
@@ -201,9 +272,22 @@ impl Ime {
         }
     }
     /// A wake after a busy moment: every open store catches up.
-    pub fn sync_all(&self) {
-        let docs = self.docs.borrow();
-        for (document, _) in docs.values() {
+    pub fn sync_all(&self, shared: &Rc<Shared>) {
+        // A store can outlive its document only if something went wrong. It goes now.
+        if let Ok(app) = shared.state.try_borrow() {
+            let dead: Vec<DocId> = self
+                .docs
+                .borrow()
+                .keys()
+                .copied()
+                .filter(|doc| app.store.view(*doc).is_none())
+                .collect();
+            drop(app);
+            for doc in dead {
+                self.close(doc);
+            }
+        }
+        for document in self.all() {
             document.sync();
         }
     }

@@ -301,6 +301,12 @@ view.run_host(HostCommand::Select { range: range.clone(), reveal: true }, &mut c
 assert_eq!(view.selection(), range);
 ```
 
+## What a host can take over
+
+- `set_hold_edits(true)` makes `can_edit` say no, so every path that changes text is refused until the host lifts it. The app uses it while a question about the text is open.
+- `set_host_shows_warnings(true)` stops the view's one-line strip. The host reads `warning()` and shows it with room for long text.
+- `set_host_runs_command_keys(true)` takes the keys of Select All, Copy, Cut, Paste, Undo and Redo away from the view, so only the host's key table decides them. Delete, Backspace, Enter and the moving keys stay.
+
 ## Save (M14)
 
 1. Call `flush_input(ctx)` so that typing still in the queue goes into the text. Keys that wait for a layout are dropped with their warning. Keys that wait for an index run on what is known.

@@ -979,6 +979,34 @@ impl UiaSlot {
         };
         Some(accessibility.respond(hwnd, wparam, lparam))
     }
+    /// `on_window_message` for a window whose popups forward their `WM_GETOBJECT`. The provider
+    /// always belongs to `home`, whose procedure runs this crate's work, whichever of them a
+    /// client asked first. `hwnd` is the window that gets the answer.
+    pub fn on_message_for_home(
+        &self,
+        home: HWND,
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        host: impl FnOnce() -> Arc<dyn UiaHost>,
+    ) -> Option<LRESULT> {
+        if let Some(answer) = crate::marshal::dispatch(message, wparam) {
+            return Some(answer);
+        }
+        if message != WM_GETOBJECT || !is_uia_request(lparam) || self.closed.get() {
+            return None;
+        }
+        let accessibility = match self.current() {
+            Some(found) => found,
+            None => {
+                let made = Rc::new(Accessibility::new(home, host()));
+                *self.current.borrow_mut() = Some(made.clone());
+                made
+            }
+        };
+        Some(accessibility.respond(hwnd, wparam, lparam))
+    }
     /// The provider, if a client has asked. The borrow ends before this returns.
     pub fn current(&self) -> Option<Rc<Accessibility>> {
         self.current.borrow().clone()
@@ -1504,7 +1532,13 @@ impl Accessibility {
             )
         };
         if let Some(document) = document {
-            unsafe { UiaDisconnectProvider(&document) }?;
+            // "No longer available" means UIA holds no such element now, which is this goal.
+            match unsafe { UiaDisconnectProvider(&document) } {
+                Err(error) if error.code() != crate::com::gone().code() => {
+                    return Err(error);
+                }
+                _ => {}
+            }
         }
         self.closed.set(true);
         Ok(self.finish())

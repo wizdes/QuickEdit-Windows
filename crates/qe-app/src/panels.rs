@@ -81,15 +81,22 @@ impl PanelJob {
 
 /// Shows a dialog, or leaves it for the test channel.
 pub fn show(shared: &Rc<Shared>, mut job: PanelJob) {
+    // The dialog belongs to its document's window, wherever that tab is now.
     let owner = shared.state.try_borrow().ok().and_then(|app| {
-        let window = app.store.last_used_window()?;
+        let doc = match &job.kind {
+            PanelKind::Open { .. } => None,
+            PanelKind::Save { request, .. } => Some(request.doc),
+            PanelKind::MoveTo { doc } | PanelKind::Export { doc } => Some(*doc),
+        };
+        let window = doc
+            .and_then(|doc| app.store.window_of(doc))
+            .or_else(|| app.store.last_used_window())?;
         app.windows.get(&window).map(|win| win.hwnd)
     });
     job.owner = owner;
     if shared.channel {
-        if let Ok(mut app) = shared.state.try_borrow_mut() {
-            app.test_panels.push_back(job);
-        }
+        // It joins the queue, so it is never lost to a busy moment.
+        push(shared, Incoming::TestPanel(job));
         return;
     }
     if shared.hidden {
@@ -134,6 +141,8 @@ pub struct PdfRun {
     pub doc: DocId,
     pub job: Option<PdfJob>,
     pub path: PathBuf,
+    /// Its document closed while the job still waited for the whole text.
+    pub doc_closed: bool,
 }
 
 impl App {
@@ -285,6 +294,7 @@ impl App {
                 doc,
                 job: Some(job),
                 path,
+                doc_closed: false,
             }),
             Err(e) => self.error_alert("The PDF could not be made", &e.to_string()),
         }
@@ -298,10 +308,15 @@ impl App {
             let Some(job) = &run.job else {
                 continue;
             };
-            if job.wants_snapshot()
-                && let Some(view) = self.store.view(run.doc)
-            {
-                job.offer_snapshot(view.worker_snapshot());
+            if job.wants_snapshot() {
+                match self.store.view(run.doc) {
+                    Some(view) => job.offer_snapshot(view.worker_snapshot()),
+                    // No more of the text can ever come, so this job ends now.
+                    None => {
+                        run.doc_closed = true;
+                        job.cancel();
+                    }
+                }
             }
             if job.is_finished() {
                 finished.push(at);
@@ -316,6 +331,10 @@ impl App {
                 Ok(summary) => self.notes.push(format!(
                     "PDF written: {} pages at {}",
                     summary.pages,
+                    run.path.display()
+                )),
+                Err(PdfError::Cancelled) if run.doc_closed => self.note(format!(
+                    "The PDF {} was not finished, because its document closed.",
                     run.path.display()
                 )),
                 Err(PdfError::Cancelled) => {}

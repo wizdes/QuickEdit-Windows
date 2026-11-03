@@ -590,6 +590,13 @@ pub struct EditorView {
     drag_origin: Range<ByteOffset>,
     wrap: bool,
     prevent_editing: bool,
+    /// The host holds every edit for a moment, as while a question about this text is open.
+    hold_edits: bool,
+    /// The host paints warnings in its own place, where a long one has room.
+    host_shows_warnings: bool,
+    /// The host's key table runs Select All, Copy, Cut, Paste, Undo and Redo, so only that
+    /// table decides their keys.
+    host_runs_command_keys: bool,
     pending: bool,
     last_click_us: u64,
     last_click_at: Option<Point>,
@@ -969,6 +976,9 @@ impl EditorView {
             drag_origin: ByteOffset(0)..ByteOffset(0),
             wrap: true,
             prevent_editing: false,
+            hold_edits: false,
+            host_shows_warnings: false,
+            host_runs_command_keys: false,
             pending: false,
             last_click_us: 0,
             last_click_at: None,
@@ -1279,7 +1289,26 @@ impl EditorView {
     }
     /// The one check every text change passes.
     pub fn can_edit(&self) -> bool {
-        !self.prevent_editing && self.mapped.is_none() && !self.loading
+        !self.prevent_editing && !self.hold_edits && self.mapped.is_none() && !self.loading
+    }
+    /// While this holds, `can_edit` says no, so every path that changes text is refused: keys,
+    /// an input method, a menu command, a spelling fix and Replace All. A host uses it while a
+    /// question about this text is open. The host's own answer lifts it first.
+    pub fn set_hold_edits(&mut self, held: bool) {
+        self.hold_edits = held;
+    }
+    pub fn edits_are_held(&self) -> bool {
+        self.hold_edits
+    }
+    /// The host shows `warning()` itself, so this view paints no strip of its own.
+    pub fn set_host_shows_warnings(&mut self, host_shows: bool) {
+        self.host_shows_warnings = host_shows;
+    }
+    /// The host's key table runs the keys of Select All, Copy, Cut, Paste, Undo and Redo, so
+    /// this view no longer knows them. A key taken out of that table then does nothing.
+    /// Delete, Backspace, Enter and the moving keys stay here.
+    pub fn set_host_runs_command_keys(&mut self, host_runs: bool) {
+        self.host_runs_command_keys = host_runs;
     }
     pub fn cancel_drag(&mut self) {
         self.dragging = false;
@@ -3960,7 +3989,10 @@ impl EditorView {
             self.schedule(ctx);
             return Handled::Yes;
         }
+        let table_key =
+            self.host_runs_command_keys && matches!(vk, 0x41 | 0x43 | 0x58 | 0x56 | 0x5a | 0x59);
         let command = match (vk, mods.ctrl) {
+            _ if table_key => None,
             (0x41, true) => Some(EditorCommand::SelectAll),
             (0x43, true) => Some(EditorCommand::Copy),
             (0x58, true) => Some(EditorCommand::Cut),
@@ -4740,7 +4772,7 @@ impl View for EditorView {
             i += 1;
             line_top += f64::from(height.0);
         }
-        if let Some(warning) = &self.warning {
+        if let Some(warning) = self.warning.as_ref().filter(|_| !self.host_shows_warnings) {
             // A warning sits over the first row of text, so it needs its own background.
             list.push(DrawCommand::FillRect {
                 rect: Rect {

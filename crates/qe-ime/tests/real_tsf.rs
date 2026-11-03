@@ -1845,3 +1845,34 @@ fn text_the_view_never_heard_of_still_goes_in_when_the_view_commits() {
     );
     tsf.fixture.no_problems();
 }
+
+#[test]
+fn leaving_focus_commits_the_composition_and_tsf_focus_leaves_the_document() {
+    let tsf = Tsf::new(laid_out("ab"));
+    let focused = unsafe { tsf.thread.thread_manager().GetFocus() }.unwrap();
+    assert_eq!(&focused, tsf.doc.document_manager());
+    assert!(tsf.doc.has_tsf_focus());
+    let held = tsf.start_composition();
+    tsf.set_composition_text(&held, "x");
+    assert!(tsf.doc.store().is_composing());
+    tsf.doc.leave_focus().unwrap();
+    assert!(!tsf.doc.store().is_composing());
+    assert!(tsf.fixture.text().contains('x'));
+    assert!(!tsf.doc.has_tsf_focus());
+    // The document can take the keyboard back.
+    tsf.doc.focus().unwrap();
+    assert!(tsf.doc.has_tsf_focus());
+    tsf.fixture.no_problems();
+}
+
+#[test]
+fn compose_for_test_starts_a_real_composition() {
+    let tsf = Tsf::new(laid_out("ab"));
+    tsf.doc.compose_for_test("zz").unwrap();
+    assert!(tsf.doc.store().is_composing());
+    tsf.doc.complete_composition();
+    tsf.doc.sync();
+    assert!(!tsf.doc.store().is_composing());
+    assert!(tsf.fixture.text().contains("zz"));
+    tsf.fixture.no_problems();
+}

@@ -14,7 +14,6 @@ use std::rc::{Rc, Weak};
 use windows::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
-use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::HSTRING;
 
@@ -32,6 +31,12 @@ pub struct Win {
     pub capture: Capture,
     pub show_state: ShowState,
     pub paint_queued: bool,
+    /// This window has the keyboard, by the last Focus or Blur.
+    pub has_keys: bool,
+    /// The tools held the keyboard at the last look, so TSF has left this window's text.
+    pub tools_had_keys: bool,
+    /// The text of the last painted frame, for the test channel's check of what really shows.
+    pub painted_text: Vec<String>,
     /// The find count and the tools' message that a screen reader last heard.
     pub said: (Option<String>, Option<String>),
 }
@@ -136,15 +141,31 @@ pub fn read_placement(hwnd: HWND) -> Option<(WindowFrame, ShowState)> {
 fn message_hook(
     weak: Weak<Shared>,
     window: WindowId,
+    home: HWND,
     slot: Rc<UiaSlot>,
     drag: Rc<Cell<Option<(WindowId, DocId)>>>,
 ) -> qe_shell::MessageHook {
     Rc::new(move |hwnd, message, w, l| {
         let host_weak = weak.clone();
-        if let Some(answer) = slot.on_window_message(hwnd, message, w, l, || {
+        // A popup forwards `WM_GETOBJECT` here. The provider stays this window's, because only
+        // this window's procedure runs the provider's work.
+        if let Some(answer) = slot.on_message_for_home(home, hwnd, message, w, l, || {
             crate::a11y::make_host(host_weak, window)
         }) {
             return Some(answer);
+        }
+        // The link ends even when the app has already let go of its shared state.
+        if message == WM_DESTROY
+            && hwnd == home
+            && let Err(e) = slot.shutdown()
+        {
+            match weak.upgrade() {
+                Some(shared) => crate::app::queue_note(
+                    &shared,
+                    format!("A screen reader's link to a closing window would not end: {e}"),
+                ),
+                None => eprintln!("A screen reader's link to a closing window would not end: {e}"),
+            }
         }
         // A cheap test first: most messages are for no one here.
         if !matches!(
@@ -157,13 +178,11 @@ fn message_hook(
                 | WM_QUERYENDSESSION
                 | WM_ENDSESSION
                 | WM_SETTINGCHANGE
-                | WM_DESTROY
                 | WM_MOUSEMOVE
                 | WM_LBUTTONUP
                 | WM_CAPTURECHANGED
                 | WM_KEYDOWN
-        ) && message != qe_ui::DIALOG_CLOSED_MESSAGE
-        {
+        ) {
             return None;
         }
         // While a torn-off tab is held, the pointer belongs to that drag.
@@ -213,18 +232,6 @@ fn message_hook(
                 return Some(LRESULT(0));
             }
             WM_SETTINGCHANGE => push(&shared, Incoming::SystemSetting),
-            WM_DESTROY => {
-                if let Err(e) = slot.shutdown() {
-                    crate::app::queue_note(
-                        &shared,
-                        format!("A screen reader's link to a closing window would not end: {e}"),
-                    );
-                }
-            }
-            other if other == qe_ui::DIALOG_CLOSED_MESSAGE => {
-                shared.alerts.closed_by_window(&shared);
-                return Some(LRESULT(0));
-            }
             _ => {}
         }
         None
@@ -234,6 +241,10 @@ fn message_hook(
 impl App {
     /// Makes the window the store has just added. It stays hidden until the effect shows it.
     pub fn create_window(&mut self, id: WindowId) -> Result<(), String> {
+        if self.fail_windows > 0 {
+            self.fail_windows -= 1;
+            return Err("this test asked for a window that fails".to_owned());
+        }
         let capture = Capture::default();
         let shell = ShellWindow::create_with_refresh(
             WindowConfig {
@@ -276,6 +287,7 @@ impl App {
             .set_message_hook(message_hook(
                 self.me.clone(),
                 id,
+                hwnd,
                 slot.clone(),
                 self.tab_drag.clone(),
             ))
@@ -300,8 +312,12 @@ impl App {
         tools.set_wake(std::sync::Arc::new(move || wake()));
         let dpi = Rc::new(Cell::new(handle.dpi().map_err(oops)?));
         let content = handle.content_rect().map_err(oops)?;
+        // The window style says the same as `DragAcceptFiles`, with no need to load shell32.
         // SAFETY: a window of this thread.
-        unsafe { DragAcceptFiles(hwnd, true) };
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_ACCEPTFILES.0 as isize);
+        }
         let saved = self.store.window_frame(id);
         let frame = match saved {
             Some((frame, _)) if frame.width > 0 && frame.height > 0 => frame,
@@ -352,6 +368,9 @@ impl App {
                 capture,
                 show_state,
                 paint_queued: false,
+                has_keys: false,
+                tools_had_keys: false,
+                painted_text: Vec::new(),
                 said: (None, None),
             },
         );
@@ -434,6 +453,11 @@ impl App {
     /// The name on a tab, with what the store says about its state.
     pub fn tab_title(&self, doc: DocId) -> String {
         let name = self.store.display_name(doc);
+        let name = if self.autosave_failing.contains(&doc) {
+            format!("{name} - no safe copy")
+        } else {
+            name
+        };
         match self.store.title_note(doc) {
             Some(note) => format!("{name} - {note}"),
             None => name,
@@ -521,6 +545,10 @@ impl App {
         }
         let content = win.content;
         let rest = win.tools.layout(content, measure.as_ref());
+        // TSF's focus follows the keyboard, so a tab that lands in a background window or
+        // behind an open Find bar leaves it alone.
+        let wants_tsf = win.has_keys && win.tools.focus() == qe_tools::ToolsFocus::Editor;
+        let rest = self.text_area(new, rest);
         if let (Some(ui), Some(view)) = (self.docs.get_mut(&new), self.store.view_mut(new)) {
             ui.frame.layout(view, rest, measure.as_ref(), &mut ctx);
         }
@@ -528,7 +556,7 @@ impl App {
         self.apply(window, ctx.requests);
         self.report_widgets(window);
         self.report_input(window);
-        if self.ime.started() {
+        if self.ime.started() && wants_tsf {
             self.effects.push(Effect::ImeFocus(window, new));
         }
         self.spell_refresh(new);
@@ -571,6 +599,7 @@ impl App {
             Err(e) => eprintln!("Reading the text area's size: {e}"),
         }
         let rest = win.tools.layout(win.content, measure.as_ref());
+        let rest = self.text_area(doc, rest);
         if let (Some(ui), Some(view)) = (self.docs.get_mut(&doc), self.store.view_mut(doc)) {
             ui.frame.layout(view, rest, measure.as_ref(), &mut ctx);
         }
@@ -596,14 +625,30 @@ impl App {
         if win.content != frame.rect {
             win.content = frame.rect;
         }
-        let rest = win.tools.layout(win.content, measure.as_ref());
+        let whole = win.tools.layout(win.content, measure.as_ref());
+        let rest = self.text_area(doc, whole);
+        let bar_lines = self.notice_lines(doc);
+        let Some(win) = self.windows.get_mut(&window) else {
+            return;
+        };
         let (Some(ui), Some(view)) = (self.docs.get_mut(&doc), self.store.view_mut(doc)) else {
             return;
         };
         ui.frame.layout(view, rest, measure.as_ref(), &mut ctx);
         let start = list.commands.len();
         ui.frame.draw(view, list, &frame.theme, measure.as_ref());
+        crate::notices::draw(list, whole, &bar_lines, &frame.theme);
         win.tools.draw(list, &frame.theme, measure.as_ref());
+        if self.channel_on {
+            win.painted_text = list.commands[start..]
+                .iter()
+                .filter_map(|c| match c {
+                    qe_api::DrawCommand::TextRun { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        self.last_theme.set(Some(frame.theme));
         let has_text = list.commands[start..]
             .iter()
             .any(|c| matches!(c, qe_api::DrawCommand::GlyphRun { .. }));

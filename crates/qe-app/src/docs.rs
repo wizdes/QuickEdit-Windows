@@ -36,6 +36,13 @@ pub struct DocUi {
     pub found: Option<qe_spell::FixMenu>,
     pub seen_revision: u64,
     pub seen_place: (Range<ByteOffset>, f64),
+    /// The revision the frame last looked at, so that one edit costs one look.
+    pub synced_revision: u64,
+    /// Messages on show for this document. Each stays until the person dismisses it.
+    pub notices: Vec<String>,
+    /// The view's own warning, as last shown.
+    pub seen_warning: Option<String>,
+    pub bar: crate::notices::BarLayout,
 }
 
 /// The real clipboard, with Copy's slow part on a worker.
@@ -150,6 +157,10 @@ impl App {
                     found: None,
                     seen_revision: 0,
                     seen_place: (ByteOffset(0)..ByteOffset(0), 0.0),
+                    synced_revision: 0,
+                    notices: Vec::new(),
+                    seen_warning: None,
+                    bar: crate::notices::BarLayout::default(),
                 },
             );
         }
@@ -185,6 +196,8 @@ impl App {
             return;
         };
         ui.prepared = true;
+        view.set_host_shows_warnings(true);
+        view.set_host_runs_command_keys(true);
         match clipboard {
             Some(memory) => view.set_clipboard(Box::new(SharedMemoryClipboard(memory))),
             None => view.set_clipboard(Box::new(SystemClipboard(qe_ui::SystemClipboard))),

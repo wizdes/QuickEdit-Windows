@@ -986,6 +986,8 @@ impl DocumentStore {
         }
         self.detach(from, doc);
         self.attach(to, doc, Some(index), true);
+        // The tab went there, so that is where the next file from Explorer belongs.
+        self.last_used = Some(to);
         self.drop_empty_window(from);
     }
     /// Move Tab to New Window.
@@ -2277,6 +2279,14 @@ impl DocumentStore {
         choices: Vec<Answer>,
         usage: QuestionUse,
     ) {
+        // A second Close, or a close from another window, must not ask the same thing twice.
+        if self
+            .questions
+            .iter()
+            .any(|q| q.question.doc == doc && q.question.kind == kind)
+        {
+            return;
+        }
         let id = QuestionId(self.next_question);
         self.next_question += 1;
         let question = Question {
@@ -2453,6 +2463,21 @@ impl DocumentStore {
         }
         self.forward(doc, ctx);
         self.note_view_changed(doc);
+    }
+
+    /// Why this document's unsaved text has no good copy on disk now. It holds until a copy
+    /// succeeds or the text no longer needs one, so a host can keep it on show.
+    pub fn autosave_failure(&self, doc: DocId) -> Option<String> {
+        let d = self.docs.get(&doc)?;
+        if !d.is_dirty() {
+            return None;
+        }
+        d.autosave.last_failure.clone()
+    }
+
+    /// New files came in while the quit ran, so the app stays open. Nothing written is undone.
+    pub fn stop_quit_for_new_files(&mut self) {
+        self.cancel_quit();
     }
 
     /// Questions not yet answered, oldest first. Part B shows one at a time.

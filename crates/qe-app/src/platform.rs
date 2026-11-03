@@ -1,7 +1,10 @@
 //! Small Windows parts: the message-only wake window, the message loop, drops and placement.
+use crate::timing::Timing;
 use qe_ime::TsfThread;
 use qe_shell::dispatch_translating;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 const WM_APP_WAKE: u32 = WM_APP + 0x70;
+const WM_APP_BENCH: u32 = WM_APP + 0x71;
 const DEADLINE_TIMER: usize = 1;
 
 type SignalHandler = Rc<dyn Fn(Signal)>;
@@ -25,6 +29,7 @@ thread_local! {
 pub enum Signal {
     Wake,
     Deadline,
+    BenchStep,
 }
 
 unsafe extern "system" fn wake_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -38,6 +43,7 @@ unsafe extern "system" fn wake_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             Some(Signal::Wake)
         }
+        WM_APP_BENCH => Some(Signal::BenchStep),
         WM_TIMER if w.0 == DEADLINE_TIMER => {
             // SAFETY: a one-shot timer of this window. A failure here only means it fires again.
             if let Err(e) = unsafe { KillTimer(Some(hwnd), DEADLINE_TIMER) } {
@@ -123,6 +129,14 @@ impl WakeWindow {
             }
         })
     }
+    /// Comes back through the message loop, after what waits in the queue.
+    pub fn post_bench_step(&self) {
+        // SAFETY: a window of this thread.
+        if let Err(e) = unsafe { PostMessageW(Some(self.hwnd), WM_APP_BENCH, WPARAM(0), LPARAM(0)) }
+        {
+            eprintln!("The bench could not go on: {e}");
+        }
+    }
     /// Arms the store's one-shot timer. `None` means no timer at all, which is the idle state.
     pub fn set_deadline(&self, milliseconds: Option<u32>) -> Result<(), String> {
         // SAFETY: plain timer calls on this thread's window.
@@ -148,9 +162,16 @@ impl WakeWindow {
 
 /// The message loop. It uses plain `GetMessageW` until the first focus has started TSF, and
 /// then TSF's pump, so that TSF costs nothing for a run that never takes the keyboard.
-pub fn message_loop(tsf: &RefCell<Option<Rc<TsfThread>>>) -> Result<i32, String> {
+pub fn message_loop(
+    tsf: &RefCell<Option<Rc<TsfThread>>>,
+    timing: &Timing,
+    broken: &Cell<bool>,
+) -> Result<i32, String> {
     let mut msg = MSG::default();
     loop {
+        if broken.get() {
+            return Err("a test broke the message loop".to_owned());
+        }
         let thread = tsf.borrow().clone();
         if let Some(thread) = thread {
             if !thread.get_message(&mut msg).map_err(|e| e.to_string())? {
@@ -169,6 +190,9 @@ pub fn message_loop(tsf: &RefCell<Option<Rc<TsfThread>>>) -> Result<i32, String>
                 return Ok(msg.wParam.0 as i32);
             }
         }
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            timing.key_message_arrived();
+        }
         dispatch_translating(&msg);
     }
 }
@@ -185,7 +209,8 @@ pub fn dropped_paths(w: WPARAM) -> Vec<PathBuf> {
             let mut wide = vec![0u16; length + 1];
             DragQueryFileW(drop, index, Some(&mut wide));
             wide.truncate(length);
-            paths.push(PathBuf::from(String::from_utf16_lossy(&wide)));
+            // A Windows file name need not be valid Unicode, and it must still open.
+            paths.push(PathBuf::from(OsString::from_wide(&wide)));
         }
         DragFinish(drop);
     }

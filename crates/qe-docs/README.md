@@ -70,7 +70,7 @@ Turn rows on and off from `commands(doc)`.
 | `PreventEditing` | `set_prevent_editing(doc, on)` | Format menu. The row shows `prevent_editing(doc)`, and is off when `commands(doc).prevent_editing` is false |
 | `WrapToPage` | `set_wrap_to_page(doc, on)`, then `ViewFrame` | Format menu. Read `wrap_to_page(doc)` when a tab first shows (parity I55) |
 | A file dropped on a window | `open_paths(&paths, OpenTarget::Window(window), None)` | As Open (parity P72) |
-| App close | `begin_quit()`. On `ReadyToQuit`: `settings.flush()` and exit | A failed copy raises `AutosaveFailedAtQuit` first |
+| App close | `begin_quit()`. On `ReadyToQuit`: `server.stop_and_take(limit)`. A request in its answer means the launch heard "taken", so call `stop_quit_for_new_files()`, open its files and listen again. Otherwise `settings.flush()` and exit | A failed copy raises `AutosaveFailedAtQuit` first |
 | `WM_ENDSESSION` | `wait_for_quit(limit)` | Nothing can be asked then |
 
 ### Before Save
@@ -82,11 +82,11 @@ Turn rows on and off from `commands(doc)`.
 
 | Event | What to do |
 | --- | --- |
-| `Question` | A dialog with `title`, `detail` and a button for each of `choices`. Then `answer(id, choice)`. Show one at a time, from `open_questions()`, which is always current. If `answer` returns an error, such as `Busy`, nothing happened and the question stays open: show the error and show the question again |
+| `Question` | The store holds one open question for each document and kind, so a second Close adds none. A dialog with `title`, `detail` and a button for each of `choices`. Then `answer(id, choice)`. Show one at a time, from `open_questions()`, which is always current. If `answer` returns an error, such as `Busy`, nothing happened and the question stays open: show the error and show the question again |
 | `NeedsSavePanel(request)` | The Save dialog: `suggested_name`, `folder`, `initial_encoding`, the list off if `encoding_fixed`, the ".txt" box from `add_txt`. Then `save_as` or `panel_cancelled(doc)` |
 | `SaveFailed { error, offer_save_as }` | The message, with a Save As button when asked. If `error.left_on_disk` has a file, name it. The `doc` may have closed already |
 | `SaveFinished { other_version, backup_kept }` | If either is set, name that file |
-| `AutosaveFailed` | A note in the window. It says this once for each kind of failure. The `doc` may have closed already, so show the `error` and do not look the document up |
+| `AutosaveFailed` | It says this once for each kind of failure. While `autosave_failure(doc)` says `Some`, keep that on show on the document's own tab: it ends when a copy succeeds or the text needs none. With `None`, show the `error` as a note. The `doc` may have closed already |
 | `DocChanged`, `TextReplaced` | Read `display_name`, `title_note`, `is_dirty`, `is_large`, `is_too_large_to_edit`. Turn spelling, substitutions, gutter and map on or off (parity I51, I52, I64) |
 | `Reloaded`, `ReloadFailed`, `FileMoved`, `MoveFailed`, `FileDeleted`, `UnlockFailed` | The title follows. Show the error kinds. `Reloaded` means another program changed the file, and nothing else raises it |
 | `RestoreProblem`, `RestoredOverNewerFile`, `WatchUnavailable`, `SessionWriteFailed` | A note in plain words |

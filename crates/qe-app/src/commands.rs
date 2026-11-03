@@ -1,6 +1,6 @@
 //! Every menu row and key: which rows are on, and what each one does. The tools go first.
 use crate::alerts::{AlertPurpose, AlertRequest};
-use crate::app::{App, Effect};
+use crate::app::{App, Effect, Incoming};
 use crate::panels::PanelJob;
 use qe_a11y::WidgetAction;
 use qe_api::{CommandId, Dip, Handled, Rect, SettingKey, ViewContext, WidgetId};
@@ -105,8 +105,11 @@ impl App {
             Copy => (selected, false),
             SelectAll => (true, false),
             ShowSpelling | CheckDocumentSpelling => (spell_ok, false),
-            CheckSpellingWhileTyping => (spell_ok, ui.is_some_and(|ui| ui.spell_on)),
-            CorrectSpellingAutomatically => (spell_ok, ui.is_some_and(|ui| ui.correct_on)),
+            // A row that is off shows no check.
+            CheckSpellingWhileTyping => (spell_ok, spell_ok && ui.is_some_and(|ui| ui.spell_on)),
+            CorrectSpellingAutomatically => {
+                (spell_ok, spell_ok && ui.is_some_and(|ui| ui.correct_on))
+            }
             // The three Smart rows beside it do this job. See the report's list of rows.
             ShowSubstitutions => (false, false),
             PreventEditing => (commands.prevent_editing, self.store.prevent_editing(doc)),
@@ -114,14 +117,16 @@ impl App {
             ActualSize => (ui.is_some_and(|ui| ui.frame.zoom() != 1.0), false),
             ZoomIn => (ui.is_some_and(|ui| ui.frame.can_zoom_in()), false),
             ZoomOut => (ui.is_some_and(|ui| ui.frame.can_zoom_out()), false),
-            ShowLineNumbers => (
-                !self.store.is_large(doc),
-                ui.is_some_and(|ui| ui.frame.line_numbers()),
-            ),
-            ShowDocumentMap => (
-                !self.store.is_large(doc),
-                ui.is_some_and(|ui| ui.frame.document_map()),
-            ),
+            // Off over 50 MiB, as on the Mac, where no line index is built. A row that is off
+            // shows no check. Zoom, Wrap to Page and PDF have no size limit on the Mac.
+            ShowLineNumbers => {
+                let on = !self.store.is_large(doc);
+                (on, on && ui.is_some_and(|ui| ui.frame.line_numbers()))
+            }
+            ShowDocumentMap => {
+                let on = !self.store.is_large(doc);
+                (on, on && ui.is_some_and(|ui| ui.frame.document_map()))
+            }
             FullScreen | Minimize | ZoomWindow | BringAllToFront => (true, false),
             PreviousTab | NextTab => (tabs.len() > 1, false),
             Tab1 => has_tab(0),
@@ -152,17 +157,30 @@ impl App {
         if let Some(data) = data
             && let Some(row) = data.strip_prefix(SPELL_ROW)
         {
+            if self.asking.contains(&doc) {
+                self.effects.push(Effect::Beep);
+                return;
+            }
             self.spell_menu_row(window, doc, row);
             return;
         }
         // A composition is not in the text yet, so it goes in before the text leaves.
-        if matches!(
+        let takes_text = matches!(
             command,
-            Save | SaveAs | SaveAll | Duplicate | ExportPdf | Print
-        ) && self.ime.is_composing(doc)
-        {
-            self.effects
-                .push(Effect::ImeCommitThenRun(window, doc, command));
+            Save | SaveAs | Duplicate | ExportPdf | Print | RevertToSaved | Close
+        );
+        if takes_text && self.ime.is_composing(doc) {
+            self.effects.push(Effect::CommitThen(
+                vec![doc],
+                Box::new(Incoming::Run(window, command)),
+            ));
+            return;
+        }
+        if command == SaveAll && self.ime.any_composing() {
+            self.effects.push(Effect::CommitThen(
+                self.store.all_documents(),
+                Box::new(Incoming::Run(window, command)),
+            ));
             return;
         }
         // A question about this document is open: what it decides must not move underneath it.
@@ -243,7 +261,7 @@ impl App {
                     buttons: vec!["Rename".to_owned(), "Cancel".to_owned()],
                     purpose: AlertPurpose::Rename(doc),
                     field: Some(name),
-                    owner: None,
+                    doc: Some(doc),
                 });
             }
             MoveTo => {
@@ -321,11 +339,7 @@ impl App {
                     .docs
                     .get(&doc)
                     .is_some_and(|ui| !ui.frame.document_map());
-                if let (Some(ui), Some(view)) = (self.docs.get_mut(&doc), self.store.view_mut(doc))
-                {
-                    ui.frame
-                        .set_document_map(on, view, measure.as_ref(), &mut ctx);
-                }
+                // The listener puts it on every window, as the Mac's setting does.
                 if let Err(e) = self.settings.set_bool(SettingKey::ShowDocumentMap, on) {
                     self.note(format!("The setting could not change: {e}"));
                 }
@@ -480,9 +494,22 @@ impl App {
         let Some(doc) = self.store.active_tab(window) else {
             return;
         };
+        // A tool's button can change the text, and a question about this text is open.
+        if self.asking.contains(&doc)
+            && !matches!(action, WidgetAction::Focus)
+            && self.windows.get(&window).is_some_and(|win| {
+                win.tools
+                    .widgets()
+                    .iter()
+                    .any(|tree| crate::a11y::find(tree, id).is_some())
+            })
+        {
+            self.effects.push(Effect::Beep);
+            return;
+        }
         let measure = self.measure.clone();
         let mut ctx = ViewContext::default();
-        let mut result = Ok(());
+        let mut result: Result<(), String> = Ok(());
         if let (Some(win), Some(view)) = (self.windows.get_mut(&window), self.store.view_mut(doc)) {
             let routed = win.tools.widget_action(
                 id,
@@ -493,18 +520,23 @@ impl App {
             );
             match routed {
                 Handled::Yes => {}
-                Handled::No => {
-                    let act = matches!(
-                        action,
-                        WidgetAction::Invoke
-                            | WidgetAction::Select
-                            | WidgetAction::Toggle
-                            | WidgetAction::Expand
-                    );
-                    if act {
-                        result = win.handle.invoke_widget(id).map(|_| ());
+                Handled::No => match action {
+                    WidgetAction::Invoke
+                    | WidgetAction::Select
+                    | WidgetAction::Toggle
+                    | WidgetAction::Expand => {
+                        result = match win.handle.invoke_widget(id) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(format!("no control {} can act now", id.0)),
+                            Err(e) => Err(e.to_string()),
+                        };
                     }
-                }
+                    // Collapse takes back what Expand opened: the menu.
+                    WidgetAction::Collapse => {
+                        result = win.handle.close_menu().map_err(|e| e.to_string());
+                    }
+                    _ => {}
+                },
             }
         }
         self.apply(window, ctx.requests);

@@ -2,7 +2,7 @@
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::FILETIME;
-use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
 fn file_time_100ns(time: FILETIME) -> u64 {
@@ -24,7 +24,7 @@ pub fn process_creation() -> Result<Instant, String> {
     }
     .map_err(|e| format!("could not read the process creation time: {e}"))?;
     // SAFETY: a plain query.
-    let now = file_time_100ns(unsafe { GetSystemTimeAsFileTime() });
+    let now = file_time_100ns(unsafe { GetSystemTimePreciseAsFileTime() });
     let age = now.saturating_sub(file_time_100ns(created));
     Instant::now()
         .checked_sub(Duration::from_nanos(age.saturating_mul(100)))
@@ -40,9 +40,14 @@ pub struct Timing {
     pub first_text: Cell<Option<Instant>>,
     /// The frame being painted holds real text.
     pub frame_has_text: Cell<bool>,
-    /// The frame being painted shows the text as it is now.
+    /// A frame was really painted just now, and it shows the text as it is. A repaint of old
+    /// pixels never sets this, so it ends no key's timer.
     pub frame_is_current: Cell<bool>,
     pub presents: Cell<u64>,
+    /// When the message loop took the latest key message. The first frame after it ends it.
+    pub arrived: Cell<Option<Instant>>,
+    /// Key messages the message loop has taken, which the bench's report shows.
+    pub key_messages: Cell<u64>,
 }
 impl Timing {
     pub fn after_present(&self) {
@@ -54,7 +59,7 @@ impl Timing {
         if self.frame_has_text.get() && self.first_text.get().is_none() {
             self.first_text.set(Some(now));
         }
-        if self.frame_is_current.get() {
+        if self.frame_is_current.take() {
             for started in self.keys_waiting.borrow_mut().drain(..) {
                 self.to_present
                     .borrow_mut()
@@ -64,6 +69,15 @@ impl Timing {
     }
     pub fn note_key(&self, started: Instant) {
         self.keys_waiting.borrow_mut().push(started);
+    }
+    /// The message loop took a key message.
+    pub fn key_message_arrived(&self) {
+        self.arrived.set(Some(Instant::now()));
+        self.key_messages.set(self.key_messages.get() + 1);
+    }
+    /// How many keys have reached a frame.
+    pub fn keys_done(&self) -> usize {
+        self.to_present.borrow().len()
     }
     pub fn report(&self, label: &str, process_start: Instant) {
         if let Some(at) = self.first_frame.get() {
@@ -89,8 +103,9 @@ impl Timing {
                 .min(samples.len() - 1)]
         };
         eprintln!(
-            "input to present, {label}: {} keys, p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms",
+            "input to present, {label}: {} keys from {} key messages through the message loop, p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms",
             samples.len(),
+            self.key_messages.get(),
             at(0.5),
             at(0.99),
             at(1.0)

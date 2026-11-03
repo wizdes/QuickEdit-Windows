@@ -30,6 +30,8 @@ impl App {
         match item {
             Incoming::Shell(window, event) => self.shell_event(window, event),
             Incoming::Signal(Signal::Wake) => self.on_wake(),
+            // The handler runs these itself, with `App` free.
+            Incoming::Signal(Signal::BenchStep) => {}
             Incoming::Signal(Signal::Deadline) => {
                 self.deadline_set = None;
                 self.store.poll(Instant::now());
@@ -46,15 +48,17 @@ impl App {
                     self.error_alert("The files could not open", &e.message);
                 }
             }
-            Incoming::EndSession => {
-                self.begin_quit();
-                self.store.wait_for_quit(std::time::Duration::from_secs(4));
-                self.effects.push(Effect::Exit);
-            }
+            // TSF's calls need `App` free, so all of this runs as one effect.
+            Incoming::EndSession => self.effects.push(Effect::EndSession),
             Incoming::SystemSetting => {
                 let reduce = system_reduce_motion();
                 for ui in self.docs.values_mut() {
                     ui.frame.set_reduce_motion(reduce);
+                }
+                // Settings copies a text window's theme, and it may hear of this first. It
+                // looks again after the message loop's turn, when each window has heard.
+                if let Some(shared) = self.me.upgrade() {
+                    crate::app::post_later(&shared, Incoming::SettingsTheme);
                 }
             }
             Incoming::TabDrop { doc, at } => self.tab_dropped(doc, at),
@@ -68,6 +72,69 @@ impl App {
                 }
             }
             Incoming::Action(window, id, action) => self.widget_action(window, id, action),
+            Incoming::AlertNext => self.effects.push(Effect::AlertNext),
+            Incoming::SettingsTheme => self.effects.push(Effect::SettingsTheme),
+            Incoming::TestPanel(job) => self.test_panels.push_back(job),
+            Incoming::CloseDoc(doc) => self.store.request_close(doc),
+            Incoming::CloseWindow(window) => self.store.request_close_window(window),
+            Incoming::StayFor(requests) => self.stay_for(requests),
+        }
+    }
+
+    /// Launches handed off during the exit, and were told their files were taken.
+    fn stay_for(&mut self, requests: Vec<qe_docs::handoff::HandoffRequest>) {
+        self.ready_to_quit = false;
+        self.store.stop_quit_for_new_files();
+        let mut opened = false;
+        for request in requests {
+            for error in &request.refused {
+                self.error_alert("A file could not open", &error.message);
+            }
+            if !request.paths.is_empty() {
+                opened = true;
+                if let Err(e) =
+                    self.store
+                        .open_paths(&request.paths, OpenTarget::LastUsedWindow, None)
+                {
+                    self.error_alert("The files could not open", &e.message);
+                }
+            }
+        }
+        if !opened
+            && self.store.windows().is_empty()
+            && let Err(e) = self.store.new_window(true)
+        {
+            self.error_alert("A window could not open", &e.message);
+        }
+    }
+
+    /// The tab's X, for the test channel.
+    pub fn close_tab_from_shell(&mut self, window: WindowId, tab: qe_shell::TabId) {
+        self.shell_event(window, ShellEvent::CloseTabRequested(tab));
+    }
+
+    /// Close, for one tab. A composition goes in first, so its text counts as unsaved.
+    pub fn close_doc(&mut self, doc: DocId) {
+        if self.ime.is_composing(doc) {
+            self.effects.push(Effect::CommitThen(
+                vec![doc],
+                Box::new(Incoming::CloseDoc(doc)),
+            ));
+        } else {
+            self.store.request_close(doc);
+        }
+    }
+
+    /// Close, for a window: the same for every tab in it.
+    fn close_window(&mut self, window: WindowId) {
+        let tabs = self.store.tabs(window);
+        if self.ime.any_composing_in(&tabs) {
+            self.effects.push(Effect::CommitThen(
+                tabs,
+                Box::new(Incoming::CloseWindow(window)),
+            ));
+        } else {
+            self.store.request_close_window(window);
         }
     }
 
@@ -80,10 +147,10 @@ impl App {
             }
             ShellEvent::CloseTabRequested(tab) => {
                 if let Some(doc) = self.doc_of_tab(window, tab) {
-                    self.store.request_close(doc);
+                    self.close_doc(doc);
                 }
             }
-            ShellEvent::CloseWindowRequested => self.store.request_close_window(window),
+            ShellEvent::CloseWindowRequested => self.close_window(window),
             ShellEvent::SelectTab(tab) => {
                 if let Some(doc) = self.doc_of_tab(window, tab)
                     && self.store.active_tab(window) != Some(doc)
@@ -185,21 +252,51 @@ impl App {
                 return;
             }
             InputKind::Focus => {
+                if let Some(win) = self.windows.get_mut(&window) {
+                    win.has_keys = true;
+                }
                 self.effects.push(Effect::ImeFocus(window, doc));
+            }
+            InputKind::Blur => {
+                if let Some(win) = self.windows.get_mut(&window) {
+                    win.has_keys = false;
+                }
             }
             _ => {}
         }
         // A question about this document is open: what it decides must not move underneath it.
+        // A click can reach Replace All or start a drag, so only what changes nothing goes on.
         if self.asking.contains(&doc)
-            && matches!(
+            && !matches!(
                 input.kind,
-                InputKind::Char(_)
-                    | InputKind::KeyDown { .. }
-                    | InputKind::ImeStart
-                    | InputKind::ImeUpdate { .. }
-                    | InputKind::ImeEnd { .. }
+                InputKind::Focus
+                    | InputKind::Blur
+                    | InputKind::KeyUp { .. }
+                    | InputKind::MouseMove { .. }
+                    | InputKind::Wheel { .. }
+                    | InputKind::DpiChange { .. }
             )
         {
+            return;
+        }
+        // A message on show takes the first Esc and any click on itself.
+        let dismissing = match input.kind {
+            InputKind::KeyDown {
+                virtual_key: 0x1b, ..
+            } => {
+                self.windows
+                    .get(&window)
+                    .is_some_and(|win| win.tools.focus() == qe_tools::ToolsFocus::Editor)
+                    && !self.ime.is_composing(doc)
+            }
+            InputKind::MouseDown {
+                at,
+                button: qe_api::MouseButton::Left,
+                ..
+            } => self.notice_hit(window, doc, at),
+            _ => false,
+        };
+        if dismissing && self.dismiss_notice(doc) {
             return;
         }
         let is_dpi = matches!(input.kind, InputKind::DpiChange { .. });
@@ -208,7 +305,6 @@ impl App {
         {
             win.dpi.set(dpi);
         }
-        let started = Instant::now();
         let is_key = matches!(input.kind, InputKind::KeyDown { .. } | InputKind::Char(_));
         let measure = self.measure.clone();
         let mut ctx = ViewContext::default();
@@ -233,6 +329,7 @@ impl App {
                 && let Some(ui) = self.docs.get_mut(&doc)
             {
                 ui.frame.handle(view, input, measure.as_ref(), &mut ctx);
+                ui.synced_revision = view.revision();
             }
         }
         if input.kind == InputKind::Blur
@@ -256,7 +353,13 @@ impl App {
             self.note_typed(doc, typed);
         }
         self.after_view_call(window, doc);
-        if is_key && (repaint || command.is_none()) && self.bench.is_some() {
+        // A key's timer began when the message loop took its message. A key that shows nothing,
+        // such as the first half of a typed letter, leaves it running for the second half.
+        if is_key
+            && repaint
+            && (self.timing_on || self.bench.is_some())
+            && let Some(started) = self.timing.arrived.take()
+        {
             self.timing.note_key(started);
         }
     }
@@ -268,6 +371,18 @@ impl App {
         };
         let layout_changed = win.tools.take_layout_changed();
         let beep = win.tools.take_beep();
+        // TSF writes where its focus is. When the keyboard goes to a field beside the text, it
+        // leaves the text, and the field's own input path takes over.
+        let tools_have_keys = win.tools.focus() != qe_tools::ToolsFocus::Editor;
+        if tools_have_keys != win.tools_had_keys {
+            win.tools_had_keys = tools_have_keys;
+            if tools_have_keys {
+                self.effects.push(Effect::ImeLeave(doc));
+            } else if win.has_keys {
+                // TSF may start only now, if the first focus found the tools with the keyboard.
+                self.effects.push(Effect::ImeFocus(window, doc));
+            }
+        }
         if let Some(ui) = self.docs.get(&doc) {
             ui.subs.set(win.tools.substitutions());
         }
@@ -359,11 +474,49 @@ impl App {
                 self.effects.push(Effect::ImeSync(doc));
             }
         }
+        if text_changed {
+            self.after_text_change(window, doc);
+        }
+        let warning = self.store.view(doc).and_then(|view| view.warning());
+        if self
+            .docs
+            .get(&doc)
+            .is_some_and(|ui| ui.seen_warning.as_deref() != warning)
+        {
+            let warning = warning.map(str::to_owned);
+            if let Some(ui) = self.docs.get_mut(&doc) {
+                ui.seen_warning = warning;
+            }
+            self.notices_changed(doc);
+        }
     }
 
-    /// One look at this window's view, as a wake gives.
-    pub fn tick_window(&mut self, window: WindowId) {
-        self.view_tick(window, false);
+    /// The wiring lists' step after any edit, whichever path made it: an input method, a screen
+    /// reader or a tool. The gutter and the map follow, and so does the tools' search.
+    fn after_text_change(&mut self, window: WindowId, doc: DocId) {
+        let measure = self.measure.clone();
+        let mut ctx = ViewContext::default();
+        let (Some(win), Some(ui), Some(view)) = (
+            self.windows.get_mut(&window),
+            self.docs.get_mut(&doc),
+            self.store.view_mut(doc),
+        ) else {
+            return;
+        };
+        if win.shown != Some(doc) {
+            return;
+        }
+        // A key through the frame has just done this.
+        if ui.synced_revision != view.revision() {
+            ui.frame.sync(view, measure.as_ref(), &mut ctx);
+            ui.synced_revision = view.revision();
+        }
+        let tools_at_work = !win.tools.is_idle();
+        win.tools.poll(view, measure.as_ref(), &mut ctx);
+        self.apply(window, ctx.requests);
+        if tools_at_work {
+            self.after_tools(window, doc);
+        }
     }
 
     /// A view timer, or a wake for this window.
@@ -399,6 +552,9 @@ impl App {
 
     /// Work has finished somewhere. A background tab has no work of its own to look at.
     fn on_wake(&mut self) {
+        if self.ime.owed.take() {
+            self.effects.push(Effect::ImeSyncAll);
+        }
         self.channel_inbox();
         // A tab change from there must reach the window before the window's work below.
         self.after_event();
@@ -411,7 +567,8 @@ impl App {
                 }
                 if request.paths.is_empty() {
                     if request.refused.is_empty() && self.restored {
-                        self.bring_forward();
+                        let window = self.store.last_used_window();
+                        self.bring_forward(window);
                     }
                 } else if let Err(e) =
                     self.store
@@ -447,11 +604,12 @@ impl App {
         self.bench_tick();
     }
 
-    fn bring_forward(&mut self) {
+    fn bring_forward(&mut self, window: Option<WindowId>) {
+        self.forward_window = window;
         if self.hidden {
             return;
         }
-        if let Some(window) = self.store.last_used_window()
+        if let Some(window) = window
             && let Some(win) = self.windows.get(&window)
         {
             // SAFETY: a window of this thread. Windows may refuse, and the taskbar then flashes.
@@ -491,6 +649,26 @@ impl App {
                     {
                         ui.frame
                             .set_line_numbers(on, view, measure.as_ref(), &mut ctx);
+                    }
+                    if let Some(window) = self.store.window_of(doc) {
+                        self.apply(window, ctx.requests);
+                    }
+                }
+            }
+            SettingChange::Value(qe_api::SettingKey::ShowDocumentMap) => {
+                let on = self
+                    .settings
+                    .get_bool(qe_api::SettingKey::ShowDocumentMap)
+                    .unwrap_or(true);
+                let measure = self.measure.clone();
+                let docs: Vec<DocId> = self.docs.keys().copied().collect();
+                for doc in docs {
+                    let mut ctx = ViewContext::default();
+                    if let (Some(ui), Some(view)) =
+                        (self.docs.get_mut(&doc), self.store.view_mut(doc))
+                    {
+                        ui.frame
+                            .set_document_map(on, view, measure.as_ref(), &mut ctx);
                     }
                     if let Some(window) = self.store.window_of(doc) {
                         self.apply(window, ctx.requests);
@@ -551,7 +729,7 @@ impl App {
         }
     }
 
-    /// Shows a note in the window in use, at once. It stays until the next edit there.
+    /// Shows a note in the window in use, at once. It stays until the person dismisses it.
     pub fn note(&mut self, text: String) {
         eprintln!("{text}");
         self.notes.push(text.clone());
@@ -559,8 +737,8 @@ impl App {
             .store
             .last_used_window()
             .and_then(|window| self.store.active_tab(window));
-        match doc.and_then(|doc| self.store.view_mut(doc)) {
-            Some(view) => view.show_warning(text),
+        match doc {
+            Some(doc) => self.add_notice(doc, text),
             None => self.waiting_notes.push(text),
         }
     }
@@ -572,25 +750,21 @@ impl App {
             buttons: vec!["OK".to_owned()],
             purpose: AlertPurpose::Note,
             field: None,
-            owner: None,
+            doc: None,
         });
     }
 
-    pub fn show_alert(&mut self, mut request: AlertRequest) {
-        if request.owner.is_none() {
-            request.owner = self
-                .store
-                .last_used_window()
-                .and_then(|window| self.windows.get(&window))
-                .map(|win| win.hwnd);
-        }
+    pub fn show_alert(&mut self, request: AlertRequest) {
         self.effects.push(Effect::Alert(request));
     }
 
     pub fn begin_quit(&mut self) {
         // A composition is not in the text yet, so it goes in before the text is kept.
         if self.ime.any_composing() {
-            self.effects.push(Effect::ImeCommitThenQuit);
+            self.effects.push(Effect::CommitThen(
+                self.store.all_documents(),
+                Box::new(Incoming::Quit),
+            ));
             return;
         }
         // Cancel in a question ends a quit and the app stays open, so a later quit starts anew.
@@ -622,8 +796,18 @@ impl App {
             }
         }
         self.sync_questions();
-        if self.ime.owed.take() {
-            self.effects.push(Effect::ImeSyncAll);
+        self.refresh_autosave_failures();
+        // Notes from when there was no window, or from a tab that has closed.
+        if !self.waiting_notes.is_empty()
+            && let Some(doc) = self
+                .store
+                .last_used_window()
+                .filter(|window| self.windows.contains_key(window))
+                .and_then(|window| self.store.active_tab(window))
+        {
+            for text in std::mem::take(&mut self.waiting_notes) {
+                self.add_notice(doc, text);
+            }
         }
         let deadline = self.store.next_deadline();
         if deadline != self.deadline_set {
@@ -667,21 +851,14 @@ impl App {
         match event {
             DocEvent::WindowAdded(window) => {
                 if let Err(e) = self.create_window(window) {
-                    self.error_alert("A window could not open", &e);
+                    self.window_failed(window, &e);
+                    return;
                 }
                 self.sync_tabs(window);
                 self.relayout(window);
                 // A window has no keyboard until Windows says so, and with none the caret
                 // sets no timer. A hidden window never gets it, and so never wakes.
                 self.send_input(window, InputKind::Blur);
-                // Notes from before there was a window to show them in.
-                let waiting = std::mem::take(&mut self.waiting_notes);
-                let doc = self.store.active_tab(window);
-                for text in waiting {
-                    if let Some(view) = doc.and_then(|doc| self.store.view_mut(doc)) {
-                        view.show_warning(text);
-                    }
-                }
             }
             DocEvent::WindowClosed(window) => {
                 self.effects.push(Effect::DestroyWindow(window));
@@ -709,7 +886,7 @@ impl App {
             }
             DocEvent::Focus { window, doc } => {
                 self.store.set_active_tab(window, doc);
-                self.bring_forward();
+                self.bring_forward(Some(window));
             }
             DocEvent::DocChanged(doc) => self.doc_changed(doc),
             DocEvent::TextReplaced(doc) => {
@@ -745,9 +922,14 @@ impl App {
             }
             DocEvent::DocClosed(doc) => {
                 self.effects.push(Effect::ImeClose(doc));
+                self.autosave_failing.remove(&doc);
+                self.commit_asked.remove(&doc);
                 if let Some(mut ui) = self.docs.remove(&doc) {
                     ui.spell.take();
+                    // A note outlives its tab, as it may be about something else.
+                    self.waiting_notes.append(&mut ui.notices);
                 }
+                self.pdf_poll();
                 for win in self.windows.values_mut() {
                     if win.shown == Some(doc) {
                         win.shown = None;
@@ -802,11 +984,22 @@ impl App {
                     buttons,
                     purpose: AlertPurpose::SaveFailed { doc, offer_save_as },
                     field: None,
-                    owner: None,
+                    doc: Some(doc),
                 });
             }
-            DocEvent::AutosaveFailed { error, .. } => {
-                self.note(format!("Unsaved text could not be kept: {}", error.message));
+            DocEvent::AutosaveFailed { doc, error } => {
+                // A copy that keeps failing stays on show, on its own tab, until one succeeds.
+                if self.store.autosave_failure(doc).is_some() {
+                    eprintln!("Unsaved text could not be kept: {}", error.message);
+                    self.notes
+                        .push(format!("Unsaved text could not be kept: {}", error.message));
+                    self.autosave_failing.insert(doc);
+                    self.doc_ui(doc);
+                    self.update_tab(doc);
+                    self.notices_changed(doc);
+                } else {
+                    self.note(format!("Unsaved text could not be kept: {}", error.message));
+                }
             }
             DocEvent::Reloaded(doc) => self.doc_changed(doc),
             DocEvent::ReloadFailed { doc, error } => {
@@ -849,7 +1042,7 @@ impl App {
                     buttons: vec!["Recover".to_owned(), "Delete".to_owned(), "Keep".to_owned()],
                     purpose: AlertPurpose::Leftover { path, leftover },
                     field: None,
-                    owner: None,
+                    doc: None,
                 });
             }
             DocEvent::LeftoverRecovered { path } => {
@@ -888,6 +1081,36 @@ impl App {
         }
     }
 
+    /// A window could not be made. Its tabs need a place, or the text has no way to show. With
+    /// no window at all, the process must not stay on, invisible and holding the pipe: the text
+    /// goes to its copies, and the app ends with the reason.
+    fn window_failed(&mut self, window: WindowId, problem: &str) {
+        let target = self
+            .store
+            .windows()
+            .into_iter()
+            .find(|other| *other != window && self.windows.contains_key(other));
+        let tabs = self.store.tabs(window);
+        match target {
+            Some(target) => {
+                self.error_alert("A window could not open", problem);
+                for doc in tabs {
+                    self.store.move_tab(doc, target, usize::MAX);
+                }
+            }
+            None => {
+                crate::app::fatal_box(
+                    self.hidden,
+                    &format!(
+                        "QuickEdit has to stop, because its window could not open: {problem}. Your text is kept, and it comes back at the next launch."
+                    ),
+                );
+                self.exit_code = 1;
+                self.begin_quit();
+            }
+        }
+    }
+
     /// The title, the dirty mark and what the file's size turns off.
     fn doc_changed(&mut self, doc: DocId) {
         // This can arrive after the document closed.
@@ -910,7 +1133,41 @@ impl App {
     /// closes. Documents with an open question take no edits until it is answered.
     fn sync_questions(&mut self) {
         let open = self.store.open_questions();
-        self.asking = open.iter().map(|question| question.doc).collect();
+        let asking: std::collections::HashSet<DocId> =
+            open.iter().map(|question| question.doc).collect();
+        let lifted: Vec<DocId> = self.asking.difference(&asking).copied().collect();
+        for doc in lifted {
+            self.commit_asked.remove(&doc);
+            if let Some(view) = self.store.view_mut(doc) {
+                view.set_hold_edits(false);
+            }
+            if self.ime.started() {
+                self.effects.push(Effect::ImeSync(doc));
+            }
+        }
+        // Every path that edits this text is refused while its question is open. A composition
+        // or a key that came first goes in first, because refusing them would lose them.
+        for doc in &asking {
+            if self.ime.is_composing(*doc) {
+                if self.commit_asked.insert(*doc) {
+                    self.effects.push(Effect::CommitThen(
+                        vec![*doc],
+                        Box::new(Incoming::Note(String::new())),
+                    ));
+                }
+                continue;
+            }
+            if let Some(view) = self.store.view_mut(*doc)
+                && !view.edits_are_held()
+                && view.queued_input_count() == 0
+            {
+                view.set_hold_edits(true);
+                if self.ime.started() {
+                    self.effects.push(Effect::ImeSync(*doc));
+                }
+            }
+        }
+        self.asking = asking;
         let gone: Vec<qe_docs::QuestionId> = self
             .shown_questions
             .iter()
@@ -943,7 +1200,7 @@ impl App {
                 choices: question.choices.clone(),
             },
             field: None,
-            owner: None,
+            doc: Some(question.doc),
         });
     }
 
@@ -956,6 +1213,9 @@ impl App {
     pub fn widget_tree(&self, window: WindowId) -> Option<qe_api::Widget> {
         let win = self.windows.get(&window)?;
         let mut tree = win.handle.widgets().ok()?;
+        if let Some(doc) = self.store.active_tab(window) {
+            tree.children.extend(self.notice_widgets(doc, win.content));
+        }
         tree.children.extend(win.tools.widgets());
         Some(tree)
     }

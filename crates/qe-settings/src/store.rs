@@ -1,16 +1,17 @@
 //! The settings store. It lives on the UI thread and is cheap to clone.
 //!
-//! Reading happens once, at `open`, on the caller's thread: one small file, under 1 ms
-//! in the release test. A change stays in memory at once, and a short-lived thread
-//! writes the file, so the UI thread never waits on the disk. No thread runs at idle.
+//! Reading happens at `open`, on the caller's thread: one small file, under 1 ms in the
+//! release test. A change stays in memory at once. A short-lived thread then looks at the
+//! file and edits it, so the UI thread never waits on the disk. No thread runs at idle.
+//! The one exception is after `flush`, which means the app is exiting: see `flush`.
 use crate::font_dialog::{LateFunction, late_function};
 use crate::format::{
-    MAX_FILE_BYTES, Parsed, SHORTCUT_PREFIX, StoredValue, default_of, encode, encoding_by_name,
-    parse, parse_font, value_problem,
+    Edit, MAX_FILE_BYTES, Parsed, StoredValue, Unsaved, apply_edits, default_of, encode,
+    encoding_by_name, parse, parse_font, value_problem,
 };
 use crate::keys::{Refusal, kind_refusal, menu_path_text, menu_place, opens_submenu};
 use qe_api::{CommandId, EncodingChoice, KeyBinding, Modifiers, SettingKey, TextEncoding};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -81,8 +82,11 @@ pub enum SettingChange {
     Value(SettingKey),
     /// A shortcut changed. The menus and the key lookup follow `key_of`.
     Keys,
-    /// A write failed. The text is for the user. Changes stay in memory.
+    /// A write failed. The text is for the user. Changes stay in memory and stay unsaved.
     WriteFailed(String),
+    /// A save found a new problem with the file, or found an old one gone. `load_problem`
+    /// says the same.
+    FileProblem(Option<String>),
     /// A write worked after one that failed.
     WriteRecovered,
 }
@@ -141,18 +145,46 @@ type Listener = Rc<RefCell<dyn FnMut(&SettingChange)>>;
 
 #[derive(Default)]
 struct WriteSlot {
-    pending: Option<(PathBuf, String)>,
+    /// A save is wanted. The path, and the whole text of memory for a file with no lines.
+    wanted: Option<(PathBuf, String)>,
     running: bool,
     finished: Option<Result<(), String>>,
+    /// Changes that have not reached the disk. A failed save leaves them here.
+    unsaved: Unsaved,
+    /// What a save found in a file that changed. `poll_writes` takes it on the UI thread.
+    found: Option<FoundFile>,
+}
+/// What a save learned from the disk, for memory and for the message.
+struct FoundFile {
+    /// The file's settings, or `None` when memory stays as it is.
+    parsed: Option<Parsed>,
+    problem: Option<String>,
+}
+/// What this store last saw on disk. Only the writer's thread uses it after `open`.
+#[derive(Default)]
+struct KnownFile {
+    /// The bytes this store last read or wrote. `None`: no file, or it could not be read.
+    bytes: Option<Vec<u8>>,
+    /// `open` could not read this file, or could not copy it. The first good look counts
+    /// as new, so that memory and the message catch up.
+    blocked: bool,
+    /// The file at `bytes` has a problem, and no save has confirmed a flushed copy yet.
+    copy_owed: bool,
+    /// The newest copy, for the message.
+    copy: Option<PathBuf>,
 }
 #[derive(Default)]
 struct Writer {
     slot: Mutex<WriteSlot>,
     done: Condvar,
     wakes: Mutex<Vec<(u64, WriteWake)>>,
-    /// The copy of a broken file. It is flushed here, off the launch thread, before the
-    /// first save may replace the original.
-    copy_to_flush: Mutex<Option<PathBuf>>,
+    known: Mutex<KnownFile>,
+    /// Counts the writer's looks at the disk, so a test can see queued saves merge.
+    #[cfg(test)]
+    attempts: AtomicU32,
+    /// Makes the next thread fail to start, so a test can see that failure.
+    #[cfg(test)]
+    fail_start: std::sync::atomic::AtomicBool,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -160,65 +192,159 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 impl Writer {
-    /// Takes the newest text. A write in progress finishes first, and any text queued
-    /// behind it is replaced, so a burst of changes makes at most two writes.
-    fn queue(self: &Arc<Self>, path: PathBuf, text: String) -> Result<(), String> {
+    /// Adds the change and asks for a save, in one step, so a save never holds a change
+    /// without its text. A write in progress finishes first, and a request behind it is
+    /// replaced, so a burst of changes makes at most two writes. `Err` means the thread
+    /// did not start: the failure is in `finished`, and the change stays unsaved.
+    fn queue(
+        self: &Arc<Self>,
+        path: PathBuf,
+        text: String,
+        change: impl FnOnce(&mut Unsaved),
+    ) -> Result<(), ()> {
         let mut slot = lock(&self.slot);
-        slot.pending = Some((path, text));
+        change(&mut slot.unsaved);
+        slot.wanted = Some((path, text));
         if slot.running {
             return Ok(());
         }
         slot.running = true;
         let me = self.clone();
-        let started = std::thread::Builder::new()
-            .name("settings-writer".into())
-            .spawn(move || me.run());
+        let started = self.start_thread(move || me.run());
         if let Err(error) = started {
             slot.running = false;
-            slot.pending = None;
-            return Err(format!("the writer could not start: {error}"));
+            slot.wanted = None;
+            // It replaces any older result, so an old success cannot clear this failure.
+            slot.finished = Some(Err(format!(
+                "Settings were not saved: the writer could not start: {error}"
+            )));
+            return Err(());
         }
         Ok(())
     }
+    fn start_thread(&self, work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_start.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::other("this test said so"));
+        }
+        std::thread::Builder::new()
+            .name("settings-writer".into())
+            .spawn(work)
+            .map(drop)
+    }
     fn run(&self) {
         loop {
-            let job = lock(&self.slot).pending.take();
-            let Some((path, text)) = job else {
+            let (path, text, unsaved) = {
                 let mut slot = lock(&self.slot);
-                if slot.pending.is_some() {
-                    continue;
-                }
-                slot.running = false;
-                self.done.notify_all();
-                return;
+                let Some((path, text)) = slot.wanted.take() else {
+                    slot.running = false;
+                    self.done.notify_all();
+                    return;
+                };
+                (path, text, slot.unsaved.clone())
             };
-            let result = self
-                .flush_copy()
-                .and_then(|()| replace_file(&path, text.as_bytes()));
-            lock(&self.slot).finished = Some(result);
+            let result = self.save(&path, &text, &unsaved);
+            {
+                let mut slot = lock(&self.slot);
+                slot.finished = Some(result.map(|found| {
+                    slot.unsaved.clear_through(unsaved.last());
+                    if found.is_some() {
+                        slot.found = found;
+                    }
+                }));
+            }
             let wakes: Vec<WriteWake> = lock(&self.wakes).iter().map(|w| w.1.clone()).collect();
             for wake in wakes {
                 wake();
             }
         }
     }
-    fn flush_copy(&self) -> Result<(), String> {
-        let copy = lock(&self.copy_to_flush).clone();
-        let Some(copy) = copy else {
-            return Ok(());
+    /// One save. It looks at the disk first, so what a person or another QuickEdit wrote
+    /// stays. A write that lands between this read and the rename, a few milliseconds, is
+    /// still lost: Windows has no rename that first checks the target.
+    fn save(
+        &self,
+        path: &Path,
+        whole_text: &str,
+        unsaved: &Unsaved,
+    ) -> Result<Option<FoundFile>, String> {
+        const TRIES: u32 = 20;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+        #[cfg(test)]
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        let not_saved = |why: String| format!("Settings were not saved: {why}");
+        let mut known = lock(&self.known);
+        let bytes = match read_disk(path, TRIES, PAUSE) {
+            Disk::Bytes(bytes) => bytes,
+            Disk::TooLong if known.blocked => return Err(not_saved(too_long_at_open(path))),
+            Disk::TooLong => {
+                return Err(not_saved(format!(
+                    "the settings file {} is over 1 MB long, so it was not replaced. Move or rename it to save settings again.",
+                    path.display()
+                )));
+            }
+            Disk::Unreadable(error) if known.blocked => {
+                return Err(not_saved(unreadable_at_open(path, &error)));
+            }
+            Disk::Unreadable(error) => {
+                return Err(not_saved(format!(
+                    "the settings file {} could not be read, so it was not replaced: {error}",
+                    path.display()
+                )));
+            }
+            // A first run, or the file was moved away. Memory is all there is.
+            Disk::Missing => {
+                replace_file(path, whole_text.as_bytes()).map_err(not_saved)?;
+                let was_known = known.bytes.is_some() || known.blocked;
+                *known = KnownFile {
+                    bytes: Some(whole_text.as_bytes().to_vec()),
+                    ..KnownFile::default()
+                };
+                return Ok(was_known.then_some(FoundFile {
+                    parsed: None,
+                    problem: None,
+                }));
+            }
         };
-        OpenOptions::new()
-            .write(true)
-            .open(&copy)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| {
-                format!(
-                    "Settings were not saved: the copy of the old file at {} is not safe: {error}",
-                    copy.display()
-                )
+        let changed = known.blocked || known.bytes.as_deref() != Some(&bytes);
+        let (mark, lines) = split_text(&bytes);
+        let why = match lines {
+            Some(lines) => parse(lines).problem(),
+            None => Some(NOT_TEXT.to_owned()),
+        };
+        // The copy counts only once its bytes are checked and flushed. The original stays
+        // until the swap below, so a copy that went missing can always be made again.
+        if why.is_some() && (changed || known.copy_owed) {
+            let copy = keep_copy(path, &bytes, true).map_err(|error| {
+                not_saved(format!(
+                    "the settings file {} has a problem, no copy of it could be kept ({error}), and so it was not replaced.",
+                    path.display()
+                ))
             })?;
-        *lock(&self.copy_to_flush) = None;
-        Ok(())
+            known.copy = Some(copy);
+        }
+        let edited = match lines {
+            Some(lines) => [mark, apply_edits(lines, unsaved).as_bytes()].concat(),
+            None => whole_text.as_bytes().to_vec(),
+        };
+        if edited.len() as u64 > MAX_FILE_BYTES {
+            return Err(not_saved(format!(
+                "this save would make {} over 1 MB long, so the file stays as it was.",
+                path.display()
+            )));
+        }
+        if edited != bytes {
+            replace_file(path, &edited).map_err(not_saved)?;
+        }
+        let found_waits = lock(&self.slot).found.is_some();
+        let found = (changed || found_waits)
+            .then(|| found_after_save(path, &edited, lines.is_none(), why, known.copy.as_deref()));
+        *known = KnownFile {
+            bytes: Some(edited),
+            copy: known.copy.take(),
+            ..KnownFile::default()
+        };
+        Ok(found)
     }
     fn wait(&self) {
         let mut slot = lock(&self.slot);
@@ -230,12 +356,62 @@ impl Writer {
         }
     }
 }
+/// What a save tells memory about a file that changed. Text is read again, because the
+/// save just edited it. A file that was not text is now memory's own, so memory stays.
+fn found_after_save(
+    path: &Path,
+    edited: &[u8],
+    was_not_text: bool,
+    why: Option<String>,
+    copy: Option<&Path>,
+) -> FoundFile {
+    let tell = |why: &str, parsed_nothing: bool| {
+        let start = if was_not_text {
+            "QuickEdit kept its settings and saved them"
+        } else if parsed_nothing {
+            "QuickEdit started with default settings"
+        } else {
+            "The settings that could not be read have their defaults"
+        };
+        problem_with_copy(why, start, copy.unwrap_or(path))
+    };
+    if was_not_text {
+        return FoundFile {
+            parsed: None,
+            problem: why.as_deref().map(|why| tell(why, false)),
+        };
+    }
+    let parsed = parse(split_text(edited).1.unwrap_or_default());
+    let problem = parsed
+        .problem()
+        .map(|why| tell(&shortened_why(&why), parsed.is_empty()));
+    FoundFile {
+        parsed: Some(parsed),
+        problem,
+    }
+}
+fn problem_with_copy(why: &str, start: &str, copy: &Path) -> String {
+    format!(
+        "The settings file has a problem: {why}. {start}. A copy of the file is at {}.",
+        copy.display()
+    )
+}
 
-fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+/// The long-path form, `\\\\?\\C:\\...`, because `MoveFileExW` stops at about 260 characters
+/// with a plain path. Rust's own file calls do this by themselves.
+fn wide_long_path(path: &Path) -> Vec<u16> {
+    let full = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let plain: Vec<u16> = full.as_os_str().encode_wide().collect();
+    let text = |value: &str| value.encode_utf16().collect::<Vec<u16>>();
+    let mut out = if plain.starts_with(&text(r"\\?\")) || plain.starts_with(&text(r"\\.\")) {
+        plain
+    } else if plain.starts_with(&text(r"\\")) {
+        [text(r"\\?\UNC\"), plain[2..].to_vec()].concat()
+    } else {
+        [text(r"\\?\"), plain].concat()
+    };
+    out.push(0);
+    out
 }
 fn temp_beside(path: &Path) -> Result<(PathBuf, File), String> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -298,14 +474,17 @@ fn remove_stale_temps(path: &Path) {
 /// then one rename over it. A reader finds the old file or the new one, and a crash leaves
 /// one of them whole. `qe_codec` is not used only because `qe-settings` has no line for it
 /// in `Cargo.lock`, and its `ReplaceFileW` leaves a moment with no file at this name.
+///
+/// `sync_all` and `MOVEFILE_WRITE_THROUGH` are here for power loss. Killing a process cannot
+/// show a lost flush, so no test proves them.
 fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let name = path
         .file_name()
         .map_or_else(|| SETTINGS_FILE_NAME.into(), |n| n.to_string_lossy());
-    let fail = |why: String| format!("Settings were not saved: {why}");
+    let fail = |why: String| format!("{} could not be replaced: {why}", path.display());
     match fs::metadata(path) {
         Ok(found) if found.permissions().readonly() => {
-            return Err(fail(format!("{name} is read-only.")));
+            return Err(format!("{name} is read-only."));
         }
         Err(error) if error.kind() != ErrorKind::NotFound => return Err(fail(error.to_string())),
         _ => {}
@@ -332,10 +511,12 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 /// One rename, tried again for about half a second while another program holds the file.
-/// A failure leaves the target as it was. This runs on the writer's thread.
+/// `ACCESS_DENIED` counts as a hold, because virus scanners give it, so a lasting one costs
+/// that half second too. A failure leaves the target as it was. This runs on the writer's
+/// thread.
 fn swap_in(path: &Path, temp: &Path) -> Result<(), String> {
     const TRIES: u32 = 20;
-    let (from, to) = (wide(temp), wide(path));
+    let (from, to) = (wide_long_path(temp), wide_long_path(path));
     let mut last = String::new();
     for _ in 0..TRIES {
         // SAFETY: both strings end in a zero and live through the call.
@@ -363,11 +544,14 @@ struct State {
     /// Only the settings that differ from their defaults.
     values: Vec<(SettingKey, StoredValue)>,
     overrides: Vec<(CommandId, Option<KeyBinding>)>,
-    kept: Vec<String>,
+    /// The file has a shortcut line for a command this version does not know.
+    unknown_shortcut: bool,
     /// Each command's key now, by `CommandId as usize`.
     resolved: Vec<Option<KeyBinding>>,
     load_problem: Option<String>,
-    /// A broken file with no copy beside it must not be replaced. This says why.
+    /// `open` could not read or copy the file, so a save may not replace it as it stands.
+    /// It shows at once. The writer looks again at each save and clears it if the cause
+    /// has gone.
     save_block: Option<String>,
     write_error: Option<String>,
 }
@@ -396,7 +580,18 @@ impl State {
             .map(|(_, value)| value)
     }
     fn encoded(&self) -> String {
-        encode(&self.values, &self.overrides, &self.kept)
+        encode(&self.values, &self.overrides)
+    }
+    /// Takes in what a file holds.
+    fn set_memory(&mut self, parsed: Parsed) {
+        self.values = parsed.values;
+        self.overrides = parsed.keys;
+        self.unknown_shortcut = parsed.unknown_shortcut;
+        self.values
+            .retain(|(key, value)| *value != default_of(*key));
+        self.overrides
+            .retain(|(command, key)| *key != command.default_key());
+        self.resolve();
     }
 }
 struct Inner {
@@ -406,6 +601,15 @@ struct Inner {
     events: RefCell<VecDeque<SettingChange>>,
     dispatching: RefCell<bool>,
     writer: Arc<Writer>,
+    /// `flush` has run, so the app is exiting and each later save is waited for.
+    flushed: Cell<bool>,
+    settling: Cell<bool>,
+}
+/// A store that goes away may be the app's last act, so its last save is waited for.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.writer.wait();
+    }
 }
 
 /// Settings and keys, shared by the app's windows on the UI thread.
@@ -418,6 +622,7 @@ struct Loaded {
     problem: Option<String>,
     block: Option<String>,
     copy: Option<PathBuf>,
+    bytes: Option<Vec<u8>>,
 }
 /// How many copies of broken files stay. Past this, the oldest of them go.
 const MAX_COPIES: usize = 5;
@@ -457,11 +662,15 @@ fn holds_these_bytes(copy: &Path, bytes: &[u8]) -> bool {
     fs::metadata(copy).is_ok_and(|found| found.len() == bytes.len() as u64)
         && fs::read(copy).is_ok_and(|held| held == bytes)
 }
+fn flush_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()
+}
 /// A copy of the broken file beside it, whole, or an error. The same content as the newest
-/// copy makes no new one, so launching again and again adds nothing. There is no flush
-/// here, on the launch thread: the writer flushes the copy before any save replaces the
-/// original, and until then the original is still there.
-fn keep_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+/// copy makes no new one, so launching again and again adds nothing. The launch thread does
+/// not flush (`must_flush` false). The writer does, before any save replaces the original,
+/// and until then the original is still there. A copy it cannot flush, such as a read-only
+/// one, does not count, so it makes a new one.
+fn keep_copy(path: &Path, bytes: &[u8], must_flush: bool) -> Result<PathBuf, String> {
     let folder = path.parent().unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
@@ -469,12 +678,13 @@ fn keep_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let copies = copies_beside(path, &stem)?;
     if let Some((_, newest)) = copies.last()
         && holds_these_bytes(newest, bytes)
+        && (!must_flush || flush_file(newest).is_ok())
     {
         return Ok(newest.clone());
     }
-    let mut number = copies
-        .last()
-        .map_or(1, |(number, _)| number.saturating_add(1));
+    // After the highest number, the count starts again from 1. Any free name will do.
+    let next = |number: u32| number.checked_add(1).unwrap_or(1);
+    let mut number = copies.last().map_or(1, |(number, _)| next(*number));
     for _ in 0..16 {
         let name = if number == 1 {
             format!("{stem}.broken.txt")
@@ -498,10 +708,21 @@ fn keep_copy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
                 for (_, old) in copies.iter().take(over) {
                     let _ = fs::remove_file(old);
                 }
+                if must_flush {
+                    drop(file);
+                    flush_file(&copy).map_err(|error| error.to_string())?;
+                    if !holds_these_bytes(&copy, bytes) {
+                        return Err(format!("{} does not hold the file", copy.display()));
+                    }
+                }
                 return Ok(copy);
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                number = number.saturating_add(1);
+            // A folder with this name gives access denied, not "already exists".
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists
+                    || fs::symlink_metadata(&copy).is_ok() =>
+            {
+                number = next(number);
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -514,23 +735,20 @@ fn shortened_why(why: &str) -> String {
         None => why.to_owned(),
     }
 }
-fn broken(path: &Path, bytes: &[u8], why: &str, kept_values: Option<Parsed>) -> Loaded {
-    let start = if kept_values.is_some() {
-        "The settings that could not be read have their defaults"
-    } else {
+fn broken(path: &Path, bytes: Vec<u8>, why: &str, parsed: Parsed) -> Loaded {
+    let start = if parsed.is_empty() {
         "QuickEdit started with default settings"
+    } else {
+        "The settings that could not be read have their defaults"
     };
-    let parsed = kept_values.unwrap_or_default();
     let why = shortened_why(why);
-    match keep_copy(path, bytes) {
+    match keep_copy(path, &bytes, false) {
         Ok(copy) => Loaded {
             parsed,
-            problem: Some(format!(
-                "The settings file has a problem: {why}. {start}. A copy of the file is at {}.",
-                copy.display()
-            )),
+            problem: Some(problem_with_copy(&why, start, &copy)),
             block: None,
             copy: Some(copy),
+            bytes: Some(bytes),
         },
         Err(error) => {
             let problem = format!(
@@ -541,90 +759,112 @@ fn broken(path: &Path, bytes: &[u8], why: &str, kept_values: Option<Parsed>) -> 
                 block: Some(format!("Settings were not saved: {problem}")),
                 problem: Some(problem),
                 copy: None,
+                bytes: Some(bytes),
             }
         }
     }
 }
-/// Opens the file, and tries again for a moment while another program holds it. Only a
+/// What is at the path now.
+enum Disk {
+    Missing,
+    TooLong,
+    Unreadable(std::io::Error),
+    Bytes(Vec<u8>),
+}
+/// Reads up to the limit, and `None` means there was more. A file may grow after its size
+/// was checked, and a part of a file is not the file.
+fn read_capped(reader: impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    Read::take(reader, MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes))
+}
+/// Reads the file, and tries again for a moment while another program holds it. Only a
 /// file that is really missing is a first run.
-fn open_for_reading(path: &Path) -> std::io::Result<File> {
-    const TRIES: u32 = 6;
-    let mut tries = 1;
-    loop {
+fn read_disk(path: &Path, tries: u32, pause: std::time::Duration) -> Disk {
+    let mut tried = 1;
+    let mut file = loop {
         match File::open(path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Disk::Missing,
             Err(error)
-                if tries < TRIES
+                if tried < tries
                     && error
                         .raw_os_error()
                         .is_some_and(|code| is_passing_hold(code as u32)) =>
             {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                tried += 1;
+                std::thread::sleep(pause);
             }
-            other => return other,
+            Err(error) => return Disk::Unreadable(error),
         }
-    }
-}
-fn read(path: &Path) -> Loaded {
-    let empty = |problem: Option<String>, block: Option<String>| Loaded {
-        parsed: Parsed::default(),
-        problem,
-        block,
-        copy: None,
-    };
-    let blocked = |problem: String| {
-        empty(
-            Some(problem.clone()),
-            Some(format!("Settings were not saved: {problem}")),
-        )
-    };
-    let unreadable = |error: std::io::Error| {
-        blocked(format!(
-            "The settings file could not be read: {error}. QuickEdit started with default settings, and changes will not be saved over the file."
-        ))
-    };
-    // A file this long is not one this app wrote. Copying it could take any time at launch,
-    // and a part of it is not a copy, so it stays where it is, not read, and is not replaced.
-    let too_long = || {
-        blocked(format!(
-            "The settings file is over 1 MB long, so it was not read. QuickEdit started with default settings, and changes will not be saved over the file. Move or rename {} to save settings again.",
-            path.display()
-        ))
-    };
-    let mut file = match open_for_reading(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return empty(None, None),
-        Err(error) => return unreadable(error),
     };
     match file.metadata() {
-        Ok(found) if found.len() > MAX_FILE_BYTES => return too_long(),
+        Ok(found) if found.len() > MAX_FILE_BYTES => return Disk::TooLong,
         Ok(_) => {}
-        Err(error) => return unreadable(error),
+        Err(error) => return Disk::Unreadable(error),
     }
-    // It may have grown since, so one byte over the limit still counts.
-    let mut bytes = Vec::new();
-    if let Err(error) = Read::take(&mut file, MAX_FILE_BYTES + 1).read_to_end(&mut bytes) {
-        return unreadable(error);
+    match read_capped(&mut file) {
+        Ok(Some(bytes)) => Disk::Bytes(bytes),
+        Ok(None) => Disk::TooLong,
+        Err(error) => Disk::Unreadable(error),
     }
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return too_long();
-    }
-    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-    let Ok(text) = std::str::from_utf8(text) else {
-        return broken(path, &bytes, "it is not UTF-8 text", None);
+}
+const NOT_TEXT: &str = "it is not UTF-8 text";
+/// The byte order mark, if there is one, and the text after it, if it is text.
+fn split_text(bytes: &[u8]) -> (&[u8], Option<&str>) {
+    let rest = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let mark = &bytes[..bytes.len() - rest.len()];
+    (mark, std::str::from_utf8(rest).ok())
+}
+fn unreadable_at_open(path: &Path, error: &std::io::Error) -> String {
+    format!(
+        "The settings file {} could not be read: {error}. QuickEdit started with default settings, and changes will not be saved over the file.",
+        path.display()
+    )
+}
+/// A file this long is not read at launch, because copying it could take any time, and a
+/// part of it is not a copy. So it stays where it is and is not replaced.
+fn too_long_at_open(path: &Path) -> String {
+    format!(
+        "The settings file is over 1 MB long, so it was not read. QuickEdit started with default settings, and changes will not be saved over the file. Move or rename {} to save settings again.",
+        path.display()
+    )
+}
+fn read(path: &Path) -> Loaded {
+    let blocked = |problem: String| Loaded {
+        parsed: Parsed::default(),
+        block: Some(format!("Settings were not saved: {problem}")),
+        problem: Some(problem),
+        copy: None,
+        bytes: None,
     };
-    match parse(text) {
-        Err(why) => broken(path, &bytes, &why, None),
-        Ok(parsed) if parsed.bad_values.is_empty() => Loaded {
+    let bytes = match read_disk(path, 6, std::time::Duration::from_millis(10)) {
+        Disk::Missing => {
+            return Loaded {
+                parsed: Parsed::default(),
+                problem: None,
+                block: None,
+                copy: None,
+                bytes: None,
+            };
+        }
+        Disk::TooLong => return blocked(too_long_at_open(path)),
+        Disk::Unreadable(error) => return blocked(unreadable_at_open(path, &error)),
+        Disk::Bytes(bytes) => bytes,
+    };
+    let Some(text) = split_text(&bytes).1 else {
+        return broken(path, bytes, NOT_TEXT, Parsed::default());
+    };
+    let parsed = parse(text);
+    match parsed.problem() {
+        Some(why) => broken(path, bytes, &why, parsed),
+        None => Loaded {
             parsed,
             problem: None,
             block: None,
             copy: None,
+            bytes: Some(bytes),
         },
-        Ok(parsed) => {
-            let why = parsed.bad_values.join("; ");
-            broken(path, &bytes, &why, Some(parsed))
-        }
     }
 }
 
@@ -634,25 +874,25 @@ impl SettingsStore {
     pub fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let loaded = read(&path);
+        let known = KnownFile {
+            blocked: loaded.block.is_some(),
+            copy_owed: loaded.problem.is_some() && loaded.bytes.is_some(),
+            copy: loaded.copy,
+            bytes: loaded.bytes,
+        };
         let mut state = State {
             path,
-            values: loaded.parsed.values,
-            overrides: loaded.parsed.keys,
-            kept: loaded.parsed.kept,
+            values: Vec::new(),
+            overrides: Vec::new(),
+            unknown_shortcut: false,
             resolved: Vec::new(),
             load_problem: loaded.problem,
             save_block: loaded.block,
             write_error: None,
         };
-        state
-            .values
-            .retain(|(key, value)| *value != default_of(*key));
-        state
-            .overrides
-            .retain(|(command, key)| *key != command.default_key());
-        state.resolve();
+        state.set_memory(loaded.parsed);
         let writer = Writer {
-            copy_to_flush: Mutex::new(loaded.copy),
+            known: Mutex::new(known),
             ..Writer::default()
         };
         Self(Rc::new(Inner {
@@ -662,16 +902,19 @@ impl SettingsStore {
             events: RefCell::default(),
             dispatching: RefCell::default(),
             writer: Arc::new(writer),
+            flushed: Cell::default(),
+            settling: Cell::default(),
         }))
     }
     pub fn path(&self) -> PathBuf {
         self.0.state.borrow().path.clone()
     }
-    /// What was wrong with the file at startup, in words for the user.
+    /// What is wrong with the file, in words for the user: what `open` found, until a save
+    /// looks at a file that changed. `SettingChange::FileProblem` says when that happens.
     pub fn load_problem(&self) -> Option<String> {
         self.0.state.borrow().load_problem.clone()
     }
-    /// Why the last write failed. The next good write clears it.
+    /// Why the last write failed. Its changes stay unsaved. The next good write clears it.
     pub fn write_error(&self) -> Option<String> {
         self.0.state.borrow().write_error.clone()
     }
@@ -750,7 +993,8 @@ impl SettingsStore {
     // Writing.
 
     /// Refuses a value with the wrong type or outside its limits. The window shows the
-    /// reason. No event and no write when the value is the same.
+    /// reason. No event when the value is the same, and no write unless a change to this
+    /// setting is still unsaved: then this tries that save again.
     pub fn set(&self, key: SettingKey, value: StoredValue) -> Result<(), SettingError> {
         if key == SettingKey::KeyboardShortcuts {
             return Err(SettingError(
@@ -767,14 +1011,18 @@ impl SettingsStore {
                 .cloned()
                 .unwrap_or_else(|| default_of(key));
             if now == value {
+                drop(state);
+                if lock(&self.0.writer.slot).unsaved.holds_setting(key) {
+                    self.save(|_| {});
+                }
                 return Ok(());
             }
             state.values.retain(|(seen, _)| *seen != key);
             if value != default_of(key) {
-                state.values.push((key, value));
+                state.values.push((key, value.clone()));
             }
         }
-        self.save();
+        self.save(|unsaved| unsaved.add(Edit::Setting(key, value)));
         self.emit(SettingChange::Value(key));
         Ok(())
     }
@@ -905,30 +1153,32 @@ impl SettingsStore {
                 state.overrides.push((command, key));
             }
             if before == state.overrides {
+                drop(state);
+                if lock(&self.0.writer.slot).unsaved.holds_key(command) {
+                    self.save(|_| {});
+                }
                 return;
             }
             state.resolve();
         }
-        self.save();
+        self.save(|unsaved| unsaved.add(Edit::Key(command, key)));
         self.emit(SettingChange::Keys);
     }
     /// Restore Keyboard Defaults: every change goes, also ones for commands this
     /// version does not know.
     pub fn restore_keyboard_defaults(&self) {
         if self.drop_key_changes() {
-            self.save();
+            self.save(Unsaved::drop_all_shortcuts);
             self.emit(SettingChange::Keys);
         }
     }
     fn drop_key_changes(&self) -> bool {
         let mut state = self.0.state.borrow_mut();
-        let before = (state.overrides.len(), state.kept.len());
+        let changed = !state.overrides.is_empty() || state.unknown_shortcut;
         state.overrides.clear();
-        state
-            .kept
-            .retain(|line| !line.trim_start().starts_with(SHORTCUT_PREFIX));
+        state.unknown_shortcut = false;
         state.resolve();
-        before != (state.overrides.len(), state.kept.len())
+        changed
     }
     /// Restore All Defaults, as on the Mac: every setting and every shortcut goes back.
     /// The encodings list stays, because the Mac's has no registered value. Keys this
@@ -949,7 +1199,18 @@ impl SettingsStore {
             changed
         };
         if keys_changed || !changed.is_empty() {
-            self.save();
+            let edits: Vec<Edit> = changed
+                .iter()
+                .map(|key| Edit::Setting(*key, default_of(*key)))
+                .collect();
+            self.save(|unsaved| {
+                if keys_changed {
+                    unsaved.drop_all_shortcuts();
+                }
+                for edit in edits {
+                    unsaved.add(edit);
+                }
+            });
         }
         for key in changed {
             self.emit(SettingChange::Value(key));
@@ -1020,7 +1281,9 @@ impl SettingsStore {
     pub fn remove_write_wake(&self, id: u64) {
         lock(&self.0.writer.wakes).retain(|(seen, _)| *seen != id);
     }
-    fn save(&self) {
+    /// Marks the change as unsaved and asks the writer for a save. A block that `open` found
+    /// shows at once, and the writer looks again.
+    fn save(&self, change: impl FnOnce(&mut Unsaved)) {
         let (path, text, block) = {
             let state = self.0.state.borrow();
             (
@@ -1029,33 +1292,85 @@ impl SettingsStore {
                 state.save_block.clone(),
             )
         };
-        let outcome = match block {
-            Some(block) => Err(block),
-            None => self
-                .0
-                .writer
-                .queue(path, text)
-                .map_err(|e| format!("Settings were not saved: {e}")),
-        };
-        if let Err(message) = outcome {
-            self.note_write(Err(message));
+        if let Some(block) = block {
+            self.note_write(Err(block));
+        }
+        if self.0.writer.queue(path, text, change).is_err() {
+            self.poll_writes();
+        }
+        if self.0.flushed.get() {
+            self.settle();
         }
     }
-    /// Turns a finished write into a `write_error` and an event. No wait.
+    /// Turns a finished write into a `write_error` and an event, and takes in what a save
+    /// found in a file that changed. No wait.
     pub fn poll_writes(&self) {
-        let finished = lock(&self.0.writer.slot).finished.take();
+        let (finished, found) = {
+            let mut slot = lock(&self.0.writer.slot);
+            let found = slot.found.take().map(|mut found| {
+                if let Some(parsed) = &mut found.parsed {
+                    slot.unsaved.apply_to(parsed);
+                }
+                found
+            });
+            (slot.finished.take(), found)
+        };
+        if let Some(found) = found {
+            self.take_found(found);
+        }
         if let Some(result) = finished {
             self.note_write(result);
+        }
+    }
+    fn take_found(&self, found: FoundFile) {
+        let mut events = Vec::new();
+        {
+            let mut state = self.0.state.borrow_mut();
+            if let Some(parsed) = found.parsed {
+                let before: Vec<StoredValue> = SettingKey::ALL
+                    .iter()
+                    .map(|key| {
+                        state
+                            .stored(*key)
+                            .cloned()
+                            .unwrap_or_else(|| default_of(*key))
+                    })
+                    .collect();
+                let keys_before = state.resolved.clone();
+                state.set_memory(parsed);
+                for (key, old) in SettingKey::ALL.iter().zip(before) {
+                    let new = state
+                        .stored(*key)
+                        .cloned()
+                        .unwrap_or_else(|| default_of(*key));
+                    if new != old {
+                        events.push(SettingChange::Value(*key));
+                    }
+                }
+                if keys_before != state.resolved {
+                    events.push(SettingChange::Keys);
+                }
+            }
+            if state.load_problem != found.problem {
+                state.load_problem.clone_from(&found.problem);
+                events.push(SettingChange::FileProblem(found.problem));
+            }
+        }
+        for event in events {
+            self.emit(event);
         }
     }
     fn note_write(&self, result: Result<(), String>) {
         let event = {
             let mut state = self.0.state.borrow_mut();
             match result {
-                Ok(()) => state
-                    .write_error
-                    .take()
-                    .map(|_| SettingChange::WriteRecovered),
+                Ok(()) => {
+                    state.save_block = None;
+                    state
+                        .write_error
+                        .take()
+                        .map(|_| SettingChange::WriteRecovered)
+                }
                 Err(message) => {
                     state.write_error = Some(message.clone());
                     Some(SettingChange::WriteFailed(message))
@@ -1066,18 +1381,129 @@ impl SettingsStore {
             self.emit(event);
         }
     }
-    /// Waits for the writer. For the app's exit and for tests: never while typing.
-    /// Returns the last write's error, if there is one.
+    /// Waits until the writer is idle, with its results taken in. A listener may save during
+    /// this, and that save is waited for too. `false` means listeners would not stop saving.
+    fn settle(&self) -> bool {
+        const ROUNDS: usize = 32;
+        if self.0.settling.replace(true) {
+            return true;
+        }
+        let mut calm = false;
+        for _ in 0..ROUNDS {
+            self.0.writer.wait();
+            self.poll_writes();
+            let slot = lock(&self.0.writer.slot);
+            if !slot.running && slot.finished.is_none() && slot.found.is_none() {
+                calm = true;
+                break;
+            }
+        }
+        self.0.settling.set(false);
+        calm
+    }
+    /// For the app's exit and for tests: never while typing. It tries any change that failed
+    /// to save once more, waits, and returns an error if any change is still unsaved.
+    ///
+    /// After this the app counts as exiting: each later save is waited for on the calling
+    /// thread, so it reaches the disk or sets `write_error` before the call returns. A
+    /// process exit can then lose nothing.
     pub fn flush(&self) -> Result<(), String> {
-        self.0.writer.wait();
-        self.poll_writes();
-        self.write_error().map_or(Ok(()), Err)
+        self.0.flushed.set(true);
+        let retry = {
+            let slot = lock(&self.0.writer.slot);
+            !slot.running && !slot.unsaved.is_empty()
+        };
+        if retry {
+            let (path, text) = {
+                let state = self.0.state.borrow();
+                (state.path.clone(), state.encoded())
+            };
+            let _ = self.0.writer.queue(path, text, |_| {});
+        }
+        let calm = self.settle();
+        if let Some(error) = self.write_error() {
+            return Err(error);
+        }
+        if !calm || !lock(&self.0.writer.slot).unsaved.is_empty() {
+            return Err(
+                "Settings were not saved: changes were still being made when QuickEdit stopped waiting."
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn scratch_path(name: &str) -> PathBuf {
+        let folder =
+            std::env::temp_dir().join(format!("qe-settings-unit-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        folder.join(SETTINGS_FILE_NAME)
+    }
+    /// The second review: a file that grows after its size check must still count as long.
+    #[test]
+    fn a_read_stops_one_byte_past_the_limit() {
+        let limit = MAX_FILE_BYTES as usize;
+        let read = |length: usize| read_capped(std::io::repeat(b'x').take(length as u64));
+        assert_eq!(read(limit).unwrap().map(|b| b.len()), Some(limit));
+        assert_eq!(read(limit + 1).unwrap(), None);
+        assert_eq!(read(limit * 3).unwrap(), None);
+    }
+    /// The second review: a burst behind a save in progress makes one more save, not 300.
+    #[test]
+    fn a_burst_of_changes_behind_a_held_file_makes_at_most_two_saves() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = scratch_path("burst");
+        fs::write(&path, "TabWidth=4\r\n").unwrap();
+        let store = SettingsStore::open(&path);
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        for width in 1..=300 {
+            store
+                .set_integer(SettingKey::WindowWidthCharacters, width)
+                .unwrap();
+        }
+        drop(held);
+        store.flush().unwrap();
+        let attempts = store.0.writer.attempts.load(Ordering::Relaxed);
+        assert!(attempts <= 2, "{attempts} saves");
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "TabWidth=4\r\nWindowWidthCharacters=300\r\n");
+        drop(store);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    /// The second review, finding 11: a thread that cannot start is an error, even with an
+    /// old success still waiting for a poll.
+    #[test]
+    fn a_stale_success_does_not_clear_a_failure_to_start() {
+        let path = scratch_path("stale-ok");
+        let store = SettingsStore::open(&path);
+        store.set_integer(SettingKey::TabWidth, 3).unwrap();
+        store.0.writer.wait();
+        assert_eq!(
+            lock(&store.0.writer.slot).finished,
+            Some(Ok(())),
+            "a success nothing has polled"
+        );
+        store.0.writer.fail_start.store(true, Ordering::Relaxed);
+        store.set_integer(SettingKey::TabWidth, 4).unwrap();
+        let error = store.write_error().expect("the failure shows at once");
+        assert!(error.contains("could not start"), "{error}");
+        store.poll_writes();
+        assert_eq!(store.write_error().as_deref(), Some(error.as_str()));
+        // The change is still unsaved, so the next try writes it.
+        store.flush().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "TabWidth=4\r\n");
+        drop(store);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
     #[test]
     fn the_variable_counts_only_as_a_full_path() {
         assert_eq!(local_folder_from_variable(None), None);

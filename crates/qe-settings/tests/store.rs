@@ -259,13 +259,13 @@ fn broken_file_is_kept_beside_itself_and_told_to_the_caller() {
     let store = write_file("broken", junk);
     let problem = store.load_problem().expect("the caller hears of it");
     assert!(problem.contains("line 1"), "{problem}");
-    assert!(problem.contains("default settings"), "{problem}");
+    assert!(problem.contains("have their defaults"), "{problem}");
     assert!(problem.contains("settings.broken.txt"), "{problem}");
     assert_eq!(std::fs::read_to_string(broken_copy(&store)).unwrap(), junk);
-    assert_eq!(store.get_integer(SettingKey::WindowHeightLines), Some(30));
-    // A later save may replace the file, because the copy holds the old text.
+    assert_eq!(store.get_integer(SettingKey::WindowHeightLines), Some(40));
+    // A later save edits the file in place, so the stray line stays. The copy stays too.
     store.set_bool(SettingKey::SmartQuotes, true).unwrap();
-    assert_eq!(on_disk(&store), "SmartQuotes=true\r\n");
+    assert_eq!(on_disk(&store), format!("{junk}SmartQuotes=true\r\n"));
     assert_eq!(std::fs::read_to_string(broken_copy(&store)).unwrap(), junk);
 }
 #[test]
@@ -400,19 +400,7 @@ fn copies_stop_at_a_small_limit_and_saving_never_stops() {
         last
     );
     store.set_bool(SettingKey::SmartQuotes, true).unwrap();
-    assert_eq!(on_disk(&store), "SmartQuotes=true\r\n");
-}
-/// The copy is flushed before the original goes, on the writer's thread and not at
-/// launch. A copy that is gone by then stops the save.
-#[test]
-fn a_copy_that_went_away_stops_the_save_over_the_original() {
-    let junk = "junk\r\n";
-    let store = write_file("copy-gone", junk);
-    std::fs::remove_file(broken_copy(&store)).unwrap();
-    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
-    let error = store.flush().unwrap_err();
-    assert!(error.contains("settings.broken.txt"), "{error}");
-    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), junk);
+    assert_eq!(on_disk(&store), format!("{last}SmartQuotes=true\r\n"));
 }
 #[test]
 fn a_very_long_bad_value_gives_a_short_message_that_still_names_the_copy() {
@@ -664,4 +652,657 @@ fn stored_values_compare_by_type() {
     assert_eq!(store.get_bool(SettingKey::TabWidth), None);
     assert_eq!(store.get_integer(SettingKey::SmartQuotes), None);
     assert_eq!(store.get_text(SettingKey::SmartQuotes), None);
+}
+
+// The second review.
+
+fn names_beside(path: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+fn good_store(name: &str) -> (SettingsStore, std::path::PathBuf) {
+    let path = settings_path(name);
+    std::fs::write(&path, "TabWidth=4\r\n").unwrap();
+    (SettingsStore::open(&path), path)
+}
+fn events_of(store: &SettingsStore) -> Rc<RefCell<Vec<SettingChange>>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    store.subscribe(move |change| log.borrow_mut().push(change.clone()));
+    seen
+}
+
+// Finding 1: a save looks at the disk first.
+#[test]
+fn a_file_that_turned_broken_after_open_gets_a_copy_and_keeps_its_lines() {
+    let (store, path) = good_store("broken-later");
+    let hand = "no equals sign here\r\nTabWidth=5\r\n";
+    std::fs::write(&path, hand).unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(broken_copy(&store)).unwrap(),
+        hand,
+        "a true copy exists"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "no equals sign here\r\nTabWidth=5\r\nSmartQuotes=true\r\n"
+    );
+    // Memory follows what the person wrote, and the store says what it found.
+    assert_eq!(store.get_integer(SettingKey::TabWidth), Some(5));
+    let problem = store.load_problem().unwrap();
+    assert!(problem.contains("line 1"), "{problem}");
+    assert!(problem.contains("settings.broken.txt"), "{problem}");
+}
+#[test]
+fn a_file_that_stopped_being_text_after_open_is_copied_then_replaced() {
+    let (store, path) = good_store("not-text-later");
+    let junk = [0xff_u8, 0xfe, 0x00, 0x41];
+    std::fs::write(&path, junk).unwrap();
+    let seen = events_of(&store);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(std::fs::read(broken_copy(&store)).unwrap(), junk);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\nTabWidth=4\r\n",
+        "from memory, in the order of the table"
+    );
+    assert!(store.load_problem().unwrap().contains("not UTF-8"));
+    assert!(
+        seen.borrow()
+            .contains(&SettingChange::FileProblem(store.load_problem()))
+    );
+}
+#[test]
+fn a_file_over_the_limit_after_open_is_not_saved_over() {
+    let path = settings_path("long-later");
+    let store = SettingsStore::open(&path);
+    let bytes = vec![b'#'; 3_145_728];
+    std::fs::write(&path, &bytes).unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    let error = store.flush().unwrap_err();
+    assert!(error.contains("over 1 MB"), "{error}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(std::fs::read(&path).unwrap() == bytes, "every byte stays");
+    assert_eq!(names_beside(&path), ["settings.txt"]);
+}
+#[test]
+fn a_hand_edit_and_another_stores_keys_survive_a_save() {
+    let (first, path) = good_store("merge");
+    let second = SettingsStore::open(&path);
+    first.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    first.flush().unwrap();
+    second.set_bool(SettingKey::SmartDashes, true).unwrap();
+    second.flush().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text,
+        "TabWidth=4\r\nSmartQuotes=true\r\nSmartDashes=true\r\n"
+    );
+    // The second store's memory follows the first store's key.
+    assert_eq!(second.get_bool(SettingKey::SmartQuotes), Some(true));
+
+    let hand = format!("# mine\r\n{text}Future=1\r\n");
+    std::fs::write(&path, &hand).unwrap();
+    first
+        .set_integer(SettingKey::WindowHeightLines, 40)
+        .unwrap();
+    first.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{hand}WindowHeightLines=40\r\n")
+    );
+    assert_eq!(first.load_problem(), None);
+}
+/// A saved change is done: a later hand edit of the same key is the newer word.
+#[test]
+fn a_hand_edit_of_a_key_saved_earlier_stays_and_memory_follows_it() {
+    let (store, path) = good_store("hand-same-key");
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    store.flush().unwrap();
+    std::fs::write(&path, "TabWidth=6\r\n").unwrap();
+    let seen = events_of(&store);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=6\r\nSmartQuotes=true\r\n"
+    );
+    assert_eq!(store.get_integer(SettingKey::TabWidth), Some(6));
+    assert!(
+        seen.borrow()
+            .contains(&SettingChange::Value(SettingKey::TabWidth))
+    );
+}
+/// A change that never reached the disk is newer than what the file holds.
+#[test]
+fn an_unsaved_change_wins_over_a_hand_edit_of_the_same_key() {
+    let (store, path) = good_store("unsaved-wins");
+    set_read_only(&path, true);
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    assert!(store.flush().is_err());
+    set_read_only(&path, false);
+    std::fs::write(&path, "# mine\r\nTabWidth=6\r\nFuture=1\r\n").unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# mine\r\nTabWidth=5\r\nFuture=1\r\n"
+    );
+    assert_eq!(store.get_integer(SettingKey::TabWidth), Some(5));
+}
+#[test]
+fn restoring_keys_after_a_hand_edit_also_drops_the_shortcuts_it_added() {
+    let (store, path) = good_store("restore-after-hand");
+    store.clear_key(CommandId::Find);
+    store.flush().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}KeyboardShortcut.Future=Ctrl+Q\r\n")).unwrap();
+    store.restore_keyboard_defaults();
+    store
+        .set_key(CommandId::Save, KeyBinding::new(0x47, true, false, true))
+        .unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=4\r\nKeyboardShortcut.Save=Ctrl+Shift+G\r\n"
+    );
+}
+
+// Finding 2: a failed save stays unsaved.
+#[test]
+fn flush_tries_a_failed_save_again() {
+    let (store, path) = good_store("flush-retry");
+    set_read_only(&path, true);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    let first = store.flush().unwrap_err();
+    assert!(first.contains("read-only"), "{first}");
+    assert!(store.flush().is_err(), "still unsaved, so still an error");
+    set_read_only(&path, false);
+    store.flush().unwrap();
+    assert_eq!(store.write_error(), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=3\r\n");
+}
+#[test]
+fn setting_the_same_value_tries_an_unsaved_change_again() {
+    let (store, path) = good_store("same-value-retry");
+    set_read_only(&path, true);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    assert!(store.flush().is_err());
+    set_read_only(&path, false);
+    let seen = events_of(&store);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    // The earlier `flush` means this save is waited for, so the set itself did this.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=3\r\n");
+    store.flush().unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        [SettingChange::WriteRecovered],
+        "the value did not change, so no value event"
+    );
+}
+#[test]
+fn setting_the_same_key_tries_an_unsaved_change_again() {
+    let (store, path) = good_store("same-key-retry");
+    set_read_only(&path, true);
+    store.clear_key(CommandId::Find);
+    assert!(store.flush().is_err());
+    set_read_only(&path, false);
+    store.clear_key(CommandId::Find);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=4\r\nKeyboardShortcut.Find=none\r\n"
+    );
+}
+#[test]
+fn a_saved_value_set_again_writes_nothing() {
+    let (store, path) = good_store("same-value-saved");
+    store.flush().unwrap();
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    store.set_integer(SettingKey::TabWidth, 4).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+// Finding 3: a block is looked at again at each save.
+#[test]
+fn a_block_clears_once_the_long_file_is_moved() {
+    let path = settings_path("block-moved");
+    let bytes = vec![b'#'; 2_000_000];
+    std::fs::write(&path, &bytes).unwrap();
+    let store = SettingsStore::open(&path);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert!(store.flush().is_err());
+    std::fs::rename(&path, path.with_extension("moved")).unwrap();
+    store.set_bool(SettingKey::SmartDashes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.write_error(), None);
+    assert_eq!(
+        store.load_problem(),
+        None,
+        "the message about the file is over"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\nSmartDashes=true\r\n"
+    );
+    assert!(std::fs::read(path.with_extension("moved")).unwrap() == bytes);
+}
+#[test]
+fn a_block_clears_if_the_long_file_shrinks_and_its_lines_are_read() {
+    let path = settings_path("block-shrunk");
+    std::fs::write(&path, vec![b'#'; 2_000_000]).unwrap();
+    let store = SettingsStore::open(&path);
+    std::fs::write(&path, "TabWidth=4\r\n").unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=4\r\nSmartQuotes=true\r\n"
+    );
+    assert_eq!(store.get_integer(SettingKey::TabWidth), Some(4));
+    assert_eq!(store.load_problem(), None);
+}
+
+// Finding 4: the copy is checked, and it counts only after the swap.
+#[test]
+fn a_failed_swap_and_then_a_lost_copy_still_keeps_the_broken_text() {
+    let junk = [0xff_u8, 0x41];
+    let path = settings_path("swap-then-lost-copy");
+    std::fs::write(&path, junk).unwrap();
+    let store = SettingsStore::open(&path);
+    set_read_only(&path, true);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert!(store.flush().is_err(), "the swap failed");
+    set_read_only(&path, false);
+    std::fs::remove_file(broken_copy(&store)).unwrap();
+    store.set_bool(SettingKey::SmartDashes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read(broken_copy(&store)).unwrap(),
+        junk,
+        "the broken text exists somewhere"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\nSmartDashes=true\r\n"
+    );
+}
+#[test]
+fn a_copy_with_changed_content_gets_a_true_copy_before_the_save() {
+    let junk = [0xff_u8, 0xfe, 0x41];
+    let path = settings_path("emptied-copy");
+    std::fs::write(&path, junk).unwrap();
+    let store = SettingsStore::open(&path);
+    std::fs::write(broken_copy(&store), "").unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\n"
+    );
+    assert_eq!(
+        std::fs::read(path.with_file_name("settings.broken-2.txt")).unwrap(),
+        junk
+    );
+}
+/// This replaces `a_copy_that_went_away_stops_the_save_over_the_original`. The original
+/// still holds the bytes, so the save makes the copy again instead of stopping.
+#[test]
+fn a_copy_that_went_away_is_made_again_before_the_save() {
+    let junk = [0xff_u8, 0x41];
+    let path = settings_path("copy-gone");
+    std::fs::write(&path, junk).unwrap();
+    let store = SettingsStore::open(&path);
+    std::fs::remove_file(broken_copy(&store)).unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(std::fs::read(broken_copy(&store)).unwrap(), junk);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\n"
+    );
+}
+/// Denies making files in the folder for as long as it lives.
+struct NoNewFiles(std::path::PathBuf);
+impl NoNewFiles {
+    fn new(folder: &std::path::Path) -> Self {
+        Self::icacls(folder, &["/deny", "*S-1-1-0:(WD)"]);
+        Self(folder.to_owned())
+    }
+    fn icacls(folder: &std::path::Path, what: &[&str]) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let done = std::process::Command::new("icacls")
+            .arg(folder)
+            .args(what)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+    }
+}
+impl Drop for NoNewFiles {
+    fn drop(&mut self) {
+        Self::icacls(&self.0, &["/remove:d", "*S-1-1-0"]);
+    }
+}
+#[test]
+fn no_way_to_make_a_copy_blocks_the_save_until_there_is_one() {
+    let junk = [0xff_u8, 0x41];
+    let path = settings_path("no-copy-possible");
+    let folder = path.parent().unwrap().to_owned();
+    std::fs::write(&path, junk).unwrap();
+    let denied = NoNewFiles::new(&folder);
+    let store = SettingsStore::open(&path);
+    assert!(
+        store
+            .load_problem()
+            .unwrap()
+            .contains("No copy could be kept")
+    );
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    let error = store.flush().unwrap_err();
+    assert!(error.contains("not saved"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), junk);
+    drop(denied);
+    store.flush().unwrap();
+    assert_eq!(std::fs::read(broken_copy(&store)).unwrap(), junk);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\n"
+    );
+}
+
+// Finding 5: nothing escapes `flush`.
+#[test]
+fn a_save_after_flush_is_on_disk_when_the_call_returns() {
+    let (store, path) = good_store("after-flush");
+    store.flush().unwrap();
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=5\r\n");
+}
+#[test]
+fn a_failed_save_after_flush_is_an_error_at_once() {
+    let (store, path) = good_store("after-flush-failed");
+    store.flush().unwrap();
+    set_read_only(&path, true);
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    assert!(store.write_error().unwrap().contains("read-only"));
+    assert!(store.flush().is_err());
+    set_read_only(&path, false);
+}
+#[test]
+fn flush_waits_for_a_save_its_own_listener_causes() {
+    let (store, path) = good_store("listener-in-flush");
+    set_read_only(&path, true);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    let (inner, target) = (store.clone(), path.clone());
+    store.subscribe(move |change| {
+        if matches!(change, SettingChange::WriteFailed(_)) {
+            set_read_only(&target, false);
+            inner.set_bool(SettingKey::SmartDashes, true).unwrap();
+        }
+    });
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=3\r\nSmartDashes=true\r\n"
+    );
+}
+#[test]
+fn a_listener_that_never_stops_saving_ends_flush_with_an_error() {
+    let (store, path) = good_store("endless-listener");
+    set_read_only(&path, true);
+    let inner = store.clone();
+    // Never 4, which the file holds: that would need no write, and so could not fail.
+    let next = std::cell::Cell::new(10);
+    store.subscribe(move |change| {
+        if matches!(change, SettingChange::WriteFailed(_)) {
+            next.set(next.get() % 50 + 10);
+            let _ = inner.set_integer(SettingKey::TabWidth, next.get());
+        }
+    });
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    assert!(store.flush().is_err());
+    set_read_only(&path, false);
+}
+#[test]
+fn dropping_the_last_store_waits_for_its_save() {
+    let (store, path) = good_store("drop-waits");
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    drop(store);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=5\r\n");
+}
+
+// Finding 6: the app never writes a file it would refuse.
+const LIMIT: usize = 1024 * 1024;
+fn comment_bytes(length: usize, line_end: &str) -> String {
+    let mut text = String::with_capacity(length);
+    let line = format!("# {}{line_end}", "x".repeat(60));
+    while length - text.len() >= 2 * line.len() {
+        text.push_str(&line);
+    }
+    let rest = length - text.len();
+    text.push_str(&format!(
+        "#{}{line_end}",
+        "y".repeat(rest - 1 - line_end.len())
+    ));
+    assert_eq!(text.len(), length);
+    text
+}
+/// The review's case: LF lines did not grow a 921,601-byte file past the limit once saves
+/// keep each line's own end.
+#[test]
+fn a_saved_file_stays_under_the_limit_and_opens_clean() {
+    let path = settings_path("lf-file");
+    let text = comment_bytes(921_601, "\n");
+    std::fs::write(&path, &text).unwrap();
+    let store = SettingsStore::open(&path);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved == format!("{text}SmartQuotes=true\r\n"));
+    let again = SettingsStore::open(&path);
+    assert_eq!(again.load_problem(), None);
+    assert_eq!(again.get_bool(SettingKey::SmartQuotes), Some(true));
+}
+#[test]
+fn a_save_that_would_pass_the_limit_is_refused_and_the_old_file_stays() {
+    // `SmartQuotes=true` and its CRLF are 18 bytes, so the CRLF's last byte is one too many.
+    let path = settings_path("past-limit");
+    let text = comment_bytes(LIMIT - 17, "\r\n");
+    std::fs::write(&path, &text).unwrap();
+    let store = SettingsStore::open(&path);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    let error = store.flush().unwrap_err();
+    assert!(error.contains("over 1 MB"), "{error}");
+    assert!(std::fs::read_to_string(&path).unwrap() == text, "unchanged");
+    assert_eq!(store.get_bool(SettingKey::SmartQuotes), Some(true));
+    assert_eq!(names_beside(&path), ["settings.txt"]);
+}
+#[test]
+fn a_save_that_lands_exactly_on_the_limit_works() {
+    let path = settings_path("on-limit");
+    let text = comment_bytes(LIMIT - 18, "\r\n");
+    std::fs::write(&path, &text).unwrap();
+    let store = SettingsStore::open(&path);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), LIMIT as u64);
+    assert_eq!(SettingsStore::open(&path).load_problem(), None);
+}
+#[test]
+fn the_read_limit_counts_to_the_exact_byte() {
+    let path = settings_path("read-limit");
+    std::fs::write(&path, comment_bytes(LIMIT, "\r\n")).unwrap();
+    assert_eq!(SettingsStore::open(&path).load_problem(), None);
+    std::fs::write(&path, comment_bytes(LIMIT + 1, "\r\n")).unwrap();
+    assert!(
+        SettingsStore::open(&path)
+            .load_problem()
+            .unwrap()
+            .contains("over 1 MB")
+    );
+}
+
+// Findings 8 and 9: a save edits the file in place.
+#[test]
+fn a_stray_line_stays_with_everything_around_it() {
+    let text = "note to self\r\nTabWidth=4\r\nFuture=1\r\n# comment\r\n";
+    let store = write_file("stray", text);
+    // The other lines still count, so a line that stays never costs them.
+    assert_eq!(store.get_integer(SettingKey::TabWidth), Some(4));
+    assert!(store.load_problem().unwrap().contains("line 1"));
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert_eq!(on_disk(&store), format!("{text}SmartQuotes=true\r\n"));
+    assert_eq!(std::fs::read_to_string(broken_copy(&store)).unwrap(), text);
+    // Later saves make no more copies of a file this store wrote.
+    store.set_bool(SettingKey::SmartDashes, true).unwrap();
+    on_disk(&store);
+    assert_eq!(copies_in(&store.path()), ["settings.broken.txt"]);
+}
+#[test]
+fn a_setting_changes_its_own_line_and_comments_stay_where_they_are() {
+    let store = write_file(
+        "in-place",
+        "# width for my laptop\r\nWindowWidthCharacters=120\r\n\r\n  # tabs\r\nTabWidth=4\r\nFuture = 1\r\n",
+    );
+    store
+        .set_integer(SettingKey::WindowWidthCharacters, 100)
+        .unwrap();
+    assert_eq!(
+        on_disk(&store),
+        "# width for my laptop\r\nWindowWidthCharacters=100\r\n\r\n  # tabs\r\nTabWidth=4\r\nFuture = 1\r\n"
+    );
+    // Back to its default: the line goes, and its comment stays where it was.
+    store.set_integer(SettingKey::TabWidth, 8).unwrap();
+    assert_eq!(
+        on_disk(&store),
+        "# width for my laptop\r\nWindowWidthCharacters=100\r\n\r\n  # tabs\r\nFuture = 1\r\n"
+    );
+}
+#[test]
+fn a_line_that_holds_a_default_or_odd_spacing_stays_until_it_changes() {
+    let text = "TabWidth=8\r\n  SmartQuotes = true  \r\n";
+    let store = write_file("spacing", text);
+    store.set_bool(SettingKey::SmartDashes, true).unwrap();
+    assert_eq!(on_disk(&store), format!("{text}SmartDashes=true\r\n"));
+    store.set_bool(SettingKey::SmartQuotes, false).unwrap();
+    assert_eq!(on_disk(&store), "TabWidth=8\r\nSmartDashes=true\r\n");
+}
+#[test]
+fn line_ends_a_byte_order_mark_and_a_missing_last_end_are_kept() {
+    let store = write_file("ends", "\u{feff}# a\nTabWidth=4\r\n# no end");
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert_eq!(
+        on_disk(&store),
+        "\u{feff}# a\nTabWidth=5\r\n# no end\r\nSmartQuotes=true\r\n"
+    );
+}
+#[test]
+fn a_change_to_a_key_set_twice_leaves_one_line() {
+    let store = write_file("twice", "TabWidth=4\r\n# between\r\nTabWidth=5\r\n");
+    assert!(store.load_problem().unwrap().contains("set twice"));
+    store.set_integer(SettingKey::TabWidth, 6).unwrap();
+    assert_eq!(on_disk(&store), "TabWidth=6\r\n# between\r\n");
+}
+#[test]
+fn a_bad_value_stays_on_its_line_until_that_setting_changes() {
+    let text = "TabWidth=abc\r\nWindowHeightLines=40\r\n";
+    let store = write_file("bad-stays", text);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert_eq!(on_disk(&store), format!("{text}SmartQuotes=true\r\n"));
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    assert_eq!(
+        on_disk(&store),
+        "TabWidth=5\r\nWindowHeightLines=40\r\nSmartQuotes=true\r\n"
+    );
+}
+#[test]
+fn a_shortcut_changes_its_own_line_and_clearing_writes_none() {
+    let store = write_file("key-line", "KeyboardShortcut.Find=Ctrl+G\r\n# keep\r\n");
+    store.clear_key(CommandId::Find);
+    assert_eq!(on_disk(&store), "KeyboardShortcut.Find=none\r\n# keep\r\n");
+    store.reset_key(CommandId::Find).unwrap();
+    assert_eq!(on_disk(&store), "# keep\r\n");
+}
+
+// Finding 12: a healthy copy does not stop a save.
+#[test]
+fn a_read_only_copy_gets_a_new_flushed_copy_and_the_save_goes_on() {
+    // The save must flush the copy, and a read-only file cannot be flushed. So this also
+    // fails if the flush is taken out: the read-only copy would then count.
+    let junk = [0xff_u8, 0x41];
+    let path = settings_path("read-only-copy");
+    std::fs::write(&path, junk).unwrap();
+    let store = SettingsStore::open(&path);
+    set_read_only(&broken_copy(&store), true);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "SmartQuotes=true\r\n"
+    );
+    assert_eq!(
+        std::fs::read(path.with_file_name("settings.broken-2.txt")).unwrap(),
+        junk
+    );
+    set_read_only(&broken_copy(&store), false);
+}
+#[test]
+fn a_file_fixed_by_hand_needs_no_copy_at_all() {
+    let store = write_file("fixed-by-hand", "junk\r\n");
+    std::fs::remove_file(broken_copy(&store)).unwrap();
+    std::fs::write(store.path(), "TabWidth=4\r\n").unwrap();
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert_eq!(on_disk(&store), "TabWidth=4\r\nSmartQuotes=true\r\n");
+    assert!(!broken_copy(&store).exists(), "a good file needs no copy");
+    assert_eq!(store.load_problem(), None);
+}
+
+// Finding 13: any free name will do.
+#[test]
+fn the_highest_copy_number_does_not_stop_a_copy() {
+    let path = settings_path("top-number");
+    let top = path.with_file_name("settings.broken-4294967295.txt");
+    std::fs::write(&top, "old").unwrap();
+    std::fs::write(&path, "junk\r\n").unwrap();
+    let store = SettingsStore::open(&path);
+    let problem = store.load_problem().unwrap();
+    assert!(problem.contains("A copy of the file"), "{problem}");
+    assert_eq!(std::fs::read_to_string(&top).unwrap(), "old");
+}
+#[test]
+fn a_folder_with_the_name_of_the_copy_does_not_stop_a_copy() {
+    let path = settings_path("folder-name");
+    std::fs::create_dir(path.with_file_name("settings.broken.txt")).unwrap();
+    std::fs::write(&path, "junk\r\n").unwrap();
+    let store = SettingsStore::open(&path);
+    let problem = store.load_problem().unwrap();
+    assert!(problem.contains("settings.broken-2.txt"), "{problem}");
+}
+
+// Finding 14: a long path saves.
+#[test]
+fn a_path_longer_than_the_old_limit_saves() {
+    let mut folder = test_folder("long-path");
+    while folder.as_os_str().len() < 300 {
+        folder.push("a-long-folder-name-for-the-path-limit");
+    }
+    let path = folder.join("settings.txt");
+    let store = SettingsStore::open(&path);
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    store.flush().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=5\r\n");
+    assert_eq!(names_beside(&path), ["settings.txt"]);
 }

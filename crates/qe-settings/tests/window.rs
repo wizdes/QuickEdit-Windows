@@ -863,3 +863,46 @@ fn the_encoding_panel_follows_the_dpi_and_the_theme() {
     assert!(host.counts.frames.get() > frames, "it repainted");
     send(panel, WM_CLOSE, 0, 0);
 }
+
+/// The second review, finding 10: a failure with no poll yet shows when Settings opens.
+#[test]
+fn opening_settings_shows_a_write_failure_nothing_polled_yet() {
+    let path = settings_path("open-polls");
+    std::fs::write(&path, "").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    let store = SettingsStore::open(&path);
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = finished.clone();
+    let wake = store.add_write_wake(Arc::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    let started = Instant::now();
+    while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::yield_now();
+    }
+    store.remove_write_wake(wake);
+    assert_eq!(store.write_error(), None, "nothing polled yet");
+    let mut window = SettingsWindow::new(store.clone(), TestHost::new());
+    window.open_as(Presentation::Hidden).unwrap();
+    let shown = window.with_panel(|p| p.status_text()).unwrap();
+    assert!(shown.contains("read-only"), "{shown}");
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+}
+/// Finding 5: the wrong order, flush and then drop the window, still saves a typed size.
+#[test]
+fn a_typed_size_reaches_the_disk_when_the_window_drops_after_flush() {
+    let (window, store, _, hwnd) = opened("drop-after-flush");
+    send(hwnd, WM_SETFOCUS, 0, 0);
+    send(hwnd, WM_CHAR, '7' as usize, 1);
+    store.flush().unwrap();
+    assert!(!store.path().exists(), "the typed size is not saved yet");
+    drop(window);
+    let text = std::fs::read_to_string(store.path()).unwrap();
+    assert!(text.contains("WindowWidthCharacters=7"), "{text}");
+}

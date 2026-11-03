@@ -550,6 +550,8 @@ impl SettingsWindow {
         let problem = |what: &str, why: String| format!("Settings could not open: {what}: {why}");
         let store = self.store.clone();
         let host = self.host.clone();
+        // A write that ended with nothing polling shows now, in this window's footer.
+        store.poll_writes();
         let mut panel = SettingsPanel::new(WidgetId(PANEL_ID), store.clone());
         let measure = host.measurer();
         panel.fit_to_text(measure.as_ref());

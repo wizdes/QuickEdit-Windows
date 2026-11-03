@@ -196,21 +196,6 @@ fn a_file_held_for_a_moment_does_not_look_broken_on_open() {
     assert_eq!(other.load_problem(), None);
     assert_eq!(other.get_integer(SettingKey::TabWidth), Some(2));
 }
-#[test]
-fn a_file_held_for_long_is_reported_and_not_saved_over() {
-    let (_store, path) = saved_store("long-hold-open");
-    let held = hold(&path);
-    let started = Instant::now();
-    let other = SettingsStore::open(&path);
-    let waited = started.elapsed();
-    let problem = other.load_problem().expect("the caller hears of it");
-    assert!(problem.contains("could not be read"), "{problem}");
-    assert!(waited < Duration::from_millis(500), "{waited:?}");
-    drop(held);
-    other.set_bool(SettingKey::SmartQuotes, true).unwrap();
-    assert!(other.write_error().is_some(), "the block holds");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=2\r\n");
-}
 fn age(path: &Path, seconds: u64) {
     let file = OpenOptions::new().write(true).open(path).unwrap();
     file.set_modified(SystemTime::now() - Duration::from_secs(seconds))
@@ -307,3 +292,120 @@ fn a_killed_save_leaves_a_whole_file() {
     last.flush().unwrap();
     assert_eq!(names_in(&folder), ["settings.txt"]);
 }
+
+// The second review.
+
+/// Finding 2, with a real hold: the review's probe.
+#[test]
+fn flush_saves_a_change_that_failed_while_the_file_was_held() {
+    let (store, path) = saved_store("held-then-flush");
+    let held = hold(&path);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    let error = store.flush().unwrap_err();
+    assert!(error.contains("not saved"), "{error}");
+    drop(held);
+    store.flush().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=3\r\n");
+}
+/// Finding 3: this replaces `a_file_held_for_long_is_reported_and_not_saved_over`, which
+/// said the block holds for the whole session. While the hold lasts nothing is written.
+/// Once it ends, the settings are read and kept.
+#[test]
+fn a_file_held_past_launch_is_read_before_any_save() {
+    let (_store, path) = saved_store("long-hold-open");
+    let held = hold(&path);
+    let started = Instant::now();
+    let other = SettingsStore::open(&path);
+    let waited = started.elapsed();
+    let problem = other.load_problem().expect("the caller hears of it");
+    assert!(problem.contains("could not be read"), "{problem}");
+    assert!(waited < Duration::from_millis(500), "{waited:?}");
+    assert_eq!(other.get_integer(SettingKey::TabWidth), Some(8), "defaults");
+
+    other.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert!(other.write_error().is_some(), "the block shows at once");
+    assert!(other.flush().is_err(), "the hold still lasts");
+    drop(held);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=2\r\n");
+
+    other.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "TabWidth=2\r\nSmartQuotes=true\r\n",
+        "the settings are not replaced by defaults"
+    );
+    assert_eq!(other.get_integer(SettingKey::TabWidth), Some(2));
+    assert_eq!(other.load_problem(), None);
+    assert_eq!(other.write_error(), None);
+}
+/// Finding 4, by the review's steps.
+#[test]
+fn a_held_original_and_then_a_lost_copy_does_not_lose_the_broken_text() {
+    let path = settings_path("held-lost-copy");
+    let junk = [0xff_u8, 0x41];
+    std::fs::write(&path, junk).unwrap();
+    let store = SettingsStore::open(&path);
+    let copy = path.with_file_name("settings.broken.txt");
+    assert_eq!(std::fs::read(&copy).unwrap(), junk);
+    let held = hold(&path);
+    store.set_bool(SettingKey::SmartQuotes, true).unwrap();
+    assert!(store.flush().is_err());
+    std::fs::remove_file(&copy).unwrap();
+    drop(held);
+    store.set_bool(SettingKey::SmartDashes, true).unwrap();
+    store.flush().unwrap();
+    let kept: Vec<Vec<u8>> = names_in(path.parent().unwrap())
+        .iter()
+        .filter(|name| name.contains("broken"))
+        .map(|name| std::fs::read(path.with_file_name(name)).unwrap())
+        .collect();
+    assert_eq!(kept, [junk.to_vec()], "the broken text exists somewhere");
+}
+/// Finding 15: the error names the file, and a lasting hold costs a short, stated wait.
+#[test]
+fn a_lasting_hold_names_the_file_and_gives_up_soon() {
+    let (store, path) = saved_store("named-file");
+    let held = hold(&path);
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    let started = Instant::now();
+    let error = store.flush().unwrap_err();
+    let took = started.elapsed();
+    drop(held);
+    println!("a lasting hold: flush returned after {took:?}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+const CHILD_AFTER_FLUSH: &str = "QE_SETTINGS_CHILD_AFTER_FLUSH";
+/// Not a test by itself: the process that `a_save_after_flush_survives_process_exit` runs.
+#[test]
+fn child_saves_after_flush_and_exits() {
+    let Some(path) = std::env::var_os(CHILD_AFTER_FLUSH) else {
+        return;
+    };
+    let store = SettingsStore::open(PathBuf::from(path));
+    store.set_integer(SettingKey::TabWidth, 3).unwrap();
+    store.flush().unwrap();
+    store.set_integer(SettingKey::TabWidth, 5).unwrap();
+    // Exit with the store alive, as an app's last line can.
+    std::process::exit(0);
+}
+/// Finding 5: the review lost this change in 20 of 20 runs.
+#[test]
+fn a_save_after_flush_survives_process_exit() {
+    let exe = std::env::current_exe().unwrap();
+    for round in 0..5 {
+        let path = settings_path(&format!("exit-{round}"));
+        let done = std::process::Command::new(&exe)
+            .args(["child_saves_after_flush_and_exits", "--exact"])
+            .env(CHILD_AFTER_FLUSH, &path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(done.success());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "TabWidth=5\r\n");
+    }
+}
+// Killing a process cannot show a lost flush, so nothing here proves `sync_all` or
+// `MOVEFILE_WRITE_THROUGH`. Only pulling the power can, and no test in this repo does.

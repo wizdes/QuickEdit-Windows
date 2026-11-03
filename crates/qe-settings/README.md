@@ -1,6 +1,6 @@
 # qe-settings
 
-This crate holds the settings store, the key table, the Settings window and its Keyboard recorder. Startup uses only the store: one small text file, read and resolved in under 1 ms. The window's code runs when the user opens Settings. Nothing here uses a timer, and no thread runs at idle.
+This crate holds the settings store, the key table, the Settings window and its Keyboard recorder. Startup uses only the store: one small text file, read and resolved in under 1 ms. A file at the 1 MB limit takes 4 to 25 ms by its kind of line, and `tests/speed.rs` holds each under 75 ms. The window's code runs when the user opens Settings. Nothing here uses a timer, and no thread runs at idle.
 
 ## The wiring list for M14
 
@@ -37,6 +37,7 @@ This crate holds the settings store, the key table, the Settings window and its 
        SettingChange::Value(SettingKey::ShowLineNumbers) => { /* update every open window */ }
        SettingChange::Keys => { /* rebuild the menu models */ }
        SettingChange::WriteFailed(message) => { /* show it, if Settings is closed */ }
+       SettingChange::FileProblem(Some(message)) => { /* a save found the file changed and broken: show it */ }
        _ => {}
    });
    ```
@@ -49,7 +50,11 @@ This crate holds the settings store, the key table, the Settings window and its 
    store.poll_writes();
    ```
 
-6. **At exit,** call `store.flush()`. It waits for the writer. This is the only wait, and it must not run while the user is working.
+6. **At exit, close Settings first, then call `store.flush()`.** Closing commits a typed size, and that is a save.
+   - `flush` tries any change that failed to save once more, and waits for the writer and for saves that its own listeners cause. It takes about half a second if the file stays held, up to about one second if the last try had already failed.
+   - It returns `Err(message)` if any change is still unsaved. The message names the file. Show it in a message box before the process ends, because those changes are lost when the app exits. Nothing else will tell the user.
+   - This is the only wait, and it must not run while the user is working. After `flush` the store counts the app as exiting: each later save is waited for on the calling thread, so it reaches the disk or sets `write_error` before the call returns.
+   - If the app gets the order wrong and drops `SettingsWindow` after `flush`, the typed size still reaches the disk. A failure then only reaches `write_error` and `WriteFailed`, so check `write_error` last. Dropping the last `SettingsStore` also waits for the writer.
 
 7. **Give the window what it needs to paint,** with `SettingsHost`. `qe-settings` links no renderer.
 
@@ -99,15 +104,17 @@ Some of the Windows keys never reach an app, such as Alt+Tab, so the recorder ca
 ## The file
 
 - One UTF-8 text file, with only the settings that differ from their defaults: `WindowWidthCharacters=120`, `KeyboardShortcut.Find=Ctrl+G`, `KeyboardShortcut.Save=none`.
-- Comments, blank lines, unknown keys and shortcuts for unknown commands stay on save.
+- A save edits the file in place. A setting changes its own line. A setting back at its default loses its line, and a comment above it stays. A new setting goes at the end. Every other line stays where it is, word for word, with its own line end: comments, blank lines, unknown keys, shortcuts for unknown commands, stray lines and lines with bad values. New lines end in CRLF.
+- A save looks at the disk first, on the writer's thread and never on the UI thread. It keeps what the file holds and puts on top only the changes this store has not saved yet. So a hand edit and another running QuickEdit's keys survive. If the file changed since this store last read or wrote it, memory follows the file, with `SettingChange::Value` or `Keys` for what moved, and `load_problem` and `FileProblem` say what is wrong with it now. A change that was saved earlier is done: a later hand edit of that key wins. If two writers both have an unsaved change to one key, the last save wins for that key. A write that lands in the few milliseconds between a save's read and its rename can still be lost, because Windows has no rename that checks the target first.
+- A change that failed to save stays marked as unsaved. The next change tries it again, and so does `flush`, and so does setting the same value again. The file is not retried on a timer.
 - A save writes a temp file beside the target, flushes it, and renames it over the target in one step with `MoveFileExW`. A reader finds the old file or the new one, never no file, and a crash leaves one of them whole. `ReplaceFileW` is not used, because it leaves a moment with no file at this name. A read-only file is an error, and the error is shown in the window.
 - The next save removes temp files that a crash left, by their exact name (`settings.txt.tmp-<process>-<number>`), once they are a minute old.
-- A file that another program holds is tried again: about 50 ms when opening, about half a second when saving. Only then is it an error. A missing file really means a first run.
-- A file that cannot be read as settings is copied to `settings.broken.txt` (then `settings.broken-2.txt`, and so on). The app starts with defaults, and `load_problem` says so. One bad value defaults only that setting, with the same copy and message.
-- A broken file with the same content as the newest copy makes no new copy. Five copies stay at most: the oldest copy this code made goes first, and the count never stops a save. The launch thread does not flush a copy. The writer flushes it before the first save may replace the original.
+- A file that another program holds is tried again: about 50 ms when opening, about half a second when saving. Only then is it an error, and the error names the file. `ACCESS_DENIED` counts as a hold, because virus scanners give it, so a lasting one also takes the half second. A missing file means a first run, or a file that was moved away: the save then writes everything in memory.
+- A file with a problem is copied to `settings.broken.txt` (then `settings.broken-2.txt`, and so on), and `load_problem` says so. A stray line or a bad value defaults only itself, because the lines around it still count, and it stays in the file. A file that is not UTF-8 text gives all defaults. A save replaces it with what is in memory, once the copy is safe.
+- A broken file with the same content as the newest copy makes no new copy. Five copies stay at most: the oldest copy this code made goes first, and the count never stops a save. The launch thread does not flush a copy. Before a save, the writer compares the copy's bytes with the file and flushes the copy. A copy that was changed, removed or made read-only does not count, so the writer makes a new one. The copy is owed until the save's rename has worked. A file that a person has fixed needs no copy.
 - A file over 1 MB is not read and not copied, because a copy could take any time at launch. No save replaces it, and the message says to move or rename it.
-- If no copy can be made, or the file cannot be read at all, no save replaces it. Each save then reports why.
-- Two running QuickEdit processes do not merge: the last write wins, whole file.
+- If no copy can be made, or the file cannot be read at all, no save replaces it. Each save looks again and reports why. Once the cause has gone, such as a moved file or a released hold, saving resumes. A file that was only held at launch is read first, so its settings are not replaced by defaults, and memory takes them in.
+- A save that would make the file over 1 MB, line ends included, is refused with a message, and the old file stays. So the app never writes a file it would refuse.
 
 ## The footer
 

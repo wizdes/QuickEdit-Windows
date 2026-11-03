@@ -2,6 +2,8 @@
 //! `CommandId`'s table, so a command added there shows up with no change here.
 use qe_api::{CommandId, KeyBinding};
 use qe_ui::{MENU_LABELS, MenuBar, key_text};
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 const BACK: u16 = 0x08;
 const TAB: u16 = 0x09;
@@ -292,6 +294,30 @@ pub fn keyboard_rows() -> Vec<KeyRow> {
 /// used here.
 pub(crate) fn command_id_text(command: CommandId) -> String {
     format!("{command:?}")
+}
+/// The command with this stable name, and whether it only opens a submenu. One table, made
+/// once, because a settings file can hold 1 MB of these lines and a lookup that formats
+/// each command's name for each line took 200 ms at every launch.
+pub(crate) fn command_by_text(text: &str) -> Option<(CommandId, bool)> {
+    static TABLE: OnceLock<HashMap<String, (CommandId, bool)>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        // Every path that starts another path is a submenu.
+        let mut submenus = HashSet::new();
+        for command in CommandId::ALL {
+            let path = command.menu_path();
+            for (end, _) in path.match_indices('/') {
+                submenus.insert(&path[..end]);
+            }
+        }
+        CommandId::ALL
+            .iter()
+            .map(|command| {
+                let opens = submenus.contains(command.menu_path());
+                (command_id_text(*command), (*command, opens))
+            })
+            .collect()
+    });
+    table.get(text).copied()
 }
 /// Reads the saved form of a key: `key_text`'s spelling, such as `Ctrl+Shift+Page Up`.
 pub fn parse_key(text: &str) -> Option<KeyBinding> {

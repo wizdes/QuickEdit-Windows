@@ -98,3 +98,50 @@ fn a_broken_file_costs_no_flush_on_the_launch_thread() {
         assert!(median < Duration::from_millis(1), "median: {median:?}");
     }
 }
+/// The second review, finding 7: what a 1 MB file costs at every launch. Each kind of line
+/// is a worst case for one part of the read. This holds in release, with room to spare on
+/// a busy PC. A debug build only reports.
+#[test]
+fn the_worst_one_megabyte_file_opens_within_the_stated_time() {
+    const WORST_MS: u128 = 75;
+    let path = support::settings_path("speed-worst");
+    let fill = |line: &str| {
+        let count = 1024 * 1024 / line.len();
+        line.repeat(count)
+    };
+    let cases = [
+        ("blank lines", fill("\r\n")),
+        ("unknown shortcuts", fill("KeyboardShortcut.Z=1\r\n")),
+        (
+            "a known shortcut, repeated",
+            fill("KeyboardShortcut.Find=Ctrl+G\r\n"),
+        ),
+        ("a known setting, repeated", fill("TabWidth=4\r\n")),
+        ("a bad setting, repeated", fill("TabWidth=x\r\n")),
+        (
+            "a bad shortcut, repeated",
+            fill("KeyboardShortcut.Rename=Ctrl+Nope\r\n"),
+        ),
+        ("lines with no equals sign", fill("x\r\n")),
+        (
+            "known and unknown shortcuts",
+            fill("KeyboardShortcut.Find=Ctrl+G\r\nKeyboardShortcut.Z=1\r\n"),
+        ),
+    ];
+    for (name, text) in cases {
+        std::fs::write(&path, &text).unwrap();
+        let mut times = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let start = Instant::now();
+            let store = SettingsStore::open(&path);
+            times.push(start.elapsed());
+            drop(store);
+        }
+        times.sort();
+        let (median, slowest) = (times[3], times[6]);
+        println!("1 MB of {name}: median {median:?}, slowest {slowest:?}");
+        if !cfg!(debug_assertions) {
+            assert!(median.as_millis() < WORST_MS, "{name}: {median:?}");
+        }
+    }
+}

@@ -477,6 +477,44 @@ fn a_txt_rule_matches_the_macs_cases() {
     assert_eq!(rule("", true), "");
 }
 
+/// The person closed the tab, so the failure of its read is not news. The store takes a worker's
+/// result only in a poll, so here the close always comes before the failure.
+#[test]
+fn closing_a_tab_while_its_missing_file_is_read_gives_no_error() {
+    let folder = test_folder("open-close-missing");
+    let closed = folder.join("closed.txt");
+    let kept = folder.join("kept.txt");
+    let mut h = Harness::new(&folder.join("root"));
+    let (window, keep) = h.store.new_window(false).unwrap();
+    let opened = h
+        .store
+        .open_paths(
+            std::slice::from_ref(&closed),
+            OpenTarget::Window(window),
+            None,
+        )
+        .unwrap();
+    h.store.request_close(opened[0]);
+    // A tab that stays open reports the same failure, so the store is still reporting.
+    h.store
+        .open_paths(
+            std::slice::from_ref(&kept),
+            OpenTarget::Window(window),
+            None,
+        )
+        .unwrap();
+    h.until("the open that stayed fails", |h| {
+        h.count(|e| matches!(e, DocEvent::OpenFailed { path, .. } if *path == kept)) == 1
+    });
+    h.settle(std::time::Duration::from_millis(50));
+    assert_eq!(
+        h.count(|e| matches!(e, DocEvent::OpenFailed { path, .. } if *path == closed)),
+        0
+    );
+    assert_eq!(h.store.tabs(window), vec![keep]);
+    assert_eq!(h.store.all_documents(), vec![keep]);
+}
+
 #[test]
 fn closing_a_document_during_its_load_drops_the_load() {
     let folder = test_folder("open-close-early");

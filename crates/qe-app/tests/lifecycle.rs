@@ -118,7 +118,14 @@ fn an_alert_waiting_behind_one_whose_owner_closes_keeps_its_text() {
     app.wait_value("the rename box", App::alert);
     let missing = folder.0.join("THE_MISSING_FILE.txt");
     app.ok(&format!("open {}", encode(&missing.display().to_string())));
-    app.ask("ping");
+    // A worker reads the file. If the tab closes before that read ends, the open ends with no
+    // error, as the person closed it, and there is no alert to wait behind this one. So the close
+    // comes only when the error is in the queue.
+    app.wait_for("the error to wait behind the rename box", |app| {
+        decode(&app.ask("alert-waiting")).contains("THE_MISSING_FILE")
+    });
+    let (open_title, _, _) = app.alert().expect("the rename box is still open");
+    assert_eq!(open_title, "Rename");
     app.ok("close-window-at 1");
     let (title, message, _) = app.wait_value("the error", |app| {
         app.alert()

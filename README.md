@@ -25,7 +25,7 @@ cargo test --workspace --exclude spike-probe --exclude spike-renderers --exclude
 
 The tests start the real app with hidden windows and their own data folders, so nothing shows on screen and your own settings stay as they are.
 
-For a release to the Microsoft Store, build with `packaging\build.ps1`. It also removes the build folder's path from the exe, and it checks the result. A plain `cargo build --release` leaves that path in, and then `the_release_exe_names_no_user_folder` fails. `packaging/README.md` has the steps for a Store upload.
+For a release to the Microsoft Store, build with `packaging\build.ps1`. It also removes the build folder's path from the exe, and it checks the result. A plain `cargo build --release` leaves that path in, so do not ship that exe. `packaging/README.md` has the steps for a Store upload.
 
 ## Where things are
 

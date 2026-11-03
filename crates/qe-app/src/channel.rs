@@ -866,6 +866,7 @@ impl App {
             | "alert-hwnd"
             | "alert-x"
             | "alert-owner"
+            | "alert-waiting"
             | "alert-dpi"
             | "alert-scale"
             | "alert-theme"
@@ -1501,6 +1502,10 @@ pub fn alert_verb(shared: &Rc<Shared>, verb: &str, word: Option<&str>) {
             }
             None => reply("error no alert"),
         },
+        "alert-waiting" => reply(&encode(&shared.alerts.waiting_titles().join(
+            "
+",
+        ))),
         "alert-owner" => match shared.alerts.window() {
             Some(hwnd) => {
                 // SAFETY: a plain query. No owner comes back as an error.

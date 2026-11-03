@@ -520,6 +520,14 @@ impl Alerts {
             open.buttons.clone(),
         ))
     }
+    /// The titles of the alerts behind the open one, in order, for the test channel.
+    pub fn waiting_titles(&self) -> Vec<String> {
+        self.waiting
+            .borrow()
+            .iter()
+            .map(|request| request.title.clone())
+            .collect()
+    }
     /// The open alert's window, for the test channel's real key messages.
     pub fn window(&self) -> Option<HWND> {
         Some(self.current.borrow().as_ref()?.hwnd)

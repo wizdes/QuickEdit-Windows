@@ -814,6 +814,40 @@ fn remove_stale_list_temps(dir: &Path, prefix: &str) {
 
 /// Takes a session folder and reads what the last run left, from this folder and from any
 /// other folder no running QuickEdit holds. It reads only descriptions, never text.
+const SESSION_END_FAILURES: &str = "session-end-failures.txt";
+
+/// Word of Saves that failed as Windows ended the session, for the next launch to show. A
+/// launch that reads it removes it, so each one shows once.
+pub(crate) fn write_session_end_failures(root: &Path, lines: &[String]) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(SESSION_END_FAILURES))?;
+    for line in lines {
+        writeln!(file, "{line}")?;
+    }
+    file.sync_all()
+}
+
+fn read_session_end_failures(root: &Path, problems: &mut Vec<DocError>) {
+    let path = root.join(SESSION_END_FAILURES);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            problems.push(DocError::io("QuickEdit could not read", &path, &error));
+            return;
+        }
+    };
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        problems.push(DocError::new(DocErrorKind::Other, None, line));
+    }
+    if let Err(error) = std::fs::remove_file(&path) {
+        problems.push(DocError::io("QuickEdit could not remove", &path, &error));
+    }
+}
+
 pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
     let what = "QuickEdit could not use its session folder at";
     let mut lock = None;
@@ -839,6 +873,7 @@ pub(crate) fn build_restore_plan(root: &Path) -> Result<RestorePlan, DocError> {
         return Err(DocError::new(DocErrorKind::Other, Some(root), "no session"));
     };
     let mut problems = Vec::new();
+    read_session_end_failures(root, &mut problems);
     remove_stale_large_files(root, this_process());
     remove_stale_list_temps(&lock.dir, "session.tmp-");
     remove_stale_list_temps(root, "recent.tmp-");

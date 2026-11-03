@@ -245,6 +245,7 @@ fn message_hook(
             }
             WM_QUERYENDSESSION => return Some(LRESULT(1)),
             WM_ENDSESSION if w.0 != 0 => {
+                crate::app::keep_text_if_store_is_busy(&shared);
                 push(&shared, Incoming::EndSession);
                 return Some(LRESULT(0));
             }

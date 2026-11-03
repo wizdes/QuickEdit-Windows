@@ -22,7 +22,7 @@ pub use paths::check_open_path;
 pub use recent::{RECENT_LIMIT, recent_menu_rows};
 pub use store::{
     Answer, BLANK_SCAN_LIMIT_UTF16, DocCommands, DocEvent, DocId, DocumentStore, Faults,
-    OpenTarget, PanelPurpose, Question, QuestionId, QuestionKind, SavePanelRequest, ShowState,
-    StoreConfig, Wake, WindowFrame, WindowId, default_root, filename_with_txt_rule,
-    large_title_note, read_only_title_note,
+    OpenTarget, PanelPurpose, Question, QuestionId, QuestionKind, SavePanelRequest,
+    SessionEndCopies, ShowState, StoreConfig, Wake, WindowFrame, WindowId, default_root,
+    filename_with_txt_rule, large_title_note, read_only_title_note,
 };

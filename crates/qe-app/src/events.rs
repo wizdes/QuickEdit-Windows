@@ -1013,7 +1013,7 @@ impl App {
             DocEvent::Reloaded(doc) => self.doc_changed(doc),
             DocEvent::ReloadFailed { doc, error } => {
                 self.doc_changed(doc);
-                self.error_alert("The new version could not be read", &error.message);
+                self.error_alert("The new version could not be shown", &error.message);
             }
             DocEvent::FileMoved { doc, .. } => self.doc_changed(doc),
             DocEvent::MoveFailed { doc, error } => {

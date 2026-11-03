@@ -245,7 +245,7 @@ impl App {
                 }
                 return;
             }
-            "compose" | "tsf-focus" | "commit-now" => {
+            "compose" | "tsf-focus" | "commit-now" | "compose-cancel" => {
                 self.effects.push(Effect::ChannelIme(
                     verb.to_owned(),
                     rest.first().map(|word| (*word).to_owned()),
@@ -510,6 +510,22 @@ impl App {
                     None => "error no window".to_owned(),
                 }
             }
+            // `WM_ENDSESSION` during a borrow of `App`, with the end Windows may bring when the
+            // message's answer comes.
+            "session-end-then-die" => match window.and_then(|window| self.windows.get(&window)) {
+                Some(win) => {
+                    // SAFETY: a window of this thread, and the end of this process.
+                    unsafe {
+                        SendMessageW(win.hwnd, 0x16, Some(WPARAM(1)), Some(LPARAM(0)));
+                        let _ = windows::Win32::System::Threading::TerminateProcess(
+                            windows::Win32::System::Threading::GetCurrentProcess(),
+                            0,
+                        );
+                    }
+                    "ok".to_owned()
+                }
+                None => "error no window".to_owned(),
+            },
             "popup-hwnd" => thread_window_of_class("QuickEditPopup")
                 .map_or_else(|| "none".to_owned(), |hwnd| format!("{}", hwnd.0 as isize)),
             "settings-hwnd" => {
@@ -1400,6 +1416,10 @@ pub fn ime_verb(shared: &Rc<Shared>, verb: &str, word: Option<&str>) {
                 Ok(()) => reply("ok"),
                 Err(e) => reply(&format!("error {e}")),
             }
+        }
+        "compose-cancel" => {
+            shared.ime.cancel(doc);
+            reply("ok");
         }
         "tsf-focus" => reply(if shared.ime.has_focus(doc) {
             "doc"

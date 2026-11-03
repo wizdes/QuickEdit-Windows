@@ -1255,6 +1255,11 @@ impl EditorView {
     pub fn queued_input_count(&self) -> usize {
         self.deferred.len() + self.pending_pages.unsigned_abs() as usize
     }
+    /// True while a queued key will change the text when its turn comes, so the text on show
+    /// is not yet all the person typed. A close or a revert must count those keys.
+    pub fn has_queued_edits(&self) -> bool {
+        self.can_edit() && self.deferred.iter().any(Queued::changes_text)
+    }
     #[doc(hidden)]
     pub fn test_byte_at_top(&mut self) -> usize {
         self.byte_at_top().0
@@ -1325,6 +1330,15 @@ impl EditorView {
     }
     pub fn end_edit_group(&mut self) {
         self.history.end_group();
+    }
+    /// A host has seen every edit up to now. See `split_last_key`.
+    pub fn mark_edits_seen(&mut self) {
+        self.history.mark_seen();
+    }
+    /// Makes the last typed key an undo step of its own, as a question about that key needs:
+    /// its Cancel must not take back the typing before it.
+    pub fn split_last_key(&mut self) {
+        self.history.split_last_key();
     }
     /// Changes a range of the text and puts the caret after the new text.
     pub fn replace_range(&mut self, range: Range<ByteOffset>, text: &str, ctx: &mut ViewContext) {

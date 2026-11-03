@@ -118,6 +118,15 @@ impl Trash {
 /// go to a worker, and its size does not then matter to the thread that holds the view.
 pub struct ReleasedHistory(#[allow(dead_code)] Trash);
 
+/// A key that joined the typed run in the newest group: that group as it stood before the key,
+/// and the key's own edit. Every tree here is a shared handle, so this costs little to keep.
+struct LastKey {
+    edits_before: usize,
+    last_before: Edit,
+    state_before: u64,
+    key: Edit,
+}
+
 /// Records edits to one `PieceStore` so that they can be undone.
 ///
 /// - **One writer.** Undo refuses to run after an edit it did not record. Direct
@@ -145,6 +154,10 @@ pub struct UndoHistory {
     undo: VecDeque<Group>,
     redo: VecDeque<Group>,
     typing_end: Option<usize>,
+    /// How to part the newest group from the key that joined it last. See `split_last_key`.
+    last_key: Option<LastKey>,
+    /// The state at the last `mark_seen`.
+    seen_state: u64,
     group_depth: usize,
     group_started: bool,
     state: u64,
@@ -174,6 +187,8 @@ impl UndoHistory {
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             typing_end: None,
+            last_key: None,
+            seen_state: 0,
             group_depth: 0,
             group_started: false,
             state: 0,
@@ -196,6 +211,62 @@ impl UndoHistory {
     /// Ends the current typed run. The next edit starts a new undo step.
     pub fn break_group(&mut self) {
         self.typing_end = None;
+    }
+    /// A host has looked at every edit up to now. `split_last_key` keeps what came after this
+    /// together when the whole group came after it.
+    pub fn mark_seen(&mut self) {
+        self.seen_state = self.state;
+    }
+    /// Makes the key that joined the typed run last into an undo step of its own, so an undo
+    /// takes back that key and leaves the earlier typing. A host uses it when that key raises
+    /// a question. A group that began after `mark_seen` stays whole: all of it is new to the
+    /// host, as keys that waited in a queue are, and the question covers all of it. It takes
+    /// constant time, and it does nothing unless the newest edit was such a key.
+    pub fn split_last_key(&mut self) {
+        if self
+            .undo
+            .back()
+            .is_none_or(|group| group.state_before == self.seen_state)
+        {
+            self.drop_last_key();
+            return;
+        }
+        let Some(LastKey {
+            edits_before,
+            last_before,
+            state_before,
+            key,
+        }) = self.last_key.take()
+        else {
+            return;
+        };
+        let Some(group) = self.undo.back_mut() else {
+            return;
+        };
+        let old_charge = group.charge;
+        group.edits.truncate(edits_before);
+        if let Some(last) = group.edits.last_mut() {
+            *last = last_before;
+        }
+        group.state_after = state_before;
+        group.charge = charge_of(&group.edits);
+        let new_charge = group.charge;
+        let edits = vec![key];
+        let charge = charge_of(&edits);
+        self.undo_charge = self.undo_charge - old_charge + new_charge + charge;
+        self.undo.push_back(Group {
+            edits,
+            state_before,
+            state_after: self.state,
+            charge,
+        });
+    }
+    /// The trees here may be the last handles on old text, so they go to the release list.
+    fn drop_last_key(&mut self) {
+        if let Some(last_key) = self.last_key.take() {
+            self.trash.add_tree(last_key.last_before.other);
+            self.trash.add_tree(last_key.key.other);
+        }
     }
     pub fn cursor_moved(&mut self) {
         self.break_group();
@@ -277,7 +348,9 @@ impl UndoHistory {
         self.close_group();
         self.state = self.fresh_state();
         self.saved = saved.then_some(self.state);
+        self.seen_state = self.state;
         self.attached = Some(store.stamp());
+        self.drop_last_key();
     }
     fn fresh_state(&mut self) -> u64 {
         self.next_state += 1;
@@ -384,6 +457,27 @@ impl UndoHistory {
         let continues_delete =
             at_caret && !empty_range && inserted == 0 && self.typing_end == Some(range.end.0);
         let in_open_group = self.group_depth > 0 && self.group_started;
+        self.drop_last_key();
+        if (continues_delete || continues_insert)
+            && !in_open_group
+            && let Some(group) = self.undo.back()
+            && let Some(last) = group.edits.last()
+        {
+            self.last_key = Some(LastKey {
+                edits_before: group.edits.len(),
+                last_before: Edit {
+                    start: last.start,
+                    len_in_doc: last.len_in_doc,
+                    other: last.other.clone(),
+                },
+                state_before: self.state,
+                key: Edit {
+                    start: range.start.0,
+                    len_in_doc: inserted,
+                    other: removed.clone(),
+                },
+            });
+        }
         if continues_delete {
             self.absorb_delete(removed, range.end.0 - range.start.0);
             self.undo.back_mut().expect("checked above").state_after = state;
@@ -510,6 +604,7 @@ impl UndoHistory {
     }
     fn finish_swap(&mut self, store: &PieceStore, group: Group, edits: Vec<Edit>, undoing: bool) {
         self.close_group();
+        self.drop_last_key();
         self.attached = Some(store.stamp());
         let charge = charge_of(&edits);
         if undoing {

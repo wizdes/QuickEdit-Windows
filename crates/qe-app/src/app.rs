@@ -126,6 +126,8 @@ pub struct Shared {
     pub missed_paint: RefCell<Vec<WindowId>>,
     pub ime_after_frame: Cell<Option<(WindowId, DocId)>>,
     pub pumps: Cell<u64>,
+    pub session_end_copies: RefCell<Option<qe_docs::SessionEndCopies>>,
+    pub session_end_next: Cell<Option<std::time::Instant>>,
     /// Compositions that could not end yet, and what waits for them.
     pub commits_waiting: RefCell<Vec<(Vec<DocId>, Incoming)>>,
     /// Items for the next wake, after a turn of the message loop.
@@ -366,6 +368,8 @@ fn start(mut args: Args) -> Result<i32, String> {
         missed_paint: RefCell::new(Vec::new()),
         ime_after_frame: Cell::new(None),
         pumps: Cell::new(0),
+        session_end_copies: RefCell::new(None),
+        session_end_next: Cell::new(None),
         commits_waiting: RefCell::new(Vec::new()),
         later: RefCell::new(Vec::new()),
         wake: wake.clone(),
@@ -550,6 +554,7 @@ pub fn pump(shared: &Rc<Shared>) {
             run_effect(shared, effect);
         }
     }
+    refresh_session_end_copies(shared);
     let missed = std::mem::take(&mut *shared.missed_paint.borrow_mut());
     if !missed.is_empty()
         && let Ok(app) = shared.state.try_borrow()
@@ -561,6 +566,57 @@ pub fn pump(shared: &Rc<Shared>) {
                 eprintln!("repainting after a busy moment: {e}");
             }
         }
+    }
+}
+
+/// Keeps `keep_text_if_store_is_busy` ready. Each round holds handles on the text, so the old
+/// round is freed by a worker: it may hold the last handle on text that has gone. So that typing
+/// does not start a thread per key, this runs at most twice a second, and a key in the last half
+/// second before a busy session end is the most this can miss.
+fn refresh_session_end_copies(shared: &Rc<Shared>) {
+    let now = std::time::Instant::now();
+    if shared.session_end_next.get().is_some_and(|at| now < at) {
+        return;
+    }
+    let Ok(mut app) = shared.state.try_borrow_mut() else {
+        return;
+    };
+    shared
+        .session_end_next
+        .set(Some(now + std::time::Duration::from_millis(500)));
+    let Some(copies) = app.store.session_end_copies() else {
+        return;
+    };
+    drop(app);
+    let Ok(mut slot) = shared.session_end_copies.try_borrow_mut() else {
+        return;
+    };
+    if let Some(old) = slot.replace(copies) {
+        // With no thread to be had, the closure and the old round are simply freed here.
+        drop(
+            std::thread::Builder::new()
+                .name("free session-end copies".to_owned())
+                .spawn(move || drop(old)),
+        );
+    }
+}
+
+/// `WM_ENDSESSION` came while the store is in use lower on this stack, so `end_session` cannot
+/// run before this message's answer, and Windows may end the process at that answer. This
+/// writes the ready copies first, as it needs no borrow of `App`.
+pub fn keep_text_if_store_is_busy(shared: &Rc<Shared>) {
+    if shared.state.try_borrow_mut().is_ok() {
+        return;
+    }
+    let Ok(slot) = shared.session_end_copies.try_borrow() else {
+        eprintln!("The session ended during a refresh of the copies, so none could be written.");
+        return;
+    };
+    let Some(copies) = slot.as_ref() else {
+        return;
+    };
+    for error in copies.write() {
+        eprintln!("The session ended before a copy could be written: {error}");
     }
 }
 

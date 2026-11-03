@@ -170,7 +170,7 @@ The choice: **`ReadDirectoryChangesW` on one thread for each folder, plus a chec
 | One name of a file with several hard links deleted | `Deleted` in the title. It does not move to another link | The same |
 | Deleted, or in the Recycle Bin | Stays open, `Deleted` in the title, counts as unsaved, and a Save writes it again | The same |
 | Deleted then created within 300 ms, as some editors save | A reload, with no word about a deletion | As bytes changed |
-| The file returns after `Deleted` | Reload, under the rows above | The text and any copy stay, and a Save asks |
+| A file comes to the name after `Deleted` | A worker compares it with the tab's text, which may exist nowhere else. The same text: the tab is clean again, its caret and undo stay, and any copy goes. Other text: the text and the copy stay, and `ChangedOnDisk` asks at once | The text and any copy stay, and a Save asks |
 | A read that fails, such as a file held open | `ReloadFailed`. The stamp stays, so a later Save asks | The same |
 
 The 300 ms is one check at a one-shot deadline, so it costs no timer at idle. A file too large to edit that has gone cannot be written again from its map, because the map refuses to read once the file has gone. Its Save row is off, a Save named in a close question fails by name, and Don't Save still works. One read through a UTF-8 copy can be written again.

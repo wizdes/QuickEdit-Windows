@@ -96,6 +96,46 @@ pub fn check_open_path(raw: &Path) -> Result<PathBuf, DocError> {
     Ok(path)
 }
 
+/// The absolute form of a path a file may be given, for Rename and Move To. It follows
+/// `check_open_path`, and it also refuses a last name that Windows would change or refuse: a
+/// trailing dot or space, and the characters no file name may hold. So a tab's name is always
+/// the file's real name.
+pub fn check_new_path(raw: &Path) -> Result<PathBuf, DocError> {
+    let last_as_written = raw
+        .as_os_str()
+        .to_string_lossy()
+        .rsplit(['\\', '/'])
+        .next()
+        .map(str::to_owned)
+        .unwrap_or_default();
+    if last_as_written.ends_with(['.', ' ']) {
+        return Err(DocError::new(
+            DocErrorKind::PathRefused,
+            Some(raw),
+            format!(
+                "QuickEdit cannot use \u{201C}{last_as_written}\u{201D}: Windows would drop the dot or space at its end."
+            ),
+        ));
+    }
+    let path = check_open_path(raw).map_err(|mut error| {
+        error.message = error.message.replacen("cannot open", "cannot use", 1);
+        error
+    })?;
+    let last = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    if last.contains(['<', '>', '"', '|', '?', '*']) || last.chars().any(|c| (c as u32) < 32) {
+        return Err(DocError::new(
+            DocErrorKind::PathRefused,
+            Some(&path),
+            format!(
+                "QuickEdit cannot use \u{201C}{last}\u{201D}: Windows does not allow one of its characters in a file name."
+            ),
+        ));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -183,6 +183,10 @@ impl WakeWindow {
             eprintln!("The bench could not go on: {e}");
         }
     }
+    /// The target of the same message from another thread, as a number that can cross to it.
+    pub fn bench_step_target(&self) -> isize {
+        self.hwnd.0 as isize
+    }
     /// Arms the store's one-shot timer. `None` means no timer at all, which is the idle state.
     pub fn set_deadline(&self, milliseconds: Option<u32>) -> Result<(), String> {
         // SAFETY: plain timer calls on this thread's window.
@@ -269,6 +273,15 @@ pub fn cursor_pos() -> Result<POINT, String> {
     // SAFETY: `at` lives through the call.
     unsafe { GetCursorPos(&mut at) }.map_err(|e| e.to_string())?;
     Ok(at)
+}
+
+/// `WakeWindow::post_bench_step`, from another thread.
+pub fn post_bench_step_to(target: isize) {
+    let hwnd = HWND(target as *mut std::ffi::c_void);
+    // SAFETY: Windows checks the handle.
+    if let Err(e) = unsafe { PostMessageW(Some(hwnd), WM_APP_BENCH, WPARAM(0), LPARAM(0)) } {
+        eprintln!("The bench could not go on: {e}");
+    }
 }
 
 #[cfg(test)]

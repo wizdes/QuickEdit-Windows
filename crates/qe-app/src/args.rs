@@ -15,6 +15,9 @@ QuickEdit [options] [files]
   --data-root DIR    settings, session and pipe name under this folder
   --bench-keys N     hidden window: sends N keys and prints the timers
   --bench-middle     with --bench-keys: the keys go to the middle of the text
+  --bench-paced      with --bench-keys: keys come from another thread, every 8 ms, so the
+                     message loop rests between them and its timers can fire
+  --bench-tab-motion with --bench-keys: --bench-paced, while tabs open and close with motion
   --timings          prints the timers when the app ends, with real keys
   --watchdog MS      test channel: ends with code 99 if the UI thread stops answering
   --test-fail-windows N  the next N windows fail to open, for tests
@@ -35,6 +38,8 @@ pub struct Args {
     pub root: Option<PathBuf>,
     pub timings: bool,
     pub bench_keys: usize,
+    pub bench_paced: bool,
+    pub bench_tab_motion: bool,
     pub bench_middle: bool,
     pub help: bool,
     pub watchdog_ms: u64,
@@ -96,6 +101,11 @@ impl Args {
                 Some("--stub-spell") => args.stub_spell = true,
                 Some("--timings") => args.timings = true,
                 Some("--bench-middle") => args.bench_middle = true,
+                Some("--bench-paced") => args.bench_paced = true,
+                Some("--bench-tab-motion") => {
+                    args.bench_paced = true;
+                    args.bench_tab_motion = true;
+                }
                 Some("--bench-keys") => {
                     args.bench_keys = items
                         .next()
@@ -128,8 +138,10 @@ impl Args {
                 _ => args.files.push(PathBuf::from(item)),
             }
         }
-        if args.bench_middle && args.bench_keys == 0 {
-            return Err(format!("--bench-middle needs --bench-keys\n{HELP}"));
+        if (args.bench_middle || args.bench_paced) && args.bench_keys == 0 {
+            return Err(format!(
+                "--bench-middle, --bench-paced and --bench-tab-motion need --bench-keys\n{HELP}"
+            ));
         }
         Ok(args)
     }

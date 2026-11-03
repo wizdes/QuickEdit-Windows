@@ -1,6 +1,10 @@
 //! The top row as plain data: tabs, the + button and the window buttons. It holds
 //! no window handle, so that every rule here can run in a test with no desktop.
 use crate::ShellError;
+use qe_api::motion::{
+    BUTTON_FADE_IN_MS, BUTTON_FADE_OUT_MS, CLOSE_FADE_MS, Clock, LIST_QUIET_MS, OPEN_FADE_MS,
+    SLIDE_CURVE, SLIDE_MS, part_of,
+};
 use qe_api::*;
 use std::cell::Cell;
 
@@ -271,6 +275,9 @@ const VK_ESCAPE: u16 = 0x1b;
 const VK_SPACE: u16 = 0x20;
 const VK_LEFT: u16 = 0x25;
 const VK_RIGHT: u16 = 0x27;
+/// A release this near a press made during a slide counts as the same click, even though
+/// the tabs have reached their places by then.
+const PRESS_SLOP: f32 = 4.0;
 
 fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect {
@@ -384,11 +391,127 @@ struct TabDrag {
     moved: bool,
 }
 
+/// Where one thing is drawn while it slides. Its end is always its final place, so that a
+/// change of place during the slide needs no new work and makes no jump.
+#[derive(Clone, Copy)]
+struct Slide {
+    from_x: f32,
+    from_width: f32,
+    start: f64,
+}
+impl Slide {
+    fn place(self, end: Rect, now: f64) -> Rect {
+        let part = SLIDE_CURVE.at(part_of(now, self.start, SLIDE_MS)) as f32;
+        Rect {
+            x: Dip(self.from_x + (end.x.0 - self.from_x) * part),
+            width: Dip(self.from_width + (end.width.0 - self.from_width) * part),
+            ..end
+        }
+    }
+    fn done(self, now: f64) -> bool {
+        now - self.start >= SLIDE_MS
+    }
+}
+/// What is left of a closed tab: pixels only. No hit test and no screen reader sees it.
+struct Ghost {
+    rect: Rect,
+    title: String,
+    dirty: bool,
+    active: bool,
+    start: f64,
+}
+/// A window button's hover fill: 0 is none, 1 is all of it.
+#[derive(Clone, Copy, Default)]
+struct ButtonFade {
+    lit: bool,
+    moving: bool,
+    from: f32,
+    start: f64,
+}
+impl ButtonFade {
+    fn value(self, now: f64) -> f32 {
+        if !self.moving {
+            return if self.lit { 1.0 } else { 0.0 };
+        }
+        if self.lit {
+            (self.from + ((now - self.start) / BUTTON_FADE_IN_MS) as f32).min(1.0)
+        } else {
+            (self.from - ((now - self.start) / BUTTON_FADE_OUT_MS) as f32).max(0.0)
+        }
+    }
+    fn done(self, now: f64) -> bool {
+        let value = self.value(now);
+        if self.lit { value >= 1.0 } else { value <= 0.0 }
+    }
+}
+/// Where the row's parts were drawn just before a change.
+struct DrawnBefore {
+    tabs: Vec<(TabId, f32, f32)>,
+    plus: (f32, f32),
+}
+/// Everything that moves in the row. Only drawing reads it. Hit tests, the order of the tabs,
+/// focus and the screen reader's tree all come from the final places.
+struct StripMotion {
+    /// `motion_off`: every change shows its end state at once. A new strip starts here, and
+    /// a window turns motion on when it may.
+    off: bool,
+    clock: Clock,
+    /// The time of the frame being drawn. A paint between ticks draws the same frame.
+    now: f64,
+    /// Bounded by what fits in the row, not by the number of tabs.
+    slides: Vec<(TabId, Slide)>,
+    plus: Option<Slide>,
+    ghosts: Vec<Ghost>,
+    fade_in: Option<(TabId, f64)>,
+    buttons: [ButtonFade; 3],
+    last_list_change: Option<f64>,
+    quiet_ms: f64,
+    /// What the last frame drew that moves, so that the next one also repaints it.
+    drawn: Option<Rect>,
+}
+const CAPTION_HITS: [CaptionHit; 3] = [
+    CaptionHit::Minimize,
+    CaptionHit::Maximize,
+    CaptionHit::Close,
+];
+fn union_rect(a: Option<Rect>, b: Rect) -> Rect {
+    match a {
+        None => b,
+        Some(a) => {
+            let (left, top) = (a.x.0.min(b.x.0), a.y.0.min(b.y.0));
+            let right = (a.x.0 + a.width.0).max(b.x.0 + b.width.0);
+            let bottom = (a.y.0 + a.height.0).max(b.y.0 + b.height.0);
+            r(left, top, right - left, bottom - top)
+        }
+    }
+}
+fn mix(a: Color, b: Color, part: f32) -> Color {
+    let channel =
+        |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * part).round() as u8;
+    Color {
+        r: channel(a.r, b.r),
+        g: channel(a.g, b.g),
+        b: channel(a.b, b.b),
+        a: channel(a.a, b.a),
+    }
+}
+
 pub struct TabStrip {
     tabs: Vec<Tab>,
     active: usize,
     bounds: Rect,
     tab_width: f32,
+    /// The tab width while the pointer stays in the row after a close by mouse. The next tab
+    /// then comes under the pointer, so that the next click hits its X. WinUI's rule.
+    held_width: Option<f32>,
+    /// Where the mouse was last seen on this row.
+    pointer: Option<Point>,
+    pointer_in_row: bool,
+    /// The X or a middle click asked to close this tab. A close of any other kind has no hold.
+    pointer_close: Option<TabId>,
+    /// A press during a slide that took what was drawn over the final place: where, and what.
+    drawn_press: Option<(Point, CaptionHit)>,
+    motion: StripMotion,
     /// Always one rectangle per tab, whether or not `layout` has run.
     tab_rects: Vec<Rect>,
     plus: Rect,
@@ -423,6 +546,24 @@ impl TabStrip {
             active: 0,
             bounds: Rect::default(),
             tab_width: light_tokens().max_width,
+            held_width: None,
+            pointer: None,
+            pointer_in_row: false,
+            pointer_close: None,
+            drawn_press: None,
+            motion: StripMotion {
+                off: true,
+                clock: Clock::real(),
+                now: 0.0,
+                slides: Vec::new(),
+                plus: None,
+                ghosts: Vec::new(),
+                fade_in: None,
+                buttons: [ButtonFade::default(); 3],
+                last_list_change: None,
+                quiet_ms: LIST_QUIET_MS,
+                drawn: None,
+            },
             tab_rects: Vec::new(),
             plus: Rect::default(),
             overflow: false,
@@ -463,10 +604,14 @@ impl TabStrip {
     pub fn add_tab(&mut self, mut tab: Tab) -> TabId {
         tab.id = self.new_id();
         let id = tab.id;
+        let before = self.drawn_before();
+        self.held_width = None;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.clear_pointer();
         self.reveal(self.active);
+        self.after_list_change(before, None, Some(id));
+        self.sync_button_fades();
         id
     }
     /// The position of a tab now, or nothing if it has closed.
@@ -516,6 +661,8 @@ impl TabStrip {
     pub fn set_frame_mode(&mut self, mode: FrameMode) {
         if self.mode != mode {
             self.mode = mode;
+            self.held_width = None;
+            self.finish_motion();
             self.arrange();
         }
     }
@@ -616,15 +763,28 @@ impl TabStrip {
         let Some(index) = self.index_of(id) else {
             return;
         };
+        let by_pointer = self.pointer_close.take() == Some(id) && self.pointer_in_row;
+        let before = self.drawn_before();
+        let ghost = before.is_some().then(|| self.ghost_of(index));
+        let old_list_width = self.tab_width * self.tabs.len() as f32;
         self.clear_pointer();
         if self.tabs.len() == 1 {
             self.tabs[0] = Tab::new("Untitled");
             self.tabs[0].id = self.new_id();
             self.active = 0;
+            self.held_width = None;
             self.arrange();
+            self.after_list_change(before, None, None);
+            self.sync_button_fades();
             return;
         }
+        let was_rightmost = index + 1 == self.tabs.len();
         self.tabs.remove(index);
+        self.held_width = if by_pointer {
+            self.width_to_hold(was_rightmost, old_list_width)
+        } else {
+            None
+        };
         let last = self.tabs.len() - 1;
         if index < self.active {
             self.active -= 1;
@@ -650,6 +810,366 @@ impl TabStrip {
         };
         self.arrange();
         self.reveal(self.active);
+        self.after_list_change(before, ghost, None);
+        if by_pointer && let Some(at) = self.pointer {
+            // The next tab is under the pointer now, so its X lights up with no move.
+            self.hover = self.hit_test(at);
+        }
+        self.sync_button_fades();
+    }
+    /// The width that the tabs keep after a close by mouse, or nothing if they may fill.
+    /// Closing the rightmost tab keeps the list's right end in place, up to the maximum.
+    fn width_to_hold(&self, was_rightmost: bool, old_list_width: f32) -> Option<f32> {
+        let t = light_tokens();
+        let count = self.tabs.len() as f32;
+        let available = (self.bounds.width.0 - 3.0 * t.caption_width - t.plus_width).max(0.0);
+        if count * t.min_width > available {
+            return None;
+        }
+        let fill = (available / count).clamp(t.min_width, t.max_width);
+        let width = if was_rightmost {
+            (old_list_width / count).min(t.max_width)
+        } else {
+            self.tab_width
+        };
+        (width < fill).then_some(width)
+    }
+    /// Ends the hold, and the widths jump, as WinUI's do. No motion follows.
+    fn release_hold(&mut self, ctx: &mut ViewContext) {
+        if self.held_width.take().is_some() {
+            self.motion.slides.clear();
+            self.motion.plus = None;
+            self.arrange();
+            ctx.invalidate(self.row_rect());
+        }
+    }
+    /// True where the pointer holds the widths: the part of the row left of the window buttons.
+    pub fn in_hold_zone(&self, at: Point) -> bool {
+        inside(at, self.row_rect()) && at.x.0 < self.caption_x(0, light_tokens())
+    }
+    /// True while a close by mouse holds the tab widths.
+    pub fn width_is_held(&self) -> bool {
+        self.held_width.is_some()
+    }
+    /// Sets `motion_off`. Turning it on shows every end state at once. True if a motion ended.
+    pub fn set_motion_off(&mut self, off: bool) -> bool {
+        self.motion.off = off;
+        off && self.finish_motion()
+    }
+    pub fn motion_off(&self) -> bool {
+        self.motion.off
+    }
+    /// The clock that motion reads. A test sets the time with `Clock::manual`.
+    pub fn set_motion_clock(&mut self, clock: Clock) {
+        self.motion.clock = clock;
+    }
+    /// How long the tab list must rest before its next change animates. A bench that needs
+    /// constant motion sets 0.
+    #[doc(hidden)]
+    pub fn set_motion_quiet_ms(&mut self, ms: f64) {
+        self.motion.quiet_ms = ms;
+    }
+    /// True while anything in the row moves. This costs the same with any number of tabs.
+    pub fn is_moving(&self) -> bool {
+        let m = &self.motion;
+        !m.slides.is_empty()
+            || m.plus.is_some()
+            || !m.ghosts.is_empty()
+            || m.fade_in.is_some()
+            || m.buttons.iter().any(|b| b.moving)
+    }
+    /// Shows every end state at once. True if anything was moving.
+    pub fn finish_motion(&mut self) -> bool {
+        let moving = self.is_moving();
+        let m = &mut self.motion;
+        m.slides.clear();
+        m.plus = None;
+        m.ghosts.clear();
+        m.fade_in = None;
+        m.drawn = None;
+        for button in &mut m.buttons {
+            button.moving = false;
+        }
+        moving
+    }
+    /// One animation frame at this time: ends what is done and says what to repaint. The
+    /// frame that shows the end state repaints too, and then nothing moves.
+    pub fn step_motion(&mut self, now: f64) -> Vec<Rect> {
+        self.motion.now = now;
+        let mut out = Vec::with_capacity(4);
+        if let Some(area) = self.moving_area() {
+            out.push(union_rect(self.motion.drawn, area));
+        } else if let Some(drawn) = self.motion.drawn {
+            out.push(drawn);
+        }
+        for (slot, hit) in CAPTION_HITS.into_iter().enumerate() {
+            if self.motion.buttons[slot].moving {
+                out.push(self.part_rect(hit));
+            }
+        }
+        let m = &mut self.motion;
+        m.slides.retain(|(_, slide)| !slide.done(now));
+        if m.plus.is_some_and(|slide| slide.done(now)) {
+            m.plus = None;
+        }
+        m.ghosts.retain(|ghost| now - ghost.start < CLOSE_FADE_MS);
+        if m.fade_in
+            .is_some_and(|(_, start)| now - start >= OPEN_FADE_MS)
+        {
+            m.fade_in = None;
+        }
+        for button in &mut m.buttons {
+            if button.moving && button.done(now) {
+                button.moving = false;
+            }
+        }
+        self.motion.drawn = self.moving_area();
+        out
+    }
+    /// The smallest rectangle around all that slides or fades in the tab list.
+    fn moving_area(&self) -> Option<Rect> {
+        let m = &self.motion;
+        let now = m.now;
+        let mut area = None;
+        for (id, slide) in &m.slides {
+            if let Some(i) = self.index_of(*id) {
+                area = Some(union_rect(area, slide.place(self.tab_rects[i], now)));
+            }
+        }
+        if let Some(slide) = m.plus {
+            area = Some(union_rect(area, slide.place(self.plus, now)));
+        }
+        for ghost in &m.ghosts {
+            area = Some(union_rect(area, ghost.rect));
+        }
+        if let Some((id, _)) = m.fade_in
+            && let Some(i) = self.index_of(id)
+        {
+            area = Some(union_rect(area, self.tab_rects[i]));
+        }
+        area
+    }
+    /// Where a tab is drawn now.
+    fn drawn_rect(&self, index: usize) -> Rect {
+        let end = self.tab_rects[index];
+        if self.motion.slides.is_empty() {
+            return end;
+        }
+        let id = self.tabs[index].id;
+        match self.motion.slides.iter().find(|(known, _)| *known == id) {
+            Some((_, slide)) => slide.place(end, self.motion.now),
+            None => end,
+        }
+    }
+    /// Where the tabs stop being drawn. Tabs on their way in from the right show until the
+    /// + arrives, and a new tab shows whole at once.
+    fn drawn_clip_end(&self) -> f32 {
+        let end = self.clip_end();
+        match self.motion.plus {
+            Some(_) if !self.overflow => end.max(self.drawn_plus().x.0),
+            _ => end,
+        }
+    }
+    fn drawn_plus(&self) -> Rect {
+        match self.motion.plus {
+            Some(slide) => slide.place(self.plus, self.motion.now),
+            None => self.plus,
+        }
+    }
+    /// The tabs in or near the row's view now, by index. The cost follows the view, not the
+    /// number of tabs.
+    fn shown_range(&self) -> std::ops::Range<usize> {
+        let first = self.scroll.min(self.tabs.len());
+        let count = if self.tab_width > 0.0 {
+            ((self.clip_end() - self.clip_start()) / self.tab_width)
+                .ceil()
+                .max(0.0) as usize
+                + 2
+        } else {
+            self.tabs.len()
+        };
+        first.saturating_sub(1)..(first + count).min(self.tabs.len())
+    }
+    fn drawn_before(&self) -> Option<DrawnBefore> {
+        if self.motion.off {
+            return None;
+        }
+        let (start, end) = (self.clip_start(), self.clip_end());
+        let mut tabs = Vec::new();
+        for i in self.shown_range() {
+            let b = self.drawn_rect(i);
+            if b.x.0 < end && b.x.0 + b.width.0 > start {
+                tabs.push((self.tabs[i].id, b.x.0, b.width.0));
+            }
+        }
+        let plus = self.drawn_plus();
+        Some(DrawnBefore {
+            tabs,
+            plus: (plus.x.0, plus.width.0),
+        })
+    }
+    fn ghost_of(&self, index: usize) -> Ghost {
+        let tab = &self.tabs[index];
+        Ghost {
+            rect: self.drawn_rect(index),
+            title: tab.title.clone(),
+            dirty: tab.dirty,
+            active: index == self.active,
+            start: 0.0,
+        }
+    }
+    /// Every slide starts from where its tab is drawn now and ends at its final place, so
+    /// that a second change during a slide makes no jump.
+    fn start_slides(&mut self, before: &DrawnBefore, except: Option<TabId>, now: f64) {
+        self.motion.slides.clear();
+        let mut after_last = None;
+        let (start, end) = (self.clip_start(), self.clip_end());
+        for i in self.shown_range() {
+            let b = self.tab_rects[i];
+            let id = self.tabs[i].id;
+            if Some(id) == except {
+                after_last = Some(b.x.0 + b.width.0);
+                continue;
+            }
+            let known = before.tabs.iter().find(|(tab, ..)| *tab == id);
+            // A tab that was out of view comes in behind its neighbour.
+            let (from_x, from_width) = match (known, after_last) {
+                (Some((_, x, width)), _) => (*x, *width),
+                (None, Some(x)) => (x, b.width.0),
+                (None, None) => (b.x.0, b.width.0),
+            };
+            after_last = Some(from_x + from_width);
+            let moved = from_x != b.x.0 || from_width != b.width.0;
+            let reaches_view = from_x.min(b.x.0) < end && from_x.max(b.x.0) + b.width.0 > start;
+            if moved && reaches_view {
+                self.motion.slides.push((
+                    id,
+                    Slide {
+                        from_x,
+                        from_width,
+                        start: now,
+                    },
+                ));
+            }
+        }
+        self.motion.plus = (before.plus != (self.plus.x.0, self.plus.width.0)).then_some(Slide {
+            from_x: before.plus.0,
+            from_width: before.plus.1,
+            start: now,
+        });
+        self.motion.now = now;
+    }
+    /// A tab came or went. It animates if the list has rested, as WinUI's does. A change
+    /// during motion goes on from what is drawn. Any other quick change just jumps.
+    fn after_list_change(
+        &mut self,
+        before: Option<DrawnBefore>,
+        ghost: Option<Ghost>,
+        new_tab: Option<TabId>,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        let now = self.motion.clock.now_ms();
+        let quiet = self
+            .motion
+            .last_list_change
+            .is_none_or(|last| now - last >= self.motion.quiet_ms);
+        let in_flight = !self.motion.slides.is_empty()
+            || self.motion.plus.is_some()
+            || !self.motion.ghosts.is_empty()
+            || self.motion.fade_in.is_some();
+        self.motion.last_list_change = Some(now);
+        if !quiet && !in_flight {
+            return;
+        }
+        self.start_slides(&before, new_tab, now);
+        if let Some(mut ghost) = ghost {
+            ghost.start = now;
+            self.motion.ghosts.push(ghost);
+        }
+        if let Some(id) = new_tab {
+            self.motion.fade_in = Some((id, now));
+        }
+        self.motion.drawn = self.moving_area();
+    }
+    /// Starts a window button's fade if what the pointer does to it changed. The key path
+    /// never comes here.
+    fn sync_button_fades(&mut self) {
+        for (slot, hit) in CAPTION_HITS.into_iter().enumerate() {
+            let look = self.look(hit);
+            let want = look != Look::Rest;
+            let button = self.motion.buttons[slot];
+            if self.motion.off || look == Look::Pressed {
+                self.motion.buttons[slot] = ButtonFade {
+                    lit: want,
+                    ..Default::default()
+                };
+            } else if want != button.lit {
+                let now = self.motion.clock.now_ms();
+                self.motion.now = now;
+                self.motion.buttons[slot] = ButtonFade {
+                    lit: want,
+                    moving: true,
+                    from: button.value(now),
+                    start: now,
+                };
+            }
+        }
+    }
+    /// What a click at this place means. Hit tests are final from the first moment, but a
+    /// person clicks what is drawn. So during a slide, a tab or the + drawn here takes the
+    /// click, even if another one's final place is here. If the same tab is both, its final
+    /// place says which part of it was hit, so that a repeated click reaches the next X. A
+    /// gap with nothing drawn takes the final answer, and the window buttons never move.
+    pub fn drawn_hit_test(&self, at: Point) -> CaptionHit {
+        let hit = self.hit_test(at);
+        let m = &self.motion;
+        if m.slides.is_empty() && m.plus.is_none() {
+            return hit;
+        }
+        if !matches!(
+            hit,
+            CaptionHit::Tab(_) | CaptionHit::TabClose(_) | CaptionHit::NewTab | CaptionHit::Drag
+        ) {
+            return hit;
+        }
+        if inside(at, self.drawn_plus()) {
+            return CaptionHit::NewTab;
+        }
+        if at.x.0 < self.clip_start() || at.x.0 >= self.drawn_clip_end() {
+            return hit;
+        }
+        let t = light_tokens();
+        for i in self.shown_range() {
+            let b = self.drawn_rect(i);
+            if inside(at, b) {
+                if let CaptionHit::Tab(same) | CaptionHit::TabClose(same) = hit
+                    && same == i
+                {
+                    return hit;
+                }
+                return if at.x.0 >= b.x.0 + b.width.0 - t.close_width {
+                    CaptionHit::TabClose(i)
+                } else {
+                    CaptionHit::Tab(i)
+                };
+            }
+        }
+        hit
+    }
+    /// What a release at this place means. One near a press that took a drawn place belongs
+    /// to that press, wherever the tabs have got to by now.
+    fn release_hit(&mut self, at: Point) -> CaptionHit {
+        match self.drawn_press.take() {
+            Some((from, target))
+                if (at.x.0 - from.x.0).abs() <= PRESS_SLOP
+                    && (at.y.0 - from.y.0).abs() <= PRESS_SLOP =>
+            {
+                target
+            }
+            _ => self.drawn_hit_test(at),
+        }
     }
     /// The one hit test. Clicks, hover, `WM_NCHITTEST` and `WM_NCMOUSEMOVE` all use it.
     pub fn hit_test(&self, at: Point) -> CaptionHit {
@@ -732,13 +1252,24 @@ impl TabStrip {
             ctx.invalidate(self.part_rect(self.hover));
         }
         self.clear_pointer();
+        self.sync_button_fades();
     }
-    /// The pointer left the window. A button held by capture keeps its press.
+    /// The pointer left the window, or this row. A button held by capture keeps its press.
     pub fn pointer_left(&mut self, ctx: &mut ViewContext) {
+        self.pointer_moved_off(ctx);
+        if !self.capturing {
+            self.pointer_in_row = false;
+            self.release_hold(ctx);
+        }
+    }
+    /// The pointer left a tab for the empty part of the row. Windows counts that as leaving
+    /// the client area, but the tab widths stay held.
+    pub fn pointer_moved_off(&mut self, ctx: &mut ViewContext) {
         if self.hover != CaptionHit::None && !self.capturing {
             ctx.invalidate(self.part_rect(self.hover));
             self.hover = CaptionHit::None;
         }
+        self.sync_button_fades();
     }
     /// `WM_CAPTURECHANGED`: capture already ended, so this asks for no release.
     pub fn capture_lost(&mut self, ctx: &mut ViewContext) {
@@ -749,6 +1280,7 @@ impl TabStrip {
         if self.capturing {
             self.release_capture = true;
         }
+        self.drawn_press = None;
         self.hover = CaptionHit::None;
         self.pressed = CaptionHit::None;
         self.drag = None;
@@ -801,9 +1333,8 @@ impl TabStrip {
             _ => Rect::default(),
         }
     }
-    /// The hover box of a tab's X.
-    fn close_box(&self, index: usize, t: ShellTokens) -> Rect {
-        let b = self.tab_rects[index];
+    /// The hover box of the X of a tab drawn at `b`.
+    fn close_box_in(b: Rect, t: ShellTokens) -> Rect {
         r(
             b.x.0 + b.width.0 - t.close_width + (t.close_width - t.close_box) / 2.0,
             b.y.0 + (b.height.0 - t.close_box) / 2.0,
@@ -833,7 +1364,9 @@ impl TabStrip {
         let t = light_tokens();
         let bounds = self.bounds;
         let available = (bounds.width.0 - 3.0 * t.caption_width - t.plus_width).max(0.0);
-        self.tab_width = (available / self.tabs.len() as f32).clamp(t.min_width, t.max_width);
+        self.tab_width = self.held_width.unwrap_or_else(|| {
+            (available / self.tabs.len() as f32).clamp(t.min_width, t.max_width)
+        });
         self.overflow = self.tabs.len() as f32 * t.min_width > available;
         let left = bounds.x.0 + if self.overflow { t.scroll_width } else { 0.0 };
         self.visible_width = if self.overflow {
@@ -890,6 +1423,9 @@ impl TabStrip {
             .min(self.max_scroll());
         if next != self.scroll {
             self.scroll = next;
+            // Scrolling has no motion, and a slide would cross it.
+            self.motion.slides.clear();
+            self.motion.plus = None;
             self.arrange();
         }
     }
@@ -1020,6 +1556,11 @@ impl TabStrip {
     fn mouse_move(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
         let t = light_tokens();
         let hit = self.hit_test(at);
+        self.pointer = Some(at);
+        self.pointer_in_row = self.in_hold_zone(at);
+        if !self.pointer_in_row && !self.capturing {
+            self.release_hold(ctx);
+        }
         self.set_hover(hit, ctx);
         if let Some(drag) = self.drag {
             if (at.y.0 - drag.start.y.0).abs() > self.row_height() {
@@ -1049,7 +1590,15 @@ impl TabStrip {
                 _ => None,
             });
             if let Some(to) = target {
+                let before = self.drawn_before();
+                let dragged = self.tab_id(drag.index);
                 self.reorder_index(drag.index, to);
+                if let Some(before) = before {
+                    // The other tabs slide. The one in hand goes where the hand is.
+                    let now = self.motion.clock.now_ms();
+                    self.start_slides(&before, dragged, now);
+                    self.motion.drawn = self.moving_area();
+                }
                 self.drag = Some(TabDrag {
                     index: to,
                     start: at,
@@ -1072,7 +1621,10 @@ impl TabStrip {
             return Handled::Yes;
         }
         let left = button == MouseButton::Left;
-        let hit = self.hit_test(at);
+        self.pointer = Some(at);
+        self.pointer_in_row = self.in_hold_zone(at);
+        let hit = self.drawn_hit_test(at);
+        self.drawn_press = (hit != self.hit_test(at)).then_some((at, hit));
         // Any other press ends a middle press. A left press on a target below keeps the
         // capture: a release here would end that new press too, through `capture_lost`.
         if self.middle_press.take().is_some()
@@ -1122,7 +1674,9 @@ impl TabStrip {
     }
     /// The tab under the pointer closes the way its X does, if the press began on it.
     fn middle_up(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
-        let hit = self.hit_test(at);
+        self.pointer = Some(at);
+        self.pointer_in_row = self.in_hold_zone(at);
+        let hit = self.release_hit(at);
         let Some(pressed) = self.middle_press.take() else {
             // During a left press, this release is no one else's either.
             return if self.capturing || inside(at, self.row_rect()) {
@@ -1138,12 +1692,15 @@ impl TabStrip {
             && self.tab_id(index) == Some(pressed)
         {
             self.activate(CaptionHit::TabClose(index));
+            self.pointer_close = Some(pressed);
         }
         Handled::Yes
     }
     fn mouse_up(&mut self, at: Point, ctx: &mut ViewContext) -> Handled {
         let pressed = self.pressed;
-        let hit = self.hit_test(at);
+        self.pointer = Some(at);
+        self.pointer_in_row = self.in_hold_zone(at);
+        let hit = self.release_hit(at);
         if pressed == CaptionHit::None {
             return if hit == CaptionHit::None {
                 Handled::No
@@ -1163,6 +1720,9 @@ impl TabStrip {
         ctx.invalidate(self.part_rect(hit));
         if hit == pressed && !moved {
             self.activate(pressed);
+            if let CaptionHit::TabClose(index) = pressed {
+                self.pointer_close = self.tab_id(index);
+            }
             if !matches!(
                 pressed,
                 CaptionHit::Minimize | CaptionHit::Maximize | CaptionHit::Close
@@ -1177,6 +1737,11 @@ impl View for TabStrip {
     fn layout(&mut self, bounds: Rect, _measure: &dyn TextMeasurer) {
         let new_width = bounds.width.0 != self.bounds.width.0;
         self.bounds = bounds;
+        if new_width {
+            // A hold could run past the new edge. A resize shows its end state at once.
+            self.held_width = None;
+            self.finish_motion();
+        }
         self.arrange();
         if self.reveal_on_layout || new_width {
             self.reveal_on_layout = false;
@@ -1184,71 +1749,15 @@ impl View for TabStrip {
         }
     }
     fn handle(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
-        match event.kind {
-            InputKind::KeyDown {
-                virtual_key,
-                modifiers,
-                repeat,
-            } => {
-                // Chords belong to the system and the command table.
-                if modifiers.alt || modifiers.ctrl || modifiers.win {
-                    return Handled::No;
-                }
-                self.focused_key(virtual_key, modifiers, repeat, ctx)
-            }
-            InputKind::MouseMove { at } => self.mouse_move(at, ctx),
-            InputKind::MouseDown { at, button, .. } => self.mouse_down(at, button, ctx),
-            InputKind::MouseUp {
-                at,
-                button: MouseButton::Left,
-                ..
-            } => self.mouse_up(at, ctx),
-            InputKind::MouseUp {
-                at,
-                button: MouseButton::Middle,
-                ..
-            } => self.middle_up(at, ctx),
-            InputKind::MouseUp { at, .. } => {
-                if inside(at, self.row_rect()) {
-                    Handled::Yes
-                } else {
-                    Handled::No
-                }
-            }
-            InputKind::Wheel {
-                at,
-                delta_x,
-                delta_y,
-                ..
-            } => {
-                if !inside(at, self.row_rect()) {
-                    return Handled::No;
-                }
-                // One notch is 1.0. Small steps from a fine wheel add up to one tab.
-                self.wheel += delta_x - delta_y;
-                let steps = self.wheel.trunc();
-                self.wheel -= steps;
-                if self.overflow && steps != 0.0 {
-                    self.scroll_by(steps as isize);
-                    // A different tab is under the pointer now.
-                    self.hover = self.hit_test(at);
-                    ctx.invalidate(self.row_rect());
-                }
-                Handled::Yes
-            }
-            InputKind::Blur => {
-                self.window_active = false;
-                self.cancel_pointer(ctx);
-                ctx.invalidate(self.row_rect());
-                Handled::Yes
-            }
-            InputKind::Focus => {
-                self.window_active = true;
-                ctx.invalidate(self.row_rect());
-                Handled::Yes
-            }
-            _ => Handled::No,
+        let handled = self.handle_event(event, ctx);
+        // Keys read no clock and start no motion here.
+        if !matches!(
+            event.kind,
+            InputKind::KeyDown { .. } | InputKind::KeyUp { .. } | InputKind::Char(_)
+        ) {
+            self.sync_button_fades();
         }
+        handled
     }
     fn draw(&self, list: &mut DisplayList, theme: &Theme, measure: &dyn TextMeasurer) {
         let mut t = ShellTokens::from_theme(theme);
@@ -1359,6 +1868,75 @@ impl View for TabStrip {
     }
 }
 impl TabStrip {
+    fn handle_event(&mut self, event: &InputEvent, ctx: &mut ViewContext) -> Handled {
+        match event.kind {
+            InputKind::KeyDown {
+                virtual_key,
+                modifiers,
+                repeat,
+            } => {
+                // A key now means a later close of that tab was not the mouse's.
+                self.pointer_close = None;
+                // Chords belong to the system and the command table.
+                if modifiers.alt || modifiers.ctrl || modifiers.win {
+                    return Handled::No;
+                }
+                self.focused_key(virtual_key, modifiers, repeat, ctx)
+            }
+            InputKind::MouseMove { at } => self.mouse_move(at, ctx),
+            InputKind::MouseDown { at, button, .. } => self.mouse_down(at, button, ctx),
+            InputKind::MouseUp {
+                at,
+                button: MouseButton::Left,
+                ..
+            } => self.mouse_up(at, ctx),
+            InputKind::MouseUp {
+                at,
+                button: MouseButton::Middle,
+                ..
+            } => self.middle_up(at, ctx),
+            InputKind::MouseUp { at, .. } => {
+                if inside(at, self.row_rect()) {
+                    Handled::Yes
+                } else {
+                    Handled::No
+                }
+            }
+            InputKind::Wheel {
+                at,
+                delta_x,
+                delta_y,
+                ..
+            } => {
+                if !inside(at, self.row_rect()) {
+                    return Handled::No;
+                }
+                // One notch is 1.0. Small steps from a fine wheel add up to one tab.
+                self.wheel += delta_x - delta_y;
+                let steps = self.wheel.trunc();
+                self.wheel -= steps;
+                if self.overflow && steps != 0.0 {
+                    self.scroll_by(steps as isize);
+                    // A different tab is under the pointer now.
+                    self.hover = self.hit_test(at);
+                    ctx.invalidate(self.row_rect());
+                }
+                Handled::Yes
+            }
+            InputKind::Blur => {
+                self.window_active = false;
+                self.cancel_pointer(ctx);
+                ctx.invalidate(self.row_rect());
+                Handled::Yes
+            }
+            InputKind::Focus => {
+                self.window_active = true;
+                ctx.invalidate(self.row_rect());
+                Handled::Yes
+            }
+            _ => Handled::No,
+        }
+    }
     /// Ids in separate ranges, so that no count of tabs makes two widgets share one.
     pub fn widget_id(hit: CaptionHit) -> WidgetId {
         WidgetId(match hit {
@@ -1373,8 +1951,91 @@ impl TabStrip {
             CaptionHit::None | CaptionHit::Drag | CaptionHit::ResizeTop => 0,
         })
     }
+    /// A closed tab on its way out, under the tabs that slide over it.
+    fn draw_ghost(
+        &self,
+        ghost: &Ghost,
+        list: &mut DisplayList,
+        t: ShellTokens,
+        measure: &dyn TextMeasurer,
+    ) {
+        let left = 1.0 - part_of(self.motion.now, ghost.start, CLOSE_FADE_MS) as f32;
+        let b = ghost.rect;
+        list.push(DrawCommand::PushOpacity(left));
+        if ghost.active {
+            list.push(DrawCommand::RoundedRect {
+                rect: r(b.x.0, b.y.0, b.width.0, b.height.0 + t.radius),
+                radius: Dip(t.radius),
+                color: t.active,
+            });
+        }
+        let text = ellipsis(
+            &ghost.title,
+            (b.width.0 - t.text_inset - t.close_width).max(0.0),
+            measure,
+            t.text_token,
+        );
+        let metrics = measure.measure(&text, t.text_token);
+        list.push(DrawCommand::TextRun {
+            at: p(
+                b.x.0 + t.text_inset,
+                b.y.0 + (b.height.0 - metrics.height.0) / 2.0 + metrics.baseline.0,
+            ),
+            text,
+            font: t.text_font.into(),
+            font_size: Dip(t.text_font_size),
+            color: if ghost.active && self.window_active {
+                t.text
+            } else {
+                t.dim
+            },
+        });
+        let close = Self::close_box_in(b, t);
+        let ink = if self.window_active {
+            t.button_text
+        } else {
+            t.dim
+        };
+        if ghost.dirty {
+            let metrics = measure.measure("•", t.text_token);
+            list.push(DrawCommand::TextRun {
+                at: centered(close, metrics),
+                text: "•".into(),
+                font: t.text_font.into(),
+                font_size: Dip(t.text_font_size),
+                color: ink,
+            });
+        } else {
+            icon(
+                list,
+                close,
+                0xe8bb,
+                IconStyle {
+                    size: t.caption_icon,
+                    token: t.caption_icon_token,
+                    color: ink,
+                    scale: self.scale.get(),
+                },
+                measure,
+            );
+        }
+        list.push(DrawCommand::PopOpacity);
+    }
+    /// How much of a new tab's fill shows: its text and its X show at once.
+    fn fill_color(&self, id: TabId, color: Color) -> Color {
+        match self.motion.fade_in {
+            Some((new, start)) if new == id => {
+                let part = part_of(self.motion.now, start, OPEN_FADE_MS) as f32;
+                Color {
+                    a: (f32::from(color.a) * part).round() as u8,
+                    ..color
+                }
+            }
+            _ => color,
+        }
+    }
     fn draw_tabs(&self, list: &mut DisplayList, t: ShellTokens, measure: &dyn TextMeasurer) {
-        let (start, end) = (self.clip_start(), self.clip_end());
+        let (start, end) = (self.clip_start(), self.drawn_clip_end());
         let row = self.row_rect();
         list.push(DrawCommand::PushClip(r(
             start,
@@ -1383,12 +2044,22 @@ impl TabStrip {
             row.height.0,
         )));
         let contrast = self.contrast.is_some();
-        for (i, tab) in self.tabs.iter().enumerate().skip(self.scroll) {
-            let b = self.tab_rects[i];
-            if b.x.0 >= end {
+        for ghost in &self.motion.ghosts {
+            self.draw_ghost(ghost, list, t, measure);
+        }
+        let sliding = !self.motion.slides.is_empty();
+        let range = if sliding {
+            self.shown_range()
+        } else {
+            self.scroll.min(self.tabs.len())..self.tabs.len()
+        };
+        for i in range {
+            let tab = &self.tabs[i];
+            let b = self.drawn_rect(i);
+            if !sliding && b.x.0 >= end {
                 break;
             }
-            if b.x.0 + b.width.0 <= start {
+            if b.x.0 >= end || b.x.0 + b.width.0 <= start {
                 continue;
             }
             let active = i == self.active;
@@ -1408,7 +2079,7 @@ impl TabStrip {
                 list.push(DrawCommand::RoundedRect {
                     rect: shape,
                     radius: Dip(t.radius),
-                    color: t.active,
+                    color: self.fill_color(tab.id, t.active),
                 });
             } else if contrast && look != Look::Rest {
                 list.push(DrawCommand::StrokeRect {
@@ -1460,7 +2131,7 @@ impl TabStrip {
                 font_size: Dip(t.text_font_size),
                 color: ink,
             });
-            let close = self.close_box(i, t);
+            let close = Self::close_box_in(b, t);
             match self.look(close_hit) {
                 Look::Rest => {}
                 close_look if contrast => list.push(DrawCommand::StrokeRect {
@@ -1483,7 +2154,10 @@ impl TabStrip {
                     },
                 }),
             }
-            if tab.dirty && !hovering {
+            // A new tab's X waits for the + to pass, or the two would cross on screen.
+            let plus_on_x = self.motion.fade_in.is_some_and(|(new, _)| new == tab.id)
+                && self.drawn_plus().x.0 < close.x.0 + close.width.0;
+            if !plus_on_x && tab.dirty && !hovering {
                 let metrics = measure.measure("•", t.text_token);
                 list.push(DrawCommand::TextRun {
                     at: centered(close, metrics),
@@ -1492,7 +2166,7 @@ impl TabStrip {
                     font_size: Dip(t.text_font_size),
                     color: button_ink,
                 });
-            } else {
+            } else if !plus_on_x {
                 icon(
                     list,
                     close,
@@ -1540,7 +2214,11 @@ impl TabStrip {
         t: ShellTokens,
         measure: &dyn TextMeasurer,
     ) {
-        let b = self.part_rect(hit);
+        let b = if hit == CaptionHit::NewTab {
+            self.drawn_plus()
+        } else {
+            self.part_rect(hit)
+        };
         let look = self.look(hit);
         if look != Look::Rest {
             list.push(DrawCommand::RoundedRect {
@@ -1591,33 +2269,55 @@ impl TabStrip {
         } else {
             (0xe921, 0xe922, 0xe923, 0xe8bb)
         };
-        for (hit, code) in [
+        for (slot, (hit, code)) in [
             (CaptionHit::Minimize, minimize),
             (
                 CaptionHit::Maximize,
                 if restore { restore_glyph } else { maximize },
             ),
             (CaptionHit::Close, close),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let b = self.part_rect(hit);
             let look = self.look(hit);
             let is_close = hit == CaptionHit::Close;
+            // A fill on its way in or out has the hover look at part of its strength. The
+            // icon's color goes with it, or white would sit on a fill too weak to show it.
+            let button = self.motion.buttons[slot];
+            let part = if button.moving {
+                button.value(self.motion.now)
+            } else if look == Look::Rest {
+                0.0
+            } else {
+                1.0
+            };
+            let hover_fill = if is_close { t.close_hover } else { t.hover };
             let fill = match (look, is_close) {
-                (Look::Rest, _) => None,
-                (Look::Hover, true) => Some(t.close_hover),
                 (Look::Pressed, true) => Some(t.close_pressed),
-                (Look::Hover, false) => Some(t.hover),
                 (Look::Pressed, false) => Some(t.pressed),
+                (Look::Hover, _) if part >= 1.0 => Some(hover_fill),
+                _ if part > 0.0 => Some(Color {
+                    a: (f32::from(hover_fill.a) * part).round() as u8,
+                    ..hover_fill
+                }),
+                _ => None,
             };
             if let Some(color) = fill {
                 list.push(DrawCommand::FillRect { rect: b, color });
             }
+            let rest_ink = if self.window_active {
+                t.text
+            } else {
+                t.caption_dim
+            };
             let color = match look {
-                Look::Hover if is_close => t.close_text,
                 Look::Pressed if is_close => t.close_text_pressed,
                 Look::Hover | Look::Pressed if contrast => t.close_text,
-                _ if self.window_active => t.text,
-                _ => t.caption_dim,
+                Look::Hover if is_close && part >= 1.0 => t.close_text,
+                _ if is_close && part > 0.0 => mix(rest_ink, t.close_text, part),
+                _ => rest_ink,
             };
             icon(
                 list,

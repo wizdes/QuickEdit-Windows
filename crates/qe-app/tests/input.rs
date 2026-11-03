@@ -419,6 +419,45 @@ fn bench_keys_sends_real_messages_through_the_message_loop() {
 }
 
 #[test]
+fn bench_keys_can_run_with_tab_motion_and_reports_what_each_frame_cost() {
+    let folder = Folder::new("bench motion");
+    let file = folder.file("bench.txt", "some text to type in\n".repeat(50).as_bytes());
+    let output = Command::new(exe())
+        .args(["--bench-keys", "40", "--bench-tab-motion", "--data-root"])
+        .arg(folder.root())
+        .arg(&file)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{said}");
+    let line = said
+        .lines()
+        .find(|line| line.starts_with("input to present"))
+        .unwrap_or_else(|| panic!("no timers in {said}"));
+    assert!(line.contains("with tab motion"), "{line}");
+    assert!(number_after(line, "keys from") >= 40.0, "{line}");
+    let motion = said
+        .lines()
+        .find(|line| line.starts_with("motion:"))
+        .unwrap_or_else(|| panic!("no motion in {said}"));
+    // Keys and frames took turns: 40 keys take 320 ms, which holds about 20 frames.
+    assert!(number_after(motion, "motion:") >= 5.0, "{motion}");
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        "some text to type in\n".repeat(50).as_bytes()
+    );
+}
+
+#[test]
+fn a_flag_of_the_bench_alone_is_an_error() {
+    let output = Command::new(exe())
+        .args(["--hidden", "--bench-tab-motion"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
 fn timings_records_real_keys_in_a_normal_run() {
     let folder = Folder::new("timings");
     let log = folder.0.join("errors.txt");

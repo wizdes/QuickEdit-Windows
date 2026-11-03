@@ -396,8 +396,14 @@ fn start(mut args: Args) -> Result<i32, String> {
             panels_waiting: Vec::new(),
             smoke: args.smoke,
             smoke_done: false,
-            bench: (args.bench_keys > 0)
-                .then(|| crate::bench::Bench::new(args.bench_keys, args.bench_middle)),
+            bench: (args.bench_keys > 0).then(|| {
+                crate::bench::Bench::new(
+                    args.bench_keys,
+                    args.bench_middle,
+                    args.bench_paced,
+                    args.bench_tab_motion,
+                )
+            }),
             tab_drag: Rc::new(Cell::new(None)),
             shown_questions: std::collections::HashSet::new(),
             asking: std::collections::HashSet::new(),

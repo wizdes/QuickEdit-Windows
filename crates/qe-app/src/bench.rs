@@ -8,7 +8,10 @@
 use crate::app::{App, Effect, Shared, pump};
 use qe_api::{ByteOffset, InputKind, ViewContext};
 use qe_docs::WindowId;
+use qe_shell::{Tab, TabId};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP};
@@ -17,13 +20,25 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP
 const KEY_LIMIT: Duration = Duration::from_secs(1);
 /// The gap between keys. Workers run while a person's fingers move.
 const KEY_GAP: Duration = Duration::from_millis(3);
+/// The gap between keys in a paced run: a very fast typist, and time for timers to fire.
+const PACED_GAP: Duration = Duration::from_millis(8);
 
 pub struct Bench {
     pub keys: usize,
     pub middle: bool,
     pub started: bool,
+    paced: bool,
+    tab_motion: bool,
     sent: usize,
     run: Option<Run>,
+}
+/// The thread that posts the keys of a paced run.
+struct Pacer {
+    sent: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+    /// The tab that comes and goes, to keep motion running.
+    extra: Option<TabId>,
 }
 struct Run {
     window: WindowId,
@@ -33,13 +48,16 @@ struct Run {
     waiting_for_index: Option<Instant>,
     /// The key on its way, and when the bench stops waiting for it.
     key_limit: Option<Instant>,
+    pacer: Option<Pacer>,
 }
 impl Bench {
-    pub fn new(keys: usize, middle: bool) -> Self {
+    pub fn new(keys: usize, middle: bool, paced: bool, tab_motion: bool) -> Self {
         Self {
             keys,
             middle,
             started: false,
+            paced,
+            tab_motion,
             sent: 0,
             run: None,
         }
@@ -96,7 +114,25 @@ pub fn run(shared: &Rc<Shared>) {
             can_edit,
             waiting_for_index: middle.then(|| Instant::now() + Duration::from_secs(60)),
             key_limit: None,
+            pacer: None,
         });
+    }
+    if app.bench.as_ref().is_some_and(|bench| bench.tab_motion)
+        && let Some(win) = app.windows.get(&window)
+    {
+        // A hidden window has no motion of its own, and a real list waits a second between
+        // changes. Here something moves all the time, which is far more than a person sees.
+        let started = win
+            .handle
+            .set_animation_setting_off(false)
+            .and_then(|()| win.handle.force_motion(Some(true)))
+            .and_then(|()| {
+                win.handle
+                    .with_strip(|strip| strip.set_motion_quiet_ms(0.0))
+            });
+        if let Err(e) = started {
+            eprintln!("The bench could not start motion: {e}");
+        }
     }
     drop(app);
     pump(shared);
@@ -155,6 +191,9 @@ pub fn step(shared: &Rc<Shared>) {
         return;
     }
     run.key_limit = None;
+    if bench.paced {
+        return paced_step(shared, app);
+    }
     if sent >= keys {
         let can_edit = run.can_edit;
         let label = if can_edit {
@@ -208,4 +247,160 @@ pub fn step(shared: &Rc<Shared>) {
         eprintln!("The bench could not post a key: {e}");
     }
     shared.wake_window.post_bench_step();
+}
+
+fn post_key(hwnd: isize, code: usize) {
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    // SAFETY: Windows checks the handle. The scan code in the high bits lets TranslateMessage
+    // make its character, as for a real key.
+    let posted = unsafe {
+        let scan = isize::try_from(windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(
+            code as u32,
+            windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VK_TO_VSC,
+        ))
+        .unwrap_or(0);
+        PostMessageW(
+            Some(hwnd),
+            WM_KEYDOWN,
+            WPARAM(code),
+            LPARAM(1 | (scan << 16)),
+        )
+        .and_then(|()| {
+            PostMessageW(
+                Some(hwnd),
+                WM_KEYUP,
+                WPARAM(code),
+                LPARAM(1 | (scan << 16) | (1 << 30) | (1 << 31)),
+            )
+        })
+    };
+    if let Err(e) = posted {
+        eprintln!("The bench could not post a key: {e}");
+    }
+}
+
+/// A paced run posts from another thread, so that this loop rests as it does for a person, and
+/// the timers fire. Each post of a step lets the bench look at where it stands.
+fn paced_step(shared: &Rc<Shared>, mut app: std::cell::RefMut<'_, App>) {
+    let step_target = shared.wake_window.bench_step_target();
+    let App { bench, .. } = &mut *app;
+    let Some(bench) = bench else {
+        return;
+    };
+    let (keys, tab_motion) = (bench.keys, bench.tab_motion);
+    let Some(run) = &mut bench.run else {
+        return;
+    };
+    let (window, hwnd, can_edit) = (run.window, run.hwnd.0 as isize, run.can_edit);
+    let pacer = run.pacer.get_or_insert_with(|| {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread_sent, thread_stop) = (sent.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                std::thread::sleep(PACED_GAP);
+                let done = thread_sent.load(Ordering::Acquire);
+                if done < keys {
+                    post_key(
+                        hwnd,
+                        match (can_edit, done % 2 == 0) {
+                            (true, true) => 0x51,
+                            (true, false) => 0x08,
+                            (false, true) => 0x28,
+                            (false, false) => 0x26,
+                        },
+                    );
+                    thread_sent.store(done + 1, Ordering::Release);
+                }
+                crate::platform::post_bench_step_to(step_target);
+            }
+        });
+        Pacer {
+            sent,
+            stop,
+            thread,
+            extra: None,
+        }
+    });
+    let all_sent = pacer.sent.load(Ordering::Acquire) >= keys;
+    let mut extra = pacer.extra;
+    if all_sent && shared.timing.keys_done() >= keys {
+        pacer.stop.store(true, Ordering::Release);
+        if let Some(pacer) = run.pacer.take()
+            && pacer.thread.join().is_err()
+        {
+            eprintln!("The bench's key thread stopped on a panic.");
+        }
+        let label = if can_edit {
+            "typing and Backspace, editable file"
+        } else {
+            "Down and Up, read-only file"
+        };
+        let what = if tab_motion {
+            format!("{label}, paced, with tab motion")
+        } else {
+            format!("{label}, paced")
+        };
+        shared.timing.report(&what, shared.process_start);
+        if tab_motion && let Some(win) = app.windows.get(&window) {
+            match win.handle.motion_stats() {
+                Ok(stats) => report_motion(&stats),
+                Err(e) => eprintln!("The bench could not read its motion: {e}"),
+            }
+        }
+        app.bench = None;
+        app.effects.push(Effect::Exit);
+        drop(app);
+        pump(shared);
+        return;
+    }
+    // Keep something moving. Nothing here waits, so the next step comes from the thread.
+    if tab_motion && let Some(win) = app.windows.get(&window) {
+        let handle = win.handle.clone();
+        let changed = handle.with_strip(|strip| {
+            if !strip.is_moving() {
+                match extra.take() {
+                    Some(id) => strip.close(id),
+                    None => {
+                        let active = strip.tab_id(strip.active());
+                        extra = Some(strip.add_tab(Tab::new("Bench")));
+                        if let Some(active) = active {
+                            strip.select(active);
+                        }
+                    }
+                }
+                drop(strip.take_events());
+            }
+        });
+        if let Err(e) = changed {
+            eprintln!("The bench could not change a tab: {e}");
+        }
+        if let Some(bench) = &mut app.bench
+            && let Some(run) = &mut bench.run
+            && let Some(pacer) = &mut run.pacer
+        {
+            pacer.extra = extra;
+        }
+    }
+    drop(app);
+    pump(shared);
+}
+
+fn report_motion(stats: &qe_shell::MotionStats) {
+    let mut times = stats.frame_us.clone();
+    times.sort_unstable();
+    let at = |part: f64| {
+        times
+            .get(((times.len() as f64 * part).ceil() as usize).saturating_sub(1))
+            .copied()
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "motion: {} ticks, {} frames, tick and paint p50 {} us, p99 {} us, max {} us",
+        stats.ticks,
+        stats.frames,
+        at(0.5),
+        at(0.99),
+        at(1.0)
+    );
 }

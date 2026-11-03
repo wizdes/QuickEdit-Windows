@@ -4,6 +4,7 @@
 //! so timers, wakes, layout results and `WM_CLOSE` keep reaching the owner while a menu is
 //! open. `ShellHandle::open_menu` is the public way in.
 use crate::ShellError;
+use qe_api::motion::{MENU_CURVE, MENU_OPEN_MS, part_of};
 use qe_api::{DisplayList, PixelRect, RenderError, Renderer, TextMeasurer, Theme};
 use qe_ui::{MenuView, MenuWindows};
 use std::cell::RefCell;
@@ -26,6 +27,8 @@ pub(crate) struct MenuRun {
     pub timer_set: bool,
     levels: Rc<RefCell<Vec<Option<Level>>>>,
     scale: f32,
+    /// For each level that is still revealing itself: when it began, and what it began at.
+    reveals: Vec<Option<(f64, f32)>>,
 }
 impl MenuRun {
     pub fn new(
@@ -72,7 +75,46 @@ impl MenuRun {
             timer_set: false,
             levels,
             scale,
+            reveals: Vec::new(),
         }
+    }
+    /// Makes the windows match the view, and starts the reveal of each new level.
+    pub fn sync(&mut self, now: f64) -> Result<(), String> {
+        let synced = self.windows.sync(&self.view);
+        let count = self.windows.levels().len();
+        self.reveals.truncate(count);
+        while self.reveals.len() < count {
+            let part = self.windows.shown_part(self.reveals.len());
+            self.reveals.push((part < 1.0).then_some((now, part)));
+        }
+        synced
+    }
+    pub fn is_revealing(&self) -> bool {
+        self.reveals.iter().any(Option::is_some)
+    }
+    /// One frame at this time. It moves a window's bottom edge, and draws nothing.
+    pub fn step_reveals(&mut self, now: f64) -> Result<(), String> {
+        for depth in 0..self.reveals.len() {
+            let Some((start, from)) = self.reveals[depth] else {
+                continue;
+            };
+            let part = part_of(now, start, MENU_OPEN_MS);
+            if part >= 1.0 {
+                self.reveals[depth] = None;
+            }
+            let shown = from + (1.0 - from) * MENU_CURVE.at(part) as f32;
+            self.windows.set_shown_part(depth, shown, &self.view)?;
+        }
+        Ok(())
+    }
+    /// Shows every level whole at once.
+    pub fn finish_reveals(&mut self) -> Result<(), String> {
+        for depth in 0..self.reveals.len() {
+            if self.reveals[depth].take().is_some() {
+                self.windows.set_shown_part(depth, 1.0, &self.view)?;
+            }
+        }
+        Ok(())
     }
     pub fn root(&self) -> Option<HWND> {
         self.windows.levels().first().map(|level| level.hwnd())

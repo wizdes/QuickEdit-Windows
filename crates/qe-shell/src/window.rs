@@ -9,8 +9,9 @@
 use crate::menu_host::{MenuRun, PopupMessages, PopupRendererFactory};
 use crate::{
     CONTENT_WIDGET, CaptionHit, ContrastColors, FrameMode, ShellError, ShellEvent, ShellTokens,
-    Tab, TabId, TabStrip, caption_hit, maximized_insets,
+    Tab, TabId, TabStrip, maximized_insets,
 };
+use qe_api::motion::{BAR_MENU_START, Clock, FRAME_MS, SUBMENU_START};
 use qe_api::{
     Color, CommandId, Dip, DisplayList, DrawCommand, Handled, InputEvent, InputKind, Modifiers,
     MouseButton, MouseCursor, PixelRect, Point, Rect as ApiRect, Renderer, TextMeasurer, Theme,
@@ -258,6 +259,21 @@ fn read_contrast() -> Result<Option<ContrastColors>, ShellError> {
         gray_text: system_color(COLOR_GRAYTEXT),
     }))
 }
+/// True when Windows' "Animation effects" setting is off. If the call fails, the problem is
+/// reported and motion stays on, as it does by default.
+fn read_animation_off() -> Result<bool, ShellError> {
+    let mut animate = BOOL(1);
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut animate).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .map_err(|e| win32("SystemParametersInfoW", e))?;
+    Ok(!animate.as_bool())
+}
 fn build_theme(dark: bool, contrast: Option<ContrastColors>) -> Theme {
     let mut theme = Theme::new(if dark {
         ThemeKind::Dark
@@ -464,6 +480,9 @@ struct State {
     dark: bool,
     contrast: Option<ContrastColors>,
     needs_draw: bool,
+    /// Some part of the window other than the moving top row waits to be drawn. Only an
+    /// animation frame leaves this false, and it then skips the text painter.
+    needs_painter: bool,
     size: (u32, u32),
     client_dips: (f32, f32),
     saved: Option<SavedFrame>,
@@ -506,12 +525,12 @@ impl State {
     /// for. A frame with a problem still ends and still copies: its pixels are valid.
     fn paint(
         &mut self,
-        list: Option<DisplayList>,
+        list: Option<(DisplayList, bool)>,
         dc: *mut c_void,
         rect: PixelRect,
     ) -> Vec<ShellError> {
         let mut problems = Vec::new();
-        if let Some(mut list) = list {
+        if let Some((mut list, whole)) = list {
             // The top border's row, which `on_paint` then paints black on the window.
             let row = self.strip.row_rect();
             if row.y.0 > 0.0 {
@@ -527,8 +546,10 @@ impl State {
             }
             self.strip
                 .draw(&mut list, &self.theme, self.measurer.as_ref());
-            self.menu_bar
-                .draw(&mut list, &self.theme, self.measurer.as_ref());
+            if whole {
+                self.menu_bar
+                    .draw(&mut list, &self.theme, self.measurer.as_ref());
+            }
             if let Err(e) = self.renderer.renderer().begin_frame() {
                 problems.push(renderer_error("begin_frame", e));
             }
@@ -550,6 +571,9 @@ impl State {
 const WM_SHELL_WAKE: u32 = WM_APP + 1;
 /// A menu's hover delay before a submenu opens. It stays inside this window.
 const MENU_TIMER: u32 = u32::MAX - 1;
+/// Runs only while something moves, and is killed in the turn the last thing ends. It stays
+/// inside this window, so that no owner wakes for it.
+pub const ANIM_TIMER: u32 = u32::MAX - 2;
 /// A timer's message time has a grain of about 16 ms, so the delay gets this on top.
 const MENU_TIMER_MARGIN_MS: u32 = 20;
 const VK_ESCAPE_KEY: u16 = 0x1b;
@@ -609,9 +633,29 @@ impl ShellWaker {
     }
 }
 
+/// What the animation frames have cost, for a bench.
+#[derive(Clone, Debug, Default)]
+pub struct MotionStats {
+    /// `ANIM_TIMER` wake-ups.
+    pub ticks: u64,
+    /// Frames painted with no text painter.
+    pub frames: u64,
+    /// How long each tick and its paint took, in microseconds. Kept for at most 100,000.
+    pub frame_us: Vec<u32>,
+}
 type ContentPainter = Box<dyn FnMut(&mut DisplayList, ContentFrame)>;
 type EventHandler = Box<dyn FnMut(&ShellHandle, ShellEvent)>;
 struct Shared {
+    clock: RefCell<Clock>,
+    /// A test or a bench says motion runs, or does not, whatever the window's state is.
+    motion_forced: Cell<Option<bool>>,
+    /// Windows' "Animation effects" setting is off.
+    animation_setting_off: Cell<bool>,
+    anim_timer_on: Cell<bool>,
+    /// For a test: where the cursor is, in client pixels. Windows sends a hidden window its
+    /// leave notice at once, because the real cursor is never on it.
+    test_cursor: Cell<Option<POINT>>,
+    motion_stats: RefCell<MotionStats>,
     message_hook: RefCell<Option<MessageHook>>,
     chord_filter: RefCell<Option<ChordFilter>>,
     /// What `ShellWaker` reads from other threads.
@@ -715,6 +759,7 @@ impl Shared {
                 state.renderer.renderer().invalidate(*b);
             }
             state.needs_draw = true;
+            state.needs_painter = true;
         });
         if done.is_none() {
             return;
@@ -736,6 +781,7 @@ impl Shared {
         let done = self.with_state(WM_PAINT, |state| {
             state.renderer.renderer().invalidate_all();
             state.needs_draw = true;
+            state.needs_painter = true;
         });
         if done.is_some() {
             unsafe {
@@ -796,6 +842,177 @@ impl Shared {
                 self.queue.borrow_mut().push_back(event);
             }
         }
+        self.sync_anim_timer();
+    }
+    /// One value says whether motion may run: not with the setting off, in high contrast,
+    /// or in a window no one can see. A test can overrule it.
+    fn motion_is_off(&self, contrast: bool) -> bool {
+        if contrast || self.animation_setting_off.get() {
+            return true;
+        }
+        match self.motion_forced.get() {
+            Some(on) => !on,
+            None => {
+                let hwnd = self.hwnd.get();
+                !unsafe { IsWindowVisible(hwnd) }.as_bool() || unsafe { IsIconic(hwnd) }.as_bool()
+            }
+        }
+    }
+    /// Tells the row, before a change, whether that change may move.
+    fn refresh_motion(&self, state: &mut State, ctx: &mut ViewContext) {
+        let off = self.motion_is_off(state.contrast.is_some());
+        if state.strip.set_motion_off(off) {
+            ctx.invalidate(state.strip.row_rect());
+        }
+    }
+    /// The timer runs exactly while something moves.
+    fn sync_anim_timer(&self) {
+        // A nested call has nothing to add: its caller comes back here.
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        let moving = state.strip.is_moving()
+            || self
+                .menu
+                .try_borrow()
+                .is_ok_and(|run| run.as_ref().is_some_and(MenuRun::is_revealing));
+        drop(state);
+        if moving == self.anim_timer_on.get() {
+            return;
+        }
+        let hwnd = self.hwnd.get();
+        if moving {
+            let id = unsafe { SetTimer(Some(hwnd), ANIM_TIMER as usize, FRAME_MS, None) };
+            if id == 0 {
+                self.report(win32("SetTimer", windows::core::Error::from_thread()));
+                self.finish_motion();
+                return;
+            }
+        } else if let Err(e) = unsafe { KillTimer(Some(hwnd), ANIM_TIMER as usize) } {
+            self.report(win32("KillTimer", e));
+        }
+        self.anim_timer_on.set(moving);
+    }
+    /// Repaints only these parts of the top row, with no text painter.
+    fn invalidate_motion(&self, rects: &[ApiRect]) {
+        let s = self.scale();
+        let done = self.with_state(WM_PAINT, |state| {
+            for b in rects {
+                state.renderer.renderer().invalidate(*b);
+            }
+            state.needs_draw |= !rects.is_empty();
+        });
+        if done.is_none() {
+            return;
+        }
+        for b in rects {
+            let rect = RECT {
+                left: (b.x.0 * s).floor() as i32,
+                top: (b.y.0 * s).floor() as i32,
+                right: ((b.x.0 + b.width.0) * s).ceil() as i32,
+                bottom: ((b.y.0 + b.height.0) * s).ceil() as i32,
+            };
+            let done = unsafe { InvalidateRect(Some(self.hwnd.get()), Some(&rect), false) };
+            if self.record_commands && done.as_bool() {
+                self.invalidated.borrow_mut().push(rect);
+            }
+        }
+    }
+    /// One animation frame. Every value comes from the time that has gone by, so a late tick
+    /// jumps to the right place. It touches no document.
+    fn on_anim_timer(&self) {
+        let began = std::time::Instant::now();
+        let now = self.clock.borrow().now_ms();
+        let rects = self.with_state(WM_TIMER, |state| state.strip.step_motion(now));
+        let reveal = self
+            .menu
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut run| run.as_mut().map(|run| run.step_reveals(now)));
+        if let Some(Err(problem)) = reveal {
+            self.report(ShellError::Menu(problem));
+        }
+        let rects = rects.unwrap_or_default();
+        let hwnd = self.hwnd.get();
+        self.invalidate_motion(&rects);
+        self.sync_anim_timer();
+        // A window that Windows does not paint, under a test or a bench that asked for motion.
+        if !rects.is_empty()
+            && self.motion_forced.get() == Some(true)
+            && !unsafe { IsWindowVisible(hwnd) }.as_bool()
+        {
+            unsafe {
+                SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+        }
+        let mut stats = self.motion_stats.borrow_mut();
+        stats.ticks += 1;
+        if stats.frame_us.len() < 100_000 {
+            stats
+                .frame_us
+                .push(began.elapsed().as_micros().min(u128::from(u32::MAX)) as u32);
+        }
+    }
+    /// Shows every end state at once: the window was hidden, minimized, moved to another DPI
+    /// or is being closed, or a timer could not start.
+    fn finish_motion(&self) {
+        let (moved, row) = self
+            .with_state(WM_TIMER, |state| {
+                (state.strip.finish_motion(), state.strip.row_rect())
+            })
+            .unwrap_or((false, ApiRect::default()));
+        if moved {
+            self.invalidate(&[row]);
+        }
+        if let Ok(mut run) = self.menu.try_borrow_mut()
+            && let Some(run) = run.as_mut()
+            && let Err(problem) = run.finish_reveals()
+        {
+            self.report(ShellError::Menu(problem));
+        }
+        self.sync_anim_timer();
+    }
+    fn read_animation_setting(&self) {
+        match read_animation_off() {
+            Ok(off) => self.animation_setting_off.set(off),
+            Err(problem) => self.report(problem),
+        }
+    }
+    /// Sets the row's flag after the system's settings changed. A motion under way ends.
+    fn motion_settings_changed(&self) {
+        let result = self.with_state(WM_SETTINGCHANGE, |state| {
+            let mut ctx = ViewContext::default();
+            self.refresh_motion(state, &mut ctx);
+            ctx.requests
+        });
+        if let Some(requests) = result {
+            self.apply(requests, Vec::new());
+        }
+        let contrast = self
+            .with_state(WM_SETTINGCHANGE, |state| state.contrast.is_some())
+            .unwrap_or(false);
+        if self.motion_is_off(contrast) {
+            self.finish_motion();
+        }
+    }
+    /// True if the real cursor is still on this window, in the row's part that holds widths.
+    /// A hidden window is never under the cursor.
+    fn cursor_is_in_hold_zone(&self) -> bool {
+        let at = match self.test_cursor.get() {
+            Some(at) => at,
+            None => {
+                let mut at = POINT::default();
+                if unsafe { GetCursorPos(&mut at) }.is_err()
+                    || unsafe { WindowFromPoint(at) } != self.hwnd.get()
+                {
+                    return false;
+                }
+                self.screen_to_client(at)
+            }
+        };
+        let at = self.dips(at);
+        self.with_state(WM_MOUSELEAVE, |state| state.strip.in_hold_zone(at))
+            .unwrap_or(false)
     }
     fn make_event(&self, kind: InputKind) -> InputEvent {
         InputEvent {
@@ -867,6 +1084,10 @@ impl Shared {
                     | InputKind::MouseUp { .. }
                     | InputKind::Wheel { .. }
             );
+            // Keys never come here. A key reads no motion state and no clock.
+            if is_mouse {
+                self.refresh_motion(state, &mut ctx);
+            }
             // A press that began on the row keeps every mouse event until it ends.
             let handled = if is_mouse && state.strip.holds_mouse() {
                 match state.strip.handle(&event, &mut ctx) {
@@ -1179,6 +1400,7 @@ impl Shared {
             state.strip.set_high_contrast(contrast);
             changed
         });
+        self.motion_settings_changed();
         self.apply_frame();
         if changed == Some(true) {
             self.invalidate_all();
@@ -1303,16 +1525,11 @@ impl Shared {
             return outer;
         }
         let client = self.screen_to_client(xy(l));
-        let at = Point {
-            x: Dip(client.x as f32),
-            y: Dip(client.y as f32),
-        };
-        let scale = self.scale();
+        let at = self.dips(client);
+        // During a slide, the + drawn here takes the click, and not the empty row that will
+        // be here. Otherwise a click on it would start a move of the window.
         let code = self.with_state(WM_NCHITTEST, |state| {
-            hit_code(
-                caption_hit(at, scale, &state.strip),
-                state.strip.frame_mode(),
-            )
+            hit_code(state.strip.drawn_hit_test(at), state.strip.frame_mode())
         });
         LRESULT(code.unwrap_or(HTCLIENT) as isize)
     }
@@ -1321,7 +1538,10 @@ impl Shared {
     fn refresh_text_settings(&self, hwnd: HWND) {
         match self.with_state(WM_DISPLAYCHANGE, |s| s.renderer.refresh(hwnd.0)) {
             Some(Ok(true)) => {
-                self.with_state(WM_DISPLAYCHANGE, |s| s.needs_draw = true);
+                self.with_state(WM_DISPLAYCHANGE, |s| {
+                    s.needs_draw = true;
+                    s.needs_painter = true;
+                });
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -1331,6 +1551,7 @@ impl Shared {
         }
     }
     fn on_dpi_changed(&self, hwnd: HWND, w: WPARAM, l: LPARAM) {
+        self.finish_motion();
         let dpi = (w.0 & 0xffff) as u32;
         self.dpi.set(dpi);
         if let Some(Err(e)) = self.with_state(WM_DPICHANGED, |s| s.renderer.renderer().set_dpi(dpi))
@@ -1370,13 +1591,14 @@ impl Shared {
                 return (None, mode);
             }
             state.needs_draw = false;
+            let whole = std::mem::take(&mut state.needs_painter);
             let mut list = std::mem::take(&mut state.list);
             list.commands.clear();
             let frame = ContentFrame {
                 rect: state.content_rect(),
                 theme: state.theme,
             };
-            (Some((list, frame)), mode)
+            (Some((list, frame, whole)), mode)
         });
         let Some((job, mode)) = job else {
             unsafe {
@@ -1384,7 +1606,12 @@ impl Shared {
             }
             return;
         };
-        let list = job.map(|(mut list, frame)| {
+        let list = job.map(|(mut list, frame, whole)| {
+            // An animation frame has nothing to do with the text.
+            if !whole {
+                self.motion_stats.borrow_mut().frames += 1;
+                return (list, false);
+            }
             list.push(DrawCommand::FillRect {
                 rect: frame.rect,
                 color: frame.theme.text_background,
@@ -1399,7 +1626,7 @@ impl Shared {
                     *slot = Some(painter);
                 }
             }
-            list
+            (list, true)
         });
         let problems = self.with_state(WM_PAINT, |state| state.paint(list, dc.0, rect));
         for problem in problems.unwrap_or_default() {
@@ -1575,13 +1802,15 @@ impl Shared {
     /// Opens a menu under `anchor`, in client dips, and returns at once. The menu runs on
     /// the window's normal message loop.
     fn open_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
+        // Moving along the bar shows the next menu whole, with no second reveal.
+        let moving_along = self.answering_group.get() && self.menu_active.get();
         // A switch between labels: the old menu goes, and the bar stays as it is. Any other
         // menu, such as a context menu, takes over from the bar.
         self.end_menu(MenuEnd::Silent);
         if !self.answering_group.get() {
             self.bar_action(|bar, ctx| bar.leave(ctx));
         }
-        let opened = self.start_menu(model, anchor);
+        let opened = self.start_menu(model, anchor, moving_along);
         if let Err(problem) = &opened {
             self.end_menu(MenuEnd::Silent);
             self.bar_action(|bar, ctx| bar.close_popup(ctx));
@@ -1589,7 +1818,12 @@ impl Shared {
         }
         opened
     }
-    fn start_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
+    fn start_menu(
+        self: &Rc<Self>,
+        model: MenuModel,
+        anchor: ApiRect,
+        moving_along: bool,
+    ) -> Result<(), ShellError> {
         if self.popup_renderers.borrow().is_none() {
             return Err(ShellError::Menu(
                 "the owner has not called set_popup_renderers".into(),
@@ -1661,8 +1895,18 @@ impl Shared {
         // A hidden window's menu stays hidden too.
         let on_screen = unsafe { IsWindowVisible(owner) }.as_bool();
         let mut run = MenuRun::new(owner, scale, on_screen, view, messages);
+        let contrast = self
+            .with_state(WM_KEYDOWN, |state| state.contrast.is_some())
+            .unwrap_or(false);
+        if !self.motion_is_off(contrast) {
+            run.windows.set_open_parts(
+                if moving_along { 1.0 } else { BAR_MENU_START },
+                SUBMENU_START,
+            );
+        }
         self.menu_active.set(true);
-        let synced = run.windows.sync(&run.view);
+        let now = self.clock.borrow().now_ms();
+        let synced = run.sync(now);
         let made = run.root().is_some();
         *self.menu.borrow_mut() = Some(run);
         if let Err(problem) = synced {
@@ -1673,6 +1917,7 @@ impl Shared {
             self.report(ShellError::Menu(problem));
         }
         self.paint_menu();
+        self.sync_anim_timer();
         Ok(())
     }
     fn paint_menu(&self) {
@@ -1705,6 +1950,7 @@ impl Shared {
                 MenuEnd::Silent => {}
             }
         }
+        self.sync_anim_timer();
     }
     fn drop_menu_run(&self, mut run: MenuRun) {
         if run.timer_set
@@ -1763,13 +2009,15 @@ impl Shared {
                 .extend(commands.into_iter().map(ShellEvent::RunCommand));
             return handled;
         }
-        if let Err(problem) = run.windows.sync(&run.view) {
+        let now = self.clock.borrow().now_ms();
+        if let Err(problem) = run.sync(now) {
             self.report(ShellError::Menu(problem));
         }
         *self.menu.borrow_mut() = Some(run);
         if repaint {
             self.paint_menu();
         }
+        self.sync_anim_timer();
         handled
     }
     fn set_menu_timer(&self, run: &mut MenuRun, ms: u32) {
@@ -1798,7 +2046,8 @@ impl Shared {
         let now_us = u64::from(unsafe { GetMessageTime() } as u32) * 1000;
         let opened = run.view.tick(now_us).is_some();
         if opened {
-            if let Err(problem) = run.windows.sync(&run.view) {
+            let now = self.clock.borrow().now_ms();
+            if let Err(problem) = run.sync(now) {
                 self.report(ShellError::Menu(problem));
             }
         } else if run.view.waiting_for_submenu() {
@@ -1807,6 +2056,7 @@ impl Shared {
         *self.menu.borrow_mut() = Some(run);
         if opened {
             self.paint_menu();
+            self.sync_anim_timer();
         }
     }
     /// The popups can go before their notice arrives. Nothing queued behind that may reach
@@ -2092,18 +2342,34 @@ impl Shared {
                 self.on_menu_timer();
                 LRESULT(0)
             }
+            WM_TIMER if w.0 as u32 == ANIM_TIMER => {
+                self.on_anim_timer();
+                LRESULT(0)
+            }
+            WM_SHOWWINDOW => {
+                if w.0 == 0 {
+                    self.finish_motion();
+                }
+                default()
+            }
             WM_NCCALCSIZE => self.on_nccalcsize(hwnd, w, l),
             WM_NCHITTEST => self.on_nchittest(hwnd, w, l),
             WM_CREATE if self.fault == Some(TestFault::FailWmCreate) => LRESULT(-1),
             WM_ERASEBKGND => LRESULT(1),
             WM_SIZE => {
-                if w.0 as u32 != SIZE_MINIMIZED {
+                if w.0 as u32 == SIZE_MINIMIZED {
+                    self.finish_motion();
+                } else {
                     self.on_size(false);
                 }
                 LRESULT(0)
             }
             WM_SETTINGCHANGE | WM_THEMECHANGED => {
+                if msg == WM_SETTINGCHANGE {
+                    self.read_animation_setting();
+                }
                 self.refresh_theme();
+                self.motion_settings_changed();
                 if msg == WM_SETTINGCHANGE {
                     self.refresh_text_settings(hwnd);
                 }
@@ -2237,7 +2503,15 @@ impl Shared {
                 if self.tracking.get() == ended {
                     self.tracking.set(Tracking::None);
                 }
-                self.strip_action(msg, |strip, ctx| strip.pointer_left(ctx));
+                // From a tab to the empty row counts as leaving too. The widths stay held.
+                let stays = self.cursor_is_in_hold_zone();
+                self.strip_action(msg, |strip, ctx| {
+                    if stays {
+                        strip.pointer_moved_off(ctx);
+                    } else {
+                        strip.pointer_left(ctx);
+                    }
+                });
                 self.bar_action(|bar, ctx| bar.pointer_left(ctx));
                 self.queue
                     .borrow_mut()
@@ -2402,6 +2676,7 @@ impl Shared {
                 LRESULT(0)
             }
             WM_CLOSE => {
+                self.finish_motion();
                 // The owner answers. Unsaved work may need a question first.
                 self.queue
                     .borrow_mut()
@@ -2409,6 +2684,7 @@ impl Shared {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                self.finish_motion();
                 self.queue
                     .borrow_mut()
                     .push_back(ShellEvent::WindowDestroyed);
@@ -2606,6 +2882,8 @@ impl ShellHandle {
                 .state
                 .try_borrow_mut()
                 .map_err(|_| ShellError::Reentered { message: 0 })?;
+            let off = shared.motion_is_off(state.contrast.is_some());
+            state.strip.set_motion_off(off);
             let result = f(&mut state.strip);
             (
                 result,
@@ -2621,6 +2899,59 @@ impl ShellHandle {
         shared.apply(requests, events);
         shared.dispatch();
         Ok(result)
+    }
+    /// For a test or a bench: `Some(true)` runs motion even in a hidden window, and
+    /// `Some(false)` stops it. `None` goes back to what the window's state says.
+    #[doc(hidden)]
+    pub fn force_motion(&self, on: Option<bool>) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        shared.motion_forced.set(on);
+        shared.motion_settings_changed();
+        Ok(())
+    }
+    /// For a test: takes the place of Windows' setting until the next `WM_SETTINGCHANGE`.
+    #[doc(hidden)]
+    pub fn set_animation_setting_off(&self, off: bool) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        shared.animation_setting_off.set(off);
+        shared.motion_settings_changed();
+        Ok(())
+    }
+    /// For a test: where the leave notice finds the cursor, in client pixels.
+    #[doc(hidden)]
+    pub fn set_test_cursor(&self, at: Option<(i32, i32)>) -> Result<(), ShellError> {
+        self.live()?
+            .test_cursor
+            .set(at.map(|(x, y)| POINT { x, y }));
+        Ok(())
+    }
+    /// For a test: motion reads this clock, in the row and in menus.
+    #[doc(hidden)]
+    pub fn set_motion_clock(&self, clock: Clock) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        *shared.clock.borrow_mut() = clock.clone();
+        shared.with_state(WM_TIMER, |state| state.strip.set_motion_clock(clock));
+        Ok(())
+    }
+    /// For a test: what the window would do on the next `ANIM_TIMER`.
+    #[doc(hidden)]
+    pub fn motion_tick(&self) -> Result<(), ShellError> {
+        let shared = self.live()?;
+        shared.on_anim_timer();
+        Ok(())
+    }
+    /// True while the window's animation timer runs.
+    pub fn motion_timer_running(&self) -> Result<bool, ShellError> {
+        Ok(self.live()?.anim_timer_on.get())
+    }
+    /// Shows every end state at once.
+    pub fn finish_motion(&self) -> Result<(), ShellError> {
+        self.live()?.finish_motion();
+        Ok(())
+    }
+    /// What the animation frames have cost so far.
+    pub fn motion_stats(&self) -> Result<MotionStats, ShellError> {
+        Ok(self.live()?.motion_stats.borrow().clone())
     }
     pub fn add_tab(&self, tab: Tab) -> Result<TabId, ShellError> {
         self.with_strip(|strip| strip.add_tab(tab))
@@ -3055,6 +3386,12 @@ impl ShellWindow {
         }
         let t = ShellTokens::from_theme(&Theme::new(ThemeKind::Light));
         let shared = Rc::new(Shared {
+            clock: RefCell::new(Clock::real()),
+            motion_forced: Cell::new(None),
+            animation_setting_off: Cell::new(false),
+            anim_timer_on: Cell::new(false),
+            test_cursor: Cell::new(None),
+            motion_stats: RefCell::default(),
             waker: ShellWaker {
                 hwnd: Arc::new(AtomicIsize::new(0)),
                 posted: Arc::new(AtomicBool::new(false)),
@@ -3090,6 +3427,7 @@ impl ShellWindow {
                 dark: false,
                 contrast: None,
                 needs_draw: true,
+                needs_painter: true,
                 size: (0, 0),
                 client_dips: (0.0, 0.0),
                 saved: None,
@@ -3164,6 +3502,7 @@ impl ShellWindow {
                 message: "forced by a test".into(),
             });
         }
+        shared.read_animation_setting();
         shared.refresh_theme();
         // Without this the first frame keeps the standard title bar until a resize.
         let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;

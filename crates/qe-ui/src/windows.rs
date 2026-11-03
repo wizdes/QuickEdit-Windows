@@ -161,6 +161,8 @@ struct PopupState {
     shown: Cell<bool>,
     alive: Cell<bool>,
     adopted: Cell<bool>,
+    /// Where the whole level will be, while its window shows only the top of it.
+    final_rect: Cell<Option<RECT>>,
     handlers: Handlers,
 }
 thread_local! {
@@ -185,9 +187,18 @@ impl PopupGroup {
     fn on_a_level(&self, point: POINT) -> bool {
         self.members().iter().any(|member| {
             let mut rect = RECT::default();
-            // SAFETY: `rect` is a valid out pointer. A dead handle returns an error.
+            // A level that is still revealing itself counts at its final size, so that a row
+            // is there for a press from the first moment.
+            let known = match member.final_rect.get() {
+                Some(whole) => {
+                    rect = whole;
+                    true
+                }
+                // SAFETY: `rect` is a valid out pointer. A dead handle returns an error.
+                None => unsafe { GetWindowRect(member.hwnd.get(), &mut rect) }.is_ok(),
+            };
             member.shown.get()
-                && unsafe { GetWindowRect(member.hwnd.get(), &mut rect) }.is_ok()
+                && known
                 && point.x >= rect.left
                 && point.x < rect.right
                 && point.y >= rect.top
@@ -500,6 +511,7 @@ impl PopupWindow {
             shown: Cell::new(false),
             alive: Cell::new(true),
             adopted: Cell::new(false),
+            final_rect: Cell::new(None),
             handlers: Handlers::default(),
         });
         let raw = Rc::into_raw(state.clone());
@@ -683,6 +695,10 @@ impl PopupWindow {
             )
         }
     }
+    /// Says where this whole level will be, while its window shows only the top of it.
+    pub fn set_final_rect(&self, rect: RECT) {
+        self.state.final_rect.set(Some(rect));
+    }
     /// Hides all levels of the group and gives focus back.
     pub fn dismiss(&self) {
         self.state.group.dismiss(PopupDismissed::Caller);
@@ -734,6 +750,11 @@ pub struct MenuWindows {
     on_screen: bool,
     levels: Vec<PopupWindow>,
     level_setup: Option<LevelSetup>,
+    /// How much of each level's height its window shows, from the top. Rows do not move, so
+    /// that what is drawn and what is hit agree from the first frame.
+    shown_parts: Vec<f32>,
+    /// What a new first level and a new submenu start at.
+    open_parts: (f32, f32),
 }
 /// Runs once for each new level, with its depth, before the level shows.
 pub type LevelSetup = Box<dyn FnMut(usize, &PopupWindow)>;
@@ -746,7 +767,43 @@ impl MenuWindows {
             on_screen: true,
             levels: Vec::new(),
             level_setup: None,
+            shown_parts: Vec::new(),
+            open_parts: (1.0, 1.0),
         }
+    }
+    /// How much of its height a new level shows at first: the first level, then a submenu.
+    pub fn set_open_parts(&mut self, first: f32, submenu: f32) {
+        self.open_parts = (first, submenu);
+    }
+    /// How much of its height this level shows now.
+    pub fn shown_part(&self, depth: usize) -> f32 {
+        self.shown_parts.get(depth).copied().unwrap_or(1.0)
+    }
+    /// Shows this much of a level, from its top. Its pixels are ready, so no drawing follows.
+    pub fn set_shown_part(
+        &mut self,
+        depth: usize,
+        part: f32,
+        menu: &MenuView,
+    ) -> Result<(), String> {
+        let rects = menu.levels();
+        let (Some(slot), Some(level), Some(r)) = (
+            self.shown_parts.get_mut(depth),
+            self.levels.get(depth),
+            rects.get(depth),
+        ) else {
+            return Ok(());
+        };
+        *slot = part;
+        let (x, y, w, h) = (
+            (r.x.0 * self.scale).round() as i32,
+            (r.y.0 * self.scale).round() as i32,
+            (r.width.0 * self.scale).round() as i32,
+            (r.height.0 * self.scale).round() as i32,
+        );
+        level
+            .move_to(x, y, w, ((h as f32 * part).round() as i32).max(1))
+            .map_err(|e| format!("revealing a menu level: {e}"))
     }
     /// Gives each new level its handlers, so that a host can run on the normal message
     /// loop: `PopupWindow::set_message_handler` gets the mouse messages.
@@ -783,6 +840,7 @@ impl MenuWindows {
         let rects = menu.levels();
         // Deepest first, so that a parent never goes while its child is listed.
         self.levels.truncate(rects.len());
+        self.shown_parts.truncate(rects.len());
         let mut problem = None;
         for (depth, r) in rects.iter().enumerate() {
             let (x, y, w, h) = (
@@ -791,16 +849,31 @@ impl MenuWindows {
                 (r.width.0 * self.scale).round() as i32,
                 (r.height.0 * self.scale).round() as i32,
             );
+            let whole = RECT {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            };
+            let shown = |part: f32| ((h as f32 * part).round() as i32).max(1);
             if let Some(level) = self.levels.get(depth) {
                 level
-                    .move_to(x, y, w, h)
+                    .move_to(x, y, w, shown(self.shown_part(depth)))
                     .map_err(|e| format!("moving a menu level: {e}"))?;
+                level.set_final_rect(whole);
             } else {
+                let part = if depth == 0 {
+                    self.open_parts.0
+                } else {
+                    self.open_parts.1
+                };
                 let made = match self.levels.last() {
-                    Some(parent) => parent.create_level(x, y, w, h),
-                    None => PopupWindow::create(self.owner, x, y, w, h),
+                    Some(parent) => parent.create_level(x, y, w, shown(part)),
+                    None => PopupWindow::create(self.owner, x, y, w, shown(part)),
                 }
                 .map_err(|e| format!("making a menu level: {e}"))?;
+                made.set_final_rect(whole);
+                self.shown_parts.push(part);
                 if let Some(setup) = &mut self.level_setup {
                     setup(depth, &made);
                 }

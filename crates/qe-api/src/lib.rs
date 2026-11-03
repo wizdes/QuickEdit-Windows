@@ -5,6 +5,7 @@ mod display;
 mod encoding;
 mod input;
 mod layout;
+pub mod motion;
 mod render;
 mod replay;
 mod settings;

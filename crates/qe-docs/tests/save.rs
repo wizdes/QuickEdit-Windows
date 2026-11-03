@@ -958,7 +958,7 @@ fn close_with_save_on_untitled_goes_through_the_dialog_and_cancel_stops_it() {
 }
 
 #[test]
-fn closing_a_window_reviews_each_tab_and_a_cancel_stops_the_rest() {
+fn closing_a_window_asks_first_and_closes_every_tab_after_the_last_answer() {
     let folder = test_folder("save-close-window");
     let mut h = Harness::new(&folder.join("root"));
     let (window, a) = h.store.new_window(false).unwrap();
@@ -970,16 +970,13 @@ fn closing_a_window_reviews_each_tab_and_a_cancel_stops_the_rest() {
     let question = h.question("about the first tab");
     assert_eq!(question.doc, a);
     h.store.answer(question.id, Answer::DontSave).unwrap();
-    assert!(
-        h.store.view(b).is_none(),
-        "a blank tab goes with no question"
+    assert_eq!(
+        h.store.tabs(window),
+        vec![a, b, c],
+        "no tab closes while a question is still to come"
     );
     let question = h.question("about the third tab");
     assert_eq!(question.doc, c);
-    h.store.answer(question.id, Answer::Cancel).unwrap();
-    assert_eq!(h.store.tabs(window), vec![c]);
-    h.store.request_close_window(window);
-    let question = h.question("about the third tab again");
     h.store.answer(question.id, Answer::DontSave).unwrap();
     assert_eq!(h.store.windows(), Vec::new());
     h.pump();
@@ -987,6 +984,126 @@ fn closing_a_window_reviews_each_tab_and_a_cancel_stops_the_rest() {
         h.count(|e| matches!(e, DocEvent::WindowClosed(w) if *w == window)),
         1
     );
+}
+
+#[test]
+fn a_cancel_while_closing_a_window_leaves_every_tab_as_it_was() {
+    let folder = test_folder("save-close-window-cancel");
+    let path = folder.join("clean.txt");
+    write(&path, b"on disk");
+    let mut h = Harness::new(&folder.join("root"));
+    let clean = h.open(&path);
+    let window = h.store.window_of(clean).unwrap();
+    let blank = h.store.new_tab(window).unwrap();
+    let first = h.store.new_tab(window).unwrap();
+    let second = h.store.new_tab(window).unwrap();
+    h.type_text(first, "first");
+    h.type_text(second, "second");
+    let all = h.store.tabs(window);
+    assert_eq!(all, vec![clean, blank, first, second]);
+    h.store.request_close_window(window);
+    let question = h.question("about the first dirty tab");
+    assert_eq!(question.doc, first);
+    assert_eq!(
+        h.store.tabs(window),
+        all,
+        "the clean tabs wait for the answers"
+    );
+    h.store.answer(question.id, Answer::DontSave).unwrap();
+    let question = h.question("about the second dirty tab");
+    assert_eq!(question.doc, second);
+    h.store.answer(question.id, Answer::Cancel).unwrap();
+    h.pump();
+    assert_eq!(h.store.tabs(window), all, "Cancel closes nothing");
+    assert_eq!(
+        h.text(first),
+        "first",
+        "a Don't Save before a Cancel loses nothing"
+    );
+    assert!(h.store.is_dirty(first));
+    assert_eq!(h.count(|e| matches!(e, DocEvent::DocClosed(_))), 0);
+    // A later Close starts anew: the earlier Don't Save no longer counts.
+    h.store.request_close_window(window);
+    let question = h.question("about the first dirty tab again");
+    assert_eq!(question.doc, first);
+    h.store.answer(question.id, Answer::Cancel).unwrap();
+}
+
+#[test]
+fn a_save_while_closing_a_window_keeps_its_tab_until_the_last_answer() {
+    let folder = test_folder("save-close-window-save");
+    let path = folder.join("doc.txt");
+    write(&path, b"old");
+    let mut h = Harness::new(&folder.join("root"));
+    let saved = h.open(&path);
+    let window = h.store.window_of(saved).unwrap();
+    let other = h.store.new_tab(window).unwrap();
+    h.caret_to_end(saved);
+    h.type_text(saved, "+new");
+    h.type_text(other, "words");
+    h.store.request_close_window(window);
+    let question = h.question("about the file");
+    assert_eq!(question.doc, saved);
+    h.store.answer(question.id, Answer::Save).unwrap();
+    let question = h.question("about the other tab");
+    assert_eq!(question.doc, other);
+    assert_eq!(std::fs::read(&path).unwrap(), b"old+new");
+    assert_eq!(h.store.tabs(window), vec![saved, other]);
+    // Cancel keeps both. The save stands, as it was the person's own answer.
+    h.store.answer(question.id, Answer::Cancel).unwrap();
+    h.pump();
+    assert_eq!(h.store.tabs(window), vec![saved, other]);
+    assert!(!h.store.is_dirty(saved));
+    // All answered: everything closes.
+    h.store.request_close_window(window);
+    let question = h.question("about the other tab again");
+    h.store.answer(question.id, Answer::DontSave).unwrap();
+    assert_eq!(h.store.windows(), Vec::new());
+}
+
+#[test]
+fn a_save_as_dialog_cancelled_while_closing_a_window_closes_nothing() {
+    let folder = test_folder("save-close-window-panel");
+    let path = folder.join("clean.txt");
+    write(&path, b"on disk");
+    let mut h = Harness::new(&folder.join("root"));
+    let clean = h.open(&path);
+    let window = h.store.window_of(clean).unwrap();
+    let untitled = h.store.new_tab(window).unwrap();
+    h.type_text(untitled, "words");
+    h.store.request_close_window(window);
+    let question = h.question("about the untitled tab");
+    h.store.answer(question.id, Answer::Save).unwrap();
+    h.pump();
+    assert_eq!(h.count(|e| matches!(e, DocEvent::NeedsSavePanel(_))), 1);
+    h.store.panel_cancelled(untitled);
+    h.pump();
+    assert_eq!(h.store.tabs(window), vec![clean, untitled]);
+    assert_eq!(h.text(untitled), "words");
+    assert!(h.store.open_questions().is_empty(), "the close has ended");
+}
+
+#[test]
+fn a_tab_opened_or_typed_in_during_the_questions_counts() {
+    let folder = test_folder("save-close-window-late");
+    let mut h = Harness::new(&folder.join("root"));
+    let (window, a) = h.store.new_window(false).unwrap();
+    let b = h.store.new_tab(window).unwrap();
+    h.type_text(a, "a");
+    h.type_text(b, "b");
+    h.store.request_close_window(window);
+    let question = h.question("about the first tab");
+    h.store.answer(question.id, Answer::DontSave).unwrap();
+    // The first tab's text changes after its answer, so the answer no longer covers it.
+    h.type_text(a, " more");
+    let question = h.question("about the second tab");
+    assert_eq!(question.doc, b);
+    h.store.answer(question.id, Answer::DontSave).unwrap();
+    let question = h.question("about the first tab's new text");
+    assert_eq!(question.doc, a);
+    h.store.answer(question.id, Answer::Cancel).unwrap();
+    assert_eq!(h.store.tabs(window), vec![a, b]);
+    assert_eq!(h.text(a), "a more");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! The window's renderer: `BitmapRenderer`, plus fonts by id, timers and saved pictures.
 use crate::timing::Timing;
 use qe_api::{Bitmap, Dip, DisplayList, DrawCommand, PixelRect, Rect, RenderError, Renderer};
-use qe_render::{BitmapRenderer, TextSettings};
+use qe_render::BitmapRenderer;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -93,7 +93,7 @@ impl Renderer for AppRenderer {
 
 /// A renderer for a menu or a dialog, at this size in device pixels.
 pub fn popup_renderer(width: u32, height: u32) -> Result<Box<dyn Renderer>, RenderError> {
-    let mut renderer = BitmapRenderer::new(width, height)?;
-    renderer.set_text_settings(TextSettings::reference())?;
+    // It keeps the system's text settings, as the window behind it does.
+    let renderer = BitmapRenderer::new(width, height)?;
     Ok(Box::new(renderer))
 }

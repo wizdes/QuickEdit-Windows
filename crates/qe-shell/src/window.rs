@@ -27,7 +27,8 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
+    WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
@@ -2859,10 +2860,18 @@ impl ShellHandle {
         }
         Ok(())
     }
-    pub fn kill_timer(&self, id: u32) -> Result<(), ShellError> {
+    /// Stops a timer, and says whether one was running. A timer that is not running is no
+    /// error: `KillTimer` then fails and leaves the last error at 0.
+    pub fn kill_timer(&self, id: u32) -> Result<bool, ShellError> {
         let shared = self.live()?;
-        unsafe { KillTimer(Some(shared.hwnd.get()), id as usize) }
-            .map_err(|e| win32("KillTimer", e))
+        // SAFETY: plain calls. The last error starts at 0 so that an old value cannot pass
+        // for this call's own.
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        match unsafe { KillTimer(Some(shared.hwnd.get()), id as usize) } {
+            Ok(()) => Ok(true),
+            Err(e) if e.code().is_ok() => Ok(false),
+            Err(e) => Err(win32("KillTimer", e)),
+        }
     }
     /// Carries out what an owner's own view asked for in its `ViewContext`.
     pub fn apply_requests(&self, requests: Vec<ViewRequest>) -> Result<(), ShellError> {

@@ -657,6 +657,75 @@ fn a_file_already_open_raises_its_own_window() {
     app.quit();
 }
 
+/// The real time of a second launch, by Windows' own record of the process. Set
+/// `QE_TEST_EXE` to the release build to read the number the user meets.
+#[test]
+fn a_second_launch_reports_its_time_and_windows_agrees() {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{FILETIME, HANDLE};
+    use windows::Win32::System::Threading::GetProcessTimes;
+
+    let folder = Folder::new("second-launch-time");
+    let root = folder.root();
+    let first = folder.file("first.txt", b"first");
+    let later = folder.file("later.txt", b"later");
+    let mut app = App::start(&root, &[&first]);
+    app.wait_text("first");
+    let mut samples = Vec::new();
+    for round in 0..5 {
+        let log = folder.0.join(format!("second-{round}.txt"));
+        let started = std::time::Instant::now();
+        let mut child = Command::new(exe())
+            .arg("--timings")
+            .arg("--hidden")
+            .arg("--data-root")
+            .arg(&root)
+            .arg(&later)
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let waited = started.elapsed().as_secs_f64() * 1000.0;
+        let empty = FILETIME::default();
+        let (mut created, mut exited, mut kernel, mut user) = (empty, empty, empty, empty);
+        // SAFETY: `child` still holds its handle, and the four values live through the call.
+        unsafe {
+            GetProcessTimes(
+                HANDLE(child.as_raw_handle()),
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        }
+        .unwrap();
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        let lived = (ticks(exited) - ticks(created)) as f64 / 10_000.0;
+        let said = std::fs::read_to_string(&log).unwrap();
+        let line = said
+            .lines()
+            .find(|line| line.starts_with("second launch:"))
+            .unwrap_or_else(|| panic!("no second-launch time in {said}"));
+        println!("{line}; Windows says it lived {lived:.3} ms; the parent waited {waited:.3} ms");
+        let handed: f64 = line
+            .split("handed off after ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no number in {line}"));
+        assert!(handed > 0.0, "{line}");
+        // The clock behind `lived` ticks coarsely, so the app's own number may pass it a little.
+        assert!(handed <= lived + 20.0, "{line}, lived {lived}");
+        samples.push(lived);
+    }
+    app.wait_for("the later file", |app| {
+        app.windows().iter().flatten().count() >= 2
+    });
+    app.quit();
+    samples.sort_by(f64::total_cmp);
+    println!("a second launch lives {:.3} ms at the median", samples[2]);
+}
+
 fn second_launch(root: &Path, file: &Path) -> std::process::Child {
     Command::new(exe())
         .arg("--test-channel")

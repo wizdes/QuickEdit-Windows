@@ -1593,8 +1593,9 @@ impl EditorView {
         self.place(self.caret, self.affinity).is_some_and(|place| {
             let sideways = self.wrap
                 || !place.x_known
-                || (place.x >= self.scroll_x
-                    && place.x <= self.scroll_x + f64::from(self.laid_width.0));
+                || (place.x + f64::from(self.text_padding()) >= self.scroll_x
+                    && place.x + f64::from(self.text_padding())
+                        <= self.scroll_x + f64::from(self.laid_width.0));
             sideways
                 && place.y + f64::from(place.height) > self.scroll
                 && place.y < self.scroll + view
@@ -1630,7 +1631,8 @@ impl EditorView {
         if !self.wrap && place.x_known {
             self.widest = self.widest.max(place.x);
             let width = f64::from(self.bounds.width.0);
-            let on_screen = place.x >= self.scroll_x && place.x <= self.scroll_x + width - 2.0;
+            let in_view = place.x + f64::from(self.text_padding());
+            let on_screen = in_view >= self.scroll_x && in_view <= self.scroll_x + width - 2.0;
             // A reveal leaves the view where it is sideways when the text already shows.
             if reveal.is_none() || !on_screen {
                 self.scroll_x = place.x.clamp(0.0, self.max_scroll_x());
@@ -1662,7 +1664,9 @@ impl EditorView {
                 - f64::from(self.bounds.width.0))
             .max(0.0),
             None | Some(_) if self.wrap => 0.0,
-            _ => (self.widest + 2.0 - f64::from(self.bounds.width.0)).max(0.0),
+            _ => (self.widest + 2.0 + f64::from(self.hooks.padding) * 2.0
+                - f64::from(self.bounds.width.0))
+            .max(0.0),
         }
     }
     fn clamp_scroll(&mut self) {
@@ -1686,7 +1690,7 @@ impl EditorView {
         self.laid_width = bounds.width;
         if width_changed {
             // A long line's segment edges follow the width.
-            self.engine = Arc::new(self.engine.with_full_rows_at(bounds.width));
+            self.engine = Arc::new(self.engine.with_full_rows_at(self.full_rows_width()));
             if let Err(e) = self.restart_layout() {
                 self.set_warning(e, false);
             }
@@ -2598,10 +2602,12 @@ impl EditorView {
         }
         if (!self.wrap || self.hooks.page.is_some()) && place.x_known {
             let width = f64::from(self.bounds.width.0);
-            let x = place.x + f64::from(self.page_margin());
+            let padding = f64::from(self.text_padding());
+            let x = place.x + f64::from(self.page_margin()) + padding;
             self.widest = self.widest.max(place.x);
-            if x < self.scroll_x {
-                self.scroll_x = x;
+            if x < self.scroll_x + padding {
+                // Back to the line's start, the padding comes back into view too.
+                self.scroll_x = (x - padding).max(0.0);
             } else if x > self.scroll_x + width - 2.0 {
                 self.scroll_x = (x - width + 2.0).max(0.0);
             }
@@ -3330,7 +3336,8 @@ impl EditorView {
     }
     fn cols(&self) -> usize {
         if self.wrap {
-            ((self.bounds.width.0 / self.cell_width).floor() as usize).max(1)
+            (((self.bounds.width.0 - self.text_padding() * 2.0) / self.cell_width).floor() as usize)
+                .max(1)
         } else {
             usize::MAX / 4
         }
@@ -4713,7 +4720,7 @@ impl View for EditorView {
                         frame.y = self.bounds.y.0 + (line_top + offset - self.scroll) as f32;
                     } else {
                         // A distance from the view, which an f32 holds exactly enough.
-                        frame.x = self.bounds.x.0 + (offset - self.scroll_x) as f32;
+                        frame.x = self.text_left() + (offset - self.scroll_x) as f32;
                     }
                     frame.caret =
                         (caret_segment == Some(segment)).then_some((self.caret, self.affinity));

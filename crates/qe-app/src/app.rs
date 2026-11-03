@@ -257,6 +257,7 @@ fn start(mut args: Args) -> Result<i32, String> {
         }
         Instant::now()
     });
+    let main_began = process_start.elapsed();
     let (root, throwaway) = data_root(&mut args)?;
     let wake_window = Rc::new(WakeWindow::create()?);
     let wake: Wake = wake_window.waker();
@@ -279,7 +280,8 @@ fn start(mut args: Args) -> Result<i32, String> {
         LaunchRole::HandedOff => {
             if args.timings {
                 eprintln!(
-                    "second launch: handed off after {:.3} ms from process creation",
+                    "second launch: main began after {:.3} ms, handed off after {:.3} ms from process creation",
+                    main_began.as_secs_f64() * 1000.0,
                     process_start.elapsed().as_secs_f64() * 1000.0
                 );
             }

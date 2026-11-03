@@ -65,9 +65,12 @@ fn window_pixels(app: &App, dpi: u32, top_dips: f32) -> (i32, i32) {
         .unwrap_or(30)
         .clamp(5, 500) as f32;
     let scale = dpi as f32 / 96.0;
-    // Two lines less one line is one row with its gap. The map takes 100 dips on the right.
+    // Two lines less one line is one row with its gap. The map takes 100 dips on the right,
+    // and the text has its padding on both sides, as the Mac's `initialContentSize` has.
     let row = (measure("0\n0").height.0 - measure("0").height.0).max(1.0);
-    let width = chars * measure("0000000000").width.0 / 10.0 + qe_views_map_width();
+    let width = chars * measure("0000000000").width.0 / 10.0
+        + qe_views::TEXT_PADDING * 2.0
+        + qe_views_map_width();
     let height = lines * row + top_dips;
     (
         (width * scale).ceil() as i32,

@@ -535,6 +535,13 @@ enum QuestionUse {
     QuitReview,
 }
 
+/// A window whose Close is asking its questions.
+struct WindowClosing {
+    window: WindowId,
+    /// Each Don't Save, with the revision that the answer was about.
+    discard: Vec<(DocId, u64)>,
+}
+
 struct OpenQuestion {
     question: Question,
     usage: QuestionUse,
@@ -694,6 +701,8 @@ pub struct DocumentStore {
     remote_stat_running: bool,
     stat_waiting: BTreeSet<DocId>,
     close_queue: VecDeque<DocId>,
+    /// A window closing as one. Its tabs stay until every question has its answer.
+    closing_window: Option<WindowClosing>,
     panel_queue: VecDeque<DocId>,
     want_focus: Option<DocId>,
     removals_running: usize,
@@ -772,6 +781,7 @@ impl DocumentStore {
             remote_stat_running: false,
             stat_waiting: BTreeSet::new(),
             close_queue: VecDeque::new(),
+            closing_window: None,
             panel_queue: VecDeque::new(),
             want_focus: None,
             removals_running: 0,
@@ -2351,8 +2361,16 @@ impl DocumentStore {
                 self.save(doc)?;
             }
             (QuestionKind::SaveBeforeClose, Answer::DontSave) => {
-                self.finish_close(doc);
-                self.continue_closing();
+                if self.window_is_closing_with(doc) {
+                    let revision = self.docs.get(&doc).map(|d| d.view.revision());
+                    if let (Some(closing), Some(revision)) = (&mut self.closing_window, revision) {
+                        closing.discard.push((doc, revision));
+                    }
+                    self.continue_window_close();
+                } else {
+                    self.finish_close(doc);
+                    self.continue_closing();
+                }
             }
             (QuestionKind::SaveBeforeClose, _) => self.cancel_closing(doc),
             (QuestionKind::AutosaveFailedAtQuit, Answer::Save) => {
@@ -2421,6 +2439,7 @@ impl DocumentStore {
                     d.close_after_save = false;
                 }
                 self.close_queue.clear();
+                self.closing_window = None;
             }
             (QuestionKind::ChangedOnDisk, _) => self.cancel_closing(doc),
             (QuestionKind::LockedFile { on_edit }, Answer::Unlock) => {
@@ -2544,8 +2563,7 @@ impl DocumentStore {
         if d.read_only && d.path.is_some() && d.file_state != FileState::Deleted {
             // A file too large to edit already holds its text. It is never written over.
             if d.close_after_save {
-                self.finish_close(doc);
-                self.continue_closing();
+                self.close_after_saved(doc);
             }
             return Ok(());
         }
@@ -2659,6 +2677,7 @@ impl DocumentStore {
             d.save_again = false;
         }
         self.close_queue.clear();
+        self.closing_window = None;
         if self.in_quit_review(doc) {
             self.cancel_quit();
         }
@@ -3033,15 +3052,18 @@ impl DocumentStore {
             );
         }
         if close_after {
-            self.finish_close(doc);
-            self.continue_closing();
+            self.close_after_saved(doc);
         } else if self.docs.get(&doc).is_some_and(|d| d.close_after_save) {
             // Typing came during the write, so the question comes again with the new text.
             if let Some(d) = self.docs.get_mut(&doc) {
                 d.close_after_save = false;
             }
-            self.close_queue.push_front(doc);
-            self.continue_closing();
+            if self.window_is_closing_with(doc) {
+                self.continue_window_close();
+            } else {
+                self.close_queue.push_front(doc);
+                self.continue_closing();
+            }
         }
         if again && let Err(error) = self.save(doc) {
             self.events.push(DocEvent::SaveFailed {
@@ -3390,14 +3412,71 @@ impl DocumentStore {
     /// `SaveBeforeClose`.
     pub fn request_close(&mut self, doc: DocId) {
         self.close_queue.clear();
+        self.closing_window = None;
         self.close_queue.push_back(doc);
         self.continue_closing();
     }
 
-    /// Close, for a window: each tab in turn, stopping at a Cancel.
+    /// Close, for a window. Every dirty tab gets its question first, in tab order, and no tab
+    /// closes until all of them have an answer. So a Cancel leaves the window as it was.
     pub fn request_close_window(&mut self, window: WindowId) {
-        self.close_queue = self.tabs(window).into();
-        self.continue_closing();
+        self.close_queue.clear();
+        self.closing_window = Some(WindowClosing {
+            window,
+            discard: Vec::new(),
+        });
+        self.continue_window_close();
+    }
+
+    fn window_is_closing_with(&self, doc: DocId) -> bool {
+        self.closing_window
+            .as_ref()
+            .is_some_and(|closing| self.tabs(closing.window).contains(&doc))
+    }
+
+    /// A save that a close waited on has ended, and the text is safe.
+    fn close_after_saved(&mut self, doc: DocId) {
+        if self.window_is_closing_with(doc) {
+            if let Some(d) = self.docs.get_mut(&doc) {
+                d.close_after_save = false;
+            }
+            self.continue_window_close();
+        } else {
+            self.finish_close(doc);
+            self.continue_closing();
+        }
+    }
+
+    /// The next question of a closing window. With none left, every tab closes at once. The
+    /// tabs are read again each time, so typing or a new tab during a question counts: text
+    /// changed since its Don't Save gets a new question.
+    fn continue_window_close(&mut self) {
+        let Some(closing) = &self.closing_window else {
+            return;
+        };
+        let window = closing.window;
+        let tabs = self.tabs(window);
+        for &doc in &tabs {
+            let Some(d) = self.docs.get(&doc) else {
+                continue;
+            };
+            if d.is_blank_untitled() || !d.is_dirty() {
+                continue;
+            }
+            if closing.discard.contains(&(doc, d.view.revision())) {
+                continue;
+            }
+            // Its Save is running, and its end brings this function back.
+            if d.close_after_save {
+                return;
+            }
+            self.ask_save_before_close(doc);
+            return;
+        }
+        self.closing_window = None;
+        for doc in tabs {
+            self.finish_close(doc);
+        }
     }
 
     fn continue_closing(&mut self) {
@@ -3409,16 +3488,23 @@ impl DocumentStore {
                 self.finish_close(doc);
                 continue;
             }
-            let name = d.display_name();
-            self.ask(
-                doc,
-                QuestionKind::SaveBeforeClose,
-                format!("Do you want to keep the changes you made to \u{201C}{name}\u{201D}?"),
-                "Your changes will be lost if you don't save them.".to_owned(),
-                vec![Answer::Save, Answer::DontSave, Answer::Cancel],
-            );
+            self.ask_save_before_close(doc);
             return;
         }
+    }
+
+    fn ask_save_before_close(&mut self, doc: DocId) {
+        let Some(d) = self.docs.get(&doc) else {
+            return;
+        };
+        let name = d.display_name();
+        self.ask(
+            doc,
+            QuestionKind::SaveBeforeClose,
+            format!("Do you want to keep the changes you made to \u{201C}{name}\u{201D}?"),
+            "Your changes will be lost if you don't save them.".to_owned(),
+            vec![Answer::Save, Answer::DontSave, Answer::Cancel],
+        );
     }
 
     fn finish_close(&mut self, doc: DocId) {
@@ -4717,6 +4803,7 @@ impl DocumentStore {
         self.quitting = true;
         self.quit_ready_sent = false;
         self.close_queue.clear();
+        self.closing_window = None;
         self.panel_queue.clear();
         self.quit_review.clear();
         for d in self.docs.values_mut() {

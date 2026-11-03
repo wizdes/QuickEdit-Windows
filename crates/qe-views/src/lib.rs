@@ -11,7 +11,9 @@ mod page;
 mod system;
 
 pub use fade::{FADE_IN_SECONDS, FADE_OUT_SECONDS, Fade};
-pub use frame::{FrameCounts, LARGE_FILE_BYTES, LARGE_FILE_TITLE_NOTE, MapBox, ViewFrame};
+pub use frame::{
+    FrameCounts, LARGE_FILE_BYTES, LARGE_FILE_TITLE_NOTE, MapBox, TEXT_PADDING, ViewFrame,
+};
 pub use gutter::{
     GUTTER_FONT, GUTTER_LEFT_PADDING, GUTTER_REDRAW_SECONDS, GUTTER_RIGHT_PADDING, GutterLabel,
     gutter_digits, gutter_font_points, gutter_labels, gutter_width,

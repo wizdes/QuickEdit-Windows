@@ -24,6 +24,10 @@ use qe_editor::{ChangesSince, EditorView, PageWrap, VisibleRows};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// The blank space on each side of the text, at 100%. It is `lineFragmentPadding` on the Mac,
+/// 5 points by AppKit's default. It grows with the zoom, as the Mac's magnification scales it.
+/// The Mac leaves `textContainerInset` at zero, so the top has no such space.
+pub const TEXT_PADDING: f32 = 5.0;
 /// Over this many bytes the gutter and the map turn off (`largeFileThreshold` on the Mac).
 pub const LARGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 /// The Mac says nothing about the gutter or the map going. It only has this title note,
@@ -323,6 +327,7 @@ impl ViewFrame {
         editor.apply_font(&self.family, self.base_points * scale, ctx)?;
         self.scale = scale;
         editor.set_page_wrap(self.page_hook(), ctx);
+        editor.set_text_padding(Dip(TEXT_PADDING * scale), ctx);
         self.force_read = true;
         ctx.invalidate(self.bounds);
         self.sync(editor, measure, ctx);
@@ -433,7 +438,7 @@ impl ViewFrame {
     /// uses the font at 100%, and zoom grows the font inside the same text area. So the PDF
     /// needs the area shrunk by the zoom to break its rows where the screen does.
     pub fn window_width_at_100_percent(&self, editor: &EditorView) -> f32 {
-        editor.text_area().width.0 / self.scale
+        editor.text_area().width.0 / self.scale - TEXT_PADDING * 2.0
     }
     /// A problem that stopped the map, in plain words.
     pub fn problem(&self) -> Option<&str> {
@@ -466,6 +471,8 @@ impl ViewFrame {
             self.force_read = true;
             ctx.invalidate(bounds);
         }
+        // Before the editor's first layout, so that the first rows wrap once, not twice.
+        editor.set_text_padding(Dip(TEXT_PADDING * self.scale), ctx);
         editor.layout(bounds, measure);
         self.sync(editor, measure, ctx);
     }

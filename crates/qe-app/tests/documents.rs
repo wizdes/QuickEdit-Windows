@@ -184,6 +184,33 @@ fn the_window_close_message_asks_the_same_question_and_the_last_window_quits() {
 }
 
 #[test]
+fn cancel_at_a_window_close_keeps_the_clean_tabs_and_the_dirty_one() {
+    let folder = Folder::new("close-cancel");
+    let files = [
+        folder.file("hello.txt", b"hello"),
+        folder.file("saved.txt", b"saved"),
+        folder.file("second.txt", b"second"),
+    ];
+    let mut app = App::start(&folder.root(), &[&files[0], &files[1], &files[2]]);
+    app.wait_for("three tabs", |app| app.tab_count() == 3);
+    app.run("NewTab");
+    app.wait_for("the fourth tab", |app| app.tab_count() == 4);
+    app.type_text("unsaved words that must survive");
+    let before = app.windows();
+    app.ok("close-window");
+    app.wait_value("the question", App::alert);
+    assert_eq!(app.tab_count(), 4, "no tab closes before the answer");
+    app.press("Cancel");
+    app.settled();
+    assert_eq!(app.windows(), before, "Cancel leaves the window as it was");
+    assert_eq!(app.text(), "unsaved words that must survive");
+    // Don't Save now closes all four, and the last window ends the app.
+    app.ok("close-window");
+    app.press("Don't Save");
+    app.wait_exit();
+}
+
+#[test]
 fn kill_and_relaunch_keeps_unsaved_text_across_two_windows() {
     let folder = Folder::new("kill");
     let file = folder.file("saved.txt", b"on disk");

@@ -601,6 +601,8 @@ pub(crate) struct HookState {
     pub(crate) outer: Rect,
     pub(crate) left: f32,
     pub(crate) right: f32,
+    /// The blank space on each side of the text, inside the view.
+    pub(crate) padding: f32,
     pub(crate) page: Option<PageWrap>,
     pub(crate) no_background: bool,
     pub(crate) next_task: u64,
@@ -631,6 +633,7 @@ impl Default for HookState {
             outer: Rect::default(),
             left: 0.0,
             right: 0.0,
+            padding: 0.0,
             page: None,
             no_background: false,
             next_task: 0,
@@ -1767,6 +1770,26 @@ impl EditorView {
         self.set_bounds(inner);
         self.after_restart(ctx);
     }
+    /// Blank space on each side of the text: the Mac's line fragment padding. Rows wrap that
+    /// much sooner, and neither a selection nor a copy holds it. A page has its own margins,
+    /// and on the Mac the padding lies inside them, so a page does not move for this.
+    pub fn set_text_padding(&mut self, padding: Dip, ctx: &mut ViewContext) {
+        let padding = padding.0.max(0.0);
+        if padding == self.hooks.padding {
+            return;
+        }
+        self.remember_view();
+        self.hooks.padding = padding;
+        if self.wrap && self.hooks.page.is_none() {
+            self.engine = Arc::new(self.engine.with_full_rows_at(self.full_rows_width()));
+            if let Err(problem) = self.restart_layout() {
+                self.set_warning(problem, false);
+            }
+        }
+        self.clamp_scroll();
+        self.after_restart(ctx);
+        ctx.invalidate(self.bounds);
+    }
     /// The rectangle that the text paints in.
     pub fn text_area(&self) -> Rect {
         self.bounds
@@ -1884,7 +1907,18 @@ impl EditorView {
         ctx.invalidate(self.bounds);
     }
     pub(crate) fn full_rows_width(&self) -> Dip {
-        self.hooks.page.map_or(self.laid_width, |p| p.text_width)
+        self.hooks.page.map_or_else(
+            || Dip((self.laid_width.0 - self.hooks.padding * 2.0).max(1.0)),
+            |p| p.text_width,
+        )
+    }
+    /// The blank space to the left of the text. A page keeps it inside its margin.
+    pub(crate) fn text_padding(&self) -> f32 {
+        if self.hooks.page.is_some() && self.wrap {
+            0.0
+        } else {
+            self.hooks.padding
+        }
     }
     /// The space to the left of the text, inside the view.
     pub(crate) fn page_margin(&self) -> f32 {
@@ -1894,7 +1928,7 @@ impl EditorView {
         }
     }
     pub(crate) fn text_left(&self) -> f32 {
-        self.bounds.x.0 + self.page_margin()
+        self.bounds.x.0 + self.page_margin() + self.text_padding()
     }
 
     // ---- Typing and the clipboard ----

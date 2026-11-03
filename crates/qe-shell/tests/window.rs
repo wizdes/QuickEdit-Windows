@@ -1613,7 +1613,7 @@ fn timers_and_run_requests_reach_the_owner() {
     f.window.set_timer(5, 60_000).unwrap();
     f.send(WM_TIMER, 5, 0);
     assert_eq!(f.events(), vec![ShellEvent::Timer(5)]);
-    f.window.kill_timer(5).unwrap();
+    assert!(f.window.kill_timer(5).unwrap(), "this timer was running");
     f.window
         .apply_requests(vec![
             ViewRequest::RequestTimer(60_000),
@@ -1624,8 +1624,8 @@ fn timers_and_run_requests_reach_the_owner() {
     f.send(WM_TIMER, VIEW_TIMER as usize, 0);
     assert_eq!(f.events(), vec![ShellEvent::Timer(VIEW_TIMER)]);
     assert!(
-        f.window.kill_timer(VIEW_TIMER).is_err(),
-        "a view timer fires once"
+        !f.window.kill_timer(VIEW_TIMER).unwrap(),
+        "a view timer fires once, and stopping one that is not running is no error"
     );
 }
 

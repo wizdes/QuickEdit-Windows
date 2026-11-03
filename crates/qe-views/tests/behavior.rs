@@ -1276,3 +1276,117 @@ fn a_frame_timer_never_replaces_a_sooner_one_from_an_earlier_call() {
         ctx.requests
     );
 }
+
+// ---- The Mac's line fragment padding: 5 points on each side of the text.
+
+fn first_text_x(rig: &Rig) -> f32 {
+    let list = rig.draw(ThemeKind::Light);
+    list.commands
+        .iter()
+        .find_map(|command| match command {
+            DrawCommand::GlyphRun { at, .. } => Some(at.x.0),
+            _ => None,
+        })
+        .expect("a row of text")
+}
+
+#[test]
+fn the_text_starts_5_dips_in_and_the_gutter_stays_to_its_left() {
+    let mut rig = Rig::new("hello\nworld", 800.0, 400.0);
+    assert_eq!(first_text_x(&rig), TEXT_PADDING);
+    numbers_on(&mut rig);
+    rig.settle();
+    let gutter = rig.frame.gutter_area().width.0;
+    assert!(gutter > 0.0);
+    assert_eq!(first_text_x(&rig), gutter + TEXT_PADDING);
+}
+
+#[test]
+fn the_padding_grows_with_the_zoom_as_the_macs_magnification_does() {
+    let mut rig = Rig::new("hello", 800.0, 400.0);
+    let mut ctx = ViewContext::default();
+    rig.frame
+        .set_zoom(2.0, &mut rig.editor, &rig.measure, &mut ctx)
+        .unwrap();
+    rig.settle();
+    assert_eq!(first_text_x(&rig), TEXT_PADDING * 2.0);
+}
+
+#[test]
+fn a_click_in_the_padding_lands_on_the_first_character_and_is_never_selected() {
+    let mut rig = Rig::new("hello\nworld", 800.0, 400.0);
+    rig.down(1.0, 2.0);
+    rig.up(1.0, 2.0);
+    assert_eq!(rig.editor.caret(), ByteOffset(0));
+    assert_eq!(rig.editor.selection(), ByteOffset(0)..ByteOffset(0));
+    // A click at the first character's middle still counts the padding.
+    let cell = qe_api::TextMeasurer::measure(&rig.measure, "0", &format!("{FAMILY} 10"))
+        .width
+        .0;
+    rig.down(TEXT_PADDING + cell * 2.0 + 1.0, 2.0);
+    assert_eq!(rig.editor.caret(), ByteOffset(2));
+}
+
+#[test]
+fn wrapping_loses_the_padding_on_both_sides() {
+    let cell = {
+        let measure =
+            DirectWriteLayout::with_font(FAMILY, 10.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap();
+        qe_api::TextMeasurer::measure(&measure, "0000000000", &format!("{FAMILY} 10"))
+            .width
+            .0
+            / 10.0
+    };
+    // The window holds exactly 40 characters and the padding, then a little less.
+    let map = MAP_WIDTH;
+    let fits = 40.0 * cell + TEXT_PADDING * 2.0 + map + 0.5;
+    let text = "x".repeat(40);
+    let rig = Rig::new(&text, fits, 200.0);
+    assert_eq!(rig.editor.visible_rows().rows.len(), 1, "40 characters fit");
+    let rig = Rig::new(&text, fits - 2.0, 200.0);
+    assert_eq!(
+        rig.editor.visible_rows().rows.len(),
+        2,
+        "a width with no room for the padding wraps"
+    );
+}
+
+#[test]
+fn a_page_keeps_its_text_at_the_margin_since_the_padding_lies_inside_it() {
+    let mut rig = Rig::new("hello", 900.0, 400.0);
+    let mut ctx = ViewContext::default();
+    rig.frame
+        .set_page_wrap(true, &mut rig.editor, &rig.measure, &mut ctx)
+        .unwrap();
+    rig.settle();
+    let margin = Paper::LETTER.margin_dips();
+    assert_eq!(
+        first_text_x(&rig),
+        margin,
+        "the Mac moves the view left by it"
+    );
+}
+
+#[test]
+fn with_wrap_off_the_text_scrolls_back_to_show_the_padding() {
+    let long = "y".repeat(400);
+    let mut rig = Rig::new(&long, 400.0, 200.0);
+    let mut ctx = ViewContext::default();
+    rig.editor.apply_wrap(false, &mut ctx).unwrap();
+    rig.settle();
+    assert_eq!(first_text_x(&rig), TEXT_PADDING);
+    // Far along the line, the view has scrolled. Home comes all the way back.
+    let key = |virtual_key| InputKind::KeyDown {
+        virtual_key,
+        modifiers: Modifiers::default(),
+        repeat: false,
+    };
+    rig.send(key(0x23));
+    rig.settle();
+    let end = rig.editor.horizontal_offset();
+    assert!(end > 0.0);
+    rig.send(key(0x24));
+    rig.settle();
+    assert_eq!(rig.editor.horizontal_offset(), 0.0, "scrolled from {end}");
+    assert_eq!(first_text_x(&rig), TEXT_PADDING);
+}

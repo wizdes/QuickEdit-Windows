@@ -558,3 +558,24 @@ fn a_run_with_a_client_ends_with_no_word_of_a_bad_close() {
     assert!(!said.contains("did not close cleanly"), "{said}");
     let _ = decode("");
 }
+
+/// With no timer running, a Blur has nothing to stop, and that is no error.
+#[test]
+fn losing_focus_with_no_caret_timer_prints_no_error() {
+    let folder = Folder::new("blur-timer");
+    let log = folder.0.join("errors.txt");
+    let mut app = App::start_logged(&folder.root(), &[], &[], Some(&log));
+    // The real order: focus, the caret's timer fires once with nothing more to do, then Blur.
+    app.ok("focus");
+    app.settled();
+    std::thread::sleep(Duration::from_millis(1500));
+    app.ok("blur");
+    app.ok("focus");
+    app.ok("blur");
+    app.ok("blur");
+    app.ask("ping");
+    app.quit();
+    let printed = std::fs::read_to_string(&log).unwrap();
+    assert!(!printed.contains("KillTimer"), "{printed}");
+    assert!(!printed.contains("caret's timer"), "{printed}");
+}

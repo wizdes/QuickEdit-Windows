@@ -50,6 +50,9 @@ impl App {
         if full {
             set_row_label(&mut model, CommandId::FullScreen, "Exit Full Screen");
         }
+        if self.store.tabs(window).len() >= 2 {
+            set_row_label(&mut model, CommandId::Close, "Close Tab");
+        }
         if let Some(doc) = self.store.active_tab(window)
             && let Some(ui) = self.docs.get(&doc)
         {
@@ -279,7 +282,8 @@ impl App {
                 }
             }
             ExportPdf | Print => {
-                let job = PanelJob::export(&self.store, doc, command == Print);
+                let checks = self.pdf_checks(doc);
+                let job = PanelJob::export(&self.store, doc, command == Print, checks);
                 self.effects.push(Effect::Panel(job));
             }
             Settings => self.effects.push(Effect::OpenSettings),

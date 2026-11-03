@@ -376,6 +376,15 @@ impl ViewFrame {
 
     // ---- What the host reads ----
 
+    pub fn font_family(&self) -> &str {
+        &self.family
+    }
+    pub fn base_points(&self) -> f32 {
+        self.base_points
+    }
+    pub fn tab_width(&self) -> usize {
+        self.tab_width
+    }
     pub fn zoom(&self) -> f32 {
         self.scale
     }

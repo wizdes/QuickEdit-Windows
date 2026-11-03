@@ -691,6 +691,15 @@ impl App {
                     frame.set_paper(paper, view, measure, ctx);
                 });
             }
+            SettingChange::Value(
+                qe_api::SettingKey::OpenEncoding
+                | qe_api::SettingKey::SaveEncoding
+                | qe_api::SettingKey::AddTxtExtension
+                | qe_api::SettingKey::ShowPageBreaks,
+            ) => {
+                let settings = self.settings.clone();
+                self.store.follow_settings(&settings);
+            }
             SettingChange::WriteFailed(message) => self.note(message),
             SettingChange::FileProblem(Some(message)) => self.note(message),
             // Menus read the keys each time they open, and each press looks its key up.

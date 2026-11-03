@@ -354,6 +354,7 @@ fn save_dialog_has_encodings_and_the_txt_checkbox() {
             ],
             selected: 2,
             add_txt: Some(true),
+            pdf: None,
         };
         let dialog = FileDialogSetup::save(&options).unwrap();
         assert_eq!(dialog.selected_encoding().unwrap(), Some(2));
@@ -967,6 +968,7 @@ fn the_default_extension_follows_the_txt_checkbox() {
     on_com_thread(|| {
         let on = FileDialogOptions {
             add_txt: Some(true),
+            pdf: None,
             ..Default::default()
         };
         let dialog = FileDialogSetup::save(&on).unwrap();
@@ -982,6 +984,7 @@ fn the_default_extension_follows_the_txt_checkbox() {
 
         let off = FileDialogOptions {
             add_txt: Some(false),
+            pdf: None,
             ..Default::default()
         };
         assert!(
@@ -1064,4 +1067,30 @@ fn clipboard_text_that_is_not_unicode_is_reported() {
         assert!(error.contains("not valid Unicode"), "{error}");
         let _ = GlobalFree(Some(bad));
     }
+}
+
+#[test]
+fn pdf_dialog_has_its_boxes_and_wrap_to_page_has_no_rewrap_box() {
+    on_com_thread(|| {
+        let with = |rewrap| FileDialogOptions {
+            title: Some("Export as PDF".into()),
+            pdf: Some(PdfChecks {
+                header: true,
+                rewrap,
+            }),
+            ..Default::default()
+        };
+        let dialog = FileDialogSetup::save(&with(Some(false))).unwrap();
+        assert_eq!(
+            dialog.pdf_checks().unwrap(),
+            Some(PdfChecks {
+                header: true,
+                rewrap: Some(false),
+            })
+        );
+        let dialog = FileDialogSetup::save(&with(None)).unwrap();
+        assert_eq!(dialog.pdf_checks().unwrap().unwrap().rewrap, None);
+        let plain = FileDialogSetup::save(&FileDialogOptions::default()).unwrap();
+        assert_eq!(plain.pdf_checks().unwrap(), None);
+    });
 }

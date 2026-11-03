@@ -66,10 +66,24 @@ fn window_pixels(app: &App, dpi: u32, top_dips: f32) -> (i32, i32) {
         .clamp(5, 500) as f32;
     let scale = dpi as f32 / 96.0;
     // Two lines less one line is one row with its gap. The map takes 100 dips on the right,
-    // and the text has its padding on both sides, as the Mac's `initialContentSize` has.
+    // the gutter takes its width when it shows, and the text has its padding on both sides,
+    // as the Mac's `initialContentSize` has.
     let row = (measure("0\n0").height.0 - measure("0").height.0).max(1.0);
+    let key = qe_api::SettingKey::ShowLineNumbers;
+    let gutter = if app.settings.get_bool(key).unwrap_or(false) {
+        let points = qe_views::gutter_font_points(app.settings.font().points);
+        let digit = qe_api::TextMeasurer::measure(
+            app.measure.as_ref(),
+            "8",
+            &format!("{} {points}", qe_views::GUTTER_FONT),
+        );
+        qe_views::gutter_width(qe_views::gutter_digits(0), digit.width.0)
+    } else {
+        0.0
+    };
     let width = chars * measure("0000000000").width.0 / 10.0
         + qe_views::TEXT_PADDING * 2.0
+        + gutter
         + qe_views_map_width();
     let height = lines * row + top_dips;
     (
@@ -327,15 +341,21 @@ impl App {
             _ => {
                 let (width, height) = window_pixels(self, dpi.get(), content.y.0);
                 let mut rect = RECT::default();
-                // SAFETY: `rect` lives through the call.
-                if let Err(e) = unsafe { GetWindowRect(hwnd, &mut rect) } {
+                let mut client = RECT::default();
+                // SAFETY: both rectangles live through their calls.
+                if let Err(e) = unsafe {
+                    GetWindowRect(hwnd, &mut rect).and_then(|()| GetClientRect(hwnd, &mut client))
+                } {
                     eprintln!("GetWindowRect for a new window: {e}");
                 }
+                // The numbers are for the client area. Windows' resize edges lie outside it.
+                let edges_x = (rect.right - rect.left) - (client.right - client.left);
+                let edges_y = (rect.bottom - rect.top) - (client.bottom - client.top);
                 WindowFrame {
                     x: rect.left,
                     y: rect.top,
-                    width,
-                    height,
+                    width: width + edges_x,
+                    height: height + edges_y,
                 }
             }
         };

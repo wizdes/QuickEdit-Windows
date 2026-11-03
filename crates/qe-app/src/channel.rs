@@ -531,6 +531,51 @@ impl App {
                 return;
             }
             "ping" => "ok".to_owned(),
+            "view-info" => self.view_info(),
+            "panel-info" => self.panel_info(),
+            "menu-dump" => {
+                let index = rest.first().and_then(|n| n.parse().ok()).unwrap_or(0);
+                match window {
+                    Some(window) => {
+                        let model = self.menu_model(window, index);
+                        let mut lines = Vec::new();
+                        dump_rows(&model, 0, &mut lines);
+                        encode(&lines.join("\n"))
+                    }
+                    None => "error no window".to_owned(),
+                }
+            }
+            "set-int" => {
+                let key = rest.first().and_then(|name| parse_setting(name));
+                let value = rest.get(1).and_then(|n| n.parse::<i64>().ok());
+                match (key, value) {
+                    (Some(key), Some(value)) => match self.settings.set_integer(key, value) {
+                        Ok(()) => "ok".to_owned(),
+                        Err(e) => format!("error {e}"),
+                    },
+                    _ => format!("error bad set-int {rest:?}"),
+                }
+            }
+            "set-text" => {
+                let key = rest.first().and_then(|name| parse_setting(name));
+                let value = decode(rest.get(1).copied().unwrap_or(""));
+                match key {
+                    Some(key) => match self.settings.set_text(key, value) {
+                        Ok(()) => "ok".to_owned(),
+                        Err(e) => format!("error {e}"),
+                    },
+                    None => format!("error bad set-text {rest:?}"),
+                }
+            }
+            "encodings" => {
+                let names: Vec<&str> = self
+                    .settings
+                    .enabled_encodings()
+                    .into_iter()
+                    .map(qe_api::TextEncoding::name)
+                    .collect();
+                encode(&names.join("|"))
+            }
             "restored" => self.restored.to_string(),
             "windows" => self.describe_windows(),
             "text" => {
@@ -761,6 +806,26 @@ impl App {
                         .or(Some(job.options.selected))
                         .filter(|_| !job.options.encodings.is_empty()),
                     add_txt: add_txt.or(job.options.add_txt),
+                    pdf: job.options.pdf,
+                    note: None,
+                };
+                self.handle(Incoming::Panel(job, Some(choice)));
+                "ok".to_owned()
+            }
+            "panel-pdf" => {
+                // The PDF dialog's answer: the path, then the header box and the rewrap box.
+                let Some(job) = self.test_panels.pop_front() else {
+                    self.say("error no panel".to_owned());
+                    return;
+                };
+                let choice = PanelChoice {
+                    path: decode(rest.first().copied().unwrap_or("")),
+                    row: None,
+                    add_txt: None,
+                    pdf: Some(qe_ui::PdfChecks {
+                        header: rest.get(1) == Some(&"true"),
+                        rewrap: Some(rest.get(2) == Some(&"true")),
+                    }),
                     note: None,
                 };
                 self.handle(Incoming::Panel(job, Some(choice)));
@@ -992,6 +1057,71 @@ impl App {
         self.say(answer);
     }
 
+    /// What a document's view holds now, as `name=value` words.
+    fn view_info(&mut self) -> String {
+        let Some(doc) = self.doc_in_use() else {
+            return "error no document".to_owned();
+        };
+        let measure = self.measure.clone();
+        let (Some(ui), Some(view)) = (self.docs.get(&doc), self.store.view_mut(doc)) else {
+            return "error no view".to_owned();
+        };
+        let frame = &ui.frame;
+        let token = format!("{} {}", frame.font_family(), frame.base_points());
+        let cell = qe_api::TextMeasurer::measure(measure.as_ref(), "0000000000", &token)
+            .width
+            .0
+            / 10.0;
+        let row = qe_api::TextMeasurer::measure(measure.as_ref(), "0\n0", &token)
+            .height
+            .0
+            - qe_api::TextMeasurer::measure(measure.as_ref(), "0", &token)
+                .height
+                .0;
+        let paper = frame.paper();
+        format!(
+            "family={} points={} tab={} zoom={} page={} lines={} map={} paper={}x{} textw={} \
+             texth={} row={row} cell={} gutterw={} mapw={} top={}",
+            encode(frame.font_family()),
+            frame.base_points(),
+            frame.tab_width(),
+            frame.zoom(),
+            frame.page_wrap(),
+            frame.line_numbers(),
+            frame.document_map(),
+            paper.width,
+            paper.height,
+            frame.window_width_at_100_percent(view),
+            view.text_area().height.0,
+            cell,
+            frame.gutter_area().width.0,
+            frame.map_area().width.0,
+            view.test_byte_at_top(),
+        )
+    }
+
+    /// The first waiting file dialog and its controls.
+    fn panel_info(&self) -> String {
+        let Some(job) = self.test_panels.front() else {
+            return "none".to_owned();
+        };
+        let rows: Vec<String> = job
+            .options
+            .encodings
+            .iter()
+            .map(|row| format!("{}:{}", row.name, row.enabled))
+            .collect();
+        format!(
+            "file={} selected={} txt={:?} header={:?} rewrap={:?} rows={}",
+            encode(job.options.file_name.as_deref().unwrap_or("")),
+            job.options.selected,
+            job.options.add_txt,
+            job.options.pdf.map(|checks| checks.header),
+            job.options.pdf.and_then(|checks| checks.rewrap),
+            encode(&rows.join("|")),
+        )
+    }
+
     fn describe_windows(&self) -> String {
         let mut parts = Vec::new();
         for window in self.store.windows() {
@@ -1077,6 +1207,19 @@ impl App {
         self.apply(window, ctx.requests);
         self.after_tools(window, doc);
         self.after_view_call(window, doc);
+    }
+}
+
+/// Every row of a menu, one per line, with its depth: `depth|label|key|on|checked`.
+fn dump_rows(model: &qe_ui::MenuModel, depth: usize, lines: &mut Vec<String>) {
+    for item in &model.items {
+        lines.push(format!(
+            "{depth}|{}|{}|{}|{}",
+            item.label, item.key_text, item.enabled, item.checked
+        ));
+        if let Some(sub) = &item.submenu {
+            dump_rows(sub, depth + 1, lines);
+        }
     }
 }
 

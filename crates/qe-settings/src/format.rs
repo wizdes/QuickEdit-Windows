@@ -71,7 +71,8 @@ pub(crate) fn value_problem(key: SettingKey, value: &StoredValue) -> Option<Stri
             .find(|name| !name.is_empty() && encoding_by_name(name).is_none())
             .map(|name| format!("{name:?} is not an encoding")),
         (SettingKey::PaperSize, StoredValue::Text(text)) => {
-            (text != "Letter" && text != "A4").then(|| format!("{text:?} is not Letter or A4"))
+            (!matches!(text.as_str(), "Letter" | "A4" | "Legal"))
+                .then(|| format!("{text:?} is not Letter, A4 or Legal"))
         }
         _ => None,
     }

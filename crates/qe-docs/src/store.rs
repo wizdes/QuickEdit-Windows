@@ -159,6 +159,14 @@ impl StoreConfig {
         config.new_docs_wrap_to_page = settings.get_bool(Key::ShowPageBreaks).unwrap_or(false);
         config
     }
+    /// The settings that the next document reads, from a Settings window's change.
+    fn follow(&mut self, settings: &qe_settings::SettingsStore) {
+        use qe_api::SettingKey as Key;
+        self.open_encoding = settings.encoding_choice(Key::OpenEncoding);
+        self.save_encoding = settings.encoding_choice(Key::SaveEncoding);
+        self.add_txt = settings.get_bool(Key::AddTxtExtension).unwrap_or(true);
+        self.new_docs_wrap_to_page = settings.get_bool(Key::ShowPageBreaks).unwrap_or(false);
+    }
 }
 
 /// `%LOCALAPPDATA%\QuickEdit`.
@@ -755,6 +763,11 @@ fn random_key() -> String {
 impl DocumentStore {
     /// Touches no disk. Call [`begin_restore`](Self::begin_restore) next, once. No autosave
     /// runs until it ends.
+    /// Settings apply to the next document (P52, I14). Open documents keep what they had.
+    pub fn follow_settings(&mut self, settings: &qe_settings::SettingsStore) {
+        self.config.follow(settings);
+    }
+
     pub fn new(config: StoreConfig) -> Self {
         let (sender, receiver) = channel();
         Self {

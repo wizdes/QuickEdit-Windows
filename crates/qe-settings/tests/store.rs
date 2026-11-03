@@ -132,7 +132,9 @@ fn set_refuses_junk_and_limits_and_keeps_the_old_value() {
             .is_err()
     );
     assert!(store.set_text(SettingKey::KeyboardShortcuts, "x").is_err());
-    assert!(store.set_text(SettingKey::PaperSize, "Legal").is_err());
+    assert!(store.set_text(SettingKey::PaperSize, "Tabloid").is_err());
+    store.set_text(SettingKey::PaperSize, "Legal").unwrap();
+    store.set_text(SettingKey::PaperSize, "A4").unwrap();
     assert_eq!(store.get_integer(SettingKey::TabWidth), Some(8));
 }
 #[test]

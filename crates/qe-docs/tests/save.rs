@@ -1260,6 +1260,23 @@ fn the_config_follows_the_settings_file() {
     settings.flush().unwrap();
 }
 
+#[test]
+fn the_next_document_follows_a_change_in_settings_and_open_ones_stay() {
+    let folder = test_folder("save-settings-change");
+    let settings = qe_settings::SettingsStore::open(folder.join("settings.txt"));
+    let mut h = Harness::new(&folder.join("root"));
+    let (_, first) = h.store.new_window(false).unwrap();
+    assert!(!h.store.wrap_to_page(first));
+    settings
+        .set_bool(qe_api::SettingKey::ShowPageBreaks, true)
+        .unwrap();
+    h.store.follow_settings(&settings);
+    let (_, second) = h.store.new_window(false).unwrap();
+    assert!(h.store.wrap_to_page(second), "the next document");
+    assert!(!h.store.wrap_to_page(first), "the open one stays");
+    settings.flush().unwrap();
+}
+
 /// The editor's README: Cut, then something that replaces the text, must not lose the cut.
 #[test]
 fn a_revert_and_a_close_wait_for_a_cut_on_its_way_to_the_clipboard() {

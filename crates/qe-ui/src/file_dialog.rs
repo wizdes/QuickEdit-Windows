@@ -1,5 +1,5 @@
-//! The native Open and Save dialogs, with the encoding list and the `.txt` checkbox
-//! added through `IFileDialogCustomize` (parity rows P4, P20, P23, I40).
+//! The native Open and Save dialogs, with the encoding list, the `.txt` checkbox and the PDF boxes
+//! added through `IFileDialogCustomize` (parity rows P4, P20, P23, P60, I40, I59).
 //!
 //! Each function needs a thread with COM started as single-threaded. `FileDialogSetup`
 //! builds the dialog without showing it, so tests can read the controls with no window.
@@ -22,6 +22,8 @@ use windows::core::{
 const GROUP: u32 = 100;
 const ENCODING_LIST: u32 = 101;
 const TXT_CHECK: u32 = 102;
+const HEADER_CHECK: u32 = 103;
+const REWRAP_CHECK: u32 = 104;
 
 /// A row of the encoding list. A disabled row stays in view and cannot be chosen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,14 @@ impl EncodingRow {
     }
 }
 
+/// The two boxes of the PDF dialog, as on the Mac's PDF Save panel (rows P60, I59). `rewrap` is
+/// `None` in Wrap to Page, whose pages are fixed: then that box does not show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdfChecks {
+    pub header: bool,
+    pub rewrap: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FileDialogOptions {
     pub title: Option<String>,
@@ -47,6 +57,8 @@ pub struct FileDialogOptions {
     pub selected: usize,
     /// `Some` adds the `.txt` checkbox, with this starting state. Save only.
     pub add_txt: Option<bool>,
+    /// `Some` adds the PDF dialog's boxes, with these starting states. Save only.
+    pub pdf: Option<PdfChecks>,
 }
 
 /// What the user chose. Each `Option` is `None` when the dialog did not have that control.
@@ -58,6 +70,7 @@ pub struct FileDialogChoice {
     pub encoding: Option<usize>,
     pub encoding_note: Option<String>,
     pub add_txt: Option<bool>,
+    pub pdf: Option<PdfChecks>,
 }
 
 /// Which row may be used, from what the dialog reports. A row that cannot hold the text
@@ -269,6 +282,7 @@ pub struct FileDialogSetup {
     custom: IFileDialogCustomize,
     rows: Vec<EncodingRow>,
     has_check: bool,
+    pdf: Option<PdfChecks>,
     extension_on: Rc<Cell<bool>>,
     events: Option<(IFileDialogEvents, u32)>,
 }
@@ -317,11 +331,26 @@ fn configure(dialog: IFileDialog, options: &FileDialogOptions) -> Result<FileDia
             let cookie = dialog.Advise(&listener)?;
             events = Some((listener, cookie));
         }
+        if let Some(checks) = options.pdf {
+            custom.AddCheckButton(
+                HEADER_CHECK,
+                &HSTRING::from("Print header and footer"),
+                checks.header,
+            )?;
+            if let Some(rewrap) = checks.rewrap {
+                custom.AddCheckButton(
+                    REWRAP_CHECK,
+                    &HSTRING::from("Rewrap contents to fit page"),
+                    rewrap,
+                )?;
+            }
+        }
         Ok(FileDialogSetup {
             dialog,
             custom,
             rows: options.encodings.clone(),
             has_check: options.add_txt.is_some(),
+            pdf: options.pdf,
             extension_on,
             events,
         })
@@ -373,6 +402,21 @@ impl FileDialogSetup {
         // SAFETY: the control was added in `configure`.
         unsafe { self.custom.GetCheckButtonState(TXT_CHECK) }.map(|on: BOOL| Some(on.as_bool()))
     }
+    /// The state of the PDF dialog's boxes.
+    pub fn pdf_checks(&self) -> Result<Option<PdfChecks>> {
+        let Some(start) = self.pdf else {
+            return Ok(None);
+        };
+        // SAFETY: each control was added in `configure`.
+        unsafe {
+            let header = self.custom.GetCheckButtonState(HEADER_CHECK)?.as_bool();
+            let rewrap = match start.rewrap {
+                Some(_) => Some(self.custom.GetCheckButtonState(REWRAP_CHECK)?.as_bool()),
+                None => None,
+            };
+            Ok(Some(PdfChecks { header, rewrap }))
+        }
+    }
     /// The dialog's option flags, as Windows reports them.
     pub fn options(&self) -> Result<u32> {
         // SAFETY: a live COM object.
@@ -419,6 +463,7 @@ impl FileDialogSetup {
                 encoding,
                 encoding_note,
                 add_txt: self.add_txt()?,
+                pdf: self.pdf_checks()?,
             }))
         }
     }

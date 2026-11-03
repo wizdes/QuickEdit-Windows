@@ -6,7 +6,7 @@ use qe_docs::{
     DocId, DocumentStore, OpenTarget, SavePanelRequest, WindowId, filename_with_txt_rule,
 };
 use qe_pdf::{PdfError, PdfJob, PdfOptions, export_worker, header_date_now};
-use qe_ui::{EncodingRow, FileDialogOptions, FileDialogSetup};
+use qe_ui::{EncodingRow, FileDialogOptions, FileDialogSetup, PdfChecks};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use windows::Win32::Foundation::HWND;
@@ -42,6 +42,7 @@ pub struct PanelChoice {
     pub path: String,
     pub row: Option<usize>,
     pub add_txt: Option<bool>,
+    pub pdf: Option<PdfChecks>,
     pub note: Option<String>,
 }
 
@@ -58,7 +59,7 @@ impl PanelJob {
             owner: None,
         }
     }
-    pub fn export(store: &DocumentStore, doc: DocId, print: bool) -> Self {
+    pub fn export(store: &DocumentStore, doc: DocId, print: bool, checks: PdfChecks) -> Self {
         Self {
             kind: PanelKind::Export { doc },
             options: FileDialogOptions {
@@ -71,6 +72,7 @@ impl PanelJob {
                     .to_owned(),
                 ),
                 file_name: Some(format!("{}.pdf", store.display_name(doc))),
+                pdf: Some(checks),
                 ..Default::default()
             },
             save: true,
@@ -124,6 +126,7 @@ pub fn show(shared: &Rc<Shared>, mut job: PanelJob) {
                 path: choice.path,
                 row: choice.encoding,
                 add_txt: choice.add_txt,
+                pdf: choice.pdf,
                 note: choice.encoding_note,
             };
             push(shared, Incoming::Panel(job, Some(choice)));
@@ -149,6 +152,20 @@ impl App {
     pub fn open_panel(&mut self, window: WindowId) {
         let mut rows = vec![None];
         rows.extend(self.settings.enabled_encodings().into_iter().map(Some));
+        let start = match self
+            .settings
+            .encoding_choice(qe_api::SettingKey::OpenEncoding)
+        {
+            EncodingChoice::Automatic => None,
+            EncodingChoice::Specific(encoding) => Some(encoding),
+        };
+        // A setting off the list still shows, right under Automatic.
+        if let Some(encoding) = start
+            && !rows.contains(&Some(encoding))
+        {
+            rows.insert(1, Some(encoding));
+        }
+        let selected = rows.iter().position(|row| *row == start).unwrap_or(0);
         let names = rows
             .iter()
             .map(|row| EncodingRow::new(row.map_or("Automatic", TextEncoding::name)))
@@ -158,6 +175,7 @@ impl App {
             options: FileDialogOptions {
                 title: Some("Open".to_owned()),
                 encodings: names,
+                selected,
                 ..Default::default()
             },
             save: false,
@@ -209,6 +227,7 @@ impl App {
             encodings: names,
             selected,
             add_txt: Some(request.add_txt),
+            pdf: None,
         };
         self.effects.push(Effect::Panel(PanelJob {
             kind: PanelKind::Save { request, rows },
@@ -256,13 +275,48 @@ impl App {
                 }
             }
             (PanelKind::Export { doc }, Some(choice)) => {
-                self.start_export(doc, PathBuf::from(choice.path));
+                self.start_export(doc, PathBuf::from(choice.path), choice.pdf);
             }
             (PanelKind::MoveTo { .. } | PanelKind::Export { .. }, None) => {}
         }
     }
 
-    fn start_export(&mut self, doc: DocId, path: PathBuf) {
+    /// How the PDF dialog's boxes start: as the last dialog left them. Wrap to Page has fixed
+    /// pages, so its dialog has no rewrap box, as on the Mac.
+    pub fn pdf_checks(&self, doc: DocId) -> PdfChecks {
+        let key = qe_api::SettingKey::NumberPagesWhenPrinting;
+        let header = self.settings.get_bool(key).unwrap_or(false);
+        let key = qe_api::SettingKey::WrapToFitWhenPrinting;
+        let rewrap = self.settings.get_bool(key).unwrap_or(true);
+        let page_wrap = self.docs.get(&doc).is_some_and(|ui| ui.frame.page_wrap());
+        PdfChecks {
+            header,
+            rewrap: (!page_wrap).then_some(rewrap),
+        }
+    }
+
+    /// The boxes' answer goes into the settings, so that the choice sticks, as on the Mac.
+    fn keep_pdf_checks(&mut self, checks: PdfChecks) {
+        let keys = [
+            (
+                qe_api::SettingKey::NumberPagesWhenPrinting,
+                Some(checks.header),
+            ),
+            (qe_api::SettingKey::WrapToFitWhenPrinting, checks.rewrap),
+        ];
+        for (key, value) in keys {
+            if let Some(value) = value
+                && let Err(e) = self.settings.set_bool(key, value)
+            {
+                self.note(format!("The PDF choice could not be kept: {e}"));
+            }
+        }
+    }
+
+    fn start_export(&mut self, doc: DocId, path: PathBuf, checks: Option<PdfChecks>) {
+        if let Some(checks) = checks {
+            self.keep_pdf_checks(checks);
+        }
         let key = qe_api::SettingKey::NumberPagesWhenPrinting;
         let numbers = self.settings.get_bool(key).unwrap_or(false);
         let key = qe_api::SettingKey::WrapToFitWhenPrinting;

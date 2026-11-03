@@ -1,61 +1,63 @@
 # QuickEdit for Windows: parity list
 
-Each Mac parity row has one row below. Inventory rows add details from `docs/research/mac-inventory.md`. Windows and speed rows record `docs/plan.md` choices. `same` means the planned behavior matches the Mac app. `changed (why)` and `left out (decision)` record differences. `QUESTION` gives a suggested default where the plan has no answer. All rows start unbuilt.
+Each Mac parity row has one row below. Inventory rows add details from `docs/research/mac-inventory.md`. Windows and speed rows record `docs/plan.md` choices. `same` means the planned behavior matches the Mac app. `changed (why)` and `left out (decision)` record differences. `QUESTION` gives a suggested default where the plan has no answer.
+
+The Built column says what proves each row. `yes` names a passing test on the real behavior, most of them against the real exe in `crates/qe-app/tests`. `lower` names a test below the app, with the app wiring read. `person` says what only a visible window, a real input method or a person can settle. `left out` gives the reason a row is not built.
 
 ## Mac parity rows
 
 | Mac ID | Behavior | What Windows does | Builds | Status | Built |
 | --- | --- | --- | --- | --- | --- |
-| P1 | New opens a plain-text window. | New opens a plain-text window with Ctrl+N. | M14 | changed (Ctrl replaces Cmd) | no |
-| P2 | Open accepts plain text and other text files. | Open the same text files. | M14 | same | no |
-| P3 | Typing and Save write UTF-8 bytes. | Save new files as UTF-8 without BOM; use Ctrl+S. | M3, M14 | changed (Ctrl replaces Cmd) | no |
-| P4 | Untitled Save offers a .txt checkbox. | Offer the .txt checkbox, on by default. | M7, M14 | same | no |
-| P5 | Dirty untitled close asks; quit keeps autosaved edits. | Keep both rules. | M14 | same | no |
-| P6 | New windows fit 90 characters by 30 lines. | Use 90 by 30. | M6, M14 | same | no |
-| P7 | Plain font is fixed-pitch; tab stops are 8 spaces. | Use Cascadia Mono 10 pt and 8-space tabs. | M4, M8 | changed (Windows default font) | no |
-| P8 | Undo, redo, clipboard, delete, and select all work. | Keep the edits with Ctrl-based keys. | M9 | changed (Ctrl replaces Cmd) | no |
-| P10 | Autosave keeps edits through quit. | Autosave and restore edits. | M14 | same | no |
-| P11 | Duplicate, Rename, Move To, Revert, and Browse Versions. | Keep the first four; omit Browse All Versions. | M14 | changed (no Windows versions browser) | no |
-| P12 | Save All saves every document. | Save every document. | M14 | same | no |
-| P13 | Open Recent has Clear Menu. | Keep Open Recent and Clear Menu. | M14 | same | no |
-| P14 | A locked file offers Unlock or Duplicate. | Offer Unlock (clears the read-only flag) or Duplicate; keep the file intact until the user picks. | M14 | same | no |
-| P15 | Clean outside changes reload; dirty changes warn. | Reload changed bytes when clean; warn on save when dirty. | M14 | same | no |
-| P16 | Windows, selection, and scroll restore. | Restore windows, selection, and first visible character. | M14 | same | no |
-| P17 | Open replaces an untouched launch window. | Replace the untouched launch window. | M14 | same | no |
-| P18 | Export as PDF saves the document. | Export as PDF. | M13 | same | no |
-| P20 | Open offers Automatic and chosen encodings. | Offer Automatic and chosen encodings. | M3, M7 | same | no |
-| P21 | Automatic reads Mac tag, BOM, UTF-8, system encoding. | Read BOM, strict UTF-8, then Windows code page. | M3 | changed (Windows has no Mac file tag) | no |
-| P22 | Bad chosen encoding shows an open error. | Show an error naming the encoding. | M3, M7 | same | no |
-| P23 | Save disables encodings that cannot hold text. | Disable those encodings. | M3, M7 | same | no |
-| P24 | Save writes a Mac encoding file tag. | Omit the tag. | M3 | left out (Windows has no Mac file tag) | no |
-| P25 | An edit beyond file encoding offers Save As or undo. | Warn and offer Save As or undo. | M3, M14 | same | no |
-| P26 | Lossy reads warn on first edit and overwrite. | Warn; offer Duplicate, Cancel, or Overwrite. | M3, M14 | same | no |
-| P27 | Keep mixed endings; Return uses the common ending. | Keep both rules. | M3, M9 | same | no |
-| P28 | Keep UTF-8 BOM on save. | Keep the BOM. | M3 | same | no |
-| P29 | Customize Encodings List changes offered encodings. | Keep the list and panel. | M3, M7, M8 | same | no |
-| P30 | Find, Replace, Next, Previous, selection, and jump. | Keep actions with Ctrl-based keys and F3. | M12 | changed (Windows keys) | no |
-| P31 | Select Line accepts numbers and ranges. | Keep `N-M`, `+N`, and other Mac forms. | M12 | same | no |
-| P32 | Spelling and Grammar menu checks and corrects text. | Keep spelling; omit grammar. | M10 | changed (grammar omitted by decision) | no |
-| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M12 | changed (Data Detectors and Text Replacement omitted by decision) | no |
-| P34 | Transform selection to upper, lower, or capitalized. | Keep all three. | M12 | same | no |
-| P35 | Speech reads selected text. | Omit Speech. | M15 | left out (user decision) | no |
-| P36 | Complete uses Option+Esc. | Use Ctrl+Space. | M12 | changed (Windows reserves Alt+Esc) | no |
-| P37 | Prevent Editing toggles read-only editing. | Keep the toggle. | M9 | same | no |
-| P40 | Wrap to Page or Window toggles its menu title. | Keep both modes and the title change. | M13 | same | no |
-| P41 | Page wrap shows paper pages and margins. | Show pages with 72 pt margins. | M13 | same | no |
-| P42 | Zoom covers 25% to 1600%. | Keep the range, steps, and Actual Size. | M13 | same | no |
-| P43 | Full screen, tabs, and dark mode work. | Use F11, always-visible tabs, and Windows colors. | M6, M14 | changed (Windows window and tab rules) | no |
-| P44 | Text width stays fixed when scroller style changes. | Hold text width when the scrollbar changes. | M6, M13 | same | no |
-| P50 | Settings set document size, font, wrap, and text options. | Keep these on New Document tab. | M8 | same | no |
-| P51 | Settings set encodings and .txt extension. | Keep these on Open and Save tab. | M8 | same | no |
-| P52 | Settings persist and apply to new windows. | Persist; line numbers also update at once. | M8, M14 | same | no |
-| P60 | Print offers header and rewrap choices. | Ctrl+P saves PDF with both choices. | M13 | changed (real printing omitted by decision) | no |
-| P61 | Page Setup changes print paper. | No Page Setup. Paper size comes from the region, as on the Mac. | M8, M13 | left out (Mac decision U1) | no |
-| P62 | Export as PDF matches Print output. | Export and Ctrl+P make the same PDF pages. | M13 | same | no |
-| P70 | AppleScript opens, edits, saves, and closes. | No scripting. File handoff opens files. | M14 | left out (Mac decision U3) | no |
-| P71 | Services uses selected text. | Omit Services. | M15 | left out (user decision) | no |
-| P72 | Dropping a file on app or window opens it. | Open Explorer files in a tab of the last used window. | M14 | changed (Windows file handoff rule) | no |
-| P73 | Share, Writing Tools, and VoiceOver work. | Omit Share and Writing Tools; expose text to UI Automation. | M11, M15 | changed (user omissions and Windows screen reader API) | no |
+| P1 | New opens a plain-text window. | New opens a plain-text window with Ctrl+N. | M14 | changed (Ctrl replaces Cmd) | yes: p01_ctrl_n_opens_an_empty_window |
+| P2 | Open accepts plain text and other text files. | Open the same text files. | M14 | same | yes: p02_open_takes_other_text_files_by_any_name |
+| P3 | Typing and Save write UTF-8 bytes. | Save new files as UTF-8 without BOM; use Ctrl+S. | M3, M14 | changed (Ctrl replaces Cmd) | yes: p03_i43_typing_and_ctrl_s_write_utf8_with_no_bom |
+| P4 | Untitled Save offers a .txt checkbox. | Offer the .txt checkbox, on by default. | M7, M14 | same | yes: p04_the_txt_box_starts_on_and_each_state_does_its_job, a_new_document_saves_through_the_save_panel_with_the_txt_rule |
+| P5 | Dirty untitled close asks; quit keeps autosaved edits. | Keep both rules. A named file with edits also asks at its close, because Windows saves nothing in place on its own; the Mac saves it with no question. | M14 | changed (Windows has no autosave in place) | yes: closing_a_dirty_document_asks_and_each_answer_does_its_job, p05_p10_a_quit_asks_nothing_and_unsaved_text_comes_back |
+| P6 | New windows fit 90 characters by 30 lines. | Use 90 by 30. | M6, M14 | same | yes: p06_a_new_window_holds_90_columns, a_new_window_shows_30_lines_by_the_setting |
+| P7 | Plain font is fixed-pitch; tab stops are 8 spaces. | Use Cascadia Mono 10 pt and 8-space tabs. | M4, M8 | changed (Windows default font) | yes: p07_i17_the_plain_font_is_cascadia_mono_10_with_8_space_tabs |
+| P8 | Undo, redo, clipboard, delete, and select all work. | Keep the edits with Ctrl-based keys. | M9 | changed (Ctrl replaces Cmd) | yes: the_tables_edit_keys_work_and_delete_backspace_and_enter_stay, every_menu_row_does_its_job |
+| P10 | Autosave keeps edits through quit. | Autosave and restore edits. | M14 | same | yes: p05_p10_a_quit_asks_nothing_and_unsaved_text_comes_back, kill_and_relaunch_keeps_unsaved_text_across_two_windows |
+| P11 | Duplicate, Rename, Move To, Revert, and Browse Versions. | Keep the first four; omit Browse All Versions. | M14 | changed (no Windows versions browser) | yes: p11_duplicate_move_to_and_revert_do_their_jobs, rename_changes_the_file_and_the_tab |
+| P12 | Save All saves every document. | Save every document. | M14 | same | yes: p12_save_all_writes_every_document |
+| P13 | Open Recent has Clear Menu. | Keep Open Recent and Clear Menu. | M14 | same | yes: p13_open_recent_lists_the_file_and_clear_menu_empties_it, open_recent_opens_its_file_through_the_row_data |
+| P14 | A locked file offers Unlock or Duplicate. | Offer Unlock (clears the read-only flag) or Duplicate; keep the file intact until the user picks. | M14 | same | yes: p14_a_locked_file_offers_unlock_or_duplicate_and_keeps_its_bytes |
+| P15 | Clean outside changes reload; dirty changes warn. | Reload changed bytes when clean; warn on save when dirty. | M14 | same | yes: a_file_changed_outside_reloads_a_clean_document, p15_a_change_outside_a_dirty_document_warns_at_the_save |
+| P16 | Windows, selection, and scroll restore. | Restore windows, selection, and first visible character. | M14 | same | yes: p16_i47_selection_and_first_visible_text_come_back, kill_and_relaunch_keeps_unsaved_text_across_two_windows |
+| P17 | Open replaces an untouched launch window. | Replace the untouched launch window. | M14 | same | yes: p17_i49_open_replaces_the_launch_window_until_it_is_edited |
+| P18 | Export as PDF saves the document. | Export as PDF. | M13 | same | yes: print_and_export_write_a_valid_pdf |
+| P20 | Open offers Automatic and chosen encodings. | Offer Automatic and chosen encodings. The list starts at the Opening files setting. | M3, M7 | same | yes: p20_open_offers_automatic_first_and_starts_at_the_setting |
+| P21 | Automatic reads Mac tag, BOM, UTF-8, system encoding. | Read BOM, strict UTF-8, then Windows code page. | M3 | changed (Windows has no Mac file tag) | yes: p21_i41_automatic_reads_each_bom_then_utf8, automatic_reads_every_byte_value_as_the_system_page_says |
+| P22 | Bad chosen encoding shows an open error. | Show an error naming the encoding. | M3, M7 | same | yes: p22_i63_a_chosen_encoding_that_does_not_fit_names_itself |
+| P23 | Save disables encodings that cannot hold text. | Disable those encodings. | M3, M7 | same | yes: p23_i40_save_as_turns_off_encodings_that_cannot_hold_the_text |
+| P24 | Save writes a Mac encoding file tag. | Omit the tag. | M3 | left out (Windows has no Mac file tag) | left out: Windows has no Mac file tag |
+| P25 | An edit beyond file encoding offers Save As or undo. | Warn and offer Save As or undo. | M3, M14 | same | yes: p25_an_edit_beyond_the_files_encoding_offers_save_as_or_undo |
+| P26 | Lossy reads warn on first edit and overwrite. | Warn; offer Duplicate, Cancel, or Overwrite. | M3, M14 | same | yes: p26_a_lossy_file_asks_at_its_first_edit_and_keeps_its_bytes, overwrite_lets_later_saves_write_with_no_second_question |
+| P27 | Keep mixed endings; Return uses the common ending. | Keep both rules. | M3, M9 | same | yes: p27_mixed_endings_stay_and_return_types_the_common_one |
+| P28 | Keep UTF-8 BOM on save. | Keep the BOM. | M3 | same | yes: p28_i43_a_utf8_bom_stays_on_save |
+| P29 | Customize Encodings List changes offered encodings. | Keep the list and panel. | M3, M7, M8 | same | yes: p29_the_encoding_list_changes_what_open_and_save_offer, customize_encodings_opens_a_modal_panel_that_changes_the_lists |
+| P30 | Find, Replace, Next, Previous, selection, and jump. | Keep actions with Ctrl-based keys and F3. | M12 | changed (Windows keys) | yes: p30_i04_the_windows_keys_find_and_step, find_replace_all_and_select_line_reach_the_document |
+| P31 | Select Line accepts numbers and ranges. | Keep `N-M`, `+N`, and other Mac forms. | M12 | same | yes: p31_i56_i57_i58_select_line_takes_each_form_and_every_line_ending |
+| P32 | Spelling and Grammar menu checks and corrects text. | Keep spelling; omit grammar. | M10 | changed (grammar omitted by decision) | yes: p32_i05_check_document_finds_the_word_and_a_fix_row_changes_it, spelling_underlines_with_the_stub_checker_only_when_on, the_real_checker_marks_a_word_and_suggests_the_right_one |
+| P33 | Substitutions include Smart Copy, quotes, dashes, replacement, detectors. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M12 | changed (Data Detectors and Text Replacement omitted by decision) | yes: p33_i06_i19_dashes_and_copy_follow_their_rows_and_defaults, smart_quotes_change_typing_for_one_document, smart_paste_table |
+| P34 | Transform selection to upper, lower, or capitalized. | Keep all three. | M12 | same | yes: p34_i07_transformations_change_the_selection |
+| P35 | Speech reads selected text. | Omit Speech. | M15 | left out (user decision) | left out: user decision |
+| P36 | Complete uses Option+Esc. | Use Ctrl+Space. | M12 | changed (Windows reserves Alt+Esc) | yes: p36_ctrl_space_completes_the_word |
+| P37 | Prevent Editing toggles read-only editing. | Keep the toggle. | M9 | same | yes: p37_prevent_editing_stops_typing_and_lets_selection_work |
+| P40 | Wrap to Page or Window toggles its menu title. | Keep both modes and the title change. | M13 | same | yes: p40_p41_wrap_to_page_flips_its_title_and_shows_paper |
+| P41 | Page wrap shows paper pages and margins. | Show pages with 72 pt margins. | M13 | same | yes: p40_p41_wrap_to_page_flips_its_title_and_shows_paper, wrap_to_page_hides_the_side_views_and_draws_white_paper_in_a_dark_window, a_page_keeps_its_text_at_the_margin_since_the_padding_lies_inside_it |
+| P42 | Zoom covers 25% to 1600%. | Keep the range, steps, and Actual Size. | M13 | same | yes: p42_i35_zoom_doubles_and_halves_inside_25_and_1600_percent |
+| P43 | Full screen, tabs, and dark mode work. | Use F11, always-visible tabs, and Windows colors. | M6, M14 | changed (Windows window and tab rules) | person: F11 fills the screen and comes back in a visible window, which a hidden run must not do; the row and key are in i03_i08_i09_i10_i11_the_other_menus_hold_their_rows, and the colors in whole_window_pictures_in_light_dark_and_high_contrast |
+| P44 | Text width stays fixed when scroller style changes. | This app has no scrollbar, so nothing takes room from the text. The map scrolls. | M6, M13 | same | yes: p44_the_text_width_does_not_change_with_the_length_of_the_text |
+| P50 | Settings set document size, font, wrap, and text options. | Keep these on New Document tab. | M8 | same | yes: p50_i14_i55_settings_reach_new_documents_and_leave_open_ones, every_checkbox_toggles_from_the_keyboard_and_writes_its_setting |
+| P51 | Settings set encodings and .txt extension. | Keep these on Open and Save tab. | M8 | same | yes: p51_the_encoding_settings_and_txt_setting_reach_open_and_save |
+| P52 | Settings persist and apply to new windows. | Persist; line numbers also update at once. | M8, M14 | same | yes: p52_settings_come_back_after_a_restart, a_setting_for_line_numbers_applies_to_every_open_window |
+| P60 | Print offers header and rewrap choices. | Ctrl+P saves PDF with both choices as boxes in the Save dialog. The choices stick when the dialog ends with Save. | M13 | changed (real printing omitted by decision) | yes: p60_i59_the_pdf_dialog_has_both_choices_with_the_macs_defaults, pdf_dialog_has_its_boxes_and_wrap_to_page_has_no_rewrap_box |
+| P61 | Page Setup changes print paper. | No Page Setup. Paper size comes from the region, as on the Mac. | M8, M13 | left out (Mac decision U1) | left out: Mac decision U1 |
+| P62 | Export as PDF matches Print output. | Export and Ctrl+P make the same PDF pages. | M13 | same | yes: p62_export_and_print_make_the_same_pages |
+| P70 | AppleScript opens, edits, saves, and closes. | No scripting. File handoff opens files. | M14 | left out (Mac decision U3) | left out: Mac decision U3 |
+| P71 | Services uses selected text. | Omit Services. | M15 | left out (user decision) | left out: user decision |
+| P72 | Dropping a file on app or window opens it. | Open Explorer files in a tab of the last used window. | M14 | changed (Windows file handoff rule) | yes: a_dropped_file_name_that_is_not_valid_unicode_still_opens, fifteen_files_from_a_second_launch_land_in_one_window |
+| P73 | Share, Writing Tools, and VoiceOver work. | Omit Share and Writing Tools; expose text to UI Automation. | M11, M15 | changed (user omissions and Windows screen reader API) | yes: a_real_client_reads_the_tree_and_the_document_of_a_hidden_window |
 
 ## Mac inventory details
 
@@ -63,85 +65,87 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 
 | Mac ID | Behavior | What Windows does | Builds | Status | Built |
 | --- | --- | --- | --- | --- | --- |
-| I01 | QuickEdit menu has About, Settings, Hide, Show All, Quit. | Settings is the last row of File. About and Quit are removed; Alt+F4 closes the window through Windows. Omit Mac hide actions. | M7, M8 | changed (user decision 2026-11-02) | no |
-| I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in the menu bar; omit Share. | M7, M13, M14 | changed (menu bar; Share omitted) | no |
-| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in the menu bar with Windows keys. | M7, M12, M14 | changed (menu bar and Windows keys) | no |
-| I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in the menu bar. | M7, M12 | changed (menu bar) | no |
-| I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10, M14 | changed (grammar omitted) | no |
-| I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | no |
-| I07 | Transformations menu has upper, lower, capitalize. | Keep all three in the menu bar. | M7, M12 | changed (menu bar) | no |
-| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in the menu bar. | M7, M13, M14 | changed (menu bar) | no |
-| I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and menu bar) | no |
-| I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in the menu bar. | M6, M7, M14 | changed (Windows controls and menu bar) | no |
-| I11 | Help menu is empty. | No Help group, because the Mac Help menu is empty. There is no About page (user decision 2026-11-02). | M7 | left out (nothing to show; choice to check) | no |
-| I12 | Settings is 440 wide, fixed size, with three tabs. | Keep three tabs and 440 device-independent pixels. | M8 | same | no |
-| I13 | Restore All Defaults sits at lower left. | Keep this button. | M8 | same | no |
-| I14 | Settings apply to new windows; line numbers apply now. | Keep this timing. | M8 | same | no |
-| I15 | New Document starts with Wrap to Page off. | Start with it off. | M8 | same | no |
-| I16 | Window size starts 90 by 30; fields accept 1–10000. | Keep values and reject junk. | M8 | same | no |
-| I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. The chooser is the system font dialog, which has no dark mode. | M8 | changed (Windows font) | no |
-| I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10, M14 | changed (grammar omitted) | no |
-| I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep the copy, quote and dash defaults. Text Replacement has no setting, because it is left out. | M8, M12 | changed (Text Replacement omitted) | no |
-| I20 | Line numbers start off. | Start them off. | M8, M13 | same | no |
-| I21 | Add .txt starts on; encoding choices are Automatic or named. | Keep these controls. | M3, M8 | same | no |
-| I22 | Keyboard tab has 394×464 panel, 132-wide key column, 18-high rows. | Keep the 132-wide key column and two-column recorder. Rows are 22 high because Windows text needs more room, with a 44 tall footer (design pick A). | M8 | same | no |
-| I23 | Escape cancels recording; Delete resets; clashes warn. | Keep these rules. Keys Windows owns are refused with a message; `crates/qe-settings/README.md` has the list. | M8 | same | no |
-| I24 | Changed keys show a marker and reset arrow. | Keep both marks. | M8 | same | no |
-| I25 | Tab width 8 and autosave delay 30 have no settings control. | Keep both without controls. | M8, M14 | same | no |
-| I26 | Paper size defaults to Letter in US/Canada, else A4. | Keep these defaults, with no Settings control, as on the Mac. | M8, M13 | same | no |
-| I27 | Text is 13 pt; gutter and map sit outside 90 by 30 text. | Use Cascadia Mono 10 pt; keep side views outside text. | M4, M13 | changed (Windows font size) | no |
-| I28 | Gutter fits digits plus 6 left and 8 right, at least 3 digits. | Keep gutter sizing. | M13 | same | no |
-| I29 | Gutter numbers use 85% font size, at least 9 pt, at 62% color. | Keep sizing, color, and right alignment. | M13 | same | no |
-| I30 | Gutter has 1 px separator and redraws 0.1 s after typing. | Keep both rules. | M13 | same | no |
-| I31 | Map is 100 px wide with 2 px lines and narrow blocks. | Keep map geometry. | M13 | same | no |
-| I32 | Map box uses 10% fill, 22% outline, 8 px pointer trigger. | Keep box geometry and trigger. | M13 | same | no |
-| I33 | Map fades 0.15 s in, 0.25 s out; Reduce Motion skips fade. | Keep timing and accessibility rule. | M13 | same | no |
-| I34 | Map click centers; drag scrolls. | Keep both actions. | M13 | same | no |
-| I35 | Zoom doubles in, halves out, and Actual Size resets. | Keep steps within 25%–1600%. | M13 | same | no |
-| I36 | Pages have 72 pt margins and Letter, A4, Legal sizes. | Use 612×792, 595×842, 612×1008 pt. | M13 | same | no |
-| I37 | Warnings, dim text, and headers have Mac colors. | Use Windows light or dark colors with flat Mac look. | M5, M7 | changed (Windows theme setting) | no |
-| I38 | Select Line panel is 253 by 62 with field and button. | Keep panel size and controls. | M12 | same | no |
-| I39 | Encoding panel is 336 by 187 with checks and list buttons. | Keep panel size and controls. | M7 | same | no |
-| I40 | Save dialog adds encoding and .txt controls. | Add both to native Save dialog. | M3, M7 | same | no |
-| I41 | Auto decode uses file tag, BOM, UTF-8, then system encoding. | Use BOM, UTF-8, then Windows code page. | M3 | changed (no Mac file tag) | no |
-| I42 | Default encodings include UTF-16, UTF-8, Mac Roman, CP1252, Mac Japanese, Shift JIS, Mac Chinese Traditional, Mac Korean, Mac Chinese Simplified, GB 18030. | Keep this list. | M3, M8 | same | no |
-| I43 | New files use UTF-8 without BOM; save keeps a UTF-8 BOM. | Keep both rules. | M3 | same | no |
-| I44 | UTF-16/32 use little-endian BOM; no-BOM reads write big-endian without BOM. | Keep byte order and BOM rules. | M3 | same | no |
-| I45 | Save writes atomically. | Write a replacement safely, then replace old file. | M3 | same | no |
-| I46 | Paste keeps line endings untouched. | Keep pasted endings. | M3, M9 | same | no |
-| I47 | Restore keeps selection and first visible character. | Restore both. | M14 | same | no |
-| I48 | Blank untitled text closes without restore; over 1 MB is not blank. | Keep whitespace and size rules. | M14 | same | no |
-| I49 | Launch window can be replaced until edited, moved, or resized. | Keep replacement rule. | M14 | same | no |
-| I50 | Date-only outside change keeps text, caret, and undo. | Compare bytes before reload. | M14 | same | no |
-| I51 | Over 50 MiB, spelling, substitutions, gutter, map turn off. | Turn them off and show large-file title. | M10, M12, M13, M14 | same | no |
-| I52 | Over 512 MiB, file is read-only; read and export still work. | Keep limit, title, and read tools. | M2, M14 | same | no |
-| I53 | Save As on large read-only file writes original bytes. | Copy original bytes. | M3, M14 | same | no |
-| I54 | Prevent Editing and Wrap to Page belong to window. | Keep choices per window. | M13, M14 | same | no |
-| I55 | New docs use wrap setting; disk files start Wrap to Window. | Keep starting modes. | M13, M14 | same | no |
-| I56 | Select Line accepts absolute and relative ranges; zero is invalid. | Keep `N`, `N-M`, `+N`, `-N`, and ranges. | M12 | same | no |
-| I57 | Select Line Return closes; button stays; bad input beeps. | Keep actions and error text. | M12 | same | no |
-| I58 | Line breaks include LF, CR, CRLF, NEL, LS, PS. | Index all six forms. | M2, M12 | same | no |
-| I59 | PDF options default header off and rewrap on. | Keep choices and defaults. | M13 | same | no |
-| I60 | Mac tab bar appears at two or more tabs. | Always show tab row. | M6 | changed (user decision) | no |
-| I61 | APFS clone copies large files. | Copy the bytes for large-file originals, because Windows has no plain clone call on NTFS. | M2, M3, M14 | changed (no APFS clone) | no |
-| I62 | Tab shortcuts include Ctrl+Tab, Ctrl+Shift+Tab, Cmd+1–9, Cmd+0. | Use Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1–9, Ctrl+0. | M8, M14 | changed (Ctrl replaces Cmd) | no |
-| I63 | A chosen bad encoding says the file could not open using that encoding. | Name the encoding in the open error. | M3, M7 | same | no |
-| I64 | Over 50 MiB and 512 MiB, title shows the large-file or read-only reason. | Show the same reason and size in the title. | M14 | same | no |
+| I01 | QuickEdit menu has About, Settings, Hide, Show All, Quit. | Settings is the last row of File. About and Quit are removed; Alt+F4 closes the window through Windows. Omit Mac hide actions. | M7, M8 | changed (user decision 2026-11-02) | yes: i01_i02_the_file_menu_ends_in_settings_with_no_about_or_quit |
+| I02 | File menu has document, save, PDF, Print, and Share actions. | Put retained actions in the menu bar; omit Share. Close reads Close Tab at two or more tabs. | M7, M13, M14 | changed (menu bar; Share omitted) | yes: i01_i02_the_file_menu_ends_in_settings_with_no_about_or_quit, i02_close_reads_close_tab_at_two_tabs |
+| I03 | Edit menu has undo, clipboard, delete, Complete, Select All. | Put these actions in the menu bar with Windows keys. | M7, M12, M14 | changed (menu bar and Windows keys) | yes: i03_i08_i09_i10_i11_the_other_menus_hold_their_rows |
+| I04 | Find submenu has find, replace, navigation, selection, Select Line. | Put these actions in the menu bar. | M7, M12 | changed (menu bar) | yes: p30_i04_the_windows_keys_find_and_step |
+| I05 | Spelling menu has show, check now, typing, grammar, autocorrect. | Keep spelling actions; omit grammar. | M7, M10, M14 | changed (grammar omitted) | yes: p32_i05_check_document_finds_the_word_and_a_fix_row_changes_it |
+| I06 | Substitutions menu has copy, quotes, dashes, detectors, replacement. | Keep Smart Copy, quotes and dashes. Leave out detectors and Text Replacement. The Show Substitutions row stays in the menu, always off. | M7, M12 | changed (Data Detectors and Text Replacement omitted) | yes: p33_i06_i19_dashes_and_copy_follow_their_rows_and_defaults |
+| I07 | Transformations menu has upper, lower, capitalize. | Keep all three in the menu bar. | M7, M12 | changed (menu bar) | yes: p34_i07_transformations_change_the_selection |
+| I08 | Format menu toggles Prevent Editing and Wrap to Page. | Keep both in the menu bar. | M7, M13, M14 | changed (menu bar) | yes: i03_i08_i09_i10_i11_the_other_menus_hold_their_rows |
+| I09 | View menu has size, zoom, gutter, map, full screen. | Keep actions; use F11 for full screen. | M7, M13 | changed (F11 and menu bar) | yes: i03_i08_i09_i10_i11_the_other_menus_hold_their_rows |
+| I10 | Window menu has minimize, zoom, tab navigation, move, merge. | Keep actions in the menu bar. | M6, M7, M14 | changed (Windows controls and menu bar) | yes: i03_i08_i09_i10_i11_the_other_menus_hold_their_rows, every_menu_row_does_its_job |
+| I11 | Help menu is empty. | No Help group, because the Mac Help menu is empty. There is no About page (user decision 2026-11-02). | M7 | left out (nothing to show; choice to check) | left out: nothing to show; i03_i08_i09_i10_i11_the_other_menus_hold_their_rows proves there are five groups |
+| I12 | Settings is 440 wide, fixed size, with three tabs. | Keep three tabs and 440 device-independent pixels. | M8 | same | lower: it_has_a_real_title_bar_with_a_close_button_and_a_fixed_size, the_tree_has_the_expected_roles |
+| I13 | Restore All Defaults sits at lower left. | Keep this button. | M8 | same | lower: restore_keyboard_defaults_and_restore_all_work_from_the_keyboard, restore_all_is_the_mac_rule |
+| I14 | Settings apply to new windows; line numbers apply now. | Keep this timing. | M8 | same | yes: p50_i14_i55_settings_reach_new_documents_and_leave_open_ones, a_setting_for_line_numbers_applies_to_every_open_window |
+| I15 | New Document starts with Wrap to Page off. | Start with it off. | M8 | same | yes: p01_ctrl_n_opens_an_empty_window |
+| I16 | Window size starts 90 by 30; fields accept 1–10000. | Keep values and reject junk. A new window uses at most 1000 by 500 and at least 10 by 5, inside the window's 500-pixel minimum width. | M8 | same | lower: width_field_takes_good_numbers_and_rejects_junk_with_a_message, set_refuses_junk_and_limits_and_keeps_the_old_value |
+| I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. The chooser is the system font dialog, which has no dark mode. | M8 | changed (Windows font) | yes: p07_i17_the_plain_font_is_cascadia_mono_10_with_8_space_tabs, the_change_button_takes_a_font_from_the_host_and_shows_it, the_dialog_shows_screen_fonts_and_no_style_choices |
+| I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10, M14 | changed (grammar omitted) | yes: spelling_underlines_with_the_stub_checker_only_when_on, defaults_match_the_mac_table |
+| I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep the copy, quote and dash defaults. Text Replacement has no setting, because it is left out. | M8, M12 | changed (Text Replacement omitted) | yes: p33_i06_i19_dashes_and_copy_follow_their_rows_and_defaults |
+| I20 | Line numbers start off. | Start them off. | M8, M13 | same | lower: line_numbers_start_off_and_the_map_starts_on, defaults_match_the_mac_table |
+| I21 | Add .txt starts on; encoding choices are Automatic or named. | Keep these controls. | M3, M8 | same | yes: p04_the_txt_box_starts_on_and_each_state_does_its_job, p20_open_offers_automatic_first_and_starts_at_the_setting |
+| I22 | Keyboard tab has 394×464 panel, 132-wide key column, 18-high rows. | Keep the 132-wide key column and two-column recorder. Rows are 22 high because Windows text needs more room, with a 44 tall footer (design pick A). | M8 | changed (Windows text needs taller rows; design pick A) | lower: the_keyboard_tab_has_the_design_sizes |
+| I23 | Escape cancels recording; Delete resets; clashes warn. | Keep these rules. Keys Windows owns are refused with a message; `crates/qe-settings/README.md` has the list. | M8 | same | lower: esc_cancels_with_no_change_and_a_held_esc_does_not_close, delete_while_recording_removes_the_key_and_delete_on_a_row_resets_it, a_clash_is_refused_with_a_message_and_recording_goes_on, reserved_keys_are_refused_and_alt_f4_stays_a_normal_close |
+| I24 | Changed keys show a marker and reset arrow. | Keep both marks. | M8 | same | lower: changed_rows_show_the_marker_and_the_arrow_resets |
+| I25 | Tab width 8 and autosave delay 30 have no settings control. | Keep both without controls. | M8, M14 | same | lower: tab_width_autosave_and_paper_have_no_control |
+| I26 | Paper size defaults to Letter in US/Canada, else A4. | Keep these defaults, with no Settings control, as on the Mac. | M8, M13 | same | lower: paper_follows_the_region_with_no_control, paper_comes_from_the_region_as_row_i26_says |
+| I27 | Text is 13 pt; gutter and map sit outside 90 by 30 text. | Use Cascadia Mono 10 pt; keep side views outside text. | M4, M13 | changed (Windows font size) | yes: i27_line_numbers_and_the_map_lie_outside_the_90_columns, p07_i17_the_plain_font_is_cascadia_mono_10_with_8_space_tabs |
+| I28 | Gutter fits digits plus 6 left and 8 right, at least 3 digits. | Keep gutter sizing. | M13 | same | lower: gutter_sizes_follow_the_mac, the_gutter_grows_with_the_line_count_and_the_text_stays |
+| I29 | Gutter numbers use 85% font size, at least 9 pt, at 62% color. | Keep sizing, color, and right alignment. | M13 | same | lower: gutter_sizes_follow_the_mac, numbers_show_on_a_lines_first_row_only_right_aligned_and_centered |
+| I30 | Gutter has 1 px separator and redraws 0.1 s after typing. | Keep both rules. | M13 | same | lower: typing_inside_a_line_redraws_the_numbers_after_0_1_s_and_a_new_line_at_once, numbers_show_on_a_lines_first_row_only_right_aligned_and_centered |
+| I31 | Map is 100 px wide with 2 px lines and narrow blocks. | Keep map geometry. | M13 | same | lower: the_map_draws_blocks_of_the_macs_size_at_the_macs_place |
+| I32 | Map box uses 10% fill, 22% outline, 8 px pointer trigger. | Keep box geometry and trigger. | M13 | same | lower: the_map_uses_the_themes_colors_and_only_shows_the_box_when_near, the_box_shows_within_8_dips_of_the_map_and_stays_during_a_drag |
+| I33 | Map fades 0.15 s in, 0.25 s out; Reduce Motion skips fade. | Keep timing and accessibility rule. | M13 | same | lower: the_box_fades_in_over_0_15_s_and_out_over_0_25_s, reduce_motion_jumps_and_needs_no_timer |
+| I34 | Map click centers; drag scrolls. | Keep both actions. | M13 | same | lower: a_click_off_the_box_centers_it_on_the_pointer, dragging_moves_the_box_exactly_with_the_pointer |
+| I35 | Zoom doubles in, halves out, and Actual Size resets. | Keep steps within 25%–1600%. | M13 | same | yes: p42_i35_zoom_doubles_and_halves_inside_25_and_1600_percent |
+| I36 | Pages have 72 pt margins and Letter, A4, Legal sizes. | Use 612×792, 595×842, 612×1008 pt. | M13 | same | yes: i36_each_paper_size_has_its_points, a_page_keeps_its_text_at_the_margin_since_the_padding_lies_inside_it |
+| I37 | Warnings, dim text, and headers have Mac colors. | Use Windows light or dark colors with flat Mac look. | M5, M7 | changed (Windows theme setting) | lower: a_dark_window_has_notepads_exact_colors_at_each_scale, a_light_window_keeps_its_colors, tokens_match_the_design_spec_and_the_theme |
+| I38 | Select Line panel is 253 by 62 with field and button. | Keep panel size and controls. | M12 | same | lower: matches_paint_in_their_colors_and_the_panel_has_the_macs_size |
+| I39 | Encoding panel is 336 by 187 with checks and list buttons. | Keep panel size and controls. | M7 | same | lower: encoding_panel_is_336_by_187_and_stays_inside, customize_encodings_opens_a_modal_panel_that_changes_the_lists |
+| I40 | Save dialog adds encoding and .txt controls. | Add both to native Save dialog. | M3, M7 | same | yes: p23_i40_save_as_turns_off_encodings_that_cannot_hold_the_text, save_dialog_has_encodings_and_the_txt_checkbox |
+| I41 | Auto decode uses file tag, BOM, UTF-8, then system encoding. | Use BOM, UTF-8, then Windows code page. | M3 | changed (no Mac file tag) | yes: p21_i41_automatic_reads_each_bom_then_utf8 |
+| I42 | Default encodings include UTF-16, UTF-8, Mac Roman, CP1252, Mac Japanese, Shift JIS, Mac Chinese Traditional, Mac Korean, Mac Chinese Simplified, GB 18030. | Keep this list. | M3, M8 | same | yes: i42_the_default_list_is_the_macs_ten_encodings |
+| I43 | New files use UTF-8 without BOM; save keeps a UTF-8 BOM. | Keep both rules. | M3 | same | yes: p03_i43_typing_and_ctrl_s_write_utf8_with_no_bom, p28_i43_a_utf8_bom_stays_on_save |
+| I44 | UTF-16/32 use little-endian BOM; no-BOM reads write big-endian without BOM. | Keep byte order and BOM rules. A file with a big-endian BOM keeps it, as the Mac's source does. | M3 | same | yes: i44_utf16_with_and_without_a_bom_save_in_their_own_form |
+| I45 | Save writes atomically. | Write a replacement safely, then replace old file. | M3 | same | lower: ten_kills_in_the_middle_of_saves_leave_a_whole_file, a_real_swap_leaves_the_original_recognisable_under_the_backup_name |
+| I46 | Paste keeps line endings untouched. | Keep pasted endings. | M3, M9 | same | yes: i46_paste_keeps_the_line_endings_it_copied |
+| I47 | Restore keeps selection and first visible character. | Restore both. | M14 | same | yes: p16_i47_selection_and_first_visible_text_come_back |
+| I48 | Blank untitled text closes without restore; over 1 MB is not blank. | Keep whitespace and size rules. | M14 | same | yes: i48_blank_untitled_text_closes_with_no_question_and_stays_gone, over_the_scan_limit_counts_as_not_blank_and_a_named_empty_file_is_never_blank |
+| I49 | Launch window can be replaced until edited, moved, or resized. | Keep replacement rule. | M14 | same | yes: p17_i49_open_replaces_the_launch_window_until_it_is_edited, an_edit_a_move_or_a_second_document_ends_the_launch_state |
+| I50 | Date-only outside change keeps text, caret, and undo. | Compare bytes before reload. | M14 | same | yes: i50_a_change_of_date_alone_keeps_text_caret_and_undo |
+| I51 | Over 50 MiB, spelling, substitutions, gutter, map turn off. | Turn them off and show large-file title. | M10, M12, M13, M14 | same | yes: i51_i64_over_50_mib_the_extras_turn_off_and_the_title_says_so, over_50_mib_rows_follow_the_mac_and_a_row_that_is_off_shows_no_check |
+| I52 | Over 512 MiB, file is read-only; read and export still work. | Keep limit, title, and read tools. | M2, M14 | same | yes: i52_i53_i64_over_512_mib_a_file_reads_finds_and_copies_its_bytes |
+| I53 | Save As on large read-only file writes original bytes. | Copy original bytes. | M3, M14 | same | yes: i52_i53_i64_over_512_mib_a_file_reads_finds_and_copies_its_bytes |
+| I54 | Prevent Editing and Wrap to Page belong to window. | Keep choices per window. | M13, M14 | same | yes: i54_prevent_editing_and_wrap_belong_to_each_document |
+| I55 | New docs use wrap setting; disk files start Wrap to Window. | Keep starting modes. | M13, M14 | same | yes: p50_i14_i55_settings_reach_new_documents_and_leave_open_ones |
+| I56 | Select Line accepts absolute and relative ranges; zero is invalid. | Keep `N`, `N-M`, `+N`, `-N`, and ranges. | M12 | same | yes: p31_i56_i57_i58_select_line_takes_each_form_and_every_line_ending |
+| I57 | Select Line Return closes; button stays; bad input beeps. | Keep actions and error text. | M12 | same | yes: p31_i56_i57_i58_select_line_takes_each_form_and_every_line_ending, select_line_return_closes_the_button_stays_as_on_the_mac |
+| I58 | Line breaks include LF, CR, CRLF, NEL, LS, PS. | Index all six forms. | M2, M12 | same | yes: p31_i56_i57_i58_select_line_takes_each_form_and_every_line_ending |
+| I59 | PDF options default header off and rewrap on. | Keep choices and defaults. | M13 | same | yes: p60_i59_the_pdf_dialog_has_both_choices_with_the_macs_defaults, pdf_dialog_has_its_boxes_and_wrap_to_page_has_no_rewrap_box |
+| I60 | Mac tab bar appears at two or more tabs. | Always show tab row. | M6 | changed (user decision) | yes: i60_w02_w03_one_tab_shows_and_the_plus_adds_one |
+| I61 | APFS clone copies large files. | Copy the bytes for large-file originals, because Windows has no plain clone call on NTFS. | M2, M3, M14 | changed (no APFS clone) | yes: i52_i53_i64_over_512_mib_a_file_reads_finds_and_copies_its_bytes, copy_large_original_preserves_bytes_and_cancels |
+| I62 | Tab shortcuts include Ctrl+Tab, Ctrl+Shift+Tab, Cmd+1–9, Cmd+0. | Use Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1–9, Ctrl+0. | M8, M14 | changed (Ctrl replaces Cmd) | yes: i62_w08_the_tab_keys_and_the_windows_keys_work |
+| I63 | A chosen bad encoding says the file could not open using that encoding. | Name the encoding in the open error. | M3, M7 | same | yes: p22_i63_a_chosen_encoding_that_does_not_fit_names_itself |
+| I64 | Over 50 MiB and 512 MiB, title shows the large-file or read-only reason. | Show the same reason and size in the title. | M14 | same | yes: i51_i64_over_50_mib_the_extras_turn_off_and_the_title_says_so, i52_i53_i64_over_512_mib_a_file_reads_finds_and_copies_its_bytes |
 
 ## Windows additions
 
 | Mac ID | Behavior | What Windows does | Builds | Status | Built |
 | --- | --- | --- | --- | --- | --- |
-| W01 | Mac has native window chrome. | Use a Windows Terminal-style top row. | M6 | changed (user decision) | no |
-| W02 | Mac hides tab bar at one tab. | Always show one tab. | M6 | changed (user decision) | no |
-| W03 | Mac has a new-tab action. | Show `+` beside tabs. | M6 | changed (Windows top row) | no |
-| W04 | Mac has a menu bar. | Show a menu bar under the tabs, like Notepad. The top row has the tabs, `+` and the window buttons, with no caret button. | M6 | changed (Windows top row; user decision 2026-11-02) | no |
-| W05 | Mac window buttons use macOS. | Show Windows buttons and support Snap Layouts. | M6 | changed (Windows window controls) | no |
-| W06 | Mac menus live in menu bar. | Put each retained menu group in the menu bar under the tabs. | M7 | changed (user decision 2026-11-02) | no |
-| W07 | Mac has no Alt key behavior for menus. | Alt or F10 focuses the menu bar, and Alt+letter opens a menu. | M7 | changed (user decision 2026-11-02) | no |
-| W08 | Mac keys mainly use Cmd. | Use Ctrl, Ctrl+H, F3, Ctrl+Space, F11; allow changes. Alt+F4 stays a normal Windows close and cannot be changed. | M8, M12 | changed (Windows keys and user decision) | no |
-| W09 | Mac opens external files in document windows. | Explorer and second launches add tabs to last used window. | M14 | changed (user decision) | no |
-| W10 | Mac uses Mac distribution. | Install and update through Microsoft Store. | M15 | changed (user decision) | no |
+| W01 | Mac has native window chrome. | Use a Windows Terminal-style top row. | M6 | changed (user decision) | person: the top row beside Windows Terminal in a visible window |
+| W02 | Mac hides tab bar at one tab. | Always show one tab. | M6 | changed (user decision) | yes: i60_w02_w03_one_tab_shows_and_the_plus_adds_one |
+| W03 | Mac has a new-tab action. | Show `+` beside tabs. | M6 | changed (Windows top row) | yes: i60_w02_w03_one_tab_shows_and_the_plus_adds_one |
+| W04 | Mac has a menu bar. | Show a menu bar under the tabs, like Notepad. The top row has the tabs, `+` and the window buttons, with no caret button. | M6 | changed (Windows top row; user decision 2026-11-02) | lower: the_row_has_no_down_caret_in_any_state, the_bar_is_client_area_at_each_scale_above_100_percent |
+| W05 | Mac window buttons use macOS. | Show Windows buttons and support Snap Layouts. | M6 | changed (Windows window controls) | person: root's visible run 2026-11-03 (Snap flyout appears on hover) |
+| W06 | Mac menus live in menu bar. | Put each retained menu group in the menu bar under the tabs. | M7 | changed (user decision 2026-11-02) | yes: i03_i08_i09_i10_i11_the_other_menus_hold_their_rows, a_real_client_reads_the_tree_and_the_document_of_a_hidden_window |
+| W07 | Mac has no Alt key behavior for menus. | Alt or F10 focuses the menu bar, and Alt+letter opens a menu. | M7 | changed (user decision 2026-11-02) | yes: alt_f_and_enter_run_new_through_real_key_messages, f10_focuses_the_bar_and_f10_again_lets_go |
+| W08 | Mac keys mainly use Cmd. | Use Ctrl, Ctrl+H, F3, Ctrl+Space, F11; allow changes. Alt+F4 stays a normal Windows close and cannot be changed. | M8, M12 | changed (Windows keys and user decision) | yes: i62_w08_the_tab_keys_and_the_windows_keys_work, p30_i04_the_windows_keys_find_and_step, alt_f4_and_alt_space_reach_the_default_handler |
+| W09 | Mac opens external files in document windows. | Explorer and second launches add tabs to last used window. | M14 | changed (user decision) | yes: fifteen_files_from_a_second_launch_land_in_one_window, a_tab_moved_to_another_window_makes_that_window_the_one_in_use |
+| W10 | Mac uses Mac distribution. | Install and update through Microsoft Store. | M15 | changed (user decision) | person: install and update through the Store; the package itself is in makeappx_packs_the_real_manifest_and_icons_around_a_stand_in_exe |
+| W11 | Mac shows input-method clauses through AppKit. | Draw an underline for each clause of a composition, and a heavier one for the target clause. | M10 | changed (Windows input methods use TSF) | person: a real input method shows each clause, with a heavier target clause; the logic is in clauses_get_their_own_underlines_and_the_target_a_heavier_one and clause_marks_from_a_service_reach_the_view |
+| W12 | Mac places the candidate list through AppKit. | Tell TSF the place of the target clause, so that the list opens beside that clause. | M10 | changed (Windows input methods use TSF) | person: a real input method opens its list beside the clause; the logic is in the_candidate_place_for_a_clause_is_that_clause_and_not_the_whole_composition |
 
 ## Speed goals
 
@@ -149,13 +153,13 @@ These are goals, not measurements. M15 records real numbers.
 
 | Mac ID | Behavior | What Windows does | Builds | Status | Built |
 | --- | --- | --- | --- | --- | --- |
-| S01 | No Mac speed row. | Warm first frame without MSIX under 60 ms; 30 runs. | M15 | changed (Windows speed goal) | no |
-| S02 | No Mac speed row. | Cold first frame under 150 ms after clearing file cache. | M15 | changed (Windows speed goal) | no |
-| S03 | No Mac speed row. | Report MSIX cost; fail above 30 ms across four launch paths. | M15 | changed (Windows speed goal) | no |
-| S04 | No Mac speed row. | Key handler p99 under 2 ms on 1 MB and 512 MiB files. | M15 | changed (Windows speed goal) | no |
-| S05 | No Mac speed row. | Key to screen p50 under 25 ms and p95 under 33 ms. | M15 | changed (Windows speed goal) | no |
-| S06 | No Mac speed row. | Second launch to visible tab under 50 ms. | M15 | changed (Windows speed goal) | no |
-| S07 | No Mac speed row. | 1 GiB read-only first screen under 100 ms; index under 2 s. | M15 | changed (Windows speed goal) | no |
-| S08 | No Mac speed row. | 100 MB editable first screen under 150 ms. | M15 | changed (Windows speed goal) | no |
-| S09 | No Mac speed row. | Idle has no timers and no wakeups. | M15 | changed (Windows speed goal) | no |
-| S10 | No Mac speed row. | Empty window uses under 40 MB private memory. | M15 | changed (Windows speed goal) | no |
+| S01 | No Mac speed row. | Warm first frame without MSIX under 60 ms; 30 runs. | M15 | changed (Windows speed goal) | person: root's visible run 2026-11-03 (first frame 28 ms from process start) |
+| S02 | No Mac speed row. | Cold first frame under 150 ms after clearing file cache. | M15 | changed (Windows speed goal) | person: a cold run on a quiet PC after clearing the file cache; not measured yet |
+| S03 | No Mac speed row. | Report MSIX cost; fail above 30 ms across four launch paths. | M15 | changed (Windows speed goal) | person: root's visible run 2026-11-03 (launch through the package adds about 28 ms over direct) |
+| S04 | No Mac speed row. | Key handler p99 under 2 ms on 1 MB and 512 MiB files. | M15 | changed (Windows speed goal) | person: root's visible run 2026-11-03 (real keys p50 0.45 ms, p99 1.76 ms on a small file); that run does not cover a 512 MiB file |
+| S05 | No Mac speed row. | Key to screen p50 under 25 ms and p95 under 33 ms. | M15 | changed (Windows speed goal) | person: key to screen with a captured frame on a quiet PC; not measured yet |
+| S06 | No Mac speed row. | Second launch to visible tab under 50 ms. | M15 | changed (Windows speed goal) | person: second launch to visible tab on a quiet PC; a_second_launch_reports_its_time_and_windows_agrees proves the timer only |
+| S07 | No Mac speed row. | 1 GiB read-only first screen under 100 ms; index under 2 s. | M15 | changed (Windows speed goal) | person: a 1 GiB file on a quiet PC, in a release build; gib_open_first_screen_and_index proves the path only |
+| S08 | No Mac speed row. | 100 MB editable first screen under 150 ms. | M15 | changed (Windows speed goal) | person: a 100 MB file on a quiet PC, in a release build; not measured yet |
+| S09 | No Mac speed row. | Idle has no timers and no wakeups. | M15 | changed (Windows speed goal) | yes: an_idle_app_wakes_for_nothing, a_tab_that_opens_in_a_window_with_no_keyboard_sets_no_caret_timer |
+| S10 | No Mac speed row. | Empty window uses under 40 MB private memory. | M15 | changed (Windows speed goal) | person: private memory of an empty window in a release build; not measured yet |

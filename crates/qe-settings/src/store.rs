@@ -105,6 +105,7 @@ impl std::error::Error for SettingError {}
 pub enum PaperSize {
     Letter,
     A4,
+    Legal,
 }
 /// Row I26: Letter in the US and Canada, else A4. A region not known means A4.
 pub fn paper_for_region(region: Option<&str>) -> PaperSize {
@@ -981,10 +982,10 @@ impl SettingsStore {
     /// The saved paper, or the one for the user's region.
     pub fn paper_size(&self) -> PaperSize {
         if let Some(StoredValue::Text(text)) = self.0.state.borrow().stored(SettingKey::PaperSize) {
-            return if text == "Letter" {
-                PaperSize::Letter
-            } else {
-                PaperSize::A4
+            return match text.as_str() {
+                "Letter" => PaperSize::Letter,
+                "Legal" => PaperSize::Legal,
+                _ => PaperSize::A4,
             };
         }
         paper_for_region(user_region().as_deref())

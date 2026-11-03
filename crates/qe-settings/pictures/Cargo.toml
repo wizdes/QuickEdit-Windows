@@ -1,0 +1,26 @@
+# Pictures of the Settings window through the real renderer. This package stands apart
+# from the workspace because `qe-settings` has no `qe-render` line in the root `Cargo.lock`,
+# and only root edits that file. Run it from the repo root:
+#   cargo test --locked --manifest-path crates/qe-settings/pictures/Cargo.toml --target-dir target
+# Once root adds `qe-render` and `qe-layout` as dev-dependencies of `qe-settings`, the test
+# file can move to `crates/qe-settings/tests/` and this folder can go.
+[package]
+name = "qe-settings-pictures"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dev-dependencies]
+qe-api = { path = "../../qe-api" }
+qe-layout = { path = "../../qe-layout" }
+qe-render = { path = "../../qe-render" }
+qe-settings = { path = ".." }
+qe-ui = { path = "../../qe-ui" }
+windows = { version = "=0.62.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }

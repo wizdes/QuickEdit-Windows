@@ -79,13 +79,13 @@ These rows cover details that the parity rows do not spell out. Each menu row co
 | I14 | Settings apply to new windows; line numbers apply now. | Keep this timing. | M8 | same | no |
 | I15 | New Document starts with Wrap to Page off. | Start with it off. | M8 | same | no |
 | I16 | Window size starts 90 by 30; fields accept 1–10000. | Keep values and reject junk. | M8 | same | no |
-| I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. | M8 | changed (Windows font) | no |
+| I17 | New Document has a font chooser and font name. | Show Cascadia Mono 10 pt by default. The chooser is the system font dialog, which has no dark mode. | M8 | changed (Windows font) | no |
 | I18 | Spelling, grammar, and autocorrect start off. | Start spelling and autocorrect off; omit grammar. | M8, M10, M14 | changed (grammar omitted) | no |
 | I19 | Smart copy starts on; quotes and dashes off; replacement uses system value. | Keep the copy, quote and dash defaults. Text Replacement has no setting, because it is left out. | M8, M12 | changed (Text Replacement omitted) | no |
 | I20 | Line numbers start off. | Start them off. | M8, M13 | same | no |
 | I21 | Add .txt starts on; encoding choices are Automatic or named. | Keep these controls. | M3, M8 | same | no |
-| I22 | Keyboard tab has 394×464 panel, 132-wide key column, 18-high rows. | Keep these sizes and the two-column recorder. | M8 | same | no |
-| I23 | Escape cancels recording; Delete resets; clashes warn. | Keep these rules. | M8 | same | no |
+| I22 | Keyboard tab has 394×464 panel, 132-wide key column, 18-high rows. | Keep the 132-wide key column and two-column recorder. Rows are 22 high because Windows text needs more room, with a 44 tall footer (design pick A). | M8 | same | no |
+| I23 | Escape cancels recording; Delete resets; clashes warn. | Keep these rules. Keys Windows owns are refused with a message; `crates/qe-settings/README.md` has the list. | M8 | same | no |
 | I24 | Changed keys show a marker and reset arrow. | Keep both marks. | M8 | same | no |
 | I25 | Tab width 8 and autosave delay 30 have no settings control. | Keep both without controls. | M8, M14 | same | no |
 | I26 | Paper size defaults to Letter in US/Canada, else A4. | Keep these defaults, with no Settings control, as on the Mac. | M8, M13 | same | no |

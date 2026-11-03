@@ -51,6 +51,8 @@ The full list came from reading the Swift code, and M1 commits it as `docs/parit
 8. New public repo: `Projects/QuickEdit-Windows`, remote `wizdes/QuickEdit-Windows`.
 9. I may add a `yjli` SSH key to the `agent` account on this PC, so that Sol builders can run there.
 
+10. On 2026-11-02 the user said "overall looks good keep going" without naming a Settings or editor design. Root took that as the recommended A and A, and told the user this can still change.
+
 ## Choices to check (my defaults; I continue unless you object)
 - **Tab bar:** always shows, as you asked. This differs from the Mac, which hides it at one tab.
 - **Encoding when opening:** BOM, then strict UTF-8, then the Windows system code page. Windows has no file tag like `com.apple.TextEncoding`, so that step goes. Mac encodings stay available in the list.

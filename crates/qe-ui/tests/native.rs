@@ -519,8 +519,14 @@ fn capture_holder() -> HWND {
     // SAFETY: a plain query.
     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }
 }
-fn caret_view(x: f32, y: f32) -> MenuView {
-    let mut view = MenuView::new(qe_api::WidgetId(1), "All menus", legacy_caret_menu());
+fn all_menus_view(x: f32, y: f32) -> MenuView {
+    let mut view = MenuView::new(
+        qe_api::WidgetId(1),
+        "All menus",
+        MenuModel {
+            items: menu_bar_groups(),
+        },
+    );
     view.bounds = qe_api::Rect {
         x: qe_api::Dip(x),
         y: qe_api::Dip(y),
@@ -541,7 +547,7 @@ fn a_submenu_window_does_not_close_the_list() {
     on_thread(|| {
         use qe_api::View;
         let owner = Owner::new();
-        let mut view = caret_view(100.0, 100.0);
+        let mut view = all_menus_view(100.0, 100.0);
         let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
         windows.sync(&view).unwrap();
         assert_eq!(windows.levels().len(), 1);
@@ -587,7 +593,7 @@ fn a_press_on_any_level_is_inside_and_elsewhere_ends_them_all() {
     on_thread(|| {
         use qe_api::View;
         let owner = Owner::new();
-        let mut view = caret_view(100.0, 100.0);
+        let mut view = all_menus_view(100.0, 100.0);
         let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
         windows.sync(&view).unwrap();
         view.handle(&key(0x27), &mut qe_api::ViewContext::default());

@@ -1642,7 +1642,7 @@ fn a_row_with_a_submenu_says_so_and_holds_the_child() {
 }
 #[test]
 fn no_empty_shortcut_values() {
-    let tree = MenuView::new(WidgetId(1), "Test", caret_menu())
+    let tree = MenuView::new(WidgetId(1), "Test", all_menus())
         .widgets()
         .unwrap();
     assert!(
@@ -1737,7 +1737,7 @@ fn child_ids_do_not_collide_across_a_whole_dialog() {
     );
     tabs.bounds = r(0.0, 600.0, 400.0, 30.0);
     frame.add(Box::new(tabs));
-    let mut menu = MenuView::new(WidgetId(4), "Test", legacy_caret_menu());
+    let mut menu = MenuView::new(WidgetId(4), "Test", all_menus());
     menu.bounds = r(400.0, 0.0, 300.0, 400.0);
     menu.open_keyboard();
     send(&mut menu, &press(0x27));
@@ -1969,7 +1969,12 @@ fn wrap_lines_breaks_at_spaces_and_inside_long_words() {
     assert_eq!(lines, ["a", "b"]);
 }
 
-// Item 25: the caret list and the encoding panel.
+// Item 25: the menu groups and the encoding panel.
+fn all_menus() -> MenuModel {
+    MenuModel {
+        items: menu_bar_groups(),
+    }
+}
 fn commands_of(model: &MenuModel, out: &mut Vec<CommandId>) {
     for item in &model.items {
         if let Some(command) = item.command {
@@ -1981,7 +1986,7 @@ fn commands_of(model: &MenuModel, out: &mut Vec<CommandId>) {
     }
 }
 #[test]
-fn menu_bar_and_caret_have_every_command_once() {
+fn menu_bar_has_every_command_once() {
     let mut found = vec![];
     commands_of(
         &MenuModel {
@@ -1989,7 +1994,6 @@ fn menu_bar_and_caret_have_every_command_once() {
         },
         &mut found,
     );
-    commands_of(&caret_menu(), &mut found);
     for command in CommandId::ALL {
         assert_eq!(
             found.iter().filter(|c| *c == command).count(),
@@ -2006,14 +2010,6 @@ fn menu_bar_has_the_groups_in_order_and_no_mac_only_rows() {
     };
     let names: Vec<&str> = model.items.iter().map(|i| i.label.as_str()).collect();
     assert_eq!(names, ["File", "Edit", "Format", "View", "Window"]);
-    assert_eq!(
-        caret_menu()
-            .items
-            .iter()
-            .map(|i| i.label.as_str())
-            .collect::<Vec<_>>(),
-        ["About QuickEdit", "Settings…", "Quit QuickEdit"]
-    );
     fn labels(model: &MenuModel, out: &mut Vec<String>) {
         for item in &model.items {
             out.push(item.label.clone());

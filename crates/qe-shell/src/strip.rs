@@ -1,4 +1,4 @@
-//! The top row as plain data: tabs, the split button and the window buttons. It holds
+//! The top row as plain data: tabs, the + button and the window buttons. It holds
 //! no window handle, so that every rule here can run in a test with no desktop.
 use crate::ShellError;
 use qe_api::*;
@@ -41,7 +41,6 @@ pub enum ShellEvent {
         tab: TabId,
         to: usize,
     },
-    OpenCaretList(Rect),
     /// A menu bar label opened. The owner hosts its popup at this rectangle.
     OpenMenuGroup(usize, Rect),
     TearOffTab {
@@ -81,7 +80,6 @@ pub enum CaptionHit {
     Tab(usize),
     TabClose(usize),
     NewTab,
-    Caret,
     ScrollLeft,
     ScrollRight,
     Minimize,
@@ -124,23 +122,13 @@ pub struct ShellTokens {
     pub button_radius: f32,
     pub max_width: f32,
     pub min_width: f32,
-    pub split_height: f32,
-    pub split_part: f32,
-    pub separator_width: f32,
+    pub plus_height: f32,
+    pub plus_width: f32,
     pub scroll_width: f32,
     pub caption_width: f32,
     pub top_band: f32,
     pub icon: f32,
     pub caption_icon: f32,
-    /// The font size that gives the caret WinUI's ink of about 7.7 x 4.2.
-    pub caret_icon: f32,
-    pub caret_box: f32,
-    pub caret_right_padding: f32,
-    /// E96E's ink sits above the middle of its em box. This moves it down to the center
-    /// at 200%, and is too small to move the baseline's whole pixel at 100%.
-    pub caret_nudge: f32,
-    /// Its ink also sits right of the middle. Terminal's center is at x = 13 of the part.
-    pub caret_nudge_x: f32,
     pub focus_width: f32,
     pub drag_threshold: f32,
     pub text_inset: f32,
@@ -157,12 +145,9 @@ pub struct ShellTokens {
     pub dim: Color,
     pub button_text: Color,
     pub button_text_pressed: Color,
-    pub caret_text: Color,
-    pub caret_text_pressed: Color,
     pub caption_dim: Color,
     pub hover: Color,
     pub pressed: Color,
-    pub separator: Color,
     pub close_hover: Color,
     pub close_pressed: Color,
     pub close_text: Color,
@@ -175,8 +160,6 @@ pub struct ShellTokens {
     pub icon_token: &'static str,
     /// Measures a 10-dip icon. 10 dips is 7.5 points.
     pub caption_icon_token: &'static str,
-    /// Measures the caret. 9 dips is 6.75 points.
-    pub caret_token: &'static str,
 }
 const fn alpha(c: Color, a: u8) -> Color {
     Color { a, ..c }
@@ -193,19 +176,13 @@ impl ShellTokens {
             button_radius: 4.0,
             max_width: 240.0,
             min_width: 80.0,
-            split_height: 24.0,
-            split_part: 31.0,
-            separator_width: 1.0,
+            plus_height: 24.0,
+            plus_width: 31.0,
             scroll_width: 20.0,
             caption_width: theme.caption_button_width.0,
             top_band: 8.0,
             icon: 12.0,
             caption_icon: 10.0,
-            caret_icon: 10.0,
-            caret_box: 12.0,
-            caret_right_padding: 12.0,
-            caret_nudge: 0.3,
-            caret_nudge_x: -0.55,
             focus_width: 2.0,
             drag_threshold: 12.0,
             text_inset: 16.0,
@@ -230,17 +207,6 @@ impl ShellTokens {
             } else {
                 alpha(theme.text, 0x9e)
             },
-            // `SplitButtonForegroundSecondary`: Terminal does not override it.
-            caret_text: if dark {
-                alpha(theme.text, 0xc5)
-            } else {
-                alpha(theme.text, 0x9e)
-            },
-            caret_text_pressed: if dark {
-                alpha(theme.text, 0x87)
-            } else {
-                alpha(theme.text, 0x72)
-            },
             caption_dim: if dark {
                 alpha(theme.text, 0x5d)
             } else {
@@ -256,12 +222,6 @@ impl ShellTokens {
             } else {
                 alpha(theme.text, 0x06)
             },
-            // `ControlStrokeColorDefault`, through `SplitButtonBorderBrushDivider`.
-            separator: if dark {
-                alpha(theme.text, 0x12)
-            } else {
-                alpha(theme.text, 0x0f)
-            },
             close_hover: Color::rgb(0xc4, 0x2b, 0x1c),
             close_pressed: alpha(Color::rgb(0xc4, 0x2b, 0x1c), 230),
             close_text: Color::rgb(255, 255, 255),
@@ -275,7 +235,6 @@ impl ShellTokens {
             text_token: "Segoe UI 9.75",
             icon_token: "Segoe Fluent Icons 9",
             caption_icon_token: "Segoe Fluent Icons 7.5",
-            caret_token: "Segoe Fluent Icons 6.75",
         }
     }
     /// Replaces each color with a system color. There is no hardcoded red or white.
@@ -286,21 +245,15 @@ impl ShellTokens {
         self.dim = c.window_text;
         self.button_text = c.window_text;
         self.button_text_pressed = c.highlight_text;
-        self.caret_text = c.window_text;
-        self.caret_text_pressed = c.highlight_text;
         self.caption_dim = c.gray_text;
         self.hover = c.highlight;
         self.pressed = c.highlight;
-        self.separator = c.window_text;
         self.close_hover = c.highlight;
         self.close_pressed = c.highlight;
         self.close_text = c.highlight_text;
         self.close_text_pressed = c.highlight_text;
         self.focus = c.window_text;
         self
-    }
-    pub fn split_width(self) -> f32 {
-        self.split_part * 2.0 + self.separator_width
     }
 }
 
@@ -435,7 +388,7 @@ pub struct TabStrip {
     tab_width: f32,
     /// Always one rectangle per tab, whether or not `layout` has run.
     tab_rects: Vec<Rect>,
-    split: Rect,
+    plus: Rect,
     overflow: bool,
     visible_width: f32,
     scroll: usize,
@@ -465,7 +418,7 @@ impl TabStrip {
             bounds: Rect::default(),
             tab_width: light_tokens().max_width,
             tab_rects: Vec::new(),
-            split: Rect::default(),
+            plus: Rect::default(),
             overflow: false,
             visible_width: 0.0,
             scroll: 0,
@@ -538,8 +491,8 @@ impl TabStrip {
     pub fn tab_width(&self) -> f32 {
         self.tab_width
     }
-    pub fn split_rect(&self) -> Rect {
-        self.split
+    pub fn plus_rect(&self) -> Rect {
+        self.plus
     }
     pub fn overflow(&self) -> bool {
         self.overflow
@@ -731,10 +684,8 @@ impl TabStrip {
                 }
             }
         }
-        for hit in [CaptionHit::NewTab, CaptionHit::Caret] {
-            if inside(at, self.part_rect(hit)) {
-                return hit;
-            }
+        if inside(at, self.plus) {
+            return CaptionHit::NewTab;
         }
         if x >= self.clip_start()
             && x < self.clip_end()
@@ -805,7 +756,7 @@ impl TabStrip {
             }
     }
     fn clip_end(&self) -> f32 {
-        self.split.x.0
+        self.plus.x.0
             - if self.overflow {
                 light_tokens().scroll_width
             } else {
@@ -823,30 +774,18 @@ impl TabStrip {
             CaptionHit::Tab(i) | CaptionHit::TabClose(i) => {
                 self.tab_rects.get(i).copied().unwrap_or_default()
             }
-            // WinUI's `PrimaryBackgroundGrid` spans the divider's column too.
-            CaptionHit::NewTab => r(
-                self.split.x.0,
-                self.split.y.0,
-                t.split_part + t.separator_width,
-                t.split_height,
-            ),
-            CaptionHit::Caret => r(
-                self.split.x.0 + t.split_part + t.separator_width,
-                self.split.y.0,
-                t.split_part,
-                t.split_height,
-            ),
+            CaptionHit::NewTab => self.plus,
             CaptionHit::ScrollLeft if self.overflow => r(
                 self.bounds.x.0,
-                self.split.y.0,
+                self.plus.y.0,
                 t.scroll_width,
-                t.split_height,
+                t.plus_height,
             ),
             CaptionHit::ScrollRight if self.overflow => r(
-                self.split.x.0 - t.scroll_width,
-                self.split.y.0,
+                self.plus.x.0 - t.scroll_width,
+                self.plus.y.0,
                 t.scroll_width,
-                t.split_height,
+                t.plus_height,
             ),
             CaptionHit::Minimize => r(self.caption_x(0, t), self.bounds.y.0, t.caption_width, row),
             CaptionHit::Maximize => r(self.caption_x(1, t), self.bounds.y.0, t.caption_width, row),
@@ -885,7 +824,7 @@ impl TabStrip {
     fn arrange(&mut self) {
         let t = light_tokens();
         let bounds = self.bounds;
-        let available = (bounds.width.0 - 3.0 * t.caption_width - t.split_width()).max(0.0);
+        let available = (bounds.width.0 - 3.0 * t.caption_width - t.plus_width).max(0.0);
         self.tab_width = (available / self.tabs.len() as f32).clamp(t.min_width, t.max_width);
         self.overflow = self.tabs.len() as f32 * t.min_width > available;
         let left = bounds.x.0 + if self.overflow { t.scroll_width } else { 0.0 };
@@ -906,15 +845,15 @@ impl TabStrip {
                 )
             })
             .collect();
-        self.split = r(
+        self.plus = r(
             if self.overflow {
                 left + self.visible_width + t.scroll_width
             } else {
                 left + self.tabs.len() as f32 * self.tab_width
             },
-            tab_top + (t.tab_height - t.split_height) / 2.0,
-            t.split_width(),
-            t.split_height,
+            tab_top + (t.tab_height - t.plus_height) / 2.0,
+            t.plus_width,
+            t.plus_height,
         );
         self.fix_focus();
     }
@@ -975,7 +914,6 @@ impl TabStrip {
             out.push(CaptionHit::ScrollRight);
         }
         out.push(CaptionHit::NewTab);
-        out.push(CaptionHit::Caret);
         out
     }
     fn move_focus_to(&mut self, next: CaptionHit, ctx: &mut ViewContext) {
@@ -1050,7 +988,6 @@ impl TabStrip {
     fn activate(&mut self, hit: CaptionHit) {
         match hit {
             CaptionHit::NewTab => self.events.push(ShellEvent::NewTab),
-            CaptionHit::Caret => self.events.push(ShellEvent::OpenCaretList(self.split)),
             CaptionHit::Tab(i) => self.select_index(i),
             CaptionHit::TabClose(i) => {
                 if let Some(id) = self.tab_id(i) {
@@ -1274,17 +1211,7 @@ impl View for TabStrip {
                 self.draw_button(list, hit, code, t, measure);
             }
         }
-        self.draw_split(list, t, measure);
-        // A fill snaps to whole pixels. A line 1 wide on a whole x would blur across two.
-        list.push(DrawCommand::FillRect {
-            rect: r(
-                self.split.x.0 + t.split_part,
-                self.split.y.0,
-                t.separator_width,
-                t.split_height,
-            ),
-            color: t.separator,
-        });
+        self.draw_button(list, CaptionHit::NewTab, 0xe710, t, measure);
         self.draw_caption(list, t, measure);
     }
     fn widgets(&self) -> Option<Widget> {
@@ -1337,7 +1264,6 @@ impl View for TabStrip {
         }
         for (hit, name) in [
             (CaptionHit::NewTab, "New tab"),
-            (CaptionHit::Caret, "Tab list"),
             (CaptionHit::Minimize, "Minimize"),
             (CaptionHit::Maximize, "Maximize or restore"),
             (CaptionHit::Close, "Close window"),
@@ -1376,7 +1302,6 @@ impl TabStrip {
             CaptionHit::Tab(i) => TAB_IDS + i as u64,
             CaptionHit::TabClose(i) => TAB_CLOSE_IDS + i as u64,
             CaptionHit::NewTab => 1,
-            CaptionHit::Caret => 2,
             CaptionHit::Minimize => 3,
             CaptionHit::Maximize => 4,
             CaptionHit::Close => 5,
@@ -1592,101 +1517,6 @@ impl TabStrip {
                 width: Dip(t.focus_width),
                 color: t.focus,
             });
-        }
-    }
-    /// WinUI's `SplitButton.xaml` and Terminal's `TabRowControl.xaml`. The fills are plain
-    /// rectangles: only the outer corners round, from the 4-radius root grid's clip. The
-    /// `+` fill spans the divider's column. The caret's 12 x 12 box is right aligned with
-    /// padding 0,0,12,0, so that its center is at x = 13 of the 31-wide part.
-    fn draw_split(&self, list: &mut DisplayList, t: ShellTokens, measure: &dyn TextMeasurer) {
-        let contrast = self.contrast.is_some();
-        let s = self.split;
-        let r_btn = t.button_radius;
-        let caret_x = s.x.0 + t.split_part + t.separator_width;
-        for (hit, clip, shape) in [
-            (
-                CaptionHit::NewTab,
-                self.part_rect(CaptionHit::NewTab),
-                r(
-                    s.x.0,
-                    s.y.0,
-                    t.split_part + t.separator_width + r_btn,
-                    t.split_height,
-                ),
-            ),
-            (
-                CaptionHit::Caret,
-                self.part_rect(CaptionHit::Caret),
-                r(caret_x - r_btn, s.y.0, t.split_part + r_btn, t.split_height),
-            ),
-        ] {
-            let look = self.look(hit);
-            if look != Look::Rest {
-                list.push(DrawCommand::PushClip(clip));
-                list.push(DrawCommand::RoundedRect {
-                    rect: shape,
-                    radius: Dip(r_btn),
-                    color: if look == Look::Pressed {
-                        t.pressed
-                    } else {
-                        t.hover
-                    },
-                });
-                list.push(DrawCommand::PopClip);
-            }
-        }
-        let plus_look = self.look(CaptionHit::NewTab);
-        icon(
-            list,
-            r(s.x.0, s.y.0, t.split_part, t.split_height),
-            0xe710,
-            IconStyle {
-                size: t.icon,
-                token: t.icon_token,
-                color: if plus_look == Look::Pressed || (contrast && plus_look == Look::Hover) {
-                    t.button_text_pressed
-                } else if self.window_active {
-                    t.button_text
-                } else {
-                    t.dim
-                },
-                scale: self.scale.get(),
-            },
-            measure,
-        );
-        let caret_look = self.look(CaptionHit::Caret);
-        icon(
-            list,
-            r(
-                caret_x + t.split_part - t.caret_right_padding - t.caret_box + t.caret_nudge_x,
-                s.y.0 + (t.split_height - t.caret_box) / 2.0 + t.caret_nudge,
-                t.caret_box,
-                t.caret_box,
-            ),
-            0xe96e,
-            IconStyle {
-                size: t.caret_icon,
-                token: t.caret_token,
-                color: match caret_look {
-                    Look::Pressed => t.caret_text_pressed,
-                    Look::Hover if contrast => t.caret_text_pressed,
-                    Look::Hover => t.button_text,
-                    Look::Rest if self.window_active => t.caret_text,
-                    Look::Rest => t.dim,
-                },
-                scale: self.scale.get(),
-            },
-            measure,
-        );
-        for hit in [CaptionHit::NewTab, CaptionHit::Caret] {
-            if self.focused == Some(hit) {
-                list.push(DrawCommand::StrokeRect {
-                    rect: self.part_rect(hit),
-                    radius: Dip(r_btn),
-                    width: Dip(t.focus_width),
-                    color: t.focus,
-                });
-            }
         }
     }
     fn draw_caption(&self, list: &mut DisplayList, t: ShellTokens, measure: &dyn TextMeasurer) {

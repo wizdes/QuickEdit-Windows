@@ -1,9 +1,9 @@
-//! Manual check of the caret list in real popups. It needs a visible desktop, so root
+//! Manual check of a menu in real popups. It needs a visible desktop, so root
 //! runs it, not the test suite.
 //!
-//! Each open level of the list has its own window, sized to that level, from
+//! Each open level of the menu has its own window, sized to that level, from
 //! `MenuWindows`. The first window holds the mouse. Every message goes through
-//! `TranslateMessage`, so that typed letters reach the list as `WM_CHAR`.
+//! `TranslateMessage`, so that typed letters reach the menu as `WM_CHAR`.
 use qe_api::{
     Dip, DisplayList, InputEvent, InputKind, Modifiers, MouseButton, Rect, Renderer, TextMeasurer,
     TextMetrics, Theme, ThemeKind, View, ViewContext,

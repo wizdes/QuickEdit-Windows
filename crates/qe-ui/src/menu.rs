@@ -113,7 +113,7 @@ enum Ended {
     Back,
 }
 
-/// One level of the caret list. A level with an open child is the parent of that child.
+/// One level of a menu. A level with an open child is the parent of that child.
 ///
 /// The letter rule: while the list was opened by keyboard, a letter that is an
 /// enabled row's mnemonic runs that row. Any other letter only moves to the next

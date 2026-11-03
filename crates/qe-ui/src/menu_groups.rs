@@ -1,5 +1,5 @@
-//! The menu bar groups and the small caret list live here.
-//! (parity rows I01 to I10 and W06). Each row's command is in `CommandId`.
+//! The five menu bar groups (parity rows I01 to I10 and W06), and the calls that change
+//! their rows. Each row's command is in `CommandId`.
 use crate::{MenuItem, MenuModel};
 use qe_api::{CommandId, KeyBinding};
 
@@ -80,11 +80,6 @@ fn group(label: &str, mnemonic: char, items: Vec<MenuItem>) -> MenuItem {
     item
 }
 
-/// The caret list with each command's default key.
-pub fn caret_menu() -> MenuModel {
-    caret_menu_with_keys(&CommandId::default_key)
-}
-
 /// The five menu bar groups, in the same order as the Mac menu.
 pub fn menu_bar_groups() -> Vec<MenuItem> {
     menu_bar_groups_with_keys(&CommandId::default_key)
@@ -93,25 +88,6 @@ pub fn menu_bar_groups() -> Vec<MenuItem> {
 pub fn menu_bar_groups_with_keys(
     key_of: &dyn Fn(CommandId) -> Option<KeyBinding>,
 ) -> Vec<MenuItem> {
-    legacy_caret_menu_with_keys(key_of)
-        .items
-        .drain(..5)
-        .collect()
-}
-
-/// The caret list contains the commands outside the five groups.
-pub fn caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>) -> MenuModel {
-    let mut old = legacy_caret_menu_with_keys(key_of);
-    old.items.drain(..6);
-    old
-}
-
-/// The old combined model, kept as a command-parity reference for tests.
-pub fn legacy_caret_menu() -> MenuModel {
-    legacy_caret_menu_with_keys(&CommandId::default_key)
-}
-
-fn legacy_caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>) -> MenuModel {
     use CommandId::*;
     let r = |label: &str, command: CommandId| row(label, command, key_of);
     let sep = MenuItem::separator;
@@ -137,6 +113,8 @@ fn legacy_caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>)
             sep(),
             r("Export as PDF…", ExportPdf),
             r("Print…", Print),
+            sep(),
+            r("Settings…", Settings),
         ],
     );
     let find = group(
@@ -253,19 +231,7 @@ fn legacy_caret_menu_with_keys(key_of: &dyn Fn(CommandId) -> Option<KeyBinding>)
             r("Merge All Windows", MergeAllWindows),
         ],
     );
-    MenuModel {
-        items: vec![
-            file,
-            edit,
-            format,
-            view,
-            window,
-            sep(),
-            r("About QuickEdit", About),
-            r("Settings…", Settings),
-            r("Quit QuickEdit", Quit),
-        ],
-    }
+    vec![file, edit, format, view, window]
 }
 
 /// Fills Open Recent with files, above Clear Menu. Each pair is the label and the

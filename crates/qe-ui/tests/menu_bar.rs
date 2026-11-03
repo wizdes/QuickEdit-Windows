@@ -3,19 +3,7 @@ use qe_api::{
     Dip, InputEvent, InputKind, Modifiers, Rect, TextMeasurer, TextMetrics, View, ViewContext,
     WidgetId,
 };
-use qe_ui::{MenuBar, caret_menu, menu_bar_groups};
-use std::collections::BTreeSet;
-
-fn commands(model: &qe_ui::MenuModel, out: &mut BTreeSet<String>) {
-    for item in &model.items {
-        if let Some(command) = item.command {
-            out.insert(format!("{command:?}"));
-        }
-        if let Some(submenu) = &item.submenu {
-            commands(submenu, out);
-        }
-    }
-}
+use qe_ui::{MenuBar, menu_bar_groups};
 
 struct Measure;
 impl TextMeasurer for Measure {
@@ -391,30 +379,6 @@ fn alt_tap_focuses_then_returns_to_text() {
 }
 
 #[test]
-fn groups_and_caret_keep_every_command_once() {
-    let groups = menu_bar_groups();
-    assert_eq!(
-        groups.iter().map(|g| g.label.as_str()).collect::<Vec<_>>(),
-        ["File", "Edit", "Format", "View", "Window"]
-    );
-    let caret = caret_menu();
-    assert_eq!(
-        caret
-            .items
-            .iter()
-            .filter_map(|i| i.command)
-            .collect::<Vec<_>>(),
-        [CommandId::About, CommandId::Settings, CommandId::Quit]
-    );
-    let mut actual = BTreeSet::new();
-    commands(&qe_ui::MenuModel { items: groups }, &mut actual);
-    commands(&caret, &mut actual);
-    let mut baseline = BTreeSet::new();
-    commands(&qe_ui::legacy_caret_menu(), &mut baseline);
-    assert_eq!(actual, baseline);
-}
-
-#[test]
 fn the_hover_highlight_goes_when_the_pointer_leaves() {
     let mut bar = MenuBar::new(WidgetId(100));
     bar.layout(
@@ -681,7 +645,7 @@ fn a_right_or_middle_press_outside_lets_go_of_the_focus() {
 
 fn submenu_view() -> qe_ui::MenuView {
     let child = qe_ui::MenuModel {
-        items: vec![qe_ui::MenuItem::command("Child", CommandId::Quit)],
+        items: vec![qe_ui::MenuItem::command("Child", CommandId::Close)],
     };
     let mut view = qe_ui::MenuView::new(
         WidgetId(300),
@@ -689,7 +653,7 @@ fn submenu_view() -> qe_ui::MenuView {
         qe_ui::MenuModel {
             items: vec![
                 qe_ui::MenuItem::submenu("Parent", child),
-                qe_ui::MenuItem::command("Plain", CommandId::About),
+                qe_ui::MenuItem::command("Plain", CommandId::Print),
             ],
         },
     );
@@ -768,30 +732,99 @@ fn a_row_with_a_submenu_says_it_has_a_popup() {
     assert!(!tree.children[1].states.has_popup);
 }
 
-fn command_list(model: &qe_ui::MenuModel, out: &mut Vec<String>) {
+// ---- Settings lives in File. About and Quit are gone.
+
+fn labels_and_commands(model: &qe_ui::MenuModel, out: &mut Vec<(String, Option<CommandId>)>) {
     for item in &model.items {
-        if let Some(command) = item.command {
-            out.push(format!("{command:?}"));
-        }
+        out.push((item.label.clone(), item.command));
         if let Some(submenu) = &item.submenu {
-            command_list(submenu, out);
+            labels_and_commands(submenu, out);
         }
     }
 }
-/// A set would hide a command listed twice, so this counts each one.
+
 #[test]
-fn no_command_is_listed_twice_or_lost_when_counted() {
-    let mut now = Vec::new();
-    command_list(
+fn file_ends_with_print_a_separator_and_settings() {
+    let file = menu_bar_groups().remove(0).submenu.unwrap();
+    let last: Vec<_> = file.items[file.items.len() - 4..]
+        .iter()
+        .map(|item| (item.label.as_str(), item.command))
+        .collect();
+    assert_eq!(
+        last,
+        [
+            ("Export as PDF…", Some(CommandId::ExportPdf)),
+            ("Print…", Some(CommandId::Print)),
+            ("", None),
+            ("Settings…", Some(CommandId::Settings)),
+        ]
+    );
+}
+
+#[test]
+fn no_about_or_quit_in_the_menus_or_the_command_table() {
+    let mut rows = Vec::new();
+    labels_and_commands(
         &qe_ui::MenuModel {
             items: menu_bar_groups(),
         },
-        &mut now,
+        &mut rows,
     );
-    command_list(&caret_menu(), &mut now);
-    let mut before = Vec::new();
-    command_list(&qe_ui::legacy_caret_menu(), &mut before);
-    now.sort();
-    before.sort();
-    assert_eq!(now, before);
+    for (label, _) in &rows {
+        assert!(!label.contains("About"), "{label}");
+        assert!(!label.contains("Quit"), "{label}");
+        assert!(!label.contains("Exit"), "{label}");
+    }
+    for command in CommandId::ALL {
+        let name = format!("{command:?}");
+        assert!(name != "About" && name != "Quit", "{name}");
+        assert!(
+            !command.menu_path().starts_with("QuickEdit/"),
+            "{}",
+            command.menu_path()
+        );
+    }
+    // Alt+F4 belongs to Windows now: no command asks for it.
+    let alt_f4 = qe_api::KeyBinding::new(0x73, false, true, false);
+    assert!(
+        !CommandId::ALL
+            .iter()
+            .any(|command| command.default_key() == Some(alt_f4))
+    );
+}
+
+#[test]
+fn ctrl_comma_still_names_settings_and_its_row_shows_it() {
+    let comma = qe_api::KeyBinding::new(0xBC, true, false, false);
+    assert_eq!(CommandId::Settings.default_key(), Some(comma));
+    assert_eq!(CommandId::Settings.menu_path(), "File/Settings");
+    let bound: Vec<_> = CommandId::ALL
+        .iter()
+        .filter(|command| command.default_key() == Some(comma))
+        .collect();
+    assert_eq!(bound, [&CommandId::Settings]);
+    let file = menu_bar_groups().remove(0).submenu.unwrap();
+    let row = file.items.last().unwrap();
+    assert_eq!(row.command, Some(CommandId::Settings));
+    assert_eq!(row.key_text, "Ctrl+,");
+}
+
+/// Each command has one row, in the group its menu path names. No other menu is left to
+/// reach a command from, so a command missing here would be out of reach.
+#[test]
+fn every_command_is_in_the_group_its_path_names_and_only_once() {
+    for command in CommandId::ALL {
+        let top = command.menu_path().split('/').next().unwrap();
+        let mut found = 0;
+        for group in menu_bar_groups() {
+            let mut rows = Vec::new();
+            labels_and_commands(group.submenu.as_ref().unwrap(), &mut rows);
+            let here = rows.iter().filter(|(_, c)| *c == Some(*command)).count();
+            if here > 0 {
+                assert_eq!(group.label, top, "{command:?}");
+            }
+            found += here;
+        }
+        assert_eq!(found, 1, "{command:?}");
+    }
 }

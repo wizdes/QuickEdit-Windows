@@ -73,13 +73,13 @@ fn menu_keyboard_nested_and_placement() {
     parent.submenu = Some(MenuModel {
         items: vec![MenuItem::command("Save", qe_api::CommandId::Save)],
     });
-    let mut disabled = MenuItem::command("Exit", qe_api::CommandId::Quit);
+    let mut disabled = MenuItem::command("Close", qe_api::CommandId::Close);
     disabled.enabled = false;
     let model = MenuModel {
         items: vec![
             parent,
             disabled,
-            MenuItem::command("About", qe_api::CommandId::About),
+            MenuItem::command("Actual Size", qe_api::CommandId::ActualSize),
         ],
     };
     let mut view = MenuView::new(WidgetId(10), "Test", model);
@@ -107,7 +107,7 @@ fn menu_keyboard_nested_and_placement() {
     view.handle(&press(0x0d), &mut ctx);
     assert!(
         ctx.requests
-            .contains(&qe_api::ViewRequest::Run(qe_api::CommandId::About))
+            .contains(&qe_api::ViewRequest::Run(qe_api::CommandId::ActualSize))
     );
     let work = Rect {
         x: Dip(0.0),

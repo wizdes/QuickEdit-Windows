@@ -1568,7 +1568,7 @@ impl Shared {
     /// the window's normal message loop.
     fn open_menu(self: &Rc<Self>, model: MenuModel, anchor: ApiRect) -> Result<(), ShellError> {
         // A switch between labels: the old menu goes, and the bar stays as it is. Any other
-        // menu, such as the caret list, takes over from the bar.
+        // menu, such as a context menu, takes over from the bar.
         self.end_menu(MenuEnd::Silent);
         if !self.answering_group.get() {
             self.bar_action(|bar, ctx| bar.leave(ctx));
@@ -1852,7 +1852,7 @@ impl Shared {
             if self.open_group().is_some() {
                 self.end_menu(MenuEnd::Leave);
             } else {
-                // From the caret list, the keyboard moves on to the bar.
+                // From any other menu, the keyboard moves on to the bar.
                 self.end_menu(MenuEnd::Silent);
                 self.bar_action(|bar, ctx| bar.focus_first(ctx));
             }
@@ -2600,7 +2600,7 @@ impl ShellHandle {
         Ok(state.theme)
     }
     /// The top row, the menu bar and any open menu, for the screen reader provider. An open
-    /// bar menu lies under its label, and the caret list under this tree's root. Every
+    /// bar menu lies under its label, and any other menu under this tree's root. Every
     /// place is in client dips, and at most one widget says it has the focus.
     pub fn widgets(&self) -> Result<Widget, ShellError> {
         let shared = self.live()?;
@@ -2653,7 +2653,7 @@ impl ShellHandle {
         Ok(())
     }
     /// Opens a menu under `anchor`, in client dips, and returns at once. Call it to answer
-    /// `ShellEvent::OpenMenuGroup` and `ShellEvent::OpenCaretList`, with their rectangle.
+    /// `ShellEvent::OpenMenuGroup`, with its rectangle, or for a menu of the owner's own.
     /// It replaces a menu that is open, which is how a switch between labels works. Called
     /// from outside the answer to `OpenMenuGroup`, it also takes the focus from the bar.
     ///

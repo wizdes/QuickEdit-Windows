@@ -10,7 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// The checkmark, U+E73E in Segoe Fluent Icons.
 pub const CHECK_ICON: char = '\u{e73e}';
-/// ChevronDownSmall, U+E96E: the same caret as the top row.
+/// ChevronDownSmall, U+E96E: the arrow on a closed combo box.
 pub const CARET_ICON: char = '\u{e96e}';
 /// The arrow on a menu row with a submenu.
 pub const SUBMENU_ICON: char = '\u{e76c}';

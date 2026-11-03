@@ -42,8 +42,8 @@ The full list came from reading the Swift code, and M1 commits it as `docs/parit
 
 ## Your decisions
 1. Top row copies Windows Terminal: one tab always shows, then `+` and `⌄`, with minimize, maximize and close on the right. Snap Layouts work.
-2. The user changed this on 2026-11-02: File, Edit, Format, View and Window sit in a menu bar under the tabs, like Notepad. Alt or F10 focuses the bar, and Alt+letter opens a menu. `⌄` holds About, Settings and Quit.
-3. Cmd becomes Ctrl, plus Ctrl+H, F3 and Alt+F4. All can be changed in Settings.
+2. The user changed this on 2026-11-02: File, Edit, Format, View and Window sit in a menu bar under the tabs, like Notepad. Alt or F10 focuses the bar, and Alt+letter opens a menu. Later that day the user removed `⌄`: Settings moved to the end of File, and About and Quit are gone.
+3. Cmd becomes Ctrl, plus Ctrl+H and F3. These can be changed in Settings. Alt+F4 stays a normal Windows close and cannot be changed.
 4. Release through the Microsoft Store.
 5. Tests stay hidden where possible. I tell you before any visible UI test run.
 6. Spell check stays. Speech, Share and real printing go, so Print saves a PDF as on the Mac.

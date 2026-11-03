@@ -33,7 +33,7 @@ use qe_shell::{
     ShellEvent, ShellHandle, ShellWindow, Tab, VIEW_TIMER, WindowConfig, quit_message_loop,
     run_message_loop,
 };
-use qe_ui::{ClipboardAccess, caret_menu, menu_bar_groups};
+use qe_ui::{ClipboardAccess, menu_bar_groups};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -799,7 +799,6 @@ fn main() -> Result<(), String> {
                 let model = group.and_then(|item| item.submenu).unwrap_or_default();
                 handle.open_menu(model, anchor)
             }
-            ShellEvent::OpenCaretList(anchor) => handle.open_menu(caret_menu(), anchor),
             ShellEvent::RunCommand(command) => {
                 println!("{command:?}");
                 Ok(())

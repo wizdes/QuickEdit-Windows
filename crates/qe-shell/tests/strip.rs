@@ -117,9 +117,9 @@ fn widths_and_overflow() {
             assert_eq!(s.tab_rects().len(), count);
             assert!(s.tab_width() <= 240.0);
             assert!(s.tab_width() >= 80.0);
-            assert_eq!(s.overflow(), count as f32 * 80.0 + 63.0 > width - 138.0);
+            assert_eq!(s.overflow(), count as f32 * 80.0 + 31.0 > width - 138.0);
             if !s.overflow() {
-                assert!(s.split_rect().x.0 >= s.tab_rects().last().unwrap().x.0 + s.tab_width());
+                assert!(s.plus_rect().x.0 >= s.tab_rects().last().unwrap().x.0 + s.tab_width());
             }
         }
     }
@@ -154,10 +154,10 @@ fn caption_buttons_and_edges_at_three_scales() {
         assert_eq!(at(1.0, 300.0), CaptionHit::None);
         assert_eq!(at(799.0, 300.0), CaptionHit::None);
         assert_eq!(at(300.0, 599.0), CaptionHit::None);
-        let split = s.split_rect();
-        assert_eq!(at(split.x.0 + 5.0, 12.0), CaptionHit::NewTab);
-        assert_eq!(at(split.x.0 + 5.0, 11.5), CaptionHit::Drag);
-        assert_eq!(at(split.x.0 + 5.0, 6.0), CaptionHit::ResizeTop);
+        let plus = s.plus_rect();
+        assert_eq!(at(plus.x.0 + 5.0, 12.0), CaptionHit::NewTab);
+        assert_eq!(at(plus.x.0 + 5.0, 11.5), CaptionHit::Drag);
+        assert_eq!(at(plus.x.0 + 5.0, 6.0), CaptionHit::ResizeTop);
     }
 }
 
@@ -168,8 +168,8 @@ fn maximized_has_no_top_band() {
     assert_eq!(s.hit_test(point(5.0, 1.0)), CaptionHit::Tab(0));
     assert_eq!(s.hit_test(point(700.0, 1.0)), CaptionHit::Minimize);
     assert_eq!(s.hit_test(point(500.0, 1.0)), CaptionHit::Drag);
-    assert_eq!(s.split_rect().y.0, 4.0);
-    assert_eq!(s.split_rect().height.0, 24.0);
+    assert_eq!(s.plus_rect().y.0, 4.0);
+    assert_eq!(s.plus_rect().height.0, 24.0);
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn closing_left_of_active_keeps_the_document() {
 #[test]
 fn click_emits_request() {
     let mut s = strip(1, 800.0);
-    let (x, y) = (s.split_rect().x.0 + 10.0, 16.0);
+    let (x, y) = (s.plus_rect().x.0 + 10.0, 16.0);
     let (_, press) = down(&mut s, x, y);
     assert!(press.requests.contains(&ViewRequest::CaptureMouse(true)));
     assert!(s.take_events().is_empty(), "nothing acts on the press");
@@ -267,7 +267,8 @@ fn replay_drag_and_close() {
         ))
         .unwrap();
         let steps: Vec<ReplayStep> = parse_replay(&script).unwrap();
-        let s = RefCell::new(strip(3, 800.0));
+        // The replays' points are for tabs 199.67 wide.
+        let s = RefCell::new(strip(3, 768.0));
         let log = RefCell::new(Vec::new());
         run_replay(
             &steps,
@@ -305,7 +306,7 @@ fn widget_tree_has_caption_and_scroll_buttons() {
             .iter()
             .filter(|w| w.role == WidgetRole::Button)
             .count(),
-        5
+        4
     );
     assert!(
         regular
@@ -325,7 +326,7 @@ fn widget_tree_has_caption_and_scroll_buttons() {
             .iter()
             .filter(|w| w.role == WidgetRole::Button)
             .count(),
-        7
+        6
     );
 }
 
@@ -397,7 +398,6 @@ fn tab_walks_every_stop_and_leaves_to_the_content() {
             CaptionHit::Tab(1),
             CaptionHit::TabClose(1),
             CaptionHit::NewTab,
-            CaptionHit::Caret,
         ]
     );
     assert_eq!(s.take_events(), vec![ShellEvent::FocusContent]);
@@ -440,13 +440,11 @@ fn overflow_tab_stops_include_scroll_buttons_and_enter_on_close_asks() {
 #[test]
 fn every_focused_part_reports_focus_in_the_widget_tree() {
     let mut s = strip(2, 800.0);
-    for hit in [CaptionHit::NewTab, CaptionHit::Caret] {
-        s.set_focused(Some(hit));
-        let tree = s.widgets().unwrap();
-        let focused: Vec<_> = tree.children.iter().filter(|w| w.states.focused).collect();
-        assert_eq!(focused.len(), 1, "{hit:?}");
-        assert_eq!(focused[0].id, TabStrip::widget_id(hit));
-    }
+    s.set_focused(Some(CaptionHit::NewTab));
+    let tree = s.widgets().unwrap();
+    let focused: Vec<_> = tree.children.iter().filter(|w| w.states.focused).collect();
+    assert_eq!(focused.len(), 1);
+    assert_eq!(focused[0].id, TabStrip::widget_id(CaptionHit::NewTab));
     s.set_focused(Some(CaptionHit::TabClose(1)));
     let tree = s.widgets().unwrap();
     let tab = tree.children.iter().find(|w| w.name == "Tab 1").unwrap();
@@ -496,7 +494,7 @@ fn widget_ids_never_collide() {
 fn overflow_buttons_scroll_one_tab() {
     let mut s = strip(40, 500.0);
     let before = s.tab_rects()[0].x.0;
-    let x = s.split_rect().x.0 - 10.0;
+    let x = s.plus_rect().x.0 - 10.0;
     down(&mut s, x, 16.0);
     up(&mut s, x, 16.0);
     s.layout(bounds(500.0), &measure());
@@ -506,13 +504,13 @@ fn overflow_buttons_scroll_one_tab() {
 #[test]
 fn scroll_stops_at_the_last_tab() {
     let mut s = strip(40, 500.0);
-    let x = s.split_rect().x.0 - 10.0;
+    let x = s.plus_rect().x.0 - 10.0;
     for _ in 0..100 {
         down(&mut s, x, 16.0);
         up(&mut s, x, 16.0);
     }
     let last = s.tab_rects()[39];
-    let end = s.split_rect().x.0 - 20.0;
+    let end = s.plus_rect().x.0 - 20.0;
     assert!(last.x.0 + last.width.0 <= end, "the last tab fully shows");
     assert!(last.x.0 + 2.0 * last.width.0 > end, "and no further");
 }
@@ -551,7 +549,7 @@ fn widening_or_closing_brings_scrolled_tabs_back() {
 fn new_selected_and_focused_tabs_scroll_into_view() {
     let shows = |s: &TabStrip, i: usize| {
         let b = s.tab_rects()[i];
-        b.x.0 >= 20.0 && b.x.0 + b.width.0 <= s.split_rect().x.0 - 20.0
+        b.x.0 >= 20.0 && b.x.0 + b.width.0 <= s.plus_rect().x.0 - 20.0
     };
     let mut s = strip(20, 500.0);
     s.add_tab(Tab::new("New"));
@@ -582,7 +580,7 @@ fn hidden_tabs_clip_at_the_left_scroll_button() {
         })
         .unwrap();
     assert_eq!(clip.x.0, 20.0);
-    assert_eq!(clip.x.0 + clip.width.0, s.split_rect().x.0 - 20.0);
+    assert_eq!(clip.x.0 + clip.width.0, s.plus_rect().x.0 - 20.0);
     // A point under the left button cannot reach a hidden tab.
     assert_eq!(s.hit_test(point(5.0, 20.0)), CaptionHit::ScrollLeft);
     assert_eq!(s.hit_test(point(5.0, 38.0)), CaptionHit::Drag);
@@ -606,7 +604,7 @@ fn draw_and_widgets_work_before_any_layout() {
     many.add_tab(Tab::new("New"));
     many.layout(bounds(500.0), &measure());
     let b = many.tab_rects()[30];
-    assert!(b.x.0 >= 20.0 && b.x.0 + b.width.0 <= many.split_rect().x.0 - 20.0);
+    assert!(b.x.0 >= 20.0 && b.x.0 + b.width.0 <= many.plus_rect().x.0 - 20.0);
 }
 
 #[test]
@@ -782,12 +780,10 @@ fn alt(m: Modifiers) -> Modifiers {
     Modifiers { alt: true, ..m }
 }
 fn opened(s: &mut TabStrip) -> bool {
-    s.take_events()
-        .iter()
-        .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
+    !s.take_events().is_empty()
 }
 #[test]
-fn alt_no_longer_opens_the_caret_list() {
+fn alt_and_its_chords_ask_the_row_for_nothing() {
     let mut s = strip(1, 800.0);
     let none = Modifiers::default();
     key(&mut s, VK_MENU, alt(none));
@@ -800,19 +796,19 @@ fn alt_no_longer_opens_the_caret_list() {
         key(&mut s, VK_MENU, alt(none));
         key(&mut s, chord, alt(none));
         key_up(&mut s, VK_MENU, none);
-        assert!(!opened(&mut s), "Alt+{chord:#x} never opens the caret");
+        assert!(!opened(&mut s), "Alt+{chord:#x} asks for nothing");
     }
     let ctrl = Modifiers { ctrl: true, ..none };
     key(&mut s, 0xa5, alt(ctrl));
     key_up(&mut s, 0xa5, none);
-    assert!(!opened(&mut s), "AltGr never opens the caret");
+    assert!(!opened(&mut s), "AltGr asks for nothing");
     let shift = Modifiers {
         shift: true,
         ..none
     };
     key(&mut s, VK_MENU, alt(shift));
     key_up(&mut s, VK_MENU, shift);
-    assert!(!opened(&mut s), "Shift+Alt never opens the caret");
+    assert!(!opened(&mut s), "Shift+Alt asks for nothing");
 }
 
 #[test]
@@ -924,22 +920,17 @@ fn strip_fills_only_its_row_and_the_active_tab_joins_the_text_area() {
 }
 
 #[test]
-fn split_and_scroll_buttons_are_24_tall_on_the_tab_center() {
+fn plus_and_scroll_buttons_are_24_tall_on_the_tab_center() {
     let mut s = strip(40, 500.0);
-    assert_eq!(s.split_rect().y.0, 12.0);
-    assert_eq!(s.split_rect().height.0, 24.0);
+    assert_eq!(s.plus_rect().y.0, 12.0);
+    assert_eq!(s.plus_rect().height.0, 24.0);
     let tree = s.widgets().unwrap();
-    for name in [
-        "Scroll tabs left",
-        "Scroll tabs right",
-        "New tab",
-        "Tab list",
-    ] {
+    for name in ["Scroll tabs left", "Scroll tabs right", "New tab"] {
         let w = tree.children.iter().find(|w| w.name == name).unwrap();
         assert_eq!((w.bounds.y.0, w.bounds.height.0), (12.0, 24.0), "{name}");
     }
     s.set_maximized(true);
-    assert_eq!(s.split_rect().y.0, 4.0);
+    assert_eq!(s.plus_rect().y.0, 4.0);
     let tree = s.widgets().unwrap();
     let w = tree
         .children
@@ -975,7 +966,7 @@ fn display_list_visual_states() {
             "maximized",
         ] {
             let mut s = strip(2, 800.0);
-            let x = s.split_rect().x.0 + 10.0;
+            let x = s.plus_rect().x.0 + 10.0;
             match state {
                 "hover" => {
                     mv(&mut s, x, 16.0);
@@ -1008,10 +999,10 @@ fn display_list_visual_states() {
 }
 
 #[test]
-fn press_changes_split_button_without_prior_move() {
+fn press_changes_the_plus_without_prior_move() {
     let mut s = strip(1, 800.0);
     let before = draw(&s, ThemeKind::Light);
-    let x = s.split_rect().x.0 + 10.0;
+    let x = s.plus_rect().x.0 + 10.0;
     down(&mut s, x, 16.0);
     assert_ne!(before, draw(&s, ThemeKind::Light));
 }
@@ -1045,7 +1036,6 @@ fn caption_icons_request_ten_pixel_font() {
         ("E922", 10.0),
         ("E8BB", 10.0),
         ("E710", 12.0),
-        ("E96E", 10.0),
     ] {
         assert!(sizes.contains(&(id.to_string(), size)), "{id} at {size}");
     }
@@ -1070,7 +1060,8 @@ fn tokens_match_the_design_spec_and_the_theme() {
     assert_eq!(t.caption_width, theme.caption_button_width.0);
     assert_eq!(t.row, theme.tab_background);
     assert_eq!(t.active, theme.text_background);
-    assert_eq!(t.split_width(), 63.0);
+    assert_eq!(t.plus_width, 31.0);
+    assert_eq!(t.plus_height, 24.0);
 }
 
 #[test]
@@ -1144,7 +1135,7 @@ fn a_dragged_tab_reaches_a_tab_that_is_scrolled_off() {
     let id = s.tab_id(0).unwrap();
     let x = s.tab_rects()[0].x.0 + 10.0;
     down(&mut s, x, 20.0);
-    let past = s.split_rect().x.0 - 5.0;
+    let past = s.plus_rect().x.0 - 5.0;
     for _ in 0..19 {
         mv(&mut s, past, 20.0);
     }
@@ -1152,7 +1143,7 @@ fn a_dragged_tab_reaches_a_tab_that_is_scrolled_off() {
     up(&mut s, past, 20.0);
     let b = s.tab_rects()[19];
     assert!(
-        b.x.0 + b.width.0 <= s.split_rect().x.0 - 20.0,
+        b.x.0 + b.width.0 <= s.plus_rect().x.0 - 20.0,
         "it stays in view"
     );
     // And back to the start, over the left scroll button.
@@ -1287,9 +1278,9 @@ fn the_quick_tab_lookup_agrees_with_a_full_scan() {
                 s.select(s.tab_id(i).unwrap());
             }
             let rects = s.tab_rects().to_vec();
-            let split = s.split_rect().x.0;
+            let plus = s.plus_rect().x.0;
             let left = if s.overflow() { 20.0 } else { 0.0 };
-            let right = if s.overflow() { split - 20.0 } else { split };
+            let right = if s.overflow() { plus - 20.0 } else { plus };
             let mut x = left;
             while x < right {
                 let expected = rects
@@ -1350,73 +1341,141 @@ fn high_contrast_uses_terminals_own_window_button_glyphs() {
 }
 
 #[test]
-fn the_split_button_values_come_from_winui_and_terminal() {
-    for (kind, secondary, tertiary, divider) in [
-        (ThemeKind::Light, 0x9e, 0x72, 0x0f),
-        (ThemeKind::Dark, 0xc5, 0x87, 0x12),
-    ] {
-        let t = ShellTokens::from_theme(&Theme::new(kind));
-        assert_eq!(t.caret_text.a, secondary, "TextFillColorSecondary");
-        assert_eq!(t.caret_text_pressed.a, tertiary, "TextFillColorTertiary");
-        assert_eq!(t.separator.a, divider, "ControlStrokeColorDefault");
-    }
-    // The caret's center is at x = 13 of the 31-wide part, and + stays at the center.
+fn the_plus_is_at_the_center_of_its_box() {
     let s = strip(1, 800.0);
     let list = draw(&s, ThemeKind::Light);
-    let at = |id: &str| {
-        list.commands
-            .iter()
-            .find_map(|c| match c {
-                DrawCommand::Icon { icon_id, at, .. } if icon_id == id => Some(at.x.0),
-                _ => None,
-            })
-            .unwrap()
-    };
+    let at = list
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCommand::Icon { icon_id, at, .. } if icon_id == "E710" => Some(at.x.0),
+            _ => None,
+        })
+        .unwrap();
     // The fixed measurer gives one character 7 wide, and starts round to whole pixels.
-    let split = s.split_rect().x.0;
-    // Its start moves 0.55 left, because its ink sits right of the middle of its em box.
-    assert_eq!(at("E96E"), (split + 32.0 + 13.0 - 3.5 - 0.55).round());
-    assert_eq!(at("E710"), (split + 15.5 - 3.5).round());
+    assert_eq!(at, (s.plus_rect().x.0 + 15.5 - 3.5).round());
 }
 
 #[test]
-fn split_hover_is_one_plain_fill_and_plus_covers_the_divider_column() {
-    let fills = |s: &TabStrip| -> Vec<(Rect, Rect)> {
-        let list = draw(s, ThemeKind::Light);
-        let mut out = Vec::new();
-        for pair in list.commands.windows(2) {
-            if let [
-                DrawCommand::PushClip(clip),
-                DrawCommand::RoundedRect { rect, .. },
-            ] = pair
-            {
-                out.push((*clip, *rect));
-            }
-        }
-        out.retain(|(clip, _)| clip.width.0 < 100.0);
-        out
+fn the_plus_hover_is_one_rounded_fill_of_its_whole_box() {
+    let fills = |s: &TabStrip| -> Vec<Rect> {
+        draw(s, ThemeKind::Light)
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::RoundedRect { rect, .. } if rect.width.0 == 31.0 => Some(*rect),
+                _ => None,
+            })
+            .collect()
     };
     let mut s = strip(1, 800.0);
-    let split = s.split_rect();
+    let plus = s.plus_rect();
     assert!(fills(&s).is_empty());
-    mv(&mut s, split.x.0 + 5.0, 20.0);
-    let plus = fills(&s);
-    assert_eq!(plus.len(), 1);
-    assert_eq!(plus[0].0.x.0, split.x.0);
-    assert_eq!(plus[0].0.width.0, 32.0, "over the divider column");
-    assert!(
-        plus[0].1.width.0 > 32.0,
-        "the inner corners fall outside the clip"
-    );
-    mv(&mut s, split.x.0 + 40.0, 20.0);
-    let caret = fills(&s);
-    assert_eq!(caret.len(), 1);
-    assert_eq!(caret[0].0.x.0, split.x.0 + 32.0);
-    assert_eq!(caret[0].0.width.0, 31.0);
-    assert!(caret[0].1.x.0 < split.x.0 + 32.0, "its inner corners too");
-    // The divider's column belongs to +.
+    mv(&mut s, plus.x.0 + 5.0, 20.0);
+    assert_eq!(fills(&s), vec![plus]);
+}
+
+// ---- The top row is tabs, then +, then the window buttons.
+
+#[test]
+fn the_plus_sits_right_after_the_last_tab_and_the_row_past_it_drags() {
+    for (count, width) in [(1, 800.0), (3, 800.0), (5, 1600.0), (4, 500.0)] {
+        let s = strip(count, width);
+        assert!(!s.overflow(), "{count} tabs in {width}");
+        let last = *s.tab_rects().last().unwrap();
+        let plus = s.plus_rect();
+        assert_eq!(plus.x.0, last.x.0 + last.width.0, "{count} tabs in {width}");
+        assert_eq!(plus.width.0, 31.0, "only the + has a place");
+        let y = plus.y.0 + plus.height.0 / 2.0;
+        assert_eq!(s.hit_test(point(plus.x.0 + 30.5, y)), CaptionHit::NewTab);
+        let minimize = width - 138.0;
+        let mut x = plus.x.0 + 31.0;
+        while x < minimize {
+            assert_eq!(s.hit_test(point(x, y)), CaptionHit::Drag, "x {x}");
+            x += 1.0;
+        }
+    }
+}
+
+#[test]
+fn with_overflow_the_plus_touches_the_window_buttons_and_nothing_overlaps() {
+    let s = strip(40, 500.0);
+    assert!(s.overflow());
+    let plus = s.plus_rect();
+    assert_eq!(plus.x.0 + plus.width.0, 500.0 - 138.0);
+    let y = plus.y.0 + 12.0;
+    assert_eq!(s.hit_test(point(plus.x.0 + 1.0, y)), CaptionHit::NewTab);
     assert_eq!(
-        s.hit_test(point(split.x.0 + 31.5, 20.0)),
-        CaptionHit::NewTab
+        s.hit_test(point(plus.x.0 - 1.0, y)),
+        CaptionHit::ScrollRight
     );
+    assert_eq!(s.hit_test(point(500.0 - 137.0, y)), CaptionHit::Minimize);
+}
+
+#[test]
+fn the_row_has_no_down_caret_in_any_state() {
+    let plain = strip(2, 800.0);
+    let mut hovered = strip(2, 800.0);
+    let plus = hovered.plus_rect();
+    send(
+        &mut hovered,
+        InputKind::MouseMove {
+            at: point(plus.x.0 + 5.0, plus.y.0 + 5.0),
+        },
+    );
+    let mut focused = strip(2, 800.0);
+    focused.set_focused(Some(CaptionHit::NewTab));
+    for (state, s) in [("plain", &plain), ("hover", &hovered), ("focus", &focused)] {
+        for kind in [ThemeKind::Light, ThemeKind::Dark] {
+            let list = draw(s, kind);
+            let has_caret = list.commands.iter().any(
+                |command| matches!(command, DrawCommand::Icon { icon_id, .. } if icon_id == "E96E"),
+            );
+            assert!(!has_caret, "{state} {kind:?}");
+        }
+    }
+    let names: Vec<String> = plain
+        .widgets()
+        .unwrap()
+        .children
+        .iter()
+        .map(|widget| widget.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Tab 0",
+            "Tab 1",
+            "New tab",
+            "Minimize",
+            "Maximize or restore",
+            "Close window",
+        ]
+    );
+}
+
+#[test]
+fn tab_from_the_plus_leaves_the_row_and_arrows_wrap_to_the_first_tab() {
+    let mut s = strip(1, 800.0);
+    s.set_focused(Some(CaptionHit::NewTab));
+    send(
+        &mut s,
+        InputKind::KeyDown {
+            virtual_key: VK_RIGHT,
+            modifiers: Modifiers::default(),
+            repeat: false,
+        },
+    );
+    assert_eq!(s.focused(), Some(CaptionHit::Tab(0)));
+    s.set_focused(Some(CaptionHit::NewTab));
+    send(
+        &mut s,
+        InputKind::KeyDown {
+            virtual_key: VK_TAB,
+            modifiers: Modifiers::default(),
+            repeat: false,
+        },
+    );
+    assert_eq!(s.focused(), None);
+    assert_eq!(s.take_events(), vec![ShellEvent::FocusContent]);
 }

@@ -37,9 +37,6 @@ const fn ctrl(k: u16) -> Option<KeyBinding> {
 const fn ctrl_shift(k: u16) -> Option<KeyBinding> {
     Some(KeyBinding::new(k, true, false, true))
 }
-const fn alt(k: u16) -> Option<KeyBinding> {
-    Some(KeyBinding::new(k, false, true, false))
-}
 const fn plain(k: u16) -> Option<KeyBinding> {
     Some(KeyBinding::new(k, false, false, false))
 }
@@ -48,9 +45,6 @@ const fn shift(k: u16) -> Option<KeyBinding> {
 }
 
 commands! {
-    About => "QuickEdit/About QuickEdit", None;
-    Settings => "QuickEdit/Settings", ctrl(0xBC);
-    Quit => "QuickEdit/Quit QuickEdit", alt(0x73);
     New => "File/New", ctrl(0x4E);
     NewTab => "File/New Tab", ctrl(0x54);
     Open => "File/Open", ctrl(0x4F);
@@ -66,6 +60,7 @@ commands! {
     RevertToSaved => "File/Revert to Saved", None;
     ExportPdf => "File/Export as PDF", None;
     Print => "File/Print", ctrl(0x50);
+    Settings => "File/Settings", ctrl(0xBC);
     Undo => "Edit/Undo", ctrl(0x5A);
     Redo => "Edit/Redo", ctrl_shift(0x5A);
     Cut => "Edit/Cut", ctrl(0x58);

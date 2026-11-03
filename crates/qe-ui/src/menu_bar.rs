@@ -70,7 +70,7 @@ impl MenuBar {
             ctx.invalidate(self.labels[i]);
         }
     }
-    /// The keyboard reached the bar with no key of its own, as F10 from the caret list.
+    /// The keyboard reached the bar with no key of its own, as F10 from another menu.
     pub fn focus_first(&mut self, ctx: &mut ViewContext) {
         self.change(Some(0), ctx);
     }

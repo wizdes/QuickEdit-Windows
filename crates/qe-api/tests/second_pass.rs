@@ -247,6 +247,7 @@ fn windows_command_and_setting_choices_are_kept() {
         "Edit/Spelling/Show Spelling"
     );
     assert_eq!(CommandId::Print.menu_path(), "File/Print");
+    assert_eq!(CommandId::Settings.menu_path(), "File/Settings");
     assert_eq!(
         CommandId::SaveAs.default_key(),
         Some(KeyBinding::new(0x7B, false, false, false))

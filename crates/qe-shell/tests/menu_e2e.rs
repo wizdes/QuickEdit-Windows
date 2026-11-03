@@ -15,8 +15,8 @@ use qe_shell::{
     ShellError, ShellEvent, ShellWindow, WindowConfig, quit_message_loop, run_message_loop,
 };
 use qe_ui::{
-    MenuModel, UiTokens, caret_menu, foreground_changed_for_test,
-    ignore_foreground_changes_for_test, menu_bar_groups,
+    MenuModel, UiTokens, foreground_changed_for_test, ignore_foreground_changes_for_test,
+    menu_bar_groups,
 };
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -290,6 +290,10 @@ impl Script {
 }
 
 /// A hidden window whose owner does just what QuickEdit's owner does.
+/// A menu the owner opens by itself, as a context menu is. Format is the shortest group.
+fn owner_menu() -> MenuModel {
+    menu_bar_groups()[2].submenu.clone().unwrap()
+}
 fn script(record_system_commands: bool) -> Rc<Script> {
     script_at(record_system_commands, None)
 }
@@ -336,11 +340,6 @@ fn script_at(record_system_commands: bool, fake_dpi: Option<u32>) -> Rc<Script> 
             ShellEvent::OpenMenuGroup(index, anchor) => {
                 let model = menu_bar_groups()[index].submenu.clone().unwrap();
                 if let Err(problem) = handle.open_menu(model, anchor) {
-                    s.failures.borrow_mut().push(problem.to_string());
-                }
-            }
-            ShellEvent::OpenCaretList(anchor) => {
-                if let Err(problem) = handle.open_menu(caret_menu(), anchor) {
                     s.failures.borrow_mut().push(problem.to_string());
                 }
             }
@@ -1040,30 +1039,18 @@ fn a_menu_opened_by_mouse_selects_no_row_and_runs_nothing_on_a_letter() {
 }
 
 #[test]
-fn the_caret_list_runs_the_same_way_and_leaves_the_bar_alone() {
+fn a_menu_of_the_owner_runs_the_same_way_and_leaves_the_bar_alone() {
     let s = script(false);
-    let caret = |s: &Script| {
-        let r = s.window.with_strip(|strip| strip.split_rect()).unwrap();
-        // The caret is the right half of the split button, in the window's client area.
-        pack(
-            (r.x.0 + r.width.0 - 6.0) as i32,
-            (r.y.0 + r.height.0 / 2.0) as i32,
-        )
-    };
     let mut steps = vec![
-        step(move |s| {
-            s.post(WM_MOUSEMOVE, 0, caret(s));
-            s.post(WM_LBUTTONDOWN, 1, caret(s));
-            s.post(WM_LBUTTONUP, 0, caret(s));
-        }),
+        step(|s| s.open_owner_menu()),
         step(|s| {
-            s.expect_popups(1, "a click on the caret");
+            s.expect_popups(1, "the owner's menu");
             s.expect(s.focused_label().is_none(), "the bar takes no focus");
             s.key(VK_ESC);
             s.key_up(VK_ESC);
         }),
     ];
-    Script::then_typing_reaches_text(&mut steps, "after Esc in the caret list");
+    Script::then_typing_reaches_text(&mut steps, "after Esc in the owner's menu");
     finish(&s, steps);
 }
 
@@ -1312,7 +1299,7 @@ fn opening_a_menu_with_no_renderers_says_so_and_leaves_the_bar_closed() {
         width: Dip(10.0),
         height: Dip(10.0),
     };
-    let failed = window.open_menu(caret_menu(), anchor);
+    let failed = window.open_menu(owner_menu(), anchor);
     assert!(
         matches!(&failed, Err(ShellError::Menu(message)) if message.contains("set_popup_renderers")),
         "{failed:?}"
@@ -1385,28 +1372,17 @@ impl Script {
             .count()
     }
     fn plus(&self) -> Rect {
-        let r = self.window.with_strip(|strip| strip.split_rect()).unwrap();
-        Rect {
-            width: Dip(r.width.0 / 2.0),
-            ..r
-        }
+        self.window.with_strip(|strip| strip.plus_rect()).unwrap()
     }
     fn tab(&self) -> Rect {
         self.window
             .with_strip(|strip| strip.tab_rects()[0])
             .unwrap()
     }
-    fn caret(&self) -> isize {
-        let r = self.window.with_strip(|strip| strip.split_rect()).unwrap();
-        pack(
-            (r.x.0 + r.width.0 - 6.0) as i32,
-            (r.y.0 + r.height.0 / 2.0) as i32,
-        )
-    }
-    fn click_caret(&self) {
-        self.post(WM_MOUSEMOVE, 0, self.caret());
-        self.post(WM_LBUTTONDOWN, 1, self.caret());
-        self.post(WM_LBUTTONUP, 0, self.caret());
+    /// A menu that is not a menu bar group, such as a context menu.
+    fn open_owner_menu(&self) {
+        let anchor = self.plus();
+        self.window.open_menu(owner_menu(), anchor).unwrap();
     }
     fn alt_down(&self) {
         self.post(WM_SYSKEYDOWN, VK_ALT, ALT_BIT | 1);
@@ -1923,16 +1899,16 @@ fn a_held_f10_does_nothing_after_the_first_press() {
     finish(&s, steps);
 }
 #[test]
-fn f10_with_the_caret_list_open_closes_it_and_focuses_the_bar() {
+fn f10_with_a_menu_of_the_owner_open_closes_it_and_focuses_the_bar() {
     let s = script(false);
     let mut steps = vec![
-        step(|s| s.click_caret()),
+        step(|s| s.open_owner_menu()),
         step(|s| {
-            s.expect_popups(1, "the caret list");
+            s.expect_popups(1, "the owner's menu");
             s.post(WM_SYSKEYDOWN, VK_F10, 1);
         }),
         step(|s| {
-            s.expect_popups(0, "F10 closes the list");
+            s.expect_popups(0, "F10 closes the menu");
             s.expect(s.focused_label() == Some(0), "F10 focuses the bar");
             s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
             s.post(WM_SYSKEYDOWN, VK_F10, REPEAT_BIT | 1);
@@ -1945,7 +1921,7 @@ fn f10_with_the_caret_list_open_closes_it_and_focuses_the_bar() {
             s.key_up(VK_ESC);
         }),
     ];
-    Script::then_typing_reaches_text(&mut steps, "after F10 from the caret list");
+    Script::then_typing_reaches_text(&mut steps, "after F10 from the owner's menu");
     finish(&s, steps);
 }
 #[test]
@@ -2112,14 +2088,14 @@ fn the_open_menu_is_in_the_tree_with_rows_in_client_places() {
     finish(&s, steps);
 }
 #[test]
-fn the_caret_list_is_in_the_tree_and_the_strip_gives_up_its_focus() {
+fn a_menu_of_the_owner_is_in_the_tree_and_the_strip_gives_up_its_focus() {
     let s = script(false);
     let steps = vec![
-        step(|s| s.click_caret()),
+        step(|s| s.open_owner_menu()),
         step(|s| {
             s.window.with_strip(|strip| strip.focus_strip()).unwrap();
             let tree = s.tree();
-            let settings = caret_menu()
+            let first = owner_menu()
                 .items
                 .iter()
                 .find(|i| i.command.is_some())
@@ -2127,8 +2103,8 @@ fn the_caret_list_is_in_the_tree_and_the_strip_gives_up_its_focus() {
                 .label
                 .clone();
             s.expect(
-                find_widget(&tree, &settings).is_some(),
-                "the list's rows are in the tree",
+                find_widget(&tree, &first).is_some(),
+                "the menu's rows are in the tree",
             );
             s.expect(
                 count_focused(&tree) == 1,
@@ -2385,22 +2361,21 @@ fn an_alt_chord_released_key_first_keeps_the_menu_open() {
     alt_chord_keeps_the_menu_open(false);
 }
 #[test]
-fn opening_the_caret_list_over_a_bar_menu_closes_the_label() {
+fn opening_a_menu_of_the_owner_over_a_bar_menu_closes_the_label() {
     let s = script(false);
     let mut steps = vec![
         step(|s| s.alt_letter(b'F')),
         step(|s| {
             s.expect(s.open_label() == Some(0), "File is open");
-            let anchor = s.window.with_strip(|strip| strip.split_rect()).unwrap();
-            s.window.open_menu(caret_menu(), anchor).unwrap();
-            s.expect_popups(1, "the list replaced the menu");
+            s.open_owner_menu();
+            s.expect_popups(1, "the owner's menu replaced the bar's");
             s.expect(s.open_label().is_none(), "File still says it is open");
             s.expect(s.focused_label().is_none(), "File still has the focus");
             s.key(VK_ESC);
             s.key_up(VK_ESC);
         }),
     ];
-    Script::then_typing_reaches_text(&mut steps, "after the caret list replaced a menu");
+    Script::then_typing_reaches_text(&mut steps, "after the owner's menu replaced a bar menu");
     finish(&s, steps);
 }
 
@@ -2690,7 +2665,7 @@ fn a_repeat_of_a_letter_runs_no_row_by_its_mnemonic() {
     let steps = vec![
         step(|s| s.key(VK_DOWN)),
         step(|s| {
-            let mut row = qe_ui::MenuItem::command("Xylophone", CommandId::About);
+            let mut row = qe_ui::MenuItem::command("Xylophone", CommandId::Print);
             row.mnemonic = Some('x');
             let anchor = s.label(0);
             s.window
@@ -2723,4 +2698,124 @@ fn a_stray_character_stays_out_of_the_text_while_the_bar_has_focus() {
         }),
     ];
     finish(&s, steps);
+}
+
+// ---- Alt+F4 with no command behind it: the whole way through the default handler.
+
+/// Makes the hidden window this thread's active window, which is what `DefWindowProcW` looks
+/// for before it sends `SC_CLOSE`. This does not touch the foreground, and nothing shows.
+fn make_active(s: &Script) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+    // SAFETY: plain calls on a window of this thread.
+    let active = unsafe {
+        let _ = SetActiveWindow(s.hwnd);
+        GetActiveWindow()
+    };
+    s.expect(active == s.hwnd, format!("the active window is {active:?}"));
+}
+
+/// The real order of a press: Alt, then F4, each as `WM_SYSKEYDOWN` with bit 29, both held in
+/// the thread's key state. Nothing here is a test double. Windows of other tests in this
+/// process can take the active state away from a hidden window, so each case runs by itself
+/// in a child process, and the parent asks for that child's result.
+fn alt_f4_closes_the_window_through_windows(name: &str, open: fn() -> Vec<Step>) {
+    const CHILD: &str = "QE_SHELL_ALT_F4_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran nothing: {stdout}"
+        );
+        return;
+    }
+    let s = script(false);
+    let mut steps = open();
+    steps.push(step(|s| {
+        make_active(s);
+        hold(&[VK_MENU_KEY, 0x73]);
+        s.post(WM_SYSKEYDOWN, VK_ALT, ALT_BIT | 1);
+        s.post(WM_SYSKEYDOWN, VK_F4, ALT_BIT | 1);
+    }));
+    steps.push(step(|s| s.expect(false, "the window outlived Alt+F4")));
+    finish(&s, steps);
+    assert!(s.was_destroyed(), "the window was not destroyed");
+    assert_eq!(s.popups().len(), 0);
+    let close_requests = s
+        .seen
+        .borrow()
+        .iter()
+        .filter(|event| **event == ShellEvent::CloseWindowRequested)
+        .count();
+    assert_eq!(close_requests, 1);
+    assert!(s.commands().is_empty(), "ran {:?}", s.commands());
+}
+
+#[test]
+fn alt_f4_closes_the_window_from_the_text() {
+    alt_f4_closes_the_window_through_windows("alt_f4_closes_the_window_from_the_text", Vec::new);
+}
+
+#[test]
+fn alt_f4_closes_the_window_from_a_focused_menu_bar() {
+    alt_f4_closes_the_window_through_windows(
+        "alt_f4_closes_the_window_from_a_focused_menu_bar",
+        || {
+            vec![
+                step(|s| s.alt_tap()),
+                step(|s| s.expect(s.focused_label() == Some(0), "Alt focuses the bar")),
+            ]
+        },
+    );
+}
+
+#[test]
+fn alt_f4_closes_the_window_with_a_menu_open() {
+    alt_f4_closes_the_window_through_windows("alt_f4_closes_the_window_with_a_menu_open", || {
+        vec![
+            step(|s| s.alt_letter(b'F')),
+            step(|s| s.expect_popups(1, "Alt+F")),
+        ]
+    });
+}
+
+#[test]
+fn alt_f4_closes_the_window_with_a_submenu_open() {
+    alt_f4_closes_the_window_through_windows(
+        "alt_f4_closes_the_window_with_a_submenu_open",
+        || {
+            let mut steps = Vec::new();
+            open_submenu_by_keys(&mut steps);
+            steps
+        },
+    );
+}
+
+/// The menu a right-click on the title bar opens is the one Windows owns, and it keeps Close.
+#[test]
+fn the_system_menu_still_has_an_enabled_close() {
+    let s = script(false);
+    // SAFETY: plain queries on a window of this thread. No menu opens.
+    unsafe {
+        let menu = GetSystemMenu(s.hwnd, false);
+        assert!(!menu.is_invalid(), "the window has no system menu");
+        let state = GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND);
+        assert_ne!(state, u32::MAX, "no Close row");
+        assert_eq!(
+            state & (MF_GRAYED.0 | MF_DISABLED.0),
+            0,
+            "Close is disabled"
+        );
+    }
 }

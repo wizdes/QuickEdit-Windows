@@ -269,13 +269,16 @@ fn controls(theme: &Theme) -> Scene {
     }
 }
 
-/// The real caret list, opened by keyboard on File, plus a mouse-opened copy.
-fn caret_list(theme: &Theme) -> Scene {
+/// All the menu bar groups as one real menu, opened by keyboard on File, plus a
+/// mouse-opened copy.
+fn all_menus(theme: &Theme) -> Scene {
     let (width, height) = (720, 520);
     let t = UiTokens::from_theme(theme);
     let mut l = DisplayList::default();
     background(&mut l, t.background, width, height);
-    let model = legacy_caret_menu();
+    let model = MenuModel {
+        items: menu_bar_groups(),
+    };
     let (w, h) = model.preferred_size(&RealMeasure);
     let mut menu = MenuView::new(WidgetId(20), "Test", model.clone()).named("All menus");
     menu.layout(r(16.0, 16.0, w, h), &RealMeasure);
@@ -299,7 +302,7 @@ fn caret_list(theme: &Theme) -> Scene {
     narrow.first_visible = 1;
     narrow.draw(&mut l, theme, &RealMeasure);
     Scene {
-        name: "caret-list",
+        name: "all-menus",
         width,
         height,
         list: l,
@@ -401,7 +404,7 @@ fn encoding_panel(theme: &Theme) -> Scene {
 pub fn all(theme: &Theme) -> Vec<Scene> {
     vec![
         controls(theme),
-        caret_list(theme),
+        all_menus(theme),
         alert(theme),
         combo_in_dialog(theme),
         encoding_panel(theme),

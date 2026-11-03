@@ -445,7 +445,7 @@ fn hover_clears_on_leave_messages() {
     assert_ne!(f.row_list(), rest, "non-client move uses the same hit test");
     f.send(WM_NCMOUSELEAVE, 0, 0);
     assert_eq!(f.row_list(), rest);
-    let plus = f.window.with_strip(|s| s.split_rect().x.0 + 5.0).unwrap();
+    let plus = f.window.with_strip(|s| s.plus_rect().x.0 + 5.0).unwrap();
     f.send(WM_MOUSEMOVE, 0, f.at(plus, 20.0));
     assert_ne!(f.row_list(), rest);
     f.send(WM_MOUSELEAVE, 0, 0);
@@ -586,7 +586,7 @@ fn handler_can_send_messages_and_change_the_strip() {
             handle.add_tab(Tab::new("From the handler")).unwrap();
         }
     });
-    let x = f.window.with_strip(|s| s.split_rect().x.0 + 5.0).unwrap();
+    let x = f.window.with_strip(|s| s.plus_rect().x.0 + 5.0).unwrap();
     f.send(WM_LBUTTONDOWN, 0, f.at(x, 20.0));
     f.send(WM_LBUTTONUP, 0, f.at(x, 20.0));
     assert_eq!(f.window.with_strip(|s| s.tabs().len()).unwrap(), 2);
@@ -730,13 +730,13 @@ fn alt_alone_focuses_the_bar_and_skips_the_menu_loop() {
     assert!(
         !f.events()
             .iter()
-            .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(..)))
     );
     assert_eq!(f.send(WM_SYSKEYUP, alt, 1 << 29), 0);
     assert!(
         !f.events()
             .iter()
-            .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(..)))
     );
     assert_eq!(f.send(WM_SYSKEYDOWN, usize::from(b'F'), 1 << 29), 0);
     assert!(
@@ -751,7 +751,7 @@ fn alt_alone_focuses_the_bar_and_skips_the_menu_loop() {
     assert!(
         !f.events()
             .iter()
-            .any(|e| matches!(e, ShellEvent::OpenCaretList(_)))
+            .any(|e| matches!(e, ShellEvent::OpenMenuGroup(..)))
     );
 }
 
@@ -959,7 +959,7 @@ fn a_caption_press_holds_the_mouse_until_release() {
 fn hover_asks_windows_for_a_repaint() {
     let f = fixture(None);
     f.send(WM_PAINT, 0, 0);
-    let plus = f.window.with_strip(|s| s.split_rect().x.0 + 5.0).unwrap();
+    let plus = f.window.with_strip(|s| s.plus_rect().x.0 + 5.0).unwrap();
     f.window.invalidated_rects().unwrap();
     f.send(WM_MOUSEMOVE, 0, f.at(plus, 20.0));
     // A hidden window keeps no update region, so `GetUpdateRect` cannot see this. The
@@ -1739,18 +1739,17 @@ fn ink_rows(image: &Bitmap, x0: u32, x1: u32, y1: u32) -> (u32, u32) {
     let ink = ink_box(image, (x0, 1, x1, y1), bg, 60).expect("ink");
     (ink.1, ink.3)
 }
-/// Root measured these on a real Terminal at 100%: `+` ink at y 19 to 29 and caret ink at
-/// y 22 to 26, both inclusive, with the row starting below the 1-pixel top border.
+/// Root measured this on a real Terminal at 100%: `+` ink at y 19 to 29, inclusive, with the
+/// row starting below the 1-pixel top border.
 #[test]
 fn restored_row_starts_below_the_top_border_as_in_terminal() {
     let f = fixture(None);
     f.send(WM_PAINT, 0, 0);
     let image = f.renderer.bitmap();
-    let split = f.window.with_strip(|s| s.split_rect()).unwrap();
-    assert_eq!(split.y.0, 13.0, "the split button starts on row 13");
-    let x = split.x.0 as u32;
+    let plus = f.window.with_strip(|s| s.plus_rect()).unwrap();
+    assert_eq!(plus.y.0, 13.0, "the + button starts on row 13");
+    let x = plus.x.0 as u32;
     assert_eq!(ink_rows(&image, x + 2, x + 29, 36), (19, 30), "plus");
-    assert_eq!(ink_rows(&image, x + 34, x + 60, 36), (22, 27), "caret");
     let tab = f.window.with_strip(|s| s.tab_rects()[0]).unwrap();
     assert_eq!(tab.y.0, 9.0, "the tab's top is 1 pixel lower");
     let row = pixel(&image, x + 100, 30);
@@ -1762,14 +1761,10 @@ fn restored_row_starts_below_the_top_border_as_in_terminal() {
     assert_eq!((ink.1 + ink.3) / 2, 21, "close button ink {ink:?}");
     // Hit tests follow it.
     let px = |x: f32, y: i32| f.hit_px(x as i32, y);
-    assert_eq!(
-        px(split.x.0 + 5.0, 12),
-        HTCAPTION,
-        "just above the split button"
-    );
-    assert_eq!(px(split.x.0 + 5.0, 13), HTCLIENT, "its first row");
-    assert_eq!(px(split.x.0 + 5.0, 36), HTCLIENT, "its last row");
-    assert_eq!(px(split.x.0 + 5.0, 37), HTCAPTION, "just below it");
+    assert_eq!(px(plus.x.0 + 5.0, 12), HTCAPTION, "just above the + button");
+    assert_eq!(px(plus.x.0 + 5.0, 13), HTCLIENT, "its first row");
+    assert_eq!(px(plus.x.0 + 5.0, 36), HTCLIENT, "its last row");
+    assert_eq!(px(plus.x.0 + 5.0, 37), HTCAPTION, "just below it");
     assert_eq!(
         px(50.0, 7),
         HTTOP,
@@ -1786,11 +1781,11 @@ fn the_row_starts_one_device_pixel_down_at_each_scale() {
     for dpi in [96u32, 120, 144, 192] {
         let f = fixture(Some(dpi));
         let scale = dpi as f32 / 96.0;
-        let split = f.window.with_strip(|s| s.split_rect()).unwrap();
+        let plus = f.window.with_strip(|s| s.plus_rect()).unwrap();
         assert!(
-            (split.y.0 * scale - (12.0 * scale + 1.0)).abs() < 0.01,
+            (plus.y.0 * scale - (12.0 * scale + 1.0)).abs() < 0.01,
             "{dpi}: {}",
-            split.y.0
+            plus.y.0
         );
     }
 }
@@ -1800,14 +1795,14 @@ fn maximized_and_full_screen_do_not_shift() {
     let f = fixture(None);
     set_maximized_style(&f);
     f.send(WM_SIZE, 0, 0);
-    assert_eq!(f.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
+    assert_eq!(f.window.with_strip(|s| s.plus_rect().y.0).unwrap(), 4.0);
     assert_eq!(f.window.content_rect().unwrap().y.0, 64.0);
     let g = fixture(None);
     full_screen_key(&g, false);
-    assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 4.0);
+    assert_eq!(g.window.with_strip(|s| s.plus_rect().y.0).unwrap(), 4.0);
     assert_eq!(g.window.content_rect().unwrap().y.0, 64.0);
     full_screen_key(&g, false);
-    assert_eq!(g.window.with_strip(|s| s.split_rect().y.0).unwrap(), 13.0);
+    assert_eq!(g.window.with_strip(|s| s.plus_rect().y.0).unwrap(), 13.0);
     assert_eq!(g.window.content_rect().unwrap().y.0, 73.0);
 }
 

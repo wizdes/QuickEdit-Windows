@@ -253,7 +253,7 @@ fn alt_chords_pass_through_every_control() {
     let mut table = Table::new(WidgetId(4), "Keys", vec![], vec![]);
     let mut bar = ScrollBar::new(WidgetId(5), 500.0, 100.0);
     let mut list = CheckList::new(WidgetId(6), "Encodings", vec![("A".into(), false)]);
-    let mut menu = MenuView::new(WidgetId(7), "All menus", caret_menu());
+    let mut menu = MenuView::new(WidgetId(7), "All menus", file_menu());
     menu.layout(r(0.0, 0.0, 200.0, 300.0), &Measure);
     let mut field = typed("x");
     let views: Vec<&mut dyn View> = vec![
@@ -346,7 +346,7 @@ fn a_press_on_the_encoding_thumb_changes_no_setting() {
 #[test]
 fn a_press_on_a_menu_thumb_runs_no_row() {
     let items = (0..100)
-        .map(|i| MenuItem::command(format!("Item {i}"), CommandId::Quit))
+        .map(|i| MenuItem::command(format!("Item {i}"), CommandId::Find))
         .collect();
     let mut menu = MenuView::new(WidgetId(1), "All menus", MenuModel { items });
     menu.layout(r(0.0, 0.0, 200.0, 100.0), &Measure);
@@ -359,7 +359,7 @@ fn a_press_on_a_menu_thumb_runs_no_row() {
     assert!(
         !released
             .requests
-            .contains(&ViewRequest::Run(CommandId::Quit))
+            .contains(&ViewRequest::Run(CommandId::Find))
     );
     assert!(
         released
@@ -370,7 +370,7 @@ fn a_press_on_a_menu_thumb_runs_no_row() {
     // A press and release on a real row still runs it.
     send(&mut menu, &down_at(20.0, 15.0));
     let ran = send(&mut menu, &up_at(20.0, 15.0));
-    assert!(ran.requests.contains(&ViewRequest::Run(CommandId::Quit)));
+    assert!(ran.requests.contains(&ViewRequest::Run(CommandId::Find)));
 }
 #[test]
 fn a_press_on_a_combo_thumb_picks_no_row() {
@@ -963,7 +963,7 @@ fn open_recent_rows_name_their_files() {
 }
 #[test]
 fn a_second_alt_tap_closes_the_list() {
-    let mut menu = MenuView::new(WidgetId(1), "All menus", caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "All menus", file_menu());
     menu.layout(r(0.0, 0.0, 200.0, 300.0), &Measure);
     menu.open_keyboard();
     send(&mut menu, &press(0x27));
@@ -986,7 +986,7 @@ fn a_second_alt_tap_closes_the_list() {
 // Item 3: what a host needs for one window per level.
 #[test]
 fn a_menu_gives_its_levels_and_paints_each_at_its_own_origin() {
-    let mut menu = MenuView::new(WidgetId(1), "All menus", legacy_caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "All menus", all_menus());
     menu.layout(r(100.0, 200.0, 200.0, 300.0), &Measure);
     menu.open_keyboard();
     assert_eq!(menu.levels().len(), 1);
@@ -1097,7 +1097,7 @@ fn every_key_is_safe_on_every_empty_list() {
 }
 #[test]
 fn a_selected_row_past_the_end_of_a_changed_model_does_not_panic() {
-    let mut menu = MenuView::new(WidgetId(1), "Menu", caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "Menu", file_menu());
     menu.layout(r(0.0, 0.0, 200.0, 100.0), &Measure);
     menu.open_keyboard();
     menu.model = MenuModel::default();
@@ -1192,7 +1192,7 @@ fn home_shows_a_leading_section_when_it_fits() {
 // Final review, item 5.
 #[test]
 fn a_closed_menu_has_no_focused_node() {
-    let mut menu = MenuView::new(WidgetId(1), "Menu", caret_menu());
+    let mut menu = MenuView::new(WidgetId(1), "Menu", file_menu());
     menu.layout(r(0.0, 0.0, 200.0, 300.0), &Measure);
     menu.open_keyboard();
     assert_eq!(focused_nodes(&menu.widgets().unwrap()).len(), 1);
@@ -1200,8 +1200,19 @@ fn a_closed_menu_has_no_focused_node() {
     assert!(menu.closed);
     assert_eq!(focused_nodes(&menu.widgets().unwrap()).len(), 0);
     // With nothing selected, an open menu's own node has focus, and a closed one's not.
-    let mut plain = MenuView::new(WidgetId(1), "Menu", caret_menu());
+    let mut plain = MenuView::new(WidgetId(1), "Menu", file_menu());
     assert_eq!(focused_nodes(&plain.widgets().unwrap()).len(), 1);
     send(&mut plain, &ev(InputKind::Blur));
     assert_eq!(focused_nodes(&plain.widgets().unwrap()).len(), 0);
+}
+
+/// A plain menu, as the tests above want one.
+fn file_menu() -> MenuModel {
+    menu_bar_groups()[0].submenu.clone().unwrap()
+}
+/// A menu whose rows open submenus.
+fn all_menus() -> MenuModel {
+    MenuModel {
+        items: menu_bar_groups(),
+    }
 }

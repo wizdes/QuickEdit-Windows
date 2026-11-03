@@ -725,7 +725,7 @@ impl Drop for PopupWindow {
     }
 }
 
-/// The windows of a caret list: one popup for each open level of a `MenuView`. Call
+/// The windows of a menu: one popup for each open level of a `MenuView`. Call
 /// `sync` after each event. The first window keeps the mouse throughout, so opening or
 /// closing a submenu never dismisses the list.
 pub struct MenuWindows {

@@ -50,10 +50,10 @@ fn strip(state: &str, contrast: bool, width: f32) -> TabStrip {
             &mut ctx,
         );
     };
-    let split = s.split_rect();
+    let plus = s.plus_rect();
     match state {
-        "hover-plus" => press(&mut s, split.x.0 + 10.0, split.y.0 + 10.0, false),
-        "pressed-caret" => press(&mut s, split.x.0 + 40.0, split.y.0 + 10.0, true),
+        "hover-plus" => press(&mut s, plus.x.0 + 10.0, plus.y.0 + 10.0, false),
+        "pressed-plus" => press(&mut s, plus.x.0 + 10.0, plus.y.0 + 10.0, true),
         "hover-close" => press(&mut s, width - 10.0, 20.0, false),
         "pressed-close" => press(&mut s, width - 10.0, 20.0, true),
         "hover-max" => press(&mut s, width - 60.0, 20.0, false),
@@ -83,7 +83,7 @@ fn main() -> Result<(), String> {
             "rest",
             "maximized",
             "hover-plus",
-            "pressed-caret",
+            "pressed-plus",
             "hover-close",
             "pressed-close",
             "hover-max",

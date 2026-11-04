@@ -4,7 +4,7 @@ use crate::app::{App, Effect, Incoming};
 use crate::panels::PanelJob;
 use qe_a11y::WidgetAction;
 use qe_api::{CommandId, Dip, Handled, Rect, SettingKey, ViewContext, WidgetId};
-use qe_docs::{DocId, OpenTarget, WindowId, recent_menu_rows};
+use qe_docs::{DocId, OpenTarget, WindowId, recent_menu_path, recent_menu_rows};
 use qe_editor::EditorCommand;
 use qe_tools::ToolsHost;
 use qe_ui::{MenuItem, MenuModel, menu_bar_groups_with_keys, set_command_state, set_recent_files};
@@ -416,12 +416,25 @@ impl App {
 
     /// What choosing an Open Recent row does, for the test channel.
     pub fn run_recent_row(&mut self, window: WindowId, path: &str) {
-        self.open_recent(window, path);
+        let paths = [PathBuf::from(path)];
+        if let Err(e) = self
+            .store
+            .open_paths(&paths, OpenTarget::Window(window), None)
+        {
+            self.error_alert("The file could not open", &e.message);
+        }
     }
 
-    /// Open Recent's row: the data is the path.
+    /// Open Recent's row: the data holds the exact UTF-16 path.
     pub fn open_recent(&mut self, window: WindowId, path: &str) {
-        let paths = [PathBuf::from(path)];
+        let Some(path) = recent_menu_path(path) else {
+            self.error_alert(
+                "The file could not open",
+                "The recent file path is damaged.",
+            );
+            return;
+        };
+        let paths = [path];
         if let Err(e) = self
             .store
             .open_paths(&paths, OpenTarget::Window(window), None)

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuickEdit Save Check</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Geist',system-ui,sans-serif;background:#f5f5f5;color:#2d3142;padding:2.5rem 1rem}
+.frame{max-width:760px;margin:0 auto}
+.diagram-container{width:100%;overflow-x:auto}
+.eyebrow{font-family:'Geist Mono',monospace;font-size:.66rem;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:#4f5d75;margin-bottom:.5rem}
+h1{font-family:'Instrument Serif',serif;font-size:2rem;font-weight:400;letter-spacing:-.02em;margin-bottom:.4rem}
+p.lede{color:#4f5d75;font-size:.95rem;margin-bottom:1.5rem;max-width:70ch}
+p.note{font-family:'Instrument Serif',serif;font-style:italic;font-size:1.05rem;color:#4f5d75;margin-top:1rem;max-width:70ch}
+svg{width:100%;min-width:720px;display:block}
+.name{font-family:'Geist',sans-serif;font-size:13px;font-weight:600;fill:#2d3142}
+.sub{font-family:'Geist Mono',monospace;font-size:9.5px;fill:#5a6580}
+.lab{font-family:'Geist Mono',monospace;font-size:9px;font-weight:500;letter-spacing:.08em;fill:#4f5d75}
+.leg{font-family:'Geist Mono',monospace;font-size:9px;fill:#5a6580}
+@media print{.diagram-container{overflow-x:visible}svg{min-width:0}}
+</style></head>
+<body><div class="frame">
+<p class="eyebrow">Save check · QuickEdit for Windows</p>
+<h1>A Save now checks the disk before and after its swap.</h1>
+<p class="lede">The two orange shapes changed. Before, a deleted file skipped the first check, and the second check compared only the byte count.</p>
+<div class="diagram-container">
+<svg viewBox="0 0 720 780" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="save-check-title save-check-desc">
+<title id="save-check-title">QuickEdit save check</title>
+<desc id="save-check-desc">A Save picks what the disk must hold, asks if the disk holds something else, swaps the file in, then keeps the stamp only if size and time still match its own file.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+</defs>
+<rect width="720" height="780" fill="#f5f5f5"/>
+
+<!-- Arrows first, so they sit behind the shapes. -->
+<g fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)">
+<line x1="240" y1="68" x2="240" y2="104"/>
+<line x1="240" y1="168" x2="240" y2="204"/>
+<line x1="240" y1="324" x2="240" y2="372"/>
+<line x1="360" y1="264" x2="440" y2="264"/>
+<line x1="240" y1="436" x2="240" y2="472"/>
+<line x1="240" y1="592" x2="240" y2="640"/>
+<line x1="360" y1="532" x2="440" y2="532"/>
+<line x1="560" y1="500" x2="560" y2="296" stroke-dasharray="5,4"/>
+</g>
+
+<!-- Arrow labels, each on its own mask and clear of its line. -->
+<rect x="250" y="340" width="32" height="16" fill="#f5f5f5"/><text x="266" y="351" text-anchor="middle" class="lab">YES</text>
+<rect x="384" y="238" width="32" height="16" fill="#f5f5f5"/><text x="400" y="249" text-anchor="middle" class="lab">NO</text>
+<rect x="250" y="608" width="32" height="16" fill="#f5f5f5"/><text x="266" y="619" text-anchor="middle" class="lab">YES</text>
+<rect x="384" y="506" width="32" height="16" fill="#f5f5f5"/><text x="400" y="517" text-anchor="middle" class="lab">NO</text>
+<rect x="570" y="390" width="72" height="16" fill="#f5f5f5"/><text x="606" y="401" text-anchor="middle" class="lab">NEXT SAVE</text>
+
+<!-- Start -->
+<rect x="160" y="24" width="160" height="44" rx="20" fill="#ececec" stroke="#2d3142"/>
+<text x="240" y="51" text-anchor="middle" class="name">The user saves</text>
+
+<!-- Changed: what the disk must hold -->
+<rect x="120" y="104" width="240" height="64" rx="6" fill="#f5f5f5"/>
+<rect x="120" y="104" width="240" height="64" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="240" y="131" text-anchor="middle" class="name">Pick what the disk must hold</text>
+<text x="240" y="150" text-anchor="middle" class="sub">deleted: nothing, else: last stamp</text>
+
+<!-- Decision 1 -->
+<polygon points="240,204 360,264 240,324 120,264" fill="#f5f5f5" stroke="#2d3142"/>
+<text x="240" y="262" text-anchor="middle" class="name">Does the disk</text>
+<text x="240" y="278" text-anchor="middle" class="name">hold that?</text>
+
+<!-- Ask -->
+<rect x="440" y="232" width="240" height="64" rx="6" fill="#f5f5f5" stroke="#2d3142"/>
+<text x="560" y="259" text-anchor="middle" class="name">Ask: changed on disk</text>
+<text x="560" y="278" text-anchor="middle" class="sub">Save Anyway, Revert or Cancel</text>
+
+<!-- Swap -->
+<rect x="120" y="372" width="240" height="64" rx="6" fill="#f5f5f5" stroke="#2d3142"/>
+<text x="240" y="399" text-anchor="middle" class="name">Swap the temp file in</text>
+<text x="240" y="418" text-anchor="middle" class="sub">ReplaceFileW</text>
+
+<!-- Changed: decision 2 -->
+<polygon points="240,472 360,532 240,592 120,532" fill="#f5f5f5"/>
+<polygon points="240,472 360,532 240,592 120,532" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="240" y="530" text-anchor="middle" class="name">Size and time</text>
+<text x="240" y="546" text-anchor="middle" class="name">match the temp file?</text>
+
+<!-- Not ours -->
+<rect x="440" y="500" width="240" height="64" rx="6" fill="#f5f5f5" stroke="#2d3142"/>
+<text x="560" y="527" text-anchor="middle" class="name">Treat the file as not ours</text>
+<text x="560" y="546" text-anchor="middle" class="sub">text stays marked unsaved</text>
+
+<!-- Keep -->
+<rect x="120" y="640" width="240" height="64" rx="6" fill="#ececec" stroke="#2d3142"/>
+<text x="240" y="667" text-anchor="middle" class="name">Keep the stamp seen on disk</text>
+<text x="240" y="686" text-anchor="middle" class="sub">the document is clean</text>
+
+<!-- Legend -->
+<line x1="24" y1="732" x2="696" y2="732" stroke="#bfc0c0"/>
+<rect x="24" y="748" width="20" height="12" rx="2" fill="rgba(191,69,32,0.08)" stroke="#bf4520"/><text x="52" y="758" class="leg">changed in this fix</text>
+<polygon points="212,754 224,747 236,754 224,761" fill="#f5f5f5" stroke="#2d3142"/><text x="244" y="758" class="leg">decision</text>
+<rect x="328" y="748" width="20" height="12" rx="2" fill="#f5f5f5" stroke="#2d3142"/><text x="356" y="758" class="leg">step</text>
+<line x1="412" y1="754" x2="444" y2="754" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4"/><text x="452" y="758" class="leg">happens at a later Save</text>
+</svg>
+</div>
+<p class="note">Limit: another program's same-size write within one step of the file time, about 16 ms on NTFS, still goes unseen. A file index that changes on a rename no longer counts as an outside write. A test proves this with a swapped file; no real FAT or exFAT drive was tried.</p>
+</div></body></html>

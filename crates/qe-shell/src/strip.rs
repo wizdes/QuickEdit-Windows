@@ -1250,7 +1250,7 @@ impl TabStrip {
             return gap;
         }
         let t = light_tokens();
-        for i in self.shown_range() {
+        for i in self.shown_range().rev() {
             let b = self.drawn_rect(i);
             if inside(at, b) {
                 if let CaptionHit::Tab(same) | CaptionHit::TabClose(same) = hit
@@ -1259,7 +1259,8 @@ impl TabStrip {
                 {
                     return hit;
                 }
-                return if at.x.0 >= b.x.0 + b.width.0 - t.close_width {
+                let hidden_x = self.new_tab_x_is_hidden(self.tabs[i].id, b, t);
+                return if at.x.0 >= b.x.0 + b.width.0 - t.close_width && !hidden_x {
                     CaptionHit::TabClose(i)
                 } else {
                     CaptionHit::Tab(i)
@@ -1455,6 +1456,13 @@ impl TabStrip {
             CaptionHit::Close => r(self.caption_x(2, t), self.bounds.y.0, t.caption_width, row),
             _ => Rect::default(),
         }
+    }
+    /// A new tab's X, with the tab drawn at `b`, waits for the + to pass, or the two would
+    /// cross on screen. While hidden, it is not drawn and takes no click.
+    fn new_tab_x_is_hidden(&self, tab: TabId, b: Rect, t: ShellTokens) -> bool {
+        let close = Self::close_box_in(b, t);
+        self.motion.fade_in.is_some_and(|(new, _)| new == tab)
+            && self.drawn_plus().x.0 < close.x.0 + close.width.0
     }
     /// The hover box of the X of a tab drawn at `b`.
     fn close_box_in(b: Rect, t: ShellTokens) -> Rect {
@@ -2303,9 +2311,7 @@ impl TabStrip {
                     },
                 }),
             }
-            // A new tab's X waits for the + to pass, or the two would cross on screen.
-            let plus_on_x = self.motion.fade_in.is_some_and(|(new, _)| new == tab.id)
-                && self.drawn_plus().x.0 < close.x.0 + close.width.0;
+            let plus_on_x = self.new_tab_x_is_hidden(tab.id, b, t);
             if !plus_on_x && tab.dirty && !hovering {
                 let metrics = measure.measure("•", t.text_token);
                 list.push(DrawCommand::TextRun {

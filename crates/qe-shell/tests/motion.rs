@@ -2494,3 +2494,52 @@ fn a_new_menu_that_fails_after_the_old_one_ended_still_ends_a_hold() {
     assert!(f.window.open_menu(model(), anchor()).is_err());
     assert_eq!(f.window.leave_notice_armed().unwrap(), "client");
 }
+
+#[test]
+fn new_tab_on_top_takes_its_close_click() {
+    let clock = Clock::manual();
+    let mut s = moving_strip(4, &clock);
+    let new = s.add_tab(Tab::new("New"));
+    s.take_events();
+    step(&mut s, &clock, 8.0);
+    let b = s.drawn_tab_places()[4];
+    let (x, y) = (b.x.0 + 20.0, b.y.0 + 10.0);
+    press(&mut s, x, y, MouseButton::Middle);
+    release(&mut s, x, y, MouseButton::Middle);
+    assert!(
+        s.take_events()
+            .contains(&ShellEvent::CloseTabRequested(new))
+    );
+}
+
+#[test]
+fn hidden_new_tab_x_is_tab_body_for_left_click() {
+    let clock = Clock::manual();
+    let mut s = moving_strip(2, &clock);
+    let new = s.add_tab(Tab::new("New"));
+    s.take_events();
+    step(&mut s, &clock, 16.0);
+    let (x, y) = x_of(&s, 2);
+    press(&mut s, x, y, MouseButton::Left);
+    release(&mut s, x, y, MouseButton::Left);
+    assert!(
+        !s.take_events()
+            .contains(&ShellEvent::CloseTabRequested(new))
+    );
+}
+
+#[test]
+fn middle_click_still_closes_tab_with_hidden_x() {
+    let clock = Clock::manual();
+    let mut s = moving_strip(2, &clock);
+    let new = s.add_tab(Tab::new("New"));
+    s.take_events();
+    step(&mut s, &clock, 16.0);
+    let (x, y) = x_of(&s, 2);
+    press(&mut s, x, y, MouseButton::Middle);
+    release(&mut s, x, y, MouseButton::Middle);
+    assert!(
+        s.take_events()
+            .contains(&ShellEvent::CloseTabRequested(new))
+    );
+}

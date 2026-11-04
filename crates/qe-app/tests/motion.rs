@@ -361,3 +361,22 @@ fn the_only_tab_of_a_row_goes_through_sync_tabs_with_the_new_one_added_first() {
     click(&mut app, at, false);
     app.wait_exit();
 }
+
+#[test]
+fn new_tab_title_middle_click_closes_the_drawn_tab() {
+    let folder = Folder::new("new-title-overlap");
+    let mut app = four_tabs(&folder);
+    app.run("NewTab");
+    wait_tabs(&mut app, 5);
+    app.ok("motion-time 8");
+    let row = strip(&mut app);
+    let (x, _) = row.drawn[4];
+    let at = (
+        ((x + 20.0) * row.scale) as i32,
+        ((row.y + 10.0) * row.scale) as i32,
+    );
+    click(&mut app, at, true);
+    wait_tabs(&mut app, 4);
+    assert_eq!(strip(&mut app).titles, ["a.txt", "b.txt", "c.txt", "d.txt"]);
+    app.quit();
+}

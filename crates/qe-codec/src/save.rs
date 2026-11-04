@@ -1048,6 +1048,17 @@ pub enum AtomicWriteResult {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<AtomicWriteResult, CodecError> {
     atomic_write_with(path, bytes, &mut RealEnv)
 }
+/// Saves against a known file, or against a name that must still be absent.
+/// The returned stamp belongs to the temp file that was committed, not a later
+/// file found by looking up the name after the swap.
+pub fn atomic_write_guarded(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<FileStamp>,
+    expect_absent: bool,
+) -> Result<(AtomicWriteResult, FileStamp), CodecError> {
+    atomic_write_expecting(path, bytes, expected, expect_absent, &mut RealEnv)
+}
 /// `atomic_write` that also refuses if the file is not what `expected` recorded, for
 /// a change at any time since then, such as since the document was opened. Nothing
 /// is written in that case, so `TargetChanged` names no file: the text is still with
@@ -1057,14 +1068,15 @@ pub fn atomic_write_if_unchanged(
     bytes: &[u8],
     expected: FileStamp,
 ) -> Result<AtomicWriteResult, CodecError> {
-    atomic_write_expecting(path, bytes, Some(expected), &mut RealEnv)
+    atomic_write_expecting(path, bytes, Some(expected), false, &mut RealEnv)
+        .map(|(result, _)| result)
 }
 fn atomic_write_with(
     path: &Path,
     bytes: &[u8],
     env: &mut impl SaveEnv,
 ) -> Result<AtomicWriteResult, CodecError> {
-    atomic_write_expecting(path, bytes, None, env)
+    atomic_write_expecting(path, bytes, None, false, env).map(|(result, _)| result)
 }
 fn changed_since_stamp(target: &Path) -> CodecError {
     CodecError::TargetChanged {
@@ -1077,12 +1089,13 @@ fn atomic_write_expecting(
     path: &Path,
     bytes: &[u8],
     expected: Option<FileStamp>,
+    expect_absent: bool,
     env: &mut impl SaveEnv,
-) -> Result<AtomicWriteResult, CodecError> {
+) -> Result<(AtomicWriteResult, FileStamp), CodecError> {
     let (target, before, rules) = match resolve_target(path)? {
         Resolved::Existing(target) => {
             let (state, rules) = preflight_existing(&target)?;
-            if expected.is_some_and(|stamp| stamp.0 != state) {
+            if expect_absent || expected.is_some_and(|stamp| stamp.0 != state) {
                 return Err(changed_since_stamp(&target));
             }
             (target, Some(state), rules)
@@ -1121,10 +1134,11 @@ fn atomic_write_expecting(
         temp_state,
         on_failure: TempOnFailure::Delete,
     };
-    match before {
+    let result = match before {
         Some(before) => commit_replace(commit, before, env),
         None => commit_new(commit, env).map(|()| AtomicWriteResult::Replaced),
-    }
+    }?;
+    Ok((result, FileStamp(temp_state)))
 }
 /// What a file was at one moment: which file, its size and its last write time. Keep
 /// the stamp from when a document was opened and from each save, and pass it to
@@ -1145,6 +1159,15 @@ pub fn file_stamp(path: &Path) -> Result<Option<FileStamp>, CodecError> {
     file_state(&target)
         .map(|state| state.map(FileStamp))
         .map_err(|code| save_error(code, &target, true, None))
+}
+
+/// The stamp a save keeps, from `committed`, taken from its temp file before the swap, and
+/// `observed`, taken at the final name after it. `None` means another program wrote there.
+/// Only size and time count, because FAT, exFAT and some network shares give a file a new
+/// index when it is renamed. The stamp kept is `observed`, so the next save's check matches
+/// what is on disk.
+pub fn stamp_after_swap(committed: FileStamp, observed: Option<FileStamp>) -> Option<FileStamp> {
+    observed.filter(|now| now.0.same_content_stamp(&committed.0))
 }
 
 /// A failed `PreparedCopy::try_commit`.

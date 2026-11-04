@@ -1078,3 +1078,64 @@ fn verbatim_and_friendly_forms() {
     assert_eq!(verbatim(share), Path::new(r"\\?\UNC\host\share\b.txt"));
     assert_eq!(friendly(&verbatim(share)), share);
 }
+
+#[test]
+fn committed_temp_stamp_matches_replaced_file_on_this_volume() {
+    let dir = scratch("committed-stamp");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"old").unwrap();
+    let expected = file_stamp(&path).unwrap().unwrap();
+    let (_, committed) = atomic_write_guarded(&path, b"mine", Some(expected), false).unwrap();
+    assert_eq!(file_stamp(&path).unwrap(), Some(committed));
+    // A same-size write inside one step of the file time, about 16 ms on NTFS, leaves the
+    // stamp as it was, and the next save then overwrites it unseen. This wait does not
+    // close that limit, which `FileStamp` also states. It only tests a write past it.
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(&path, b"THEM").unwrap();
+    assert!(matches!(
+        atomic_write_guarded(&path, b"mine", Some(committed), false),
+        Err(CodecError::TargetChanged { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), b"THEM");
+}
+
+#[test]
+fn absent_guard_refuses_a_recreated_file() {
+    let dir = scratch("absent-guard");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"theirs").unwrap();
+    assert!(matches!(
+        atomic_write_guarded(&path, b"mine", None, true),
+        Err(CodecError::TargetChanged { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), b"theirs");
+}
+
+fn state(index: u64, size: u64, written: u64) -> FileStamp {
+    FileStamp(FileState {
+        volume: 7,
+        index,
+        size,
+        written,
+    })
+}
+
+#[test]
+fn only_a_new_file_index_after_the_swap_keeps_the_stamp_seen_on_disk() {
+    let committed = state(1, 10, 100);
+    let renamed = state(2, 10, 100);
+    assert_eq!(stamp_after_swap(committed, Some(renamed)), Some(renamed));
+    assert_eq!(
+        stamp_after_swap(committed, Some(committed)),
+        Some(committed)
+    );
+}
+
+#[test]
+fn a_new_size_or_time_after_the_swap_keeps_no_stamp() {
+    let committed = state(1, 10, 100);
+    assert_eq!(stamp_after_swap(committed, Some(state(1, 10, 101))), None);
+    assert_eq!(stamp_after_swap(committed, Some(state(2, 10, 101))), None);
+    assert_eq!(stamp_after_swap(committed, Some(state(1, 11, 100))), None);
+    assert_eq!(stamp_after_swap(committed, None), None);
+}

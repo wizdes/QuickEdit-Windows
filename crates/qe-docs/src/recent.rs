@@ -63,8 +63,8 @@ pub(crate) fn decode_recent(text: &str) -> (Vec<PathBuf>, usize) {
     (list, bad)
 }
 
-/// The rows for `qe_ui::set_recent_files`: label and path. A name that appears twice shows
-/// its folder too, as AppKit does.
+/// The rows for `qe_ui::set_recent_files`: lossy label and exact UTF-16 path data.
+/// A name that appears twice shows its folder too, as AppKit does.
 pub fn recent_menu_rows(list: &[PathBuf]) -> Vec<(String, String)> {
     let name = |path: &Path| {
         path.file_name().map_or_else(
@@ -80,9 +80,34 @@ pub fn recent_menu_rows(list: &[PathBuf]) -> Vec<(String, String)> {
                 Some(folder) => format!("{shown} \u{2014} {}", folder.to_string_lossy()),
                 None => shown,
             };
-            (label, path.to_string_lossy().into_owned())
+            use std::os::windows::ffi::OsStrExt;
+            let data = path
+                .as_os_str()
+                .encode_wide()
+                .map(|unit| format!("{unit:04x}"))
+                .collect();
+            (label, data)
         })
         .collect()
+}
+/// Reads a menu row's exact UTF-16 path, including units that cannot form Unicode text.
+pub fn recent_menu_path(data: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if !data.len().is_multiple_of(4) || data.is_empty() {
+        return None;
+    }
+    let units: Option<Vec<u16>> = data
+        .as_bytes()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|part| {
+            std::str::from_utf8(part)
+                .ok()
+                .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        })
+        .collect();
+    Some(std::ffi::OsString::from_wide(&units?).into())
 }
 
 #[cfg(test)]

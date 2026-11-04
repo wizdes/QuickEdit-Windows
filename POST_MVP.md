@@ -22,3 +22,4 @@
 - `CouldNotCheck(0)`, from a failed stamp query during a read back, gets no retry.
 - `the_watch_stops_with_the_last_document_in_a_folder` and `ten_kills_in_the_middle_of_saves_leave_a_whole_file` failed under about 8 test programs at once. The cause is not proven.
 - `file_holds_bytes` has no caller outside tests.
+- If both file queries fail right after a swap, for example a network share dropping at that moment, `run_save` in `crates/qe-docs/src/store.rs` can report a save as confirmed: `marks()` throws away the query errors. Astra read this on 2026-11-04 and did not reproduce it; it needs a rare race. Tell a failed query from a missing file, retry on the worker, then keep the text dirty and show the notice.

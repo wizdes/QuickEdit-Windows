@@ -386,3 +386,462 @@ fn cancel_of_the_changed_question_drops_the_dialog_encoding() {
         [0xff, 0xfe, b'x', 0, b'h', 0, b'i', 0]
     );
 }
+
+// ---- The second review of the save checks.
+
+const OUTSIDE_WAIT: Duration = Duration::from_millis(20);
+
+fn with_faults(folder: &std::path::Path) -> (Harness, std::sync::Arc<qe_docs::Faults>) {
+    let (config, wakes) = config(&folder.join("root"));
+    let faults = config.faults.clone();
+    (Harness::with_config(config, wakes), faults)
+}
+
+fn add_named_stream(path: &std::path::Path) {
+    let stream = format!("{}:Zone.Identifier", path.display());
+    std::fs::write(stream, b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+}
+
+#[test]
+fn a_file_with_a_named_stream_comes_clean_after_each_save() {
+    let folder = test_folder("fix4-stream");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    add_named_stream(&path);
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(!h.store.is_dirty(doc), "the first Save wrote only our text");
+    assert!(h.store.open_questions().is_empty());
+    h.type_text(doc, "y");
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(!h.store.is_dirty(doc), "the later Save wrote only our text");
+    assert!(h.store.open_questions().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"xyold");
+}
+
+#[test]
+fn an_outside_write_is_still_caught_on_a_file_with_a_named_stream() {
+    let folder = test_folder("fix4-stream-outside");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    add_named_stream(&path);
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let target = path.clone();
+    *faults.after_swap.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(OUTSIDE_WAIT);
+        std::fs::write(&target, b"THEM").unwrap();
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(h.store.is_dirty(doc), "the text is not on disk");
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&path).unwrap(), b"THEM");
+}
+
+#[test]
+fn a_session_end_copy_keeps_text_an_outside_write_replaced() {
+    let folder = test_folder("fix4-session-end");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let copies = h.store.session_end_copies().expect("a round of copies");
+    let target = path.clone();
+    *faults.after_swap.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(OUTSIDE_WAIT);
+        std::fs::write(&target, b"THEM").unwrap();
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(h.store.is_dirty(doc));
+    let failed = copies.write();
+    assert!(failed.is_empty(), "{failed:?}");
+    let names = autosave_files(&folder.join("root"));
+    assert!(!names.is_empty(), "the only copy of the text was skipped");
+    let holds = names.iter().any(|name| {
+        let file = folder.join("root/session/docs").join(name);
+        std::fs::read(file).is_ok_and(|bytes| bytes.windows(4).any(|part| part == b"xold"))
+    });
+    assert!(holds, "no copy holds the text: {names:?}");
+}
+
+#[test]
+fn a_save_that_met_another_version_trusts_only_a_file_holding_its_text() {
+    let folder = test_folder("fix4-other-version");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let target = path.clone();
+    *faults.before_replace.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&target, b"another program").unwrap();
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    let kept = |h: &Harness| {
+        h.events.iter().any(|e| {
+            matches!(e, DocEvent::SaveFinished { other_version, .. } if other_version.is_some())
+        })
+    };
+    assert!(kept(&h), "the other program's bytes stay in a backup");
+    assert!(!h.store.is_dirty(doc), "the name holds our text");
+    h.type_text(doc, "y");
+    h.events.clear();
+    let target = path.clone();
+    let again = path.clone();
+    *faults.before_replace.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&target, b"another program").unwrap();
+    }));
+    *faults.after_swap.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(OUTSIDE_WAIT);
+        std::fs::write(&again, b"ZZZZZ").unwrap();
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(kept(&h));
+    assert!(
+        h.store.is_dirty(doc),
+        "the same-size text there is not ours"
+    );
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&path).unwrap(), b"ZZZZZ");
+}
+
+/// Save As through `alias` of a lossy file asks, and Overwrite then uses the dialog's encoding.
+fn alias_asks(
+    h: &mut Harness,
+    doc: qe_docs::DocId,
+    path: &std::path::Path,
+    alias: std::path::PathBuf,
+) {
+    h.events.clear();
+    h.store
+        .save_as(doc, alias, Some(qe_api::TextEncoding::Utf8))
+        .unwrap();
+    h.until("save or question", |h| {
+        h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::SaveFinished { .. } | DocEvent::Question(_)))
+    });
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        LOSSY_UTF16,
+        "bytes went with no question"
+    );
+    let question = open_question(h, QuestionKind::LossyOverwrite);
+    h.store.answer(question, Answer::Overwrite).unwrap();
+    h.saved(doc);
+    assert_eq!(std::fs::read(path).unwrap(), b"hi");
+}
+
+#[test]
+fn a_verbatim_name_of_a_lossy_file_still_asks() {
+    let folder = test_folder("fix4-verbatim");
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    let alias = std::fs::canonicalize(&path).unwrap();
+    assert!(alias.to_string_lossy().starts_with(r"\\?\"));
+    alias_asks(&mut h, doc, &path, alias);
+}
+
+#[test]
+fn a_symlink_to_a_lossy_file_still_asks() {
+    let folder = test_folder("fix4-symlink");
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let link = folder.join("link.txt");
+    if let Err(error) = std::os::windows::fs::symlink_file(&path, &link) {
+        println!("SKIPPED: this account cannot make a symlink: {error}");
+        return;
+    }
+    if std::fs::read(&link).is_err() {
+        println!("SKIPPED: this PC cannot follow a symlink");
+        return;
+    }
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    alias_asks(&mut h, doc, &path, link);
+}
+
+#[test]
+fn an_overwrite_answer_during_a_reload_is_refused_and_can_be_given_again() {
+    use std::sync::atomic::Ordering;
+    let (mut h, doc, path, question, faults) = asking_about_save_as("fix4-reload-busy");
+    faults.hold_reload.store(true, Ordering::Release);
+    std::fs::write(&path, [0xff, 0xfe, b'h', 0, b'i', 0, b'!', 0, 0x41]).unwrap();
+    h.store.app_activated();
+    h.until("the reload is under way", |_| {
+        faults.reload_is_held.load(Ordering::Acquire)
+    });
+    assert!(h.store.answer(question, Answer::Overwrite).is_err());
+    assert!(h.store.has_waiting_save_as(doc), "the target stays with it");
+    assert!(
+        h.store.open_questions().iter().any(|q| q.id == question),
+        "the question stays open"
+    );
+    faults.hold_reload.store(false, Ordering::Release);
+    h.events.clear();
+    h.until("the answer is taken", |h| {
+        h.store.answer(question, Answer::Overwrite).is_ok()
+    });
+    h.saved(doc);
+    assert_eq!(std::fs::read(&path).unwrap(), b"hi!");
+}
+
+#[test]
+fn a_failed_overwrite_keeps_the_lossy_question() {
+    use std::sync::atomic::Ordering;
+    let folder = test_folder("fix4-failed-overwrite");
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.store.save(doc).unwrap();
+    let question = open_question(&mut h, QuestionKind::LossyOverwrite);
+    faults.save_error_code.store(5, Ordering::Relaxed);
+    h.store.answer(question, Answer::Overwrite).unwrap();
+    h.until("the save fails", |h| {
+        h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::SaveFailed { .. }))
+    });
+    faults.save_error_code.store(0, Ordering::Relaxed);
+    assert!(h.store.format(doc).unwrap().lossy);
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    open_question(&mut h, QuestionKind::LossyOverwrite);
+    assert_eq!(std::fs::read(&path).unwrap(), LOSSY_UTF16);
+}
+
+#[test]
+fn a_plain_save_during_the_changed_question_replaces_the_dialog_encoding() {
+    let (mut h, doc, path) = changed_during_lossy_save_as("fix4-newest-save");
+    let changed = open_question(&mut h, QuestionKind::ChangedOnDisk);
+    h.store.save(doc).unwrap();
+    assert!(!h.store.has_waiting_save_as(doc));
+    h.events.clear();
+    h.until("the answer is taken", |h| {
+        h.store.answer(changed, Answer::SaveAnyway).is_ok()
+    });
+    h.saved(doc);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        [0xff, 0xfe, b'x', 0, b'h', 0, b'i', 0]
+    );
+}
+
+#[test]
+fn a_recreated_read_only_file_asks_about_the_change_first() {
+    let folder = test_folder("fix4-recreated-locked");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    h.type_text(doc, "my ");
+    std::fs::remove_file(&path).unwrap();
+    h.store.app_activated();
+    h.until("the deletion is known", |h| {
+        h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::FileDeleted { .. }))
+    });
+    std::fs::write(&path, b"theirs").unwrap();
+    set_read_only(&path, true);
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    let question = h.question("the save question");
+    assert_eq!(question.kind, QuestionKind::ChangedOnDisk);
+    assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+}
+
+#[test]
+fn a_file_made_during_the_temp_write_of_a_deleted_document_asks() {
+    let folder = test_folder("fix4-made-during");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "my ");
+    std::fs::remove_file(&path).unwrap();
+    h.store.app_activated();
+    h.until("the deletion is known", |h| {
+        h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::FileDeleted { .. }))
+    });
+    let target = path.clone();
+    *faults.before_commit.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&target, b"theirs").unwrap();
+    }));
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert!(
+        !h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::SaveFailed { .. })),
+        "a plain failure hides the choice"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+}
+
+#[test]
+fn each_misplaced_document_gets_its_own_notice() {
+    let folder = test_folder("fix4-two-misplaced");
+    let root = folder.join("root");
+    let mut h = Harness::new(&root);
+    let (_, first) = h.store.new_window(false).unwrap();
+    h.type_text(first, "first text");
+    let (_, second) = h.store.new_window(false).unwrap();
+    h.type_text(second, "second text");
+    h.quit();
+    let manifest = root.join("session/session.txt");
+    let damaged = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("window "))
+        .map(|line| {
+            if let Some(counts) = line.strip_prefix("end ") {
+                let docs = counts.split(' ').nth(1).unwrap();
+                return format!("end 0 {docs}");
+            }
+            if !line.starts_with("doc ") {
+                return line.to_owned();
+            }
+            line.split(' ')
+                .map(|field| {
+                    if field.starts_with("window=") {
+                        "window=999999"
+                    } else {
+                        field
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&manifest, damaged).unwrap();
+    let mut restored = Harness::new(&root);
+    restored.until("loads finish", |h| {
+        let docs = h.store.all_documents();
+        docs.len() >= 2 && docs.iter().all(|d| !h.store.is_loading(*d))
+    });
+    let texts: Vec<String> = restored
+        .store
+        .all_documents()
+        .iter()
+        .map(|d| restored.text(*d))
+        .collect();
+    assert!(texts.iter().any(|t| t == "first text"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "second text"), "{texts:?}");
+    assert_eq!(
+        restored.count(|e| matches!(e, DocEvent::RestoreProblem(_))),
+        2,
+        "one notice for each: {:#?}",
+        restored.events
+    );
+}
+
+#[test]
+fn duplicate_drops_the_chosen_target() {
+    let (mut h, doc, _path, question, _faults) = asking_about_save_as("fix4-drop-duplicate");
+    assert!(h.store.has_waiting_save_as(doc));
+    h.store.answer(question, Answer::Duplicate).unwrap();
+    assert!(!h.store.has_waiting_save_as(doc));
+}
+
+#[test]
+fn cancel_drops_the_chosen_target() {
+    let (mut h, doc, _path, question, _faults) = asking_about_save_as("fix4-drop-cancel");
+    assert!(h.store.has_waiting_save_as(doc));
+    h.store.answer(question, Answer::Cancel).unwrap();
+    assert!(!h.store.has_waiting_save_as(doc));
+}
+
+#[test]
+fn revert_drops_the_chosen_target() {
+    let (mut h, doc, _path) = changed_during_lossy_save_as("fix4-drop-revert");
+    let changed = open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert!(h.store.has_waiting_save_as(doc));
+    h.store.answer(changed, Answer::Revert).unwrap();
+    assert!(!h.store.has_waiting_save_as(doc));
+}
+
+#[test]
+fn a_lossy_save_as_onto_a_recreated_file_asks_both_questions() {
+    let folder = test_folder("fix4-lossy-recreated");
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    std::fs::remove_file(&path).unwrap();
+    h.store.app_activated();
+    h.until("the deletion is known", |h| {
+        h.events
+            .iter()
+            .any(|e| matches!(e, DocEvent::FileDeleted { .. }))
+    });
+    std::fs::write(&path, b"an outside version").unwrap();
+    h.store
+        .save_as(doc, path.clone(), Some(qe_api::TextEncoding::Utf8))
+        .unwrap();
+    let lossy = open_question(&mut h, QuestionKind::LossyOverwrite);
+    h.store.answer(lossy, Answer::Overwrite).unwrap();
+    let changed = open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&path).unwrap(), b"an outside version");
+    h.events.clear();
+    h.store.answer(changed, Answer::SaveAnyway).unwrap();
+    h.saved(doc);
+    assert_eq!(std::fs::read(&path).unwrap(), b"xhi");
+}
+
+#[test]
+fn a_write_right_after_the_codec_swap_is_caught() {
+    let folder = test_folder("fix4-after-commit");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let target = path.clone();
+    *faults.after_commit.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(OUTSIDE_WAIT);
+        std::fs::write(&target, b"THEM").unwrap();
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(h.store.is_dirty(doc), "the text there is not ours");
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&path).unwrap(), b"THEM");
+}
+
+#[test]
+fn recent_menu_path_refuses_damaged_data() {
+    for bad in ["", "abc", "zzzz", "+123", "00é0"] {
+        assert_eq!(qe_docs::recent_menu_path(bad), None, "{bad:?}");
+    }
+    assert_eq!(
+        qe_docs::recent_menu_path("0041"),
+        Some(std::path::PathBuf::from("A"))
+    );
+}

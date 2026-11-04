@@ -425,6 +425,15 @@ impl App {
         }
     }
 
+    /// What choosing the row at `index` does, with its real menu data, for the test channel.
+    pub fn run_recent_menu_row(&mut self, window: WindowId, index: usize) -> bool {
+        let Some((_, data)) = recent_menu_rows(self.store.recent()).into_iter().nth(index) else {
+            return false;
+        };
+        self.open_recent(window, &data);
+        true
+    }
+
     /// Open Recent's row: the data holds the exact UTF-16 path.
     pub fn open_recent(&mut self, window: WindowId, path: &str) {
         let Some(path) = recent_menu_path(path) else {

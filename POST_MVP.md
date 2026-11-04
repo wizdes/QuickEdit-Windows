@@ -13,5 +13,6 @@
 - Word keys stop at a gap over 256 KiB, so a very long gap can take several key presses. Check this against the Mac.
 - `qe-editor` test `p12_a_dropped_page_key_says_so` failed in 3 mutation runs that had nothing to do with it. The likely cause, not proven, is that background reads brought the page into memory first. Its setup now looks for a place where the key really waits, and it has passed 5 of 5 full runs since. Watch for it.
 - Not compared on a Mac: undo selecting the restored text, the fourth click, Backspace on a cluster, double-click and word keys on emoji.
-- The `open-recent` test command takes a plain path, so no app-level test goes through the hex decoding in `open_recent`. Add a route that uses the real menu row data; today only the `recent_menu_path` test covers it.
 - A different-size outside write right after a save leaves the document clean (`save_succeeded`, `not_ours`), so it can reload and drop the just-saved text from the view. Only a same-size write forces it dirty. Check whether this is intended.
+- A file too large to edit is refused for Save As onto its own name by name text only (`save_as`), so another name that reaches it is not refused there. Check what the large-copy path does in that case.
+- When a kept stamp no longer matches and the file also has a read-only mark, the Locked question comes before the changed question (`atomic_write_expecting`). Unlock can then clear a mark another program set.

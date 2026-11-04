@@ -886,6 +886,22 @@ impl App {
                 }
                 "ok".to_owned()
             }
+            "open-recent-row" => match (window, rest.first().and_then(|n| n.parse().ok())) {
+                (Some(window), Some(index)) => {
+                    if self.run_recent_menu_row(window, index) {
+                        "ok".to_owned()
+                    } else {
+                        "error no such row".to_owned()
+                    }
+                }
+                _ => "error no window or row number".to_owned(),
+            },
+            "open-recent-data" => {
+                if let Some(window) = window {
+                    self.open_recent(window, &decode(rest.first().copied().unwrap_or("")));
+                }
+                "ok".to_owned()
+            }
             "panels" => self.test_panels.len().to_string(),
             "panel-title" => self
                 .test_panels

@@ -370,6 +370,37 @@ fn open_recent_opens_its_file_through_the_row_data() {
 }
 
 #[test]
+fn open_recent_decodes_the_real_row_data() {
+    let folder = Folder::new("recent-row");
+    let file = folder.file("r.txt", b"recent text");
+    let mut app = App::start(&folder.root(), &[&file]);
+    app.wait_text("recent text");
+    // A second tab keeps the app open: closing the last window quits.
+    app.run("NewTab");
+    app.run("PreviousTab");
+    app.run("Close");
+    app.wait_for("the list to fill", |app| app.state("ClearRecent").0);
+    app.wait_for("one tab", |app| app.tab_count() == 1);
+    app.ok("open-recent-row 0");
+    app.wait_text("recent text");
+    app.quit();
+}
+
+#[test]
+fn open_recent_with_damaged_data_says_so() {
+    let folder = Folder::new("recent-damaged");
+    let mut app = App::start(&folder.root(), &[]);
+    for bad in ["", "abc", "zzzz"] {
+        app.ok(&format!("open-recent-data {}", encode(bad)));
+        let (_, message, _) = app.wait_value("the alert", App::alert);
+        assert!(message.contains("damaged"), "{bad:?}: {message}");
+        app.press("OK");
+        app.wait_for("the alert to close", |app| app.alert().is_none());
+    }
+    app.quit();
+}
+
+#[test]
 fn rename_changes_the_file_and_the_tab() {
     let folder = Folder::new("rename");
     let file = folder.file("old.txt", b"words");

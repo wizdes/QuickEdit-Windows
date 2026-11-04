@@ -1139,3 +1139,52 @@ fn a_new_size_or_time_after_the_swap_keeps_no_stamp() {
     assert_eq!(stamp_after_swap(committed, Some(state(1, 11, 100))), None);
     assert_eq!(stamp_after_swap(committed, None), None);
 }
+
+#[test]
+fn the_stamp_a_save_returns_is_of_its_temp_file_not_of_the_name_after_the_swap() {
+    let dir = scratch("stamp-not-by-name");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"old").unwrap();
+    let expected = file_stamp(&path).unwrap().unwrap();
+    let target = path.clone();
+    let (_, committed) = atomic_write_guarded_with(
+        &path,
+        b"mine",
+        Some(expected),
+        false,
+        SaveHooks {
+            before_commit: &|| {},
+            before_replace: &|| {},
+            after_commit: &|| fs::write(&target, b"a longer outside text").unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(committed.0.size, 4, "the stamp is of what this save wrote");
+    assert_ne!(file_stamp(&path).unwrap(), Some(committed));
+}
+
+#[test]
+fn a_file_holding_the_bytes_is_told_from_one_that_does_not() {
+    let dir = scratch("holds-bytes");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"mine").unwrap();
+    let stamp = file_stamp(&path).unwrap().unwrap();
+    assert!(file_holds_bytes(&path, b"mine", stamp));
+    assert!(!file_holds_bytes(&path, b"THEM", stamp));
+    assert!(!file_holds_bytes(&path, b"mine and more", stamp));
+    assert!(!file_holds_bytes(&dir.join("gone.txt"), b"mine", stamp));
+    let old = stamp;
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(&path, b"mine").unwrap();
+    assert!(
+        !file_holds_bytes(&path, b"mine", old),
+        "a stamp that no longer holds says nothing about the bytes"
+    );
+    let large = vec![7u8; 300_000];
+    fs::write(&path, &large).unwrap();
+    let stamp = file_stamp(&path).unwrap().unwrap();
+    assert!(file_holds_bytes(&path, &large, stamp));
+    let mut differs = large.clone();
+    differs[299_999] = 8;
+    assert!(!file_holds_bytes(&path, &differs, stamp));
+}

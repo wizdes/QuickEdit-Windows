@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 pub use save::{
     AtomicWriteResult, CommitFailure, FileStamp, Leftover, LeftoverDelete, LeftoverKind,
-    PreparedCopy, atomic_write, atomic_write_guarded, atomic_write_if_unchanged,
-    copy_large_original, delete_leftover, file_stamp, find_leftovers, prepare_large_copy,
-    stamp_after_swap,
+    PreparedCopy, SaveHooks, atomic_write, atomic_write_guarded, atomic_write_guarded_with,
+    atomic_write_if_unchanged, copy_large_original, delete_leftover, file_holds_bytes, file_stamp,
+    find_leftovers, prepare_large_copy, stamp_after_swap,
 };
 pub use text::{can_encode, decode, decode_file, encode, is_available, transcode_to_utf8_file};
 

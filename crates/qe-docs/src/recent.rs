@@ -102,6 +102,10 @@ pub fn recent_menu_path(data: &str) -> Option<PathBuf> {
         .0
         .iter()
         .map(|part| {
+            // `from_str_radix` alone also takes a leading plus sign.
+            if !part.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
             std::str::from_utf8(part)
                 .ok()
                 .and_then(|hex| u16::from_str_radix(hex, 16).ok())

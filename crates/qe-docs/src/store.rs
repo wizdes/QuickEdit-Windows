@@ -17,8 +17,9 @@ use crate::watch::{FolderNews, FolderWatch, watch_folder};
 use qe_api::{ByteOffset, EncodingChoice, TextEncoding, TextSnapshot, ViewContext, ViewRequest};
 use qe_buffer::Notify;
 use qe_codec::{
-    AtomicWriteResult, CodecError, FileStamp, Format, atomic_write_guarded, can_encode, encode,
-    file_stamp, find_leftovers, prepare_large_copy, stamp_after_swap,
+    AtomicWriteResult, CodecError, FileStamp, Format, SaveHooks, atomic_write_guarded_with,
+    can_encode, encode, file_holds_bytes, file_stamp, find_leftovers, prepare_large_copy,
+    stamp_after_swap,
 };
 use qe_editor::{ChangesSince, EditorCommand, EditorView, LoadedFile};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -93,6 +94,12 @@ pub struct Faults {
     pub before_swap: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Called on the worker just after a Save's swap, before its stamp is taken.
     pub after_swap: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called inside the codec's write, with the temp file whole and the swap still to come.
+    pub before_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called inside the codec's write, after its last look at the target and before the swap.
+    pub before_replace: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called inside the codec's write, the moment after the swap.
+    pub after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// While true, a restore's read of an autosaved copy waits before it reads.
     pub hold_restore_load: AtomicBool,
     pub restore_load_is_held: AtomicBool,
@@ -527,7 +534,7 @@ struct Doc {
     asked_fit: bool,
     /// The open dialog came from the first-edit encoding question, so its Cancel undoes.
     fit_panel_undoes: bool,
-    pending_save_as: Option<(PathBuf, Option<TextEncoding>)>,
+    pending_save_as: Option<PendingSaveAs>,
     unlocking: bool,
     panel_open: bool,
     /// The user said to quit without this document's unsaved text.
@@ -583,6 +590,24 @@ enum LoadKind {
     },
     Duplicate,
     RestoreCopy,
+}
+
+/// A Save As that waits on a question, and the document's own name when it was asked. An
+/// answer means nothing once the document has left that name.
+struct PendingSaveAs {
+    target: (PathBuf, Option<TextEncoding>),
+    own: Option<PathBuf>,
+}
+
+/// How a Save As onto this document's own file is known.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnFile {
+    /// By the text of the name.
+    ByName,
+    /// By the text of the name, and the worker asks if another name reaches a lossy file.
+    AskIfSameFile,
+    /// The worker has found it, or the person has answered about it.
+    Known,
 }
 
 struct SaveDone {
@@ -662,6 +687,8 @@ enum SaveTrouble {
     Changed {
         new_text: Option<PathBuf>,
     },
+    /// Another name reaches the lossy file this document came from, and nothing was written.
+    OwnLossyFile,
     DoesNotFit,
     Locked,
     Other {
@@ -2522,6 +2549,13 @@ impl DocumentStore {
         self.events.push(DocEvent::Question(question));
     }
 
+    /// A Save As onto this document's file waits on an open question.
+    pub fn has_waiting_save_as(&self, doc: DocId) -> bool {
+        self.docs
+            .get(&doc)
+            .is_some_and(|d| d.pending_save_as.is_some())
+    }
+
     /// The answer to a question. An answer it did not offer is an error, and the question
     /// stays open.
     pub fn answer(&mut self, id: QuestionId, answer: Answer) -> Result<(), DocError> {
@@ -2540,10 +2574,13 @@ impl DocumentStore {
             ));
         }
         let open = self.questions.remove(at);
-        let save_as_asked = self
-            .docs
-            .get(&open.question.doc)
-            .and_then(|d| d.pending_save_as.clone());
+        let save_as_asked = self.docs.get_mut(&open.question.doc).and_then(|d| {
+            let pending = d.pending_save_as.as_ref()?;
+            Some(PendingSaveAs {
+                target: pending.target.clone(),
+                own: pending.own.clone(),
+            })
+        });
         if let Err(error) = self.apply_answer(&open, answer) {
             // Nothing happened, so nothing may stay half done, and the person can answer again.
             if let Some(d) = self.docs.get_mut(&open.question.doc) {
@@ -2554,10 +2591,8 @@ impl DocumentStore {
                 ) {
                     d.pending_save_as = save_as_asked;
                 }
-                match (open.question.kind, answer) {
-                    (QuestionKind::SaveBeforeClose, Answer::Save) => d.close_after_save = false,
-                    (QuestionKind::LossyOverwrite, Answer::Overwrite) => d.format.lossy = true,
-                    _ => {}
+                if (open.question.kind, answer) == (QuestionKind::SaveBeforeClose, Answer::Save) {
+                    d.close_after_save = false;
                 }
             }
             let at = at.min(self.questions.len());
@@ -2630,13 +2665,25 @@ impl DocumentStore {
                 self.ask_lossy_again(doc);
             }
             (QuestionKind::LossyOverwrite, Answer::Overwrite) => {
-                if let Some(d) = self.docs.get_mut(&doc) {
-                    d.format.lossy = false;
-                }
+                // The file stays marked lossy until a save has really replaced it.
                 if let Some(target) = self.take_save_as_target(doc) {
-                    self.start_save(doc, Some(target), false)?;
+                    let Some(d) = self.docs.get_mut(&doc) else {
+                        return Err(self.no_doc());
+                    };
+                    if d.loading || d.reloading || d.saving {
+                        return Err(self.busy(doc, "is busy with another file action"));
+                    }
+                    if d.changed_while_away {
+                        d.pending_save_as = Some(PendingSaveAs {
+                            target,
+                            own: d.path.clone(),
+                        });
+                        self.ask_changed_on_disk(doc);
+                        return Ok(());
+                    }
+                    self.start_save_of(doc, Some(target), false, OwnFile::Known)?;
                 } else {
-                    self.save(doc)?;
+                    self.save_with(doc, true)?;
                 }
             }
             (QuestionKind::LossyOverwrite, Answer::Duplicate) => {
@@ -2722,10 +2769,12 @@ impl DocumentStore {
     /// writes to it.
     fn take_save_as_target(&mut self, doc: DocId) -> Option<(PathBuf, Option<TextEncoding>)> {
         let d = self.docs.get_mut(&doc)?;
-        let own = d.path.as_deref();
-        d.pending_save_as
-            .take()
-            .filter(|(path, _)| own.is_some_and(|own| same_path_text(own, path)))
+        let pending = d.pending_save_as.take()?;
+        let same_name = match (pending.own.as_deref(), d.path.as_deref()) {
+            (Some(then), Some(now)) => same_path_text(then, now),
+            _ => false,
+        };
+        same_name.then_some(pending.target)
     }
 
     /// The edit that raised the question has gone, so the next edit asks as this one did.
@@ -2820,6 +2869,11 @@ impl DocumentStore {
     /// question, or `NeedsSavePanel`. It first runs queued typing into the text, and it takes
     /// the text as it then stands. Typing that follows belongs to the next save.
     pub fn save(&mut self, doc: DocId) -> Result<(), DocError> {
+        self.save_with(doc, false)
+    }
+
+    /// `lossy_agreed`: the person has just answered Overwrite to the lossy question.
+    fn save_with(&mut self, doc: DocId, lossy_agreed: bool) -> Result<(), DocError> {
         let d = self.docs.get(&doc).ok_or_else(|| self.no_doc())?;
         if d.loading || d.reloading {
             return Err(self.busy(doc, "is being read again"));
@@ -2838,6 +2892,11 @@ impl DocumentStore {
             self.ask_for_panel(doc, PanelPurpose::Save);
             return Ok(());
         }
+        // This Save is the newest request, so no answer means an older Save As any more.
+        if let Some(d) = self.docs.get_mut(&doc) {
+            d.pending_save_as = None;
+        }
+        let d = self.docs.get(&doc).ok_or_else(|| self.no_doc())?;
         if d.saving {
             // One more save at the end of this one, with whatever the text is then.
             if let Some(d) = self.docs.get_mut(&doc) {
@@ -2845,29 +2904,25 @@ impl DocumentStore {
             }
             return Ok(());
         }
-        if d.format.lossy {
-            // This Save is the newest request, so an answer no longer means an older Save As.
-            if let Some(d) = self.docs.get_mut(&doc) {
-                d.pending_save_as = None;
-            }
-            self.ask(
-                doc,
-                QuestionKind::LossyOverwrite,
-                "Are you sure you want to modify the document in place?".to_owned(),
-                "Modifying the document in place might cause you to lose some of the original formatting.  Would you like to duplicate the document first?".to_owned(),
-                vec![Answer::Duplicate, Answer::Cancel, Answer::Overwrite],
-            );
+        if d.format.lossy && !lossy_agreed {
+            self.ask_lossy_overwrite(doc);
             return Ok(());
         }
         if d.changed_while_away {
-            // The same goes for this question.
-            if let Some(d) = self.docs.get_mut(&doc) {
-                d.pending_save_as = None;
-            }
             self.ask_changed_on_disk(doc);
             return Ok(());
         }
         self.start_save(doc, None, false)
+    }
+
+    fn ask_lossy_overwrite(&mut self, doc: DocId) {
+        self.ask(
+            doc,
+            QuestionKind::LossyOverwrite,
+            "Are you sure you want to modify the document in place?".to_owned(),
+            "Modifying the document in place might cause you to lose some of the original formatting.  Would you like to duplicate the document first?".to_owned(),
+            vec![Answer::Duplicate, Answer::Cancel, Answer::Overwrite],
+        );
     }
 
     fn ask_changed_on_disk(&mut self, doc: DocId) {
@@ -2920,17 +2975,20 @@ impl DocumentStore {
         }
         // Save As onto the file a lossy document came from asks, as a Save does.
         if same_file && d.format.lossy {
-            d.pending_save_as = Some((path, encoding));
-            self.ask(
-                doc,
-                QuestionKind::LossyOverwrite,
-                "Are you sure you want to modify the document in place?".to_owned(),
-                "Modifying the document in place might cause you to lose some of the original formatting.  Would you like to duplicate the document first?".to_owned(),
-                vec![Answer::Duplicate, Answer::Cancel, Answer::Overwrite],
-            );
+            d.pending_save_as = Some(PendingSaveAs {
+                target: (path, encoding),
+                own: d.path.clone(),
+            });
+            self.ask_lossy_overwrite(doc);
             return Ok(());
         }
-        self.start_save(doc, Some((path, encoding)), same_file)
+        // Another name can reach the same file, and only the worker may look at the disk.
+        let own_file = if d.format.lossy {
+            OwnFile::AskIfSameFile
+        } else {
+            OwnFile::ByName
+        };
+        self.start_save_of(doc, Some((path, encoding)), same_file, own_file)
     }
 
     /// The Save dialog was cancelled. A close or a Save All that waited on it goes on or ends.
@@ -3031,6 +3089,16 @@ impl DocumentStore {
         target: Option<(PathBuf, Option<TextEncoding>)>,
         force: bool,
     ) -> Result<(), DocError> {
+        self.start_save_of(doc, target, force, OwnFile::ByName)
+    }
+
+    fn start_save_of(
+        &mut self,
+        doc: DocId,
+        target: Option<(PathBuf, Option<TextEncoding>)>,
+        force: bool,
+        own_file: OwnFile,
+    ) -> Result<(), DocError> {
         // A swap during a copy across volumes would be removed with the old file.
         if self.docs.get(&doc).is_some_and(|d| d.moving) {
             return Err(self.busy(doc, "is being moved"));
@@ -3080,8 +3148,14 @@ impl DocumentStore {
         };
         // A save to its own file expects the file as it was read. `force` is the user's
         // answer to the question about that.
-        let expected = if same_file && !force { d.stamp } else { None };
-        let expect_absent = same_file && !force && d.file_state == FileState::Deleted;
+        let is_own = same_file || own_file == OwnFile::Known;
+        let expected = if is_own && !force { d.stamp } else { None };
+        let expect_absent = is_own && !force && d.file_state == FileState::Deleted;
+        let ask_if_own = if own_file == OwnFile::AskIfSameFile && !same_file {
+            d.base.map(|base| base.identity)
+        } else {
+            None
+        };
         d.saving = true;
         self.saves_running += 1;
         self.forward(doc, ctx);
@@ -3095,6 +3169,7 @@ impl DocumentStore {
                 path: &job_path,
                 expected,
                 expect_absent,
+                ask_if_own,
                 format: &job_format,
                 others: &others,
                 copy_source: copy_source.as_deref(),
@@ -3154,12 +3229,29 @@ impl DocumentStore {
                 if let Some(temp) = new_text {
                     remove_save_temp(&path, temp);
                 }
+                // Another program has replaced the file the lossy question was about. From here
+                // the changed question guards what is there.
+                if let Some(d) = self.docs.get_mut(&doc) {
+                    d.format.lossy = false;
+                }
                 // Only a lossy Save As answer gets here with `save_as`. Its Save Anyway must
                 // still write what the dialog chose.
                 if save_as && let Some(d) = self.docs.get_mut(&doc) {
-                    d.pending_save_as = Some((path, Some(format.encoding)));
+                    d.pending_save_as = Some(PendingSaveAs {
+                        target: (path, Some(format.encoding)),
+                        own: d.path.clone(),
+                    });
                 }
                 self.ask_changed_on_disk(doc);
+            }
+            Err(SaveTrouble::OwnLossyFile) => {
+                if let Some(d) = self.docs.get_mut(&doc) {
+                    d.pending_save_as = Some(PendingSaveAs {
+                        target: (path, Some(format.encoding)),
+                        own: d.path.clone(),
+                    });
+                }
+                self.ask_lossy_overwrite(doc);
             }
             Err(SaveTrouble::DoesNotFit) => {
                 let encoding = format.encoding;
@@ -3240,6 +3332,7 @@ impl DocumentStore {
             let why = match trouble {
                 SaveTrouble::Other { error, .. } => error.message.clone(),
                 SaveTrouble::Changed { .. } => "another program changed the file.".to_owned(),
+                SaveTrouble::OwnLossyFile => "it could lose some of the file's text.".to_owned(),
                 SaveTrouble::DoesNotFit => "its encoding cannot hold this text.".to_owned(),
                 SaveTrouble::Locked => "it has the read-only mark.".to_owned(),
             };
@@ -3272,12 +3365,15 @@ impl DocumentStore {
         let Some(d) = self.docs.get_mut(&doc) else {
             return;
         };
-        d.saved_below.fetch_max(revision + 1, Ordering::AcqRel);
         let was_read_only = d.read_only;
         let was_deleted = d.file_state == FileState::Deleted;
         // The stamp is taken just after the swap, and it cannot cover that instant. A file of
         // another size there, or no stamp at all, shows the file is not known to be ours.
         let not_ours = done.base.is_none_or(|b| b.size != done.written) || done.stamp.is_none();
+        // A session-end copy may be skipped only for text that is really on disk.
+        if !not_ours {
+            d.saved_below.fetch_max(revision + 1, Ordering::AcqRel);
+        }
         if !was_read_only {
             // True when no typing came during the write. Otherwise the view stays dirty.
             d.view.mark_save_point_at(revision);
@@ -4479,6 +4575,8 @@ impl DocumentStore {
                 active.push((id, key.clone()));
             }
         }
+        // Not added to `made`, or the next document with the bad number would look valid.
+        let mut rescue_window = None;
         for restored in docs {
             let window = if let Some(window) = made.get(&restored.meta.window).copied() {
                 window
@@ -4488,11 +4586,11 @@ impl DocumentStore {
                     restored.meta.path.as_deref(),
                     "A document named a window that was not in the last session. Its text was restored in another window.",
                 )));
-                if let Some(window) = made.values().next().copied() {
+                if let Some(window) = made.values().next().copied().or(rescue_window) {
                     window
                 } else {
                     let window = self.add_window();
-                    made.insert(restored.meta.window, window);
+                    rescue_window = Some(window);
                     window
                 }
             };
@@ -5762,6 +5860,8 @@ struct SaveJob<'a> {
     path: &'a Path,
     expected: Option<FileStamp>,
     expect_absent: bool,
+    /// The lossy file this document came from, which this Save As must not reach unasked.
+    ask_if_own: Option<FileIdentity>,
     format: &'a Format,
     others: &'a [(DocId, FileIdentity)],
     copy_source: Option<&'a Path>,
@@ -5861,6 +5961,12 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
             true,
         ));
     }
+    if let Some(own) = job.ask_if_own
+        && let Ok((base, _)) = file_base(job.path)
+        && base.identity == own
+    {
+        return Err(SaveTrouble::OwnLossyFile);
+    }
     let code = job.faults.save_error_code.load(Ordering::Relaxed);
     if code != 0 {
         return Err(map_save_error(
@@ -5887,8 +5993,17 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
         written = bytes.len() as u64;
         hold_while(&job.faults.hold_save, &job.faults.save_is_held);
         run_hook(&job.faults.before_swap);
-        let saved = atomic_write_guarded(job.path, &bytes, job.expected, job.expect_absent);
-        drop(bytes);
+        let saved = atomic_write_guarded_with(
+            job.path,
+            &bytes,
+            job.expected,
+            job.expect_absent,
+            SaveHooks {
+                before_commit: &|| run_hook(&job.faults.before_commit),
+                before_replace: &|| run_hook(&job.faults.before_replace),
+                after_commit: &|| run_hook(&job.faults.after_commit),
+            },
+        );
         match saved {
             Ok((result, committed_stamp)) => {
                 run_hook(&job.faults.after_swap);
@@ -5900,7 +6015,7 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
                 return Ok(SaveDone {
                     written,
                     base,
-                    stamp: stamp_after_swap(committed_stamp, observed_stamp),
+                    stamp: trusted_stamp(job.path, &bytes, Some(committed_stamp), observed_stamp),
                     other_version: None,
                     backup_kept,
                 });
@@ -5909,11 +6024,12 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
                 other_version: Some(version),
                 ..
             }) => {
-                let (base, stamp) = marks(job.path);
+                run_hook(&job.faults.after_swap);
+                let (base, observed_stamp) = marks(job.path);
                 return Ok(SaveDone {
                     written,
                     base,
-                    stamp,
+                    stamp: trusted_stamp(job.path, &bytes, None, observed_stamp),
                     other_version: Some(version),
                     backup_kept: None,
                 });
@@ -5936,6 +6052,19 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
     })
 }
 
+/// The stamp a save may keep. Same size and time as its temp file is enough. Otherwise the
+/// file is read back, because copying a named stream or the file system itself can move the
+/// time. `None`: the file there is not known to hold this save's bytes.
+fn trusted_stamp(
+    path: &Path,
+    bytes: &[u8],
+    committed: Option<FileStamp>,
+    observed: Option<FileStamp>,
+) -> Option<FileStamp> {
+    let same = committed.and_then(|committed| stamp_after_swap(committed, observed));
+    same.or_else(|| observed.filter(|seen| file_holds_bytes(path, bytes, *seen)))
+}
+
 fn marks(path: &Path) -> (Option<FileBase>, Option<FileStamp>) {
     (
         file_base(path).ok().map(|(base, _)| base),
@@ -5950,6 +6079,10 @@ fn map_save_error(job: &SaveJob<'_>, error: CodecError) -> SaveTrouble {
             if !job.save_as || job.expected.is_some() || job.expect_absent =>
         {
             SaveTrouble::Changed { new_text }
+        }
+        // A file came at a name that was to stay empty, during the write.
+        CodecError::TargetExists { .. } if job.expect_absent => {
+            SaveTrouble::Changed { new_text: None }
         }
         CodecError::Unencodable(_) => SaveTrouble::DoesNotFit,
         CodecError::ReadOnly(_) if !job.save_as => SaveTrouble::Locked,

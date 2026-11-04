@@ -174,6 +174,8 @@ trait SaveEnv {
     fn temp_created(&mut self, _temp: &Path) {}
     /// All bytes are on disk and the temp file is closed.
     fn before_commit(&mut self, _temp: &Path) {}
+    /// The swap has happened, and nothing has looked at the final name since.
+    fn after_commit(&mut self, _target: &Path) {}
     fn sleep(&mut self, time: Duration) {
         std::thread::sleep(time);
     }
@@ -1059,6 +1061,35 @@ pub fn atomic_write_guarded(
 ) -> Result<(AtomicWriteResult, FileStamp), CodecError> {
     atomic_write_expecting(path, bytes, expected, expect_absent, &mut RealEnv)
 }
+/// Calls for a test, around the swap inside `atomic_write_guarded_with`.
+pub struct SaveHooks<'a> {
+    pub before_commit: &'a dyn Fn(),
+    /// Just before the call that swaps, after the last check of the target.
+    pub before_replace: &'a dyn Fn(),
+    pub after_commit: &'a dyn Fn(),
+}
+impl SaveEnv for SaveHooks<'_> {
+    fn replace(&mut self, target: &Path, temp: &Path, backup: &Path) -> Result<(), u32> {
+        (self.before_replace)();
+        RealEnv.replace(target, temp, backup)
+    }
+    fn before_commit(&mut self, _temp: &Path) {
+        (self.before_commit)();
+    }
+    fn after_commit(&mut self, _target: &Path) {
+        (self.after_commit)();
+    }
+}
+/// `atomic_write_guarded` with test calls around the swap.
+pub fn atomic_write_guarded_with(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<FileStamp>,
+    expect_absent: bool,
+    mut hooks: SaveHooks<'_>,
+) -> Result<(AtomicWriteResult, FileStamp), CodecError> {
+    atomic_write_expecting(path, bytes, expected, expect_absent, &mut hooks)
+}
 /// `atomic_write` that also refuses if the file is not what `expected` recorded, for
 /// a change at any time since then, such as since the document was opened. Nothing
 /// is written in that case, so `TargetChanged` names no file: the text is still with
@@ -1094,8 +1125,12 @@ fn atomic_write_expecting(
 ) -> Result<(AtomicWriteResult, FileStamp), CodecError> {
     let (target, before, rules) = match resolve_target(path)? {
         Resolved::Existing(target) => {
+            // Asked first, because this file's read-only mark is another program's own.
+            if expect_absent {
+                return Err(changed_since_stamp(&target));
+            }
             let (state, rules) = preflight_existing(&target)?;
-            if expect_absent || expected.is_some_and(|stamp| stamp.0 != state) {
+            if expected.is_some_and(|stamp| stamp.0 != state) {
                 return Err(changed_since_stamp(&target));
             }
             (target, Some(state), rules)
@@ -1138,6 +1173,7 @@ fn atomic_write_expecting(
         Some(before) => commit_replace(commit, before, env),
         None => commit_new(commit, env).map(|()| AtomicWriteResult::Replaced),
     }?;
+    env.after_commit(&target);
     Ok((result, FileStamp(temp_state)))
 }
 /// What a file was at one moment: which file, its size and its last write time. Keep
@@ -1168,6 +1204,31 @@ pub fn file_stamp(path: &Path) -> Result<Option<FileStamp>, CodecError> {
 /// what is on disk.
 pub fn stamp_after_swap(committed: FileStamp, observed: Option<FileStamp>) -> Option<FileStamp> {
     observed.filter(|now| now.0.same_content_stamp(&committed.0))
+}
+
+/// True when the file at `path` is still `seen` and holds exactly `bytes`. It reads the disk,
+/// so it belongs on a worker. A failed read counts as false.
+pub fn file_holds_bytes(path: &Path, bytes: &[u8], seen: FileStamp) -> bool {
+    if seen.0.size != bytes.len() as u64 {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut part = vec![0u8; 64 * 1024];
+    let mut left = bytes;
+    loop {
+        match file.read(&mut part) {
+            Ok(0) => break,
+            Ok(got) => match left.split_at_checked(got) {
+                Some((same, rest)) if same == &part[..got] => left = rest,
+                _ => return false,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    left.is_empty() && matches!(file_stamp(path), Ok(Some(now)) if now == seen)
 }
 
 /// A failed `PreparedCopy::try_commit`.

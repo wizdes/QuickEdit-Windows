@@ -6,7 +6,7 @@ use qe_api::{CommandId, InputEvent, InputKind, ViewContext};
 use qe_docs::handoff::HandoffEvent;
 use qe_docs::{Answer, DocEvent, DocId, OpenTarget, WindowId};
 use qe_settings::SettingChange;
-use qe_shell::{ShellEvent, VIEW_TIMER};
+use qe_shell::{ShellEvent, TabStrip, VIEW_TIMER};
 use qe_views::system_reduce_motion;
 use std::time::Instant;
 
@@ -148,6 +148,14 @@ impl App {
             ShellEvent::CloseTabRequested(tab) => {
                 if let Some(doc) = self.doc_of_tab(window, tab) {
                     self.close_doc(doc);
+                    // A question or a save came first, so that a close, if any, comes later
+                    // and by another hand than the one on the X.
+                    if self.store.tabs(window).contains(&doc)
+                        && let Some(win) = self.windows.get(&window)
+                        && let Err(e) = win.handle.with_strip(TabStrip::forget_pointer_close)
+                    {
+                        eprintln!("Answering a close of a tab: {e}");
+                    }
                 }
             }
             ShellEvent::CloseWindowRequested => self.close_window(window),

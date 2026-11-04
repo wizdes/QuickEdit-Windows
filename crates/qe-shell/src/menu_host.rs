@@ -29,7 +29,18 @@ pub(crate) struct MenuRun {
     scale: f32,
     /// For each level that is still revealing itself: when it began, and what it began at.
     reveals: Vec<Option<(f64, f32)>>,
+    /// What happened to each level, in order, for a test. It stops at `STEP_LIMIT`.
+    steps: Vec<MenuStep>,
 }
+/// One thing done to a popup level on its way to the screen.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuStep {
+    Drawn(usize),
+    Shown(usize),
+    Copied(usize),
+}
+const STEP_LIMIT: usize = 64;
 impl MenuRun {
     pub fn new(
         owner: HWND,
@@ -76,11 +87,21 @@ impl MenuRun {
             levels,
             scale,
             reveals: Vec::new(),
+            steps: Vec::new(),
         }
     }
-    /// Makes the windows match the view, and starts the reveal of each new level.
+    pub fn steps(&self) -> &[MenuStep] {
+        &self.steps
+    }
+    fn note(&mut self, step: MenuStep) {
+        if self.steps.len() < STEP_LIMIT {
+            self.steps.push(step);
+        }
+    }
+    /// Makes the windows match the view, and starts the reveal of each new level. A new level
+    /// stays off the screen until `show_new_levels`, so that the owner can draw it first.
     pub fn sync(&mut self, now: f64) -> Result<(), String> {
-        let synced = self.windows.sync(&self.view);
+        let synced = self.windows.sync_unshown(&self.view);
         let count = self.windows.levels().len();
         self.reveals.truncate(count);
         while self.reveals.len() < count {
@@ -88,6 +109,42 @@ impl MenuRun {
             self.reveals.push((part < 1.0).then_some((now, part)));
         }
         synced
+    }
+    pub fn has_unshown_level(&self) -> bool {
+        self.windows.has_unshown_level()
+    }
+    /// Shows each new level, with its first frame copied in at once, and starts its reveal now.
+    /// Windows sends messages here, so that the owner holds no borrow during this call.
+    pub fn show_new_levels(&mut self, now: f64) -> Result<(), String> {
+        let mut problem = None;
+        if !self.windows.has_unshown_level() {
+            return Ok(());
+        }
+        for depth in 0..self.windows.levels().len() {
+            if self.windows.levels()[depth].has_begun() {
+                continue;
+            }
+            if let Err(refused) = self.windows.show_level(depth) {
+                problem = Some(refused);
+            }
+            self.note(MenuStep::Shown(depth));
+            if let Some(Some((start, _))) = self.reveals.get_mut(depth) {
+                *start = now;
+            }
+            let hwnd = self.windows.levels()[depth].hwnd();
+            let copied = match self.levels.borrow_mut().get_mut(depth) {
+                Some(Some(level)) => Some(level.renderer.present(hwnd.0)),
+                _ => None,
+            };
+            match copied {
+                Some(Ok(())) => self.note(MenuStep::Copied(depth)),
+                Some(Err(e)) => {
+                    problem = Some(format!("copying a menu to its window: {}", e.message));
+                }
+                None => {}
+            }
+        }
+        problem.map_or(Ok(()), Err)
     }
     pub fn is_revealing(&self) -> bool {
         self.reveals.iter().any(Option::is_some)
@@ -119,7 +176,7 @@ impl MenuRun {
     pub fn root(&self) -> Option<HWND> {
         self.windows.levels().first().map(|level| level.hwnd())
     }
-    /// Draws every open level and copies it to its window.
+    /// Draws every open level, and copies it to its window if that window has shown.
     pub fn paint(
         &mut self,
         factory: &mut PopupRendererFactory,
@@ -172,9 +229,17 @@ impl MenuRun {
             renderer
                 .end_frame()
                 .map_err(|e| failed("menu end_frame", e))?;
-            renderer
-                .present(popup.hwnd().0)
-                .map_err(|e| failed("menu present", e))?;
+            if self.steps.len() < STEP_LIMIT {
+                self.steps.push(MenuStep::Drawn(depth));
+            }
+            if popup.has_begun() {
+                renderer
+                    .present(popup.hwnd().0)
+                    .map_err(|e| failed("menu present", e))?;
+                if self.steps.len() < STEP_LIMIT {
+                    self.steps.push(MenuStep::Copied(depth));
+                }
+            }
         }
         Ok(())
     }

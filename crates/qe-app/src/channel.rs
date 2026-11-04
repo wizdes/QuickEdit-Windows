@@ -438,6 +438,72 @@ impl App {
                     None => "error no window".to_owned(),
                 }
             }
+            "motion-on" => {
+                // Motion in this hidden window, on a clock the test sets.
+                let clock = qe_api::motion::Clock::manual();
+                clock.set_ms(100_000.0);
+                let done = window
+                    .and_then(|window| self.windows.get(&window))
+                    .map(|win| {
+                        win.handle
+                            .set_animation_setting_off(false)
+                            .and_then(|()| win.handle.force_motion(Some(true)))
+                            .and_then(|()| win.handle.set_motion_clock(clock.clone()))
+                    });
+                TEST_CLOCK.with(|slot| *slot.borrow_mut() = Some(clock));
+                match done {
+                    Some(Ok(())) => "ok".to_owned(),
+                    Some(Err(e)) => format!("error {e}"),
+                    None => "error no window".to_owned(),
+                }
+            }
+            "motion-time" => {
+                // The time goes on by this much, and one animation frame runs.
+                let ms = match rest.as_slice() {
+                    [one] => one.parse::<f64>().ok(),
+                    _ => None,
+                };
+                let clock = TEST_CLOCK.with(|slot| slot.borrow().clone());
+                match (ms, clock, window.and_then(|w| self.windows.get(&w))) {
+                    (None, ..) => format!("error bad motion-time {rest:?}"),
+                    (_, None, _) => "error motion-on has not run".to_owned(),
+                    (_, _, None) => "error no window".to_owned(),
+                    (Some(ms), Some(clock), Some(win)) => {
+                        clock.set_ms(clock.now_ms() + ms);
+                        match win.handle.motion_tick() {
+                            Ok(()) => "ok".to_owned(),
+                            Err(e) => format!("error {e}"),
+                        }
+                    }
+                }
+            }
+            "test-cursor" => {
+                // Where the leave notice finds the cursor, in client pixels. A person's cursor
+                // stays on the window, and the real one is never on a hidden window: Windows
+                // would send its notice at once. From here on, only the test posts notices.
+                // `test-cursor none` ends this.
+                let at = match rest.as_slice() {
+                    ["none"] => Some(None),
+                    [x, y] => x.parse::<i32>().ok().zip(y.parse::<i32>().ok()).map(Some),
+                    _ => None,
+                };
+                match (at, window.and_then(|window| self.windows.get(&window))) {
+                    (None, _) => format!("error bad test-cursor {rest:?}"),
+                    (_, None) => "error no window".to_owned(),
+                    (Some(at), Some(win)) => match win
+                        .handle
+                        .set_leave_by_test(at.is_some())
+                        .and_then(|()| win.handle.set_test_cursor(at))
+                    {
+                        Ok(()) => "ok".to_owned(),
+                        Err(e) => format!("error {e}"),
+                    },
+                }
+            }
+            "strip" => match window.and_then(|window| self.windows.get(&window)) {
+                Some(win) => describe_strip(win),
+                None => "error no window".to_owned(),
+            },
             "tab-drag-held" => self.tab_drag.get().is_some().to_string(),
             "queued-keys" => self
                 .doc_in_use()
@@ -1410,6 +1476,44 @@ fn thread_window_of_class(class: &str) -> Option<HWND> {
         )
     };
     search.found
+}
+
+thread_local! {
+    /// The motion clock of `motion-on`.
+    static TEST_CLOCK: std::cell::RefCell<Option<qe_api::motion::Clock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The row as a test needs it: final and drawn places in dips, each `x:width`, and the ghosts.
+fn describe_strip(win: &crate::ui::Win) -> String {
+    let place = |b: &qe_api::Rect| format!("{}:{}", b.x.0, b.width.0);
+    let join = |rects: &[qe_api::Rect]| rects.iter().map(place).collect::<Vec<_>>().join(",");
+    let scale = match win.handle.dpi() {
+        Ok(dpi) => dpi as f32 / 96.0,
+        Err(e) => return format!("error {e}"),
+    };
+    let found = win.handle.with_strip(|strip| {
+        let ghosts: Vec<String> = strip
+            .ghost_places()
+            .iter()
+            .map(|(b, title)| format!("{}:{}", place(b), encode(title)))
+            .collect();
+        let titles: Vec<String> = strip.tabs().iter().map(|t| encode(&t.title)).collect();
+        format!(
+            "scale={scale} width={} held={} active={} y={} close={} hover={:?} titles={} final={} drawn={} ghosts={}",
+            strip.tab_width(),
+            strip.width_is_held(),
+            strip.active(),
+            strip.tab_rects().first().map_or(0.0, |b| b.y.0),
+            strip.close_box_width(),
+            strip.hover_hit(),
+            titles.join(","),
+            join(strip.tab_rects()),
+            join(&strip.drawn_tab_places()),
+            ghosts.join(","),
+        )
+    });
+    found.unwrap_or_else(|e| format!("error {e}"))
 }
 
 /// Builds the block a drop hands over, and posts it as Windows does.

@@ -436,27 +436,30 @@ impl App {
                 .map(|(_, id)| *id)
                 .collect();
             tabs.retain(|(doc, _)| want.contains(doc));
-            for (at, (doc, (title, dirty))) in want.iter().zip(&titles).enumerate() {
-                let id = match tabs.iter().find(|(known, _)| known == doc) {
-                    Some((_, id)) => *id,
-                    None => {
-                        let id = strip.add_tab(Tab::new(title.clone()));
-                        tabs.push((*doc, id));
-                        id
-                    }
-                };
-                if strip.index_of(id) != Some(at) {
-                    strip.reorder(id, at);
+            // New tabs first: the last tab of a strip cannot close.
+            for (doc, (title, _)) in want.iter().zip(&titles) {
+                if !tabs.iter().any(|(known, _)| known == doc) {
+                    let id = strip.add_tab(Tab::new(title.clone()));
+                    tabs.push((*doc, id));
                 }
-                if let Some(index) = strip.index_of(id) {
+            }
+            // Then the closes, with every tab still where the person saw it. A close moved
+            // to a new place first would fade there, and the others would jump.
+            for id in gone {
+                strip.close(id);
+            }
+            for (at, (doc, (title, dirty))) in want.iter().zip(&titles).enumerate() {
+                let Some((_, id)) = tabs.iter().find(|(known, _)| known == doc) else {
+                    continue;
+                };
+                if strip.index_of(*id) != Some(at) {
+                    strip.reorder(*id, at);
+                }
+                if let Some(index) = strip.index_of(*id) {
                     let tab = &mut strip.tabs_mut()[index];
                     tab.title.clone_from(title);
                     tab.dirty = *dirty;
                 }
-            }
-            // After the new tabs: the last tab of a strip cannot close.
-            for id in gone {
-                strip.close(id);
             }
             if let Some(active) = active
                 && let Some((_, id)) = tabs.iter().find(|(doc, _)| *doc == active)

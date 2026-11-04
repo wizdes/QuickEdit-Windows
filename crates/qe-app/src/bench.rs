@@ -39,6 +39,8 @@ struct Pacer {
     thread: std::thread::JoinHandle<()>,
     /// The tab that comes and goes, to keep motion running.
     extra: Option<TabId>,
+    /// When all keys had gone. A key that never reaches a frame must not hang the run.
+    last_sent: Option<Instant>,
 }
 struct Run {
     window: WindowId,
@@ -320,11 +322,26 @@ fn paced_step(shared: &Rc<Shared>, mut app: std::cell::RefMut<'_, App>) {
             stop,
             thread,
             extra: None,
+            last_sent: None,
         }
     });
     let all_sent = pacer.sent.load(Ordering::Acquire) >= keys;
     let mut extra = pacer.extra;
-    if all_sent && shared.timing.keys_done() >= keys {
+    if all_sent && pacer.last_sent.is_none() {
+        pacer.last_sent = Some(Instant::now());
+    }
+    let keys_done = shared.timing.keys_done();
+    let out_of_time = pacer
+        .last_sent
+        .is_some_and(|sent| sent.elapsed() >= KEY_LIMIT);
+    if all_sent && (keys_done >= keys || out_of_time) {
+        let fell_short = keys_done < keys;
+        if fell_short {
+            eprintln!(
+                "The bench stopped waiting: {keys_done} of {keys} keys reached a frame within \
+                 {KEY_LIMIT:?} of the last one sent."
+            );
+        }
         pacer.stop.store(true, Ordering::Release);
         if let Some(pacer) = run.pacer.take()
             && pacer.thread.join().is_err()
@@ -341,12 +358,18 @@ fn paced_step(shared: &Rc<Shared>, mut app: std::cell::RefMut<'_, App>) {
         } else {
             format!("{label}, paced")
         };
-        shared.timing.report(&what, shared.process_start);
-        if tab_motion && let Some(win) = app.windows.get(&window) {
-            match win.handle.motion_stats() {
-                Ok(stats) => report_motion(&stats),
-                Err(e) => eprintln!("The bench could not read its motion: {e}"),
+        // Timings from a part of the keys would read as a result.
+        if !fell_short {
+            shared.timing.report(&what, shared.process_start);
+            if tab_motion && let Some(win) = app.windows.get(&window) {
+                match win.handle.motion_stats() {
+                    Ok(stats) => report_motion(&stats),
+                    Err(e) => eprintln!("The bench could not read its motion: {e}"),
+                }
             }
+        }
+        if fell_short {
+            app.exit_code = 1;
         }
         app.bench = None;
         app.effects.push(Effect::Exit);

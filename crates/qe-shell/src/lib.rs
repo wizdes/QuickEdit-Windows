@@ -5,6 +5,6 @@ mod strip;
 mod window;
 
 pub use error::*;
-pub use menu_host::PopupRendererFactory;
+pub use menu_host::{MenuStep, PopupRendererFactory};
 pub use strip::*;
 pub use window::*;

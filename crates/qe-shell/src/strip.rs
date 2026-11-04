@@ -458,9 +458,10 @@ struct StripMotion {
     clock: Clock,
     /// The time of the frame being drawn. A paint between ticks draws the same frame.
     now: f64,
-    /// Bounded by what fits in the row, not by the number of tabs.
+    /// Only tabs in or near the view slide, so that this grows with the row, not the list.
     slides: Vec<(TabId, Slide)>,
     plus: Option<Slide>,
+    /// At most `MAX_GHOSTS`, the newest, however many tabs close at once.
     ghosts: Vec<Ghost>,
     fade_in: Option<(TabId, f64)>,
     buttons: [ButtonFade; 3],
@@ -469,6 +470,9 @@ struct StripMotion {
     /// What the last frame drew that moves, so that the next one also repaints it.
     drawn: Option<Rect>,
 }
+/// How many closed tabs may fade at once. A person sees no more than a few, and a frame's cost
+/// must not follow the number of tabs that closed.
+const MAX_GHOSTS: usize = 8;
 const CAPTION_HITS: [CaptionHit; 3] = [
     CaptionHit::Minimize,
     CaptionHit::Maximize,
@@ -504,6 +508,9 @@ pub struct TabStrip {
     /// The tab width while the pointer stays in the row after a close by mouse. The next tab
     /// then comes under the pointer, so that the next click hits its X. WinUI's rule.
     held_width: Option<f32>,
+    /// While set, the row keeps this overflow state and its scroll place, whatever the list
+    /// says. A close by mouse sets it when the next tab would not come under the pointer.
+    held_row: Option<bool>,
     /// Where the mouse was last seen on this row.
     pointer: Option<Point>,
     pointer_in_row: bool,
@@ -547,6 +554,7 @@ impl TabStrip {
             bounds: Rect::default(),
             tab_width: light_tokens().max_width,
             held_width: None,
+            held_row: None,
             pointer: None,
             pointer_in_row: false,
             pointer_close: None,
@@ -605,7 +613,7 @@ impl TabStrip {
         tab.id = self.new_id();
         let id = tab.id;
         let before = self.drawn_before();
-        self.held_width = None;
+        self.clear_hold();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.clear_pointer();
@@ -661,7 +669,7 @@ impl TabStrip {
     pub fn set_frame_mode(&mut self, mode: FrameMode) {
         if self.mode != mode {
             self.mode = mode;
-            self.held_width = None;
+            self.clear_hold();
             self.finish_motion();
             self.arrange();
         }
@@ -772,14 +780,23 @@ impl TabStrip {
             self.tabs[0] = Tab::new("Untitled");
             self.tabs[0].id = self.new_id();
             self.active = 0;
-            self.held_width = None;
+            self.clear_hold();
             self.arrange();
             self.after_list_change(before, None, None);
             self.sync_button_fades();
             return;
         }
         let was_rightmost = index + 1 == self.tabs.len();
+        let was_active = index == self.active;
+        // A selected tab that the person scrolled away from has no claim on the row.
+        let selected_matters = was_active || self.tab_shows_whole(self.active);
+        let next = self.tab_id(index + 1);
+        let row_before = (self.overflow, self.scroll, self.tab_width);
+        let on_x = self
+            .pointer
+            .is_some_and(|at| matches!(self.hit_test(at), CaptionHit::TabClose(_)));
         self.tabs.remove(index);
+        self.held_row = None;
         self.held_width = if by_pointer {
             self.width_to_hold(was_rightmost, old_list_width)
         } else {
@@ -809,13 +826,62 @@ impl TabStrip {
             other => other,
         };
         self.arrange();
-        self.reveal(self.active);
+        // A close by mouse does not move the row to show a tab that is scrolled off.
+        if !by_pointer || was_active {
+            self.reveal(self.active);
+        }
+        if by_pointer && row_before.0 {
+            let aimed = next.or_else(|| self.tab_id(self.tabs.len() - 1));
+            self.keep_next_under_pointer(aimed, on_x, row_before, selected_matters);
+        }
         self.after_list_change(before, ghost, None);
         if by_pointer && let Some(at) = self.pointer {
             // The next tab is under the pointer now, so its X lights up with no move.
             self.hover = self.hit_test(at);
         }
         self.sync_button_fades();
+    }
+    /// Ends a hold of the widths and of the row. True if there was one.
+    fn clear_hold(&mut self) -> bool {
+        let row = self.held_row.take().is_some();
+        self.held_width.take().is_some() || row
+    }
+    /// With the scroll arrows in play, a close can move every tab: the arrows go, or the scroll
+    /// place falls back. If the tab the person would aim at next is then not under the pointer,
+    /// the row stays as it was until the pointer leaves. No click closes an unseen target.
+    fn keep_next_under_pointer(
+        &mut self,
+        aimed: Option<TabId>,
+        on_x: bool,
+        row: (bool, usize, f32),
+        selected_matters: bool,
+    ) {
+        // The same part of the next tab: its X after a click on an X.
+        let under = self.pointer.and_then(|at| match self.hit_test(at) {
+            CaptionHit::TabClose(i) if on_x => self.tab_id(i),
+            CaptionHit::Tab(i) if !on_x => self.tab_id(i),
+            _ => None,
+        });
+        if under == aimed {
+            return;
+        }
+        let normal = (self.scroll, self.held_width);
+        let (overflow, scroll, width) = row;
+        self.held_row = Some(overflow);
+        self.held_width = Some(width);
+        self.scroll = scroll;
+        self.arrange();
+        // The row is not kept if that shows no tabs or hides the selected tab.
+        let selected_shows = !selected_matters || self.tab_shows_whole(self.active);
+        if selected_shows && self.scroll < self.tabs.len() {
+            return;
+        }
+        self.held_row = None;
+        (self.scroll, self.held_width) = normal;
+        self.arrange();
+        if selected_matters {
+            self.reveal(self.active);
+        }
     }
     /// The width that the tabs keep after a close by mouse, or nothing if they may fill.
     /// Closing the rightmost tab keeps the list's right end in place, up to the maximum.
@@ -836,7 +902,7 @@ impl TabStrip {
     }
     /// Ends the hold, and the widths jump, as WinUI's do. No motion follows.
     fn release_hold(&mut self, ctx: &mut ViewContext) {
-        if self.held_width.take().is_some() {
+        if self.clear_hold() {
             self.motion.slides.clear();
             self.motion.plus = None;
             self.arrange();
@@ -846,6 +912,39 @@ impl TabStrip {
     /// True where the pointer holds the widths: the part of the row left of the window buttons.
     pub fn in_hold_zone(&self, at: Point) -> bool {
         inside(at, self.row_rect()) && at.x.0 < self.caption_x(0, light_tokens())
+    }
+    /// Where each tab is drawn now, for a test.
+    #[doc(hidden)]
+    pub fn drawn_tab_places(&self) -> Vec<Rect> {
+        (0..self.tabs.len()).map(|i| self.drawn_rect(i)).collect()
+    }
+    /// Where each closed tab fades, and its title, for a test.
+    #[doc(hidden)]
+    pub fn ghost_places(&self) -> Vec<(Rect, String)> {
+        let ghosts = &self.motion.ghosts;
+        ghosts.iter().map(|g| (g.rect, g.title.clone())).collect()
+    }
+    /// What the pointer lights now, for a test.
+    #[doc(hidden)]
+    pub fn hover_hit(&self) -> CaptionHit {
+        self.hover
+    }
+    /// True if the whole of this tab shows between the arrows.
+    #[doc(hidden)]
+    pub fn tab_shows_whole(&self, index: usize) -> bool {
+        self.tab_rects
+            .get(index)
+            .is_some_and(|b| b.x.0 >= self.clip_start() && b.x.0 + b.width.0 <= self.clip_end())
+    }
+    /// How wide a tab's X box is, for a test.
+    #[doc(hidden)]
+    pub fn close_box_width(&self) -> f32 {
+        light_tokens().close_width
+    }
+    /// The owner answered a close by mouse with no close, or other input came first. A later
+    /// close of that tab is not the mouse's.
+    pub fn forget_pointer_close(&mut self) {
+        self.pointer_close = None;
     }
     /// True while a close by mouse holds the tab widths.
     pub fn width_is_held(&self) -> bool {
@@ -1086,6 +1185,9 @@ impl TabStrip {
         self.start_slides(&before, new_tab, now);
         if let Some(mut ghost) = ghost {
             ghost.start = now;
+            if self.motion.ghosts.len() >= MAX_GHOSTS {
+                self.motion.ghosts.remove(0);
+            }
             self.motion.ghosts.push(ghost);
         }
         if let Some(id) = new_tab {
@@ -1119,9 +1221,10 @@ impl TabStrip {
     }
     /// What a click at this place means. Hit tests are final from the first moment, but a
     /// person clicks what is drawn. So during a slide, a tab or the + drawn here takes the
-    /// click, even if another one's final place is here. If the same tab is both, its final
-    /// place says which part of it was hit, so that a repeated click reaches the next X. A
-    /// gap with nothing drawn takes the final answer, and the window buttons never move.
+    /// click, even if another one's final place is here. While a close by mouse holds the
+    /// widths, the final answer wins on a tab or a gap, so that a repeated click reaches the
+    /// next X. With no hold, the X must be seen to be hit: a tab's drawn box says which part
+    /// was hit, and a gap never closes a tab. The window buttons never move.
     pub fn drawn_hit_test(&self, at: Point) -> CaptionHit {
         let hit = self.hit_test(at);
         let m = &self.motion;
@@ -1137,8 +1240,14 @@ impl TabStrip {
         if inside(at, self.drawn_plus()) {
             return CaptionHit::NewTab;
         }
+        let held = self.held_width.is_some();
+        // No X is drawn in a gap, so that a press there can at most select.
+        let gap = match hit {
+            CaptionHit::TabClose(i) if !held => CaptionHit::Tab(i),
+            other => other,
+        };
         if at.x.0 < self.clip_start() || at.x.0 >= self.drawn_clip_end() {
-            return hit;
+            return gap;
         }
         let t = light_tokens();
         for i in self.shown_range() {
@@ -1146,6 +1255,7 @@ impl TabStrip {
             if inside(at, b) {
                 if let CaptionHit::Tab(same) | CaptionHit::TabClose(same) = hit
                     && same == i
+                    && held
                 {
                     return hit;
                 }
@@ -1156,7 +1266,7 @@ impl TabStrip {
                 };
             }
         }
-        hit
+        gap
     }
     /// What a release at this place means. One near a press that took a drawn place belongs
     /// to that press, wherever the tabs have got to by now.
@@ -1252,7 +1362,20 @@ impl TabStrip {
             ctx.invalidate(self.part_rect(self.hover));
         }
         self.clear_pointer();
+        self.end_hold_if_pointer_is_off(ctx);
         self.sync_button_fades();
+    }
+    /// A press kept the hold while it had the mouse. Now that it has ended, a pointer outside
+    /// the row has no other notice to end the hold with.
+    fn end_hold_if_pointer_is_off(&mut self, ctx: &mut ViewContext) {
+        if !self.capturing && !self.pointer_in_row {
+            self.release_hold(ctx);
+        }
+    }
+    /// Where the pointer is after a time when the row heard no moves.
+    pub fn pointer_checked(&mut self, in_hold_zone: bool, ctx: &mut ViewContext) {
+        self.pointer_in_row = in_hold_zone;
+        self.end_hold_if_pointer_is_off(ctx);
     }
     /// The pointer left the window, or this row. A button held by capture keeps its press.
     pub fn pointer_left(&mut self, ctx: &mut ViewContext) {
@@ -1367,14 +1490,18 @@ impl TabStrip {
         self.tab_width = self.held_width.unwrap_or_else(|| {
             (available / self.tabs.len() as f32).clamp(t.min_width, t.max_width)
         });
-        self.overflow = self.tabs.len() as f32 * t.min_width > available;
+        self.overflow = self
+            .held_row
+            .unwrap_or(self.tabs.len() as f32 * t.min_width > available);
         let left = bounds.x.0 + if self.overflow { t.scroll_width } else { 0.0 };
         self.visible_width = if self.overflow {
             (available - 2.0 * t.scroll_width).max(t.min_width)
         } else {
             available
         };
-        self.scroll = self.scroll.min(self.max_scroll());
+        if self.held_row.is_none() {
+            self.scroll = self.scroll.min(self.max_scroll());
+        }
         let tab_top = bounds.y.0 + self.row_height() - t.tab_height;
         self.tab_rects = (0..self.tabs.len())
             .map(|i| {
@@ -1400,6 +1527,13 @@ impl TabStrip {
     }
     /// Scrolls so that this whole tab shows.
     fn reveal(&mut self, index: usize) {
+        // A held row stays while what is asked for shows. Otherwise, showing it comes first.
+        if self.held_row.is_some() {
+            if self.tab_shows_whole(index) {
+                return;
+            }
+            self.clear_hold();
+        }
         self.arrange();
         if self.bounds.width.0 <= 0.0 {
             self.reveal_on_layout = true;
@@ -1417,6 +1551,11 @@ impl TabStrip {
         self.arrange();
     }
     fn scroll_by(&mut self, delta: isize) {
+        // The person takes over: a kept row ends first, so that the scroll limit is true again.
+        if self.held_row.is_some() {
+            self.clear_hold();
+            self.arrange();
+        }
         let next = self
             .scroll
             .saturating_add_signed(delta)
@@ -1616,6 +1755,7 @@ impl TabStrip {
         }
     }
     fn mouse_down(&mut self, at: Point, button: MouseButton, ctx: &mut ViewContext) -> Handled {
+        self.pointer_close = None;
         // A left press holds the mouse. Its drag goes on as if this press never happened.
         if button == MouseButton::Middle && self.capturing {
             return Handled::Yes;
@@ -1648,6 +1788,12 @@ impl TabStrip {
         if button == MouseButton::Middle
             && let CaptionHit::Tab(index) | CaptionHit::TabClose(index) = hit
         {
+            // Where nothing is drawn, a middle press means nothing. A hold is the exception:
+            // the person is closing tab after tab at this spot.
+            if self.held_width.is_none() && !inside(at, self.drawn_rect(index)) {
+                self.drawn_press = None;
+                return Handled::Yes;
+            }
             self.middle_press = self.tab_id(index);
             self.capturing = true;
             ctx.capture_mouse(true);
@@ -1687,6 +1833,7 @@ impl TabStrip {
         };
         self.capturing = false;
         ctx.capture_mouse(false);
+        self.end_hold_if_pointer_is_off(ctx);
         self.set_hover(hit, ctx);
         if let CaptionHit::Tab(index) | CaptionHit::TabClose(index) = hit
             && self.tab_id(index) == Some(pressed)
@@ -1717,6 +1864,7 @@ impl TabStrip {
             self.capturing = false;
             ctx.capture_mouse(false);
         }
+        self.end_hold_if_pointer_is_off(ctx);
         ctx.invalidate(self.part_rect(hit));
         if hit == pressed && !moved {
             self.activate(pressed);
@@ -1739,7 +1887,7 @@ impl View for TabStrip {
         self.bounds = bounds;
         if new_width {
             // A hold could run past the new edge. A resize shows its end state at once.
-            self.held_width = None;
+            self.clear_hold();
             self.finish_motion();
         }
         self.arrange();
@@ -1925,6 +2073,7 @@ impl TabStrip {
             }
             InputKind::Blur => {
                 self.window_active = false;
+                self.pointer_close = None;
                 self.cancel_pointer(ctx);
                 ctx.invalidate(self.row_rect());
                 Handled::Yes

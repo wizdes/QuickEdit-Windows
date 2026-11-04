@@ -671,6 +671,10 @@ impl PopupWindow {
             None => Ok(()),
         }
     }
+    /// True once `show` or `begin_hidden` has run.
+    pub fn has_begun(&self) -> bool {
+        self.state.shown.get()
+    }
     /// Hides this level alone, as when a submenu closes and its parent stays.
     pub fn hide_level(&self) {
         if self.state.shown.replace(false) {
@@ -828,6 +832,41 @@ impl MenuWindows {
     /// Makes the windows match the menu's open levels. A closed menu hides them all.
     /// `Err` names a window that could not be made, or a refusal from `show`.
     pub fn sync(&mut self, menu: &MenuView) -> Result<(), String> {
+        self.sync_unshown(menu)?;
+        // A closed menu stays closed. Showing it again would take the mouse again.
+        if menu.closed {
+            return Ok(());
+        }
+        let mut problem = None;
+        for depth in 0..self.levels.len() {
+            if let Err(refused) = self.show_level(depth) {
+                problem = Some(refused);
+            }
+        }
+        problem.map_or(Ok(()), Err)
+    }
+    /// True if a level has been made and has not shown yet. A dismissed menu has none: its
+    /// levels hide for good.
+    pub fn has_unshown_level(&self) -> bool {
+        self.dismissed().is_none() && self.levels.iter().any(|level| !level.has_begun())
+    }
+    /// Shows this level, if it has not shown. `sync_unshown` leaves that to the caller, who can
+    /// then draw first and copy the pixels in right after the show.
+    pub fn show_level(&self, depth: usize) -> Result<(), String> {
+        let Some(level) = self.levels.get(depth) else {
+            return Ok(());
+        };
+        if self.dismissed().is_some() {
+            return Ok(());
+        }
+        if self.on_screen {
+            level.show()
+        } else {
+            level.begin_hidden()
+        }
+    }
+    /// As `sync`, and a new level waits for `show_level`. It takes no capture until then.
+    pub fn sync_unshown(&mut self, menu: &MenuView) -> Result<(), String> {
         if menu.closed {
             if let Some(root) = self.levels.first() {
                 root.dismiss();
@@ -841,7 +880,6 @@ impl MenuWindows {
         // Deepest first, so that a parent never goes while its child is listed.
         self.levels.truncate(rects.len());
         self.shown_parts.truncate(rects.len());
-        let mut problem = None;
         for (depth, r) in rects.iter().enumerate() {
             let (x, y, w, h) = (
                 (r.x.0 * self.scale).round() as i32,
@@ -877,18 +915,10 @@ impl MenuWindows {
                 if let Some(setup) = &mut self.level_setup {
                     setup(depth, &made);
                 }
-                let shown = if self.on_screen {
-                    made.show()
-                } else {
-                    made.begin_hidden()
-                };
-                if let Err(refused) = shown {
-                    problem = Some(refused);
-                }
                 self.levels.push(made);
             }
         }
-        problem.map_or(Ok(()), Err)
+        Ok(())
     }
     /// A mouse message's place on the first window, in the menu's own dips. Mouse
     /// messages for every level arrive there, because it holds the capture.

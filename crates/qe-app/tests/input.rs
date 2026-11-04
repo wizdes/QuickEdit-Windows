@@ -618,3 +618,81 @@ fn losing_focus_with_no_caret_timer_prints_no_error() {
     assert!(!printed.contains("KillTimer"), "{printed}");
     assert!(!printed.contains("caret's timer"), "{printed}");
 }
+
+/// A file with the read-only mark, which goes back to normal when this drops, so that its
+/// folder can go too, even after a failed assertion. Declare it after the folder.
+struct MarkedReadOnly(std::path::PathBuf);
+impl MarkedReadOnly {
+    fn new(folder: &Folder) -> Self {
+        let path = folder.file("empty.txt", b"");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        Self(path)
+    }
+}
+impl Drop for MarkedReadOnly {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.0) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&self.0, perms);
+        }
+    }
+}
+
+#[test]
+fn a_paced_bench_whose_keys_reach_no_frame_stops_at_its_limit_and_says_so() {
+    let folder = Folder::new("bench paced limit");
+    // A file with the read-only mark is still editable, so the bench types into it. The first
+    // key reaches a frame and opens the store's question, and the rest reach no frame. See
+    // `the_read_only_mark_lets_the_first_key_open_a_question`.
+    let file = MarkedReadOnly::new(&folder);
+    // To a file: a full pipe that no one reads would stop the app.
+    let log = folder.0.join("errors.txt");
+    let mut child = Command::new(exe())
+        .args(["--bench-keys", "10", "--bench-paced", "--data-root"])
+        .arg(folder.root())
+        .arg(&file.0)
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if began.elapsed() > std::time::Duration::from_secs(30) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the bench still waits after 30 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(said.contains("stopped waiting"), "{said}");
+    assert!(
+        !said.contains("input to present"),
+        "no timings from a part of the keys: {said}"
+    );
+}
+
+#[test]
+fn the_read_only_mark_lets_the_first_key_open_a_question() {
+    let folder = Folder::new("read only key");
+    let file = MarkedReadOnly::new(&folder);
+    let mut app = App::start(&folder.root(), &[&file.0]);
+    app.settled();
+    assert_eq!(app.alert(), None);
+    app.ok("post-key 81");
+    app.wait_value("the question", App::alert);
+    // That key went in, and it is the one frame. The later keys do not reach the text.
+    app.ok("post-key 8");
+    app.ok("post-key 81");
+    app.ask("ping");
+    assert_eq!(app.text(), "q");
+    app.press("Cancel");
+    app.quit();
+}

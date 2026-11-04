@@ -1094,3 +1094,57 @@ fn pdf_dialog_has_its_boxes_and_wrap_to_page_has_no_rewrap_box() {
         assert_eq!(plain.pdf_checks().unwrap(), None);
     });
 }
+
+#[test]
+fn closing_a_menu_does_not_show_it_again_or_take_the_mouse_again() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let mut view = all_menus_view(100.0, 100.0);
+        let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
+        windows.sync(&view).unwrap();
+        let root = windows.levels()[0].hwnd();
+        assert_eq!(capture_holder(), root);
+        view.closed = true;
+        windows.sync(&view).unwrap();
+        assert_eq!(windows.dismissed(), Some(PopupDismissed::Caller));
+        assert_ne!(
+            capture_holder(),
+            root,
+            "the closed menu took the mouse again"
+        );
+        assert!(!windows.levels()[0].has_begun());
+        // A menu closed before it first showed: there is no dismissal yet to stop it.
+        let mut view = all_menus_view(100.0, 100.0);
+        let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
+        windows.sync_unshown(&view).unwrap();
+        view.closed = true;
+        windows.sync(&view).unwrap();
+        assert!(
+            !windows.levels()[0].has_begun(),
+            "it showed after its close"
+        );
+    });
+}
+#[test]
+fn a_dismissed_menu_has_nothing_left_to_show() {
+    on_thread(|| {
+        let owner = Owner::new();
+        let view = all_menus_view(100.0, 100.0);
+        let mut windows = MenuWindows::new_hidden(owner.0, 1.0);
+        windows.sync_unshown(&view).unwrap();
+        assert!(windows.has_unshown_level());
+        windows.show_level(0).unwrap();
+        assert!(!windows.has_unshown_level());
+        let root = windows.levels()[0].hwnd();
+        assert_eq!(capture_holder(), root);
+        windows.levels()[0].dismiss();
+        assert!(windows.dismissed().is_some());
+        assert!(!windows.has_unshown_level(), "it would show again");
+        windows.show_level(0).unwrap();
+        assert!(windows.dismissed().is_some(), "it came back");
+        assert_ne!(capture_holder(), root);
+        windows.sync(&view).unwrap();
+        assert!(windows.dismissed().is_some(), "it came back by sync");
+        assert_ne!(capture_holder(), root);
+    });
+}

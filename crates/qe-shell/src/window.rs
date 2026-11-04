@@ -6,7 +6,7 @@
 //! No reference to the state lives across a call that can send a message. `RefCell`
 //! enforces this: each borrow is short, and a message that finds the state in use takes
 //! the default path and names itself in `ShellError::Reentered`.
-use crate::menu_host::{MenuRun, PopupMessages, PopupRendererFactory};
+use crate::menu_host::{MenuRun, MenuStep, PopupMessages, PopupRendererFactory};
 use crate::{
     CONTENT_WIDGET, CaptionHit, ContrastColors, FrameMode, ShellError, ShellEvent, ShellTokens,
     Tab, TabId, TabStrip, maximized_insets,
@@ -655,6 +655,8 @@ struct Shared {
     /// For a test: where the cursor is, in client pixels. Windows sends a hidden window its
     /// leave notice at once, because the real cursor is never on it.
     test_cursor: Cell<Option<POINT>>,
+    leave_by_test: Cell<bool>,
+    fail_next_menu: Cell<bool>,
     motion_stats: RefCell<MotionStats>,
     message_hook: RefCell<Option<MessageHook>>,
     chord_filter: RefCell<Option<ChordFilter>>,
@@ -924,11 +926,7 @@ impl Shared {
         let began = std::time::Instant::now();
         let now = self.clock.borrow().now_ms();
         let rects = self.with_state(WM_TIMER, |state| state.strip.step_motion(now));
-        let reveal = self
-            .menu
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut run| run.as_mut().map(|run| run.step_reveals(now)));
+        let reveal = self.with_menu_out(|run| run.step_reveals(now));
         if let Some(Err(problem)) = reveal {
             self.report(ShellError::Menu(problem));
         }
@@ -964,13 +962,24 @@ impl Shared {
         if moved {
             self.invalidate(&[row]);
         }
-        if let Ok(mut run) = self.menu.try_borrow_mut()
-            && let Some(run) = run.as_mut()
-            && let Err(problem) = run.finish_reveals()
-        {
+        if let Some(Err(problem)) = self.with_menu_out(MenuRun::finish_reveals) {
             self.report(ShellError::Menu(problem));
         }
         self.sync_anim_timer();
+    }
+    /// Runs this with the open menu out of its slot, for work that sends messages: what those
+    /// messages reach finds no menu and no borrow. A menu that ended meanwhile stays ended.
+    fn with_menu_out<R>(&self, f: impl FnOnce(&mut MenuRun) -> R) -> Option<R> {
+        let mut run = self.menu.try_borrow_mut().ok()?.take()?;
+        let result = f(&mut run);
+        let empty = self.menu.try_borrow().is_ok_and(|slot| slot.is_none());
+        if self.menu_active.get() && empty {
+            *self.menu.borrow_mut() = Some(run);
+        } else {
+            self.drop_menu_run(run);
+            self.arm_leave_for_hold(self.hwnd.get());
+        }
+        Some(result)
     }
     fn read_animation_setting(&self) {
         match read_animation_off() {
@@ -1135,8 +1144,48 @@ impl Shared {
             self.apply(requests, events);
         }
     }
+    /// A hold ends on the leave notice, so that one must be on its way. A press can use it up,
+    /// and a close by mouse starts its hold after the press has ended.
+    fn arm_leave_for_hold(&self, hwnd: HWND) {
+        if self.tracking.get() != Tracking::None {
+            return;
+        }
+        let held = self
+            .state
+            .try_borrow()
+            .is_ok_and(|state| state.strip.width_is_held());
+        if !held {
+            return;
+        }
+        let mut at = POINT::default();
+        match self.test_cursor.get() {
+            Some(client) => {
+                at = client;
+                if !unsafe { ClientToScreen(hwnd, &mut at) }.as_bool() {
+                    return;
+                }
+            }
+            None => {
+                if let Err(e) = unsafe { GetCursorPos(&mut at) } {
+                    self.report(win32("GetCursorPos", e));
+                    return;
+                }
+            }
+        }
+        let packed = (at.y as i16 as u16 as u32) << 16 | (at.x as i16 as u16 as u32);
+        let code = self.on_nchittest(hwnd, WPARAM(0), LPARAM(packed as i32 as isize));
+        self.track_leave(if code.0 as u32 == HTCLIENT {
+            Tracking::Client
+        } else {
+            Tracking::NonClient
+        });
+    }
     fn track_leave(&self, wanted: Tracking) {
         if self.tracking.get() == wanted {
+            return;
+        }
+        if self.leave_by_test.get() {
+            self.tracking.set(wanted);
             return;
         }
         let mut flags = TME_LEAVE;
@@ -1813,6 +1862,7 @@ impl Shared {
         let opened = self.start_menu(model, anchor, moving_along);
         if let Err(problem) = &opened {
             self.end_menu(MenuEnd::Silent);
+            self.pointer_back_from_menu();
             self.bar_action(|bar, ctx| bar.close_popup(ctx));
             self.report(problem.clone());
         }
@@ -1824,6 +1874,9 @@ impl Shared {
         anchor: ApiRect,
         moving_along: bool,
     ) -> Result<(), ShellError> {
+        if self.fail_next_menu.take() {
+            return Err(ShellError::Menu("a test made this menu fail".into()));
+        }
         if self.popup_renderers.borrow().is_none() {
             return Err(ShellError::Menu(
                 "the owner has not called set_popup_renderers".into(),
@@ -1920,21 +1973,28 @@ impl Shared {
         self.sync_anim_timer();
         Ok(())
     }
+    /// Draws the menu first, shows a new level after, and copies its rows in at once. The screen
+    /// can still show one frame of the box before the rows. A cloak and a desktop shadow were tried,
+    /// neither helped on the real screen, and that frame is accepted.
+    /// A level shows even if drawing failed, and the error is reported.
     fn paint_menu(&self) {
-        let Some(mut run) = self.menu.borrow_mut().take() else {
-            return;
-        };
-        let factory = self.popup_renderers.borrow_mut().take();
-        if let Some(mut factory) = factory {
-            let painted = self.with_state(WM_PAINT, |state| {
-                run.paint(&mut factory, &state.theme, state.measurer.as_ref())
-            });
-            *self.popup_renderers.borrow_mut() = Some(factory);
-            if let Some(Err(problem)) = painted {
-                self.report(problem);
+        self.with_menu_out(|run| {
+            let factory = self.popup_renderers.borrow_mut().take();
+            if let Some(mut factory) = factory {
+                let painted = self.with_state(WM_PAINT, |state| {
+                    run.paint(&mut factory, &state.theme, state.measurer.as_ref())
+                });
+                *self.popup_renderers.borrow_mut() = Some(factory);
+                if let Some(Err(problem)) = painted {
+                    self.report(problem);
+                }
             }
-        }
-        *self.menu.borrow_mut() = Some(run);
+            let now = self.clock.borrow().now_ms();
+            // No state is borrowed here: taking the mouse sends `WM_CAPTURECHANGED` to the owner.
+            if let Err(problem) = run.show_new_levels(now) {
+                self.report(ShellError::Menu(problem));
+            }
+        });
     }
     /// Destroys the popups, so that none outlives its menu, and tells the bar.
     fn end_menu(&self, how: MenuEnd) {
@@ -1949,8 +2009,20 @@ impl Shared {
                 MenuEnd::KeepBarFocus => self.bar_action(|bar, ctx| bar.close_popup(ctx)),
                 MenuEnd::Silent => {}
             }
+            if how != MenuEnd::Silent {
+                self.pointer_back_from_menu();
+            }
         }
         self.sync_anim_timer();
+    }
+    /// The popup held the mouse, so the row heard no moves and the leave notice is gone. The
+    /// row learns where the pointer is now. A pointer still on it needs a new notice.
+    fn pointer_back_from_menu(&self) {
+        let stays = self.cursor_is_in_hold_zone();
+        self.strip_action(WM_MOUSELEAVE, |strip, ctx| {
+            strip.pointer_checked(stays, ctx)
+        });
+        self.arm_leave_for_hold(self.hwnd.get());
     }
     fn drop_menu_run(&self, mut run: MenuRun) {
         if run.timer_set
@@ -2013,6 +2085,8 @@ impl Shared {
         if let Err(problem) = run.sync(now) {
             self.report(ShellError::Menu(problem));
         }
+        // A new level has nothing else to bring it to the screen.
+        repaint |= run.has_unshown_level();
         *self.menu.borrow_mut() = Some(run);
         if repaint {
             self.paint_menu();
@@ -2273,7 +2347,13 @@ impl Shared {
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         };
         match msg {
-            WM_KEYDOWN | WM_SYSKEYDOWN => self.input_is_key.set(true),
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                self.input_is_key.set(true);
+                // A key may reach only a menu. A later close is not the mouse's.
+                if let Ok(mut state) = self.state.try_borrow_mut() {
+                    state.strip.forget_pointer_close();
+                }
+            }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
             | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 self.input_is_key.set(false);
@@ -2492,6 +2572,11 @@ impl Shared {
                 // buttons too (`NonClientIslandWindow.cpp`, the `WM_NCMOUSEMOVE` case and
                 // the `DefWindowProc` at the end of its handler). The Snap flyout may
                 // depend on it.
+                if self.leave_by_test.get() {
+                    // It starts a watch of its own, and that sends a notice at once on a hidden
+                    // window. A test of the notices' order posts its own.
+                    return LRESULT(0);
+                }
                 default()
             }
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
@@ -2500,8 +2585,21 @@ impl Shared {
                 } else {
                     Tracking::NonClient
                 };
-                if self.tracking.get() == ended {
+                let tracking = self.tracking.get();
+                if tracking == ended {
                     self.tracking.set(Tracking::None);
+                }
+                // The old kind's notice, after a move that already asked for the other kind.
+                // Windows sends it behind that move, so that it says nothing about where the
+                // pointer is now, and the move has already set the hover. A real leave of the
+                // window still comes, as the notice of the kind being tracked.
+                if tracking != Tracking::None && tracking != ended {
+                    if msg == WM_MOUSELEAVE {
+                        self.queue
+                            .borrow_mut()
+                            .push_back(ShellEvent::ContentPointerLeft);
+                    }
+                    return default();
                 }
                 // From a tab to the empty row counts as leaving too. The widths stay held.
                 let stays = self.cursor_is_in_hold_zone();
@@ -2560,6 +2658,7 @@ impl Shared {
                             .push_back(ShellEvent::ContentCaptureLost);
                     }
                     self.strip_action(msg, |strip, ctx| strip.capture_lost(ctx));
+                    self.arm_leave_for_hold(hwnd);
                 }
                 LRESULT(0)
             }
@@ -2898,6 +2997,7 @@ impl ShellHandle {
         }
         shared.apply(requests, events);
         shared.dispatch();
+        shared.arm_leave_for_hold(shared.hwnd.get());
         Ok(result)
     }
     /// For a test or a bench: `Some(true)` runs motion even in a hidden window, and
@@ -2924,6 +3024,36 @@ impl ShellHandle {
             .test_cursor
             .set(at.map(|(x, y)| POINT { x, y }));
         Ok(())
+    }
+    /// For a test: Windows sends no leave notice, and only the test's own posted ones arrive.
+    /// A hidden window otherwise gets one at once, as no cursor is ever on it, and that hides
+    /// the order of a person's pointer.
+    #[doc(hidden)]
+    pub fn set_leave_by_test(&self, on: bool) -> Result<(), ShellError> {
+        self.live()?.leave_by_test.set(on);
+        Ok(())
+    }
+    /// For a test: the next new menu fails to start.
+    #[doc(hidden)]
+    pub fn fail_next_menu(&self) -> Result<(), ShellError> {
+        self.live()?.fail_next_menu.set(true);
+        Ok(())
+    }
+    /// For a test: the kind of leave notice on its way.
+    #[doc(hidden)]
+    pub fn leave_notice_armed(&self) -> Result<&'static str, ShellError> {
+        Ok(match self.live()?.tracking.get() {
+            Tracking::None => "none",
+            Tracking::Client => "client",
+            Tracking::NonClient => "non-client",
+        })
+    }
+    /// For a test: what happened to the open menu's levels, in order.
+    #[doc(hidden)]
+    pub fn menu_steps(&self) -> Result<Vec<MenuStep>, ShellError> {
+        let shared = self.live()?;
+        let run = shared.menu.borrow();
+        Ok(run.as_ref().map_or(Vec::new(), |run| run.steps().to_vec()))
     }
     /// For a test: motion reads this clock, in the row and in menus.
     #[doc(hidden)]
@@ -3391,6 +3521,8 @@ impl ShellWindow {
             animation_setting_off: Cell::new(false),
             anim_timer_on: Cell::new(false),
             test_cursor: Cell::new(None),
+            leave_by_test: Cell::new(false),
+            fail_next_menu: Cell::new(false),
             motion_stats: RefCell::default(),
             waker: ShellWaker {
                 hwnd: Arc::new(AtomicIsize::new(0)),

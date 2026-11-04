@@ -11,7 +11,8 @@ use qe_api::{
 };
 use qe_render::{BitmapRenderer, TextSettings};
 use qe_shell::{
-    ANIM_TIMER, CaptionHit, ContrastColors, ShellEvent, ShellWindow, Tab, TabStrip, WindowConfig,
+    ANIM_TIMER, CaptionHit, ContrastColors, MenuStep, ShellEvent, ShellWindow, Tab, TabStrip,
+    WindowConfig,
 };
 use qe_ui::{MenuItem, MenuModel, ignore_foreground_changes_for_test};
 use std::cell::{Cell, RefCell};
@@ -21,6 +22,7 @@ use std::rc::Rc;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::BOOL;
 
@@ -1511,4 +1513,984 @@ fn a_mid_reveal_frame_shows_the_top_rows_where_they_will_stay() {
         };
         check_picture(&top, &format!("motion-menu-mid-{}", theme_name(kind)));
     }
+}
+
+// ---- The order of a person's pointer, and what must end a hold. ----
+
+impl Fix {
+    /// Where this part of the row is, in client pixels, found by the row's own hit test.
+    fn find(&self, wanted: CaptionHit) -> (i32, i32) {
+        self.window
+            .with_strip(|s| {
+                let y = s.tab_rects()[0].y.0 + 10.0;
+                (0..2000)
+                    .map(|x| at(x as f32, y))
+                    .find(|p| s.hit_test(*p) == wanted)
+                    .map(|p| (p.x.0 as i32, p.y.0 as i32))
+                    .unwrap_or_else(|| panic!("no {wanted:?} in the row"))
+            })
+            .unwrap()
+    }
+    fn screen(&self, client: (i32, i32)) -> isize {
+        let mut p = POINT {
+            x: client.0,
+            y: client.1,
+        };
+        assert!(unsafe { ClientToScreen(self.hwnd(), &mut p) }.as_bool());
+        pack(p.x, p.y)
+    }
+    fn hover(&self) -> CaptionHit {
+        self.window.with_strip(|s| s.hover_hit()).unwrap()
+    }
+    fn held(&self) -> bool {
+        self.window.with_strip(|s| s.width_is_held()).unwrap()
+    }
+    /// Only the notices that this test posts arrive, in the order that Windows sends them.
+    fn by_hand(&self) {
+        self.window.set_leave_by_test(true).unwrap();
+    }
+}
+const TEXT_POINT: (i32, i32) = (300, 300);
+
+#[test]
+fn a_jump_to_a_window_button_keeps_its_hover_when_the_old_leave_notice_comes_behind_the_move() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    let close = f.find(CaptionHit::Close);
+    f.window.set_test_cursor(Some(close)).unwrap();
+    f.post(WM_MOUSEMOVE, 0, pack(TEXT_POINT.0, TEXT_POINT.1));
+    pump();
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "client");
+    // The order Windows uses: the move on the new part, then the notice for the old part.
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert_eq!(f.hover(), CaptionHit::Close, "the old notice cleared it");
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "non-client");
+    // The fade plays to its end, with no second move.
+    f.clock.set_ms(T0 + 200.0);
+    f.window.motion_tick().unwrap();
+    assert_eq!(f.hover(), CaptionHit::Close);
+    // The real leave of the window still clears it.
+    f.window.set_test_cursor(None).unwrap();
+    f.post(WM_NCMOUSELEAVE, 0, 0);
+    pump();
+    assert_eq!(f.hover(), CaptionHit::None);
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "none");
+}
+
+#[test]
+fn the_same_jump_with_the_notice_first_also_ends_lit() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    let close = f.find(CaptionHit::Close);
+    f.post(WM_MOUSEMOVE, 0, pack(TEXT_POINT.0, TEXT_POINT.1));
+    pump();
+    f.post(WM_MOUSELEAVE, 0, 0);
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    pump();
+    assert_eq!(f.hover(), CaptionHit::Close);
+}
+
+#[test]
+fn a_jump_after_a_menu_closed_by_keys_keeps_the_hover_too() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    let close = f.find(CaptionHit::Close);
+    f.post(WM_MOUSEMOVE, 0, pack(TEXT_POINT.0, TEXT_POINT.1));
+    pump();
+    f.window.open_menu(model(), anchor()).unwrap();
+    f.send(WM_KEYDOWN, 0x1B, 1);
+    pump();
+    assert!(!f.window.menu_is_open().unwrap());
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "none");
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert_eq!(f.hover(), CaptionHit::Close);
+}
+
+#[test]
+fn the_hold_survives_the_old_notice_on_the_empty_row_and_ends_at_the_window_buttons() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    f.tabs(8);
+    let width = f.window.with_strip(|s| s.tab_width()).unwrap();
+    let x = f.find(CaptionHit::TabClose(1));
+    f.window.set_test_cursor(Some(x)).unwrap();
+    f.post_click(WM_LBUTTONDOWN, WM_LBUTTONUP, x.0, x.1);
+    f.answer_closes();
+    assert!(f.held());
+    // From a tab to the empty part of the row: the old notice must not end the hold.
+    let (right, y) = f
+        .window
+        .with_strip(|s| {
+            let plus = s.plus_rect();
+            (plus.x.0 + plus.width.0 + 20.0, s.tab_rects()[0].y.0 + 10.0)
+        })
+        .unwrap();
+    let empty = (right as i32, y as i32);
+    f.window.set_test_cursor(Some(empty)).unwrap();
+    f.post(WM_NCMOUSEMOVE, HTCAPTION as usize, f.screen(empty));
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert!(f.held());
+    assert_eq!(f.window.with_strip(|s| s.tab_width()).unwrap(), width);
+    // On to the window buttons: the move ends the hold, and the button stays lit.
+    let close = f.find(CaptionHit::Close);
+    f.window.set_test_cursor(Some(close)).unwrap();
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    pump();
+    assert!(!f.held());
+    assert_eq!(f.hover(), CaptionHit::Close);
+}
+
+#[test]
+fn a_notice_of_the_old_kind_does_not_tell_the_text_that_a_pointer_now_on_it_has_left() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    let close = f.find(CaptionHit::Close);
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    pump();
+    f.window.take_events().unwrap();
+    f.post(WM_MOUSEMOVE, 0, pack(TEXT_POINT.0, TEXT_POINT.1));
+    f.post(WM_NCMOUSELEAVE, 0, 0);
+    pump();
+    let events = f.window.take_events().unwrap();
+    assert!(
+        !events.contains(&ShellEvent::ContentPointerLeft),
+        "{events:?}"
+    );
+    assert_eq!(f.hover(), CaptionHit::None, "the move already cleared it");
+    // The other way, the text really was left.
+    f.post(WM_NCMOUSEMOVE, HTCLOSE as usize, f.screen(close));
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    let events = f.window.take_events().unwrap();
+    assert!(
+        events.contains(&ShellEvent::ContentPointerLeft),
+        "{events:?}"
+    );
+}
+
+// ---- A menu's first frame. ----
+
+#[test]
+fn a_menu_level_is_drawn_before_it_shows_and_its_first_frame_is_copied_at_once() {
+    let f = fixture(Some(true));
+    f.post(WM_KEYDOWN, 0x41, 1);
+    pump();
+    f.window.take_events().unwrap();
+    f.window.open_menu(model(), anchor()).unwrap();
+    assert_eq!(
+        f.window.menu_steps().unwrap(),
+        [MenuStep::Drawn(0), MenuStep::Shown(0), MenuStep::Copied(0)],
+        "the rows must be ready before the level shows"
+    );
+    assert_eq!(unsafe { GetCapture() }, popups(f.hwnd())[0]);
+    // A submenu: the open level draws again, and the new one shows after its own drawing.
+    f.send(WM_KEYDOWN, 0x27, 1);
+    let steps = f.window.menu_steps().unwrap();
+    let new = &steps[3..];
+    assert_eq!(
+        new,
+        [
+            MenuStep::Drawn(0),
+            MenuStep::Copied(0),
+            MenuStep::Drawn(1),
+            MenuStep::Shown(1),
+            MenuStep::Copied(1)
+        ]
+    );
+    assert!(f.window.problems().unwrap().is_empty());
+    f.window.close_menu().unwrap();
+}
+
+#[test]
+fn opening_a_menu_paints_no_document_and_the_first_show_is_at_the_reveal_start_height() {
+    let f = fixture(Some(true));
+    let painted = f.painter_calls.get();
+    f.window.open_menu(model(), anchor()).unwrap();
+    assert_eq!(f.painter_calls.get(), painted, "no paint of the document");
+    let popup = popups(f.hwnd())[0];
+    let shown = height(popup);
+    f.clock.set_ms(T0 + MENU_OPEN_MS);
+    f.window.motion_tick().unwrap();
+    let whole = height(popup);
+    assert!(
+        (shown as f32 - whole as f32 * BAR_MENU_START).abs() <= 1.0,
+        "{shown} of {whole}"
+    );
+    f.window.close_menu().unwrap();
+}
+
+#[test]
+fn a_menu_opened_during_a_press_in_the_row_takes_the_mouse_with_no_reentered_problem() {
+    let f = fixture(Some(true));
+    unsafe {
+        SetCapture(f.hwnd());
+    }
+    f.window.open_menu(model(), anchor()).unwrap();
+    assert_eq!(unsafe { GetCapture() }, popups(f.hwnd())[0]);
+    assert!(
+        f.window.problems().unwrap().is_empty(),
+        "{:?}",
+        f.window.problems()
+    );
+    f.window.close_menu().unwrap();
+}
+
+// ---- R5: a message during a reveal's window move finds no borrow. ----
+
+thread_local! {
+    static OLD_PROC: Cell<isize> = const { Cell::new(0) };
+    static CLOSE_MENU_OF: RefCell<Option<qe_shell::ShellHandle>> = const { RefCell::new(None) };
+}
+unsafe extern "system" fn closes_the_menu_when_moved(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    if msg == WM_WINDOWPOSCHANGING
+        && let Some(handle) = CLOSE_MENU_OF.with(|slot| slot.borrow_mut().take())
+    {
+        handle.close_menu().unwrap();
+    }
+    let old = OLD_PROC.with(Cell::get);
+    unsafe { CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(old), hwnd, msg, w, l) }
+}
+fn close_on_next_move(f: &Fix) {
+    let popup = popups(f.hwnd())[0];
+    CLOSE_MENU_OF.with(|slot| *slot.borrow_mut() = Some(f.window.handle()));
+    let old = unsafe {
+        SetWindowLongPtrW(
+            popup,
+            GWLP_WNDPROC,
+            closes_the_menu_when_moved as *const () as isize,
+        )
+    };
+    OLD_PROC.with(|slot| slot.set(old));
+}
+
+#[test]
+fn a_menu_closed_by_a_message_during_a_reveal_frame_stays_closed() {
+    let f = fixture(Some(true));
+    f.window.open_menu(model(), anchor()).unwrap();
+    close_on_next_move(&f);
+    f.clock.set_ms(T0 + 50.0);
+    f.window.motion_tick().unwrap();
+    assert!(!f.window.menu_is_open().unwrap());
+    pump();
+    assert!(!f.window.motion_timer_running().unwrap());
+}
+
+#[test]
+fn a_menu_closed_by_a_message_while_motion_finishes_stays_closed() {
+    let f = fixture(Some(true));
+    f.window.open_menu(model(), anchor()).unwrap();
+    close_on_next_move(&f);
+    f.window.finish_motion().unwrap();
+    assert!(!f.window.menu_is_open().unwrap());
+    assert!(!f.window.motion_timer_running().unwrap());
+}
+
+// ---- R1: a click lands on what is drawn. ----
+
+#[test]
+fn with_no_hold_a_press_on_a_sliding_tabs_title_selects_it_and_does_not_close_it() {
+    let clock = Clock::manual();
+    let mut s = moving_strip(4, &clock);
+    s.add_tab(Tab::new("New"));
+    s.take_events();
+    step(&mut s, &clock, 8.0);
+    let last = s.tab_rects()[2];
+    let drawn = s.drawn_tab_places()[2];
+    assert!(drawn.width.0 > last.width.0, "it is still narrowing");
+    let x = last.x.0 + last.width.0 - 10.0;
+    assert_eq!(s.hit_test(at(x, 20.0)), CaptionHit::TabClose(2));
+    assert_eq!(
+        s.drawn_hit_test(at(x, 20.0)),
+        CaptionHit::Tab(2),
+        "drawn from {} wide {}",
+        drawn.x.0,
+        drawn.width.0
+    );
+    press(&mut s, x, 20.0, MouseButton::Left);
+    step(&mut s, &clock, SLIDE_MS + 5.0);
+    release(&mut s, x, 20.0, MouseButton::Left);
+    assert!(
+        !s.take_events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::CloseTabRequested(_))),
+        "the tab must not close"
+    );
+    assert_eq!(s.tabs().len(), 5);
+}
+
+#[test]
+fn after_a_close_by_key_a_press_in_the_gap_on_the_fading_x_closes_nothing() {
+    let clock = Clock::manual();
+    let mut s = narrow_moving_strip(8, &clock);
+    let y = 20.0;
+    s.close(s.tab_id(1).unwrap());
+    s.take_events();
+    assert!(!s.width_is_held());
+    step(&mut s, &clock, 1.0);
+    // Where nothing is drawn, and a tab's X will end. The tab that fades was there.
+    let places = s.drawn_tab_places();
+    let x = (0..1000)
+        .map(|x| x as f32)
+        .find(|x| {
+            matches!(s.hit_test(at(*x, y)), CaptionHit::TabClose(_))
+                && !places.iter().any(|b| *x >= b.x.0 && *x < b.x.0 + b.width.0)
+        })
+        .expect("a gap over a final X");
+    assert!(
+        !matches!(s.drawn_hit_test(at(x, y)), CaptionHit::TabClose(_)),
+        "{:?}",
+        s.drawn_hit_test(at(x, y))
+    );
+    press(&mut s, x, y, MouseButton::Left);
+    step(&mut s, &clock, SLIDE_MS + 5.0);
+    release(&mut s, x, y, MouseButton::Left);
+    assert!(
+        !s.take_events()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::CloseTabRequested(_)))
+    );
+}
+
+#[test]
+fn under_a_hold_a_press_during_the_slide_still_closes_the_next_tab() {
+    let clock = Clock::manual();
+    let mut s = narrow_moving_strip(8, &clock);
+    let (x, y) = x_of(&s, 1);
+    click(&mut s, x, y, MouseButton::Left);
+    assert!(s.width_is_held());
+    for ms in [1.0, 8.0, 40.0, 100.0] {
+        step(&mut s, &clock, ms);
+        assert_eq!(s.drawn_hit_test(at(x, y)), CaptionHit::TabClose(1), "{ms}");
+    }
+}
+
+// ---- R2: a hold ends with the pointer. ----
+
+fn held_strip() -> (TabStrip, f32, f32) {
+    let mut s = narrow_strip(8);
+    let (x, y) = x_of(&s, 1);
+    click(&mut s, x, y, MouseButton::Left);
+    assert!(s.width_is_held());
+    (s, x, y)
+}
+
+#[test]
+fn a_drag_released_outside_the_row_ends_the_hold() {
+    let (mut s, x, y) = held_strip();
+    press(&mut s, x - 30.0, y, MouseButton::Left);
+    event(&mut s, InputKind::MouseMove { at: at(1300.0, y) });
+    assert!(s.width_is_held(), "the press still has the mouse");
+    release(&mut s, 1300.0, y, MouseButton::Left);
+    assert!(!s.width_is_held());
+}
+
+#[test]
+fn a_tear_off_ends_the_hold() {
+    let (mut s, x, y) = held_strip();
+    press(&mut s, x - 30.0, y, MouseButton::Left);
+    event(
+        &mut s,
+        InputKind::MouseMove {
+            at: at(x - 30.0, y + 300.0),
+        },
+    );
+    assert!(!s.width_is_held());
+}
+
+#[test]
+fn a_lost_capture_or_a_blur_outside_the_row_ends_the_hold_and_inside_it_does_not() {
+    for blur in [false, true] {
+        let finish = |s: &mut TabStrip| {
+            if blur {
+                event(s, InputKind::Blur);
+            } else {
+                s.capture_lost(&mut ViewContext::default());
+            }
+        };
+        let (mut s, x, y) = held_strip();
+        press(&mut s, x - 30.0, y, MouseButton::Left);
+        event(&mut s, InputKind::MouseMove { at: at(1500.0, y) });
+        finish(&mut s);
+        assert!(!s.width_is_held(), "outside, blur={blur}");
+        let (mut s, x, y) = held_strip();
+        press(&mut s, x - 30.0, y, MouseButton::Left);
+        finish(&mut s);
+        assert!(s.width_is_held(), "still on the row, blur={blur}");
+    }
+}
+
+#[test]
+fn a_middle_press_released_outside_the_row_ends_the_hold() {
+    let (mut s, x, y) = held_strip();
+    press(&mut s, x - 30.0, y, MouseButton::Middle);
+    event(&mut s, InputKind::MouseMove { at: at(1300.0, y) });
+    release(&mut s, 1300.0, y, MouseButton::Middle);
+    assert!(!s.width_is_held());
+}
+
+#[test]
+fn the_leave_notice_is_armed_again_when_a_hold_starts_and_after_a_press_used_it_up() {
+    let f = fixture(Some(true));
+    f.by_hand();
+    f.tabs(8);
+    let x = f.find(CaptionHit::TabClose(1));
+    f.window.set_test_cursor(Some(x)).unwrap();
+    f.post_click(WM_LBUTTONDOWN, WM_LBUTTONUP, x.0, x.1);
+    // The notice came during the press, and no move followed the release.
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "none");
+    f.answer_closes();
+    assert!(f.held());
+    assert_eq!(
+        f.window.leave_notice_armed().unwrap(),
+        "client",
+        "a hold starts with a notice on its way"
+    );
+    // A press that uses it up, then ends.
+    let l = pack(x.0, x.1 + 1);
+    f.post(WM_RBUTTONDOWN, 2, l);
+    pump();
+    unsafe {
+        SetCapture(f.hwnd());
+    }
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "none");
+    unsafe { ReleaseCapture() }.unwrap();
+    pump();
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "client");
+    // That notice ends the hold, with the cursor gone.
+    f.window.set_test_cursor(None).unwrap();
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert!(!f.held());
+}
+
+// ---- R3: a close the mouse did not make has no hold. ----
+
+#[test]
+fn a_key_or_a_press_after_an_unanswered_x_click_means_the_later_close_has_no_hold() {
+    let keys_or_press: [(u32, usize); 2] = [(WM_KEYDOWN, 0x12), (WM_RBUTTONDOWN, 2)];
+    for (msg, w) in keys_or_press {
+        let f = fixture(Some(true));
+        f.tabs(8);
+        let x = f.find(CaptionHit::TabClose(1));
+        f.window.set_test_cursor(Some(x)).unwrap();
+        f.post_click(WM_LBUTTONDOWN, WM_LBUTTONUP, x.0, x.1);
+        // The owner said no to this click, for now: a question was up, and got Cancel.
+        let closes: Vec<_> = f.window.take_events().unwrap();
+        assert!(
+            closes
+                .iter()
+                .any(|e| matches!(e, ShellEvent::CloseTabRequested(_)))
+        );
+        let id = f.window.with_strip(|s| s.tab_id(1).unwrap()).unwrap();
+        f.post(msg, w, pack(x.0, x.1));
+        pump();
+        f.window.take_events().unwrap();
+        f.window.close_tab(id).unwrap();
+        assert!(!f.held(), "message {msg}");
+    }
+}
+
+#[test]
+fn a_key_that_reaches_only_a_menu_after_an_unanswered_x_click_means_no_hold() {
+    let f = fixture(Some(true));
+    f.tabs(8);
+    let x = f.find(CaptionHit::TabClose(1));
+    f.window.set_test_cursor(Some(x)).unwrap();
+    f.post_click(WM_LBUTTONDOWN, WM_LBUTTONUP, x.0, x.1);
+    f.window.take_events().unwrap();
+    let id = f.window.with_strip(|s| s.tab_id(1).unwrap()).unwrap();
+    f.window.open_menu(model(), anchor()).unwrap();
+    f.send(WM_KEYDOWN, 0x1B, 1);
+    pump();
+    assert!(!f.window.menu_is_open().unwrap());
+    f.window.take_events().unwrap();
+    f.window.close_tab(id).unwrap();
+    assert!(!f.held());
+}
+
+#[test]
+fn an_owner_can_say_that_a_close_by_mouse_was_not_answered_with_a_close() {
+    let mut s = narrow_strip(8);
+    let (x, y) = x_of(&s, 1);
+    press(&mut s, x, y, MouseButton::Left);
+    release(&mut s, x, y, MouseButton::Left);
+    s.take_events();
+    s.forget_pointer_close();
+    s.close(s.tab_id(1).unwrap());
+    assert!(!s.width_is_held());
+}
+
+// ---- R4 ----
+
+#[test]
+fn closing_many_tabs_at_once_fades_only_a_few() {
+    let clock = Clock::manual();
+    let mut s = moving_strip(300, &clock);
+    for _ in 0..250 {
+        s.close(s.tab_id(0).unwrap());
+    }
+    s.take_events();
+    let list = draw(&s, ThemeKind::Dark);
+    let fades = list
+        .commands
+        .iter()
+        .filter(|c| matches!(c, DrawCommand::PushOpacity(_)))
+        .count();
+    assert!(fades <= 8, "{fades} fading tabs in one frame");
+    assert!(fades >= 1);
+}
+
+fn narrow_moving_strip(count: usize, clock: &Clock) -> TabStrip {
+    let mut s = moving_strip(count, clock);
+    assert!(s.tab_width() < 240.0);
+    s.take_events();
+    s
+}
+
+// ---- S2: a menu used up the leave notice. ----
+
+fn hold_then_menu(f: &Fix) {
+    f.by_hand();
+    f.tabs(8);
+    let x = f.find(CaptionHit::TabClose(1));
+    f.window.set_test_cursor(Some(x)).unwrap();
+    f.post_click(WM_LBUTTONDOWN, WM_LBUTTONUP, x.0, x.1);
+    f.answer_closes();
+    assert!(f.held());
+    f.window.open_menu(model(), anchor()).unwrap();
+}
+
+#[test]
+fn a_pointer_that_left_the_window_during_a_menu_ends_the_hold_when_the_menu_closes() {
+    let f = fixture(Some(true));
+    hold_then_menu(&f);
+    f.window.set_test_cursor(Some((-50, -50))).unwrap();
+    f.send(WM_KEYDOWN, 0x1B, 1);
+    pump();
+    assert!(!f.window.menu_is_open().unwrap());
+    assert!(!f.held(), "the hold outlived the pointer");
+}
+
+#[test]
+fn a_pointer_still_on_the_row_keeps_the_hold_with_a_notice_on_its_way_after_a_menu() {
+    let f = fixture(Some(true));
+    hold_then_menu(&f);
+    f.send(WM_KEYDOWN, 0x1B, 1);
+    pump();
+    assert!(!f.window.menu_is_open().unwrap());
+    // This comes first: a call into the row can arm the notice too.
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "client");
+    assert!(f.held());
+    // That notice ends it, with no more moves on the window.
+    f.window.set_test_cursor(None).unwrap();
+    f.post(WM_MOUSELEAVE, 0, 0);
+    pump();
+    assert!(!f.held());
+}
+
+#[test]
+fn a_menu_dismissed_by_another_app_leaves_no_stale_pointer_for_the_blur() {
+    let f = fixture(Some(true));
+    hold_then_menu(&f);
+    f.window.set_test_cursor(Some((-50, -50))).unwrap();
+    // Another program took the mouse.
+    unsafe { ReleaseCapture() }.unwrap();
+    pump();
+    f.post(WM_MOUSEMOVE, 0, pack(-50, -50));
+    pump();
+    assert!(!f.window.menu_is_open().unwrap());
+    assert!(!f.held());
+}
+
+// ---- S3 and S4: no click closes a tab that no one aimed at. ----
+
+/// The fewest tabs that overflow the row, so that one close ends the overflow.
+fn just_overflowing() -> TabStrip {
+    let mut count = 2;
+    loop {
+        let s = narrow_strip(count);
+        if s.overflow() {
+            return s;
+        }
+        count += 1;
+    }
+}
+fn wheel_right(s: &mut TabStrip, notches: i32) {
+    for _ in 0..notches {
+        event(
+            s,
+            InputKind::Wheel {
+                at: at(200.0, 20.0),
+                delta_x: 1.0,
+                delta_y: 0.0,
+                modifiers: Modifiers::default(),
+            },
+        );
+    }
+}
+fn ids_of(s: &TabStrip) -> Vec<qe_shell::TabId> {
+    s.tabs().iter().map(Tab::id).collect()
+}
+/// Under the pointer now: the X of this tab.
+fn x_of_is_under(s: &TabStrip, x: f32, y: f32, id: qe_shell::TabId) {
+    match s.hit_test(at(x, y)) {
+        CaptionHit::TabClose(i) => assert_eq!(s.tab_id(i), Some(id), "the X of another tab"),
+        other => panic!("{other:?} is under the pointer, and the next X should be"),
+    }
+}
+/// Which visible tab comes last, by final place, before the X buttons.
+fn visible_x(s: &TabStrip, index: usize) -> (f32, f32) {
+    let b = s.tab_rects()[index];
+    assert!(
+        b.x.0 >= 0.0 && b.x.0 + b.width.0 <= 1000.0,
+        "{index} is off"
+    );
+    x_of(s, index)
+}
+
+#[test]
+fn a_close_by_mouse_that_ends_the_overflow_keeps_the_row_until_the_pointer_leaves() {
+    let mut s = just_overflowing();
+    wheel_right(&mut s, 1);
+    assert!(s.overflow());
+    let count = s.tabs().len();
+    let ids = ids_of(&s);
+    let index = count - 3;
+    let (x, y) = visible_x(&s, index);
+    let slot = s.tab_rects()[index];
+    click(&mut s, x, y, MouseButton::Left);
+    assert_eq!(s.tabs().len(), count - 1);
+    assert_eq!(s.tab_rects()[index].x.0, slot.x.0, "the row moved");
+    x_of_is_under(&s, x, y, ids[index + 1]);
+    assert!(s.width_is_held());
+    click(&mut s, x, y, MouseButton::Left);
+    assert_eq!(s.tabs().len(), count - 2);
+    x_of_is_under(&s, x, y, ids[index + 2]);
+    // The pointer leaves: the row settles with no arrows.
+    s.pointer_left(&mut ViewContext::default());
+    assert!(!s.width_is_held());
+    assert!(!s.overflow());
+    assert!(s.tab_rects()[0].x.0 <= 1.0, "{:?}", s.tab_rects()[0]);
+}
+
+#[test]
+fn a_close_by_mouse_with_the_active_tab_scrolled_off_does_not_move_the_row() {
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    s.select(ids[0]);
+    wheel_right(&mut s, 12);
+    let index = 16;
+    let (x, y) = visible_x(&s, index);
+    let slot = s.tab_rects()[index];
+    click(&mut s, x, y, MouseButton::Left);
+    assert_eq!(s.tabs().len(), 39);
+    assert_eq!(s.tab_rects()[index].x.0, slot.x.0, "the row moved");
+    x_of_is_under(&s, x, y, ids[index + 1]);
+    assert_eq!(
+        s.tab_id(s.active()),
+        Some(ids[0]),
+        "the same tab stays active"
+    );
+    click(&mut s, x, y, MouseButton::Left);
+    x_of_is_under(&s, x, y, ids[index + 2]);
+    // The same close by key still shows the active tab.
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    s.select(ids[0]);
+    wheel_right(&mut s, 12);
+    s.close(ids[16]);
+    assert!(s.tab_rects()[0].x.0 >= 0.0, "the active tab is in view");
+}
+
+#[test]
+fn a_close_by_mouse_at_the_end_of_the_scroll_keeps_the_next_x_under_the_pointer() {
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    wheel_right(&mut s, 60);
+    let last = s.tab_rects().len() - 1;
+    let index = last - 3;
+    let (x, y) = visible_x(&s, index);
+    click(&mut s, x, y, MouseButton::Left);
+    x_of_is_under(&s, x, y, ids[index + 1]);
+    assert!(s.width_is_held());
+    // The rightmost tab: the row keeps its right end, and the new last X comes under it.
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    wheel_right(&mut s, 60);
+    let (x, y) = visible_x(&s, 39);
+    click(&mut s, x, y, MouseButton::Left);
+    x_of_is_under(&s, x, y, ids[38]);
+}
+
+#[test]
+fn a_held_row_lets_go_when_a_tab_off_the_view_is_selected_by_key() {
+    let mut s = just_overflowing();
+    wheel_right(&mut s, 1);
+    let index = s.tabs().len() - 3;
+    let (x, y) = visible_x(&s, index);
+    click(&mut s, x, y, MouseButton::Left);
+    assert!(s.width_is_held());
+    s.select(s.tab_id(0).unwrap());
+    assert!(s.tab_rects()[0].x.0 >= 0.0);
+}
+
+// ---- S5 ----
+
+#[test]
+fn a_middle_click_where_nothing_is_drawn_does_nothing() {
+    let clock = Clock::manual();
+    let mut s = narrow_moving_strip(8, &clock);
+    s.close(s.tab_id(1).unwrap());
+    s.take_events();
+    assert!(!s.width_is_held());
+    step(&mut s, &clock, 1.0);
+    let y = 20.0;
+    let places = s.drawn_tab_places();
+    let x = (0..1000)
+        .map(|x| x as f32)
+        .find(|x| {
+            matches!(
+                s.hit_test(at(*x, y)),
+                CaptionHit::Tab(_) | CaptionHit::TabClose(_)
+            ) && !places.iter().any(|b| *x >= b.x.0 && *x < b.x.0 + b.width.0)
+        })
+        .expect("a gap over a final tab");
+    press(&mut s, x, y, MouseButton::Middle);
+    assert!(!s.holds_mouse(), "nothing was pressed");
+    release(&mut s, x, y, MouseButton::Middle);
+    let events = s.take_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ShellEvent::CloseTabRequested(_))),
+        "{events:?}"
+    );
+    // On a drawn tab it still closes that tab.
+    let drawn = s.drawn_tab_places()[0];
+    let x = drawn.x.0 + 10.0;
+    let first = s.tab_id(0).unwrap();
+    press(&mut s, x, y, MouseButton::Middle);
+    release(&mut s, x, y, MouseButton::Middle);
+    assert!(
+        s.take_events()
+            .contains(&ShellEvent::CloseTabRequested(first))
+    );
+}
+
+// ---- S8: the reveal starts when the menu shows, and the document is not touched. ----
+
+#[test]
+fn the_reveal_starts_at_the_show_even_if_drawing_the_first_frame_took_time() {
+    let f = fixture(Some(true));
+    let clock = f.clock.clone();
+    f.window
+        .set_popup_renderers(move |width, height| {
+            // A slow first frame.
+            clock.set_ms(clock.now_ms() + 60.0);
+            let mut renderer = BitmapRenderer::new(width, height)?;
+            renderer.set_text_settings(TextSettings::reference())?;
+            Ok(Box::new(renderer) as Box<dyn Renderer>)
+        })
+        .unwrap();
+    f.window.open_menu(model(), anchor()).unwrap();
+    let popup = popups(f.hwnd())[0];
+    let shown = height(popup);
+    f.window.motion_tick().unwrap();
+    assert_eq!(
+        height(popup),
+        shown,
+        "the reveal lost the time spent drawing"
+    );
+    f.window.close_menu().unwrap();
+}
+
+#[test]
+fn opening_a_menu_marks_no_part_of_the_document_for_repaint() {
+    let f = fixture(Some(true));
+    let content = f.window.content_rect().unwrap();
+    f.window.invalidated_rects().unwrap();
+    f.window.open_menu(model(), anchor()).unwrap();
+    let top = content.y.0 as i32;
+    let touched: Vec<RECT> = f
+        .window
+        .invalidated_rects()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.bottom > top)
+        .collect();
+    assert!(touched.is_empty(), "{touched:?}");
+    f.window.close_menu().unwrap();
+}
+
+// ---- T1 to T6: a kept row never hides what the person works on. ----
+
+/// A row kept beyond its normal scroll limit: at the end of the scroll, after one X.
+fn kept_row() -> (TabStrip, f32, f32) {
+    let mut s = narrow_strip(40);
+    wheel_right(&mut s, 60);
+    let index = s.tabs().len() - 4;
+    let (x, y) = visible_x(&s, index);
+    click(&mut s, x, y, MouseButton::Left);
+    assert!(s.width_is_held());
+    (s, x, y)
+}
+fn in_view(s: &TabStrip) -> Vec<usize> {
+    (0..s.tabs().len())
+        .filter(|i| s.tab_shows_whole(*i))
+        .collect()
+}
+
+#[test]
+fn a_kept_row_never_shows_no_tabs_and_never_takes_the_selected_tab_out_of_view() {
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    s.select(ids[39]);
+    wheel_right(&mut s, 60);
+    let index = in_view(&s)[0];
+    let (x, y) = visible_x(&s, index);
+    for round in 0..30 {
+        if !matches!(s.hit_test(at(x, y)), CaptionHit::TabClose(_)) {
+            break;
+        }
+        click(&mut s, x, y, MouseButton::Left);
+        assert!(!in_view(&s).is_empty(), "round {round}: no tabs show");
+        assert!(
+            s.tab_shows_whole(s.active()),
+            "round {round}: the selected tab {} is out of view, {:?}",
+            s.active(),
+            s.tab_rects()[s.active()]
+        );
+    }
+}
+
+#[test]
+fn a_kept_row_with_the_selected_tab_scrolled_away_still_shows_some_tab() {
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    s.select(ids[0]);
+    wheel_right(&mut s, 60);
+    let index = in_view(&s)[0];
+    let (x, y) = visible_x(&s, index);
+    for round in 0..30 {
+        if !matches!(s.hit_test(at(x, y)), CaptionHit::TabClose(_)) {
+            break;
+        }
+        click(&mut s, x, y, MouseButton::Left);
+        assert!(!in_view(&s).is_empty(), "round {round}: no tabs show");
+    }
+}
+
+#[test]
+fn a_middle_click_on_a_cut_off_selected_tab_leaves_the_next_selected_tab_whole() {
+    let mut s = narrow_strip(40);
+    let ids = ids_of(&s);
+    s.select(ids[20]);
+    for _ in 0..30 {
+        if !s.tab_shows_whole(20) && s.tab_rects()[20].x.0 > 100.0 {
+            break;
+        }
+        event(
+            &mut s,
+            InputKind::Wheel {
+                at: at(200.0, 20.0),
+                delta_x: -1.0,
+                delta_y: 0.0,
+                modifiers: Modifiers::default(),
+            },
+        );
+    }
+    let cut = s.tab_rects()[20];
+    assert!(!s.tab_shows_whole(20) && cut.x.0 > 100.0, "{cut:?}");
+    click(&mut s, cut.x.0 + 10.0, 20.0, MouseButton::Middle);
+    assert_eq!(s.tabs().len(), 39);
+    assert!(
+        s.tab_shows_whole(s.active()),
+        "{:?}",
+        s.tab_rects()[s.active()]
+    );
+}
+
+#[test]
+fn a_new_frame_mode_ends_a_kept_row_for_good() {
+    let mut s = just_overflowing();
+    wheel_right(&mut s, 1);
+    let index = s.tabs().len() - 3;
+    let (x, y) = visible_x(&s, index);
+    click(&mut s, x, y, MouseButton::Left);
+    assert!(s.width_is_held());
+    s.set_maximized(true);
+    assert!(!s.width_is_held());
+    assert!(!s.overflow(), "the arrows stayed");
+    assert!(s.tab_rects()[0].x.0 >= 0.0, "{:?}", s.tab_rects()[0]);
+    s.pointer_left(&mut ViewContext::default());
+    assert!(!s.overflow());
+    assert!(s.tab_rects()[0].x.0 >= 0.0, "{:?}", s.tab_rects()[0]);
+}
+
+#[test]
+fn leaving_a_kept_row_rearranges_it() {
+    let (mut s, ..) = kept_row();
+    let kept_first = s.tab_rects()[0].x.0;
+    s.pointer_left(&mut ViewContext::default());
+    assert!(!s.width_is_held());
+    assert!(s.tab_rects()[0].x.0 > kept_first, "the row fell back");
+}
+
+#[test]
+fn a_wheel_or_an_arrow_on_a_kept_row_ends_the_keeping_first() {
+    for arrow in [false, true] {
+        let (mut s, ..) = kept_row();
+        let kept_first = s.tab_rects()[0].x.0;
+        if arrow {
+            let y = s.tab_rects()[0].y.0 + 10.0;
+            let x = (0..1000)
+                .map(|x| x as f32)
+                .find(|x| s.hit_test(at(*x, y)) == CaptionHit::ScrollRight)
+                .expect("the right arrow");
+            click(&mut s, x, y, MouseButton::Left);
+        } else {
+            wheel_right(&mut s, 1);
+        }
+        assert!(!s.width_is_held(), "arrow={arrow}");
+        // The normal limit holds again, and the row is what a plain row of 39 shows.
+        let mut plain = narrow_strip(39);
+        wheel_right(&mut plain, 60);
+        assert_eq!(
+            s.tab_rects()[0].x.0,
+            plain.tab_rects()[0].x.0,
+            "arrow={arrow}, kept at {kept_first}"
+        );
+    }
+}
+
+#[test]
+fn a_new_menu_that_fails_after_the_old_one_ended_still_ends_a_hold() {
+    let f = fixture(Some(true));
+    hold_then_menu(&f);
+    f.window.set_test_cursor(Some((-50, -50))).unwrap();
+    f.window.fail_next_menu().unwrap();
+    assert!(f.window.open_menu(model(), anchor()).is_err());
+    assert!(!f.window.menu_is_open().unwrap());
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "none");
+    assert!(!f.held(), "nothing is left to end this hold");
+    // With the pointer still on the row, a notice is on its way instead.
+    let f = fixture(Some(true));
+    hold_then_menu(&f);
+    f.window.fail_next_menu().unwrap();
+    assert!(f.window.open_menu(model(), anchor()).is_err());
+    assert_eq!(f.window.leave_notice_armed().unwrap(), "client");
 }

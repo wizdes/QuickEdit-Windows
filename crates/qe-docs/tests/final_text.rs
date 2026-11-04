@@ -25,7 +25,10 @@ fn cp1252(h: &mut Harness, path: &Path) -> DocId {
 fn mark_read_only(h: &mut Harness, path: &Path) {
     set_read_only(path, true);
     h.store.app_activated();
-    h.settle(Duration::from_millis(100));
+    h.until("the store to see the read-only mark", |h| {
+        let docs = h.store.all_documents();
+        docs.iter().any(|doc| h.store.file_has_read_only_mark(*doc))
+    });
 }
 
 /// No other opener may read or write the file while this lives, so a Save fails for real.

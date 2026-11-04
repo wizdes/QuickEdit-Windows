@@ -401,6 +401,22 @@ fn open_recent_with_damaged_data_says_so() {
 }
 
 #[test]
+fn a_bad_percent_escape_on_the_channel_gives_an_error_and_no_abort() {
+    let folder = Folder::new("bad-escape");
+    let mut app = App::start(&folder.root(), &[]);
+    for bad in ["%\u{20ac}", "%", "%4", "%zz", "\u{20ac}"] {
+        let answer = app.ask(&format!("open-recent-data {bad}"));
+        assert!(answer.starts_with("error"), "{bad:?}: {answer}");
+    }
+    // A route that takes the text as it comes also lives through it.
+    app.ask("note %\u{20ac}");
+    app.ok("open-recent-data 0041");
+    app.wait_value("the alert", App::alert);
+    app.press("OK");
+    app.quit();
+}
+
+#[test]
 fn rename_changes_the_file_and_the_tab() {
     let folder = Folder::new("rename");
     let file = folder.file("old.txt", b"words");

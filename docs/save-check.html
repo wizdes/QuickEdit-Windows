@@ -99,5 +99,5 @@ svg{width:100%;min-width:720px;display:block}
 <line x1="412" y1="754" x2="444" y2="754" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4"/><text x="452" y="758" class="leg">happens at a later Save</text>
 </svg>
 </div>
-<p class="note">Limit: another program's same-size write within one step of the file time, about 16 ms on NTFS, still goes unseen. When only the time moved, as it does for a file with a hidden data stream, the worker reads the file back and compares its bytes. A new file index does not count as an outside write. No real FAT or exFAT drive was tried.</p>
+<p class="note">Limit: another program's same-size write within one step of the file time, about 16 ms on NTFS, still goes unseen. When only the time moved, as it does for a file with a hidden data stream, the worker reads the file back and compares its bytes. A new file index does not count as an outside write. If it cannot read the file back, the text stays marked unsaved and a notice says so. No real FAT or exFAT drive was tried.</p>
 </div></body></html>

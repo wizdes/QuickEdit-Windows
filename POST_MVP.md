@@ -16,3 +16,4 @@
 - A different-size outside write right after a save leaves the document clean (`save_succeeded`, `not_ours`), so it can reload and drop the just-saved text from the view. Only a same-size write forces it dirty. Check whether this is intended.
 - A file too large to edit is refused for Save As onto its own name by name text only (`save_as`), so another name that reaches it is not refused there. Check what the large-copy path does in that case.
 - When a kept stamp no longer matches and the file also has a read-only mark, the Locked question comes before the changed question (`atomic_write_expecting`). Unlock can then clear a mark another program set.
+- A document saved through a `\\?\` path shows twice in Open Recent, once under each form of the name.

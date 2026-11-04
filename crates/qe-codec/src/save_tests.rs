@@ -1188,3 +1188,31 @@ fn a_file_holding_the_bytes_is_told_from_one_that_does_not() {
     differs[299_999] = 8;
     assert!(!file_holds_bytes(&path, &differs, stamp));
 }
+
+#[test]
+fn a_read_back_tells_same_different_and_could_not_check() {
+    let dir = scratch("read-back");
+    let path = dir.join("doc.txt");
+    fs::write(&path, b"mine").unwrap();
+    let stamp = file_stamp(&path).unwrap().unwrap();
+    assert_eq!(read_back(&path, b"mine", stamp), ReadBack::Same);
+    assert_eq!(read_back(&path, b"THEM", stamp), ReadBack::Different);
+    assert_eq!(
+        read_back(&dir.join("gone.txt"), b"mine", stamp),
+        ReadBack::Different
+    );
+    let held = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap()
+    };
+    assert!(matches!(
+        read_back(&path, b"mine", stamp),
+        ReadBack::CouldNotCheck(_)
+    ));
+    drop(held);
+    assert_eq!(read_back(&path, b"mine", stamp), ReadBack::Same);
+}

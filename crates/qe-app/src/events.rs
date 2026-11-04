@@ -970,9 +970,16 @@ impl App {
                 doc,
                 other_version,
                 backup_kept,
+                unconfirmed,
                 ..
             } => {
                 self.doc_changed(doc);
+                if unconfirmed {
+                    self.note(
+                        "QuickEdit wrote this file but could not read it back to confirm the save. Another program may be holding it. The document stays marked as unsaved, so save it again when the file is free."
+                            .to_owned(),
+                    );
+                }
                 if let Some(path) = other_version {
                     self.note(format!(
                         "Another program wrote to this file at the last moment. Its version is in {}.",

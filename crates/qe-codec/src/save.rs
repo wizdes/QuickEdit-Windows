@@ -1206,14 +1206,42 @@ pub fn stamp_after_swap(committed: FileStamp, observed: Option<FileStamp>) -> Op
     observed.filter(|now| now.0.same_content_stamp(&committed.0))
 }
 
-/// True when the file at `path` is still `seen` and holds exactly `bytes`. It reads the disk,
-/// so it belongs on a worker. A failed read counts as false.
-pub fn file_holds_bytes(path: &Path, bytes: &[u8], seen: FileStamp) -> bool {
-    if seen.0.size != bytes.len() as u64 {
-        return false;
+/// What reading a saved file back found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadBack {
+    /// The file is still as stamped, and holds exactly these bytes.
+    Same,
+    /// The file holds other bytes, has moved on from its stamp, or has gone.
+    Different,
+    /// Windows would not let it be read. The number is its error code.
+    CouldNotCheck(u32),
+}
+/// Compares the file with `bytes`. It reads the disk, so it belongs on a worker.
+pub fn read_back(path: &Path, bytes: &[u8], seen: FileStamp) -> ReadBack {
+    let mut tries = 0;
+    loop {
+        match read_back_once(path, bytes, seen) {
+            ReadBack::CouldNotCheck(code) if is_passing(code) && tries + 1 < TRIES => {
+                tries += 1;
+                std::thread::sleep(TRY_DELAY);
+            }
+            result => return result,
+        }
     }
-    let Ok(mut file) = File::open(path) else {
-        return false;
+}
+fn read_back_once(path: &Path, bytes: &[u8], seen: FileStamp) -> ReadBack {
+    fn trouble(error: &std::io::Error) -> ReadBack {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return ReadBack::Different;
+        }
+        ReadBack::CouldNotCheck(error.raw_os_error().map_or(0, |code| code as u32))
+    }
+    if seen.0.size != bytes.len() as u64 {
+        return ReadBack::Different;
+    }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => return trouble(&error),
     };
     let mut part = vec![0u8; 64 * 1024];
     let mut left = bytes;
@@ -1222,13 +1250,26 @@ pub fn file_holds_bytes(path: &Path, bytes: &[u8], seen: FileStamp) -> bool {
             Ok(0) => break,
             Ok(got) => match left.split_at_checked(got) {
                 Some((same, rest)) if same == &part[..got] => left = rest,
-                _ => return false,
+                _ => return ReadBack::Different,
             },
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
+            Err(error) => return trouble(&error),
         }
     }
-    left.is_empty() && matches!(file_stamp(path), Ok(Some(now)) if now == seen)
+    if !left.is_empty() {
+        return ReadBack::Different;
+    }
+    match file_stamp(path) {
+        Ok(Some(now)) if now == seen => ReadBack::Same,
+        Ok(_) => ReadBack::Different,
+        Err(_) => ReadBack::CouldNotCheck(0),
+    }
+}
+
+/// True when `read_back` finds the same bytes. A check that could not run counts as false,
+/// so a caller that must tell those apart uses `read_back`.
+pub fn file_holds_bytes(path: &Path, bytes: &[u8], seen: FileStamp) -> bool {
+    read_back(path, bytes, seen) == ReadBack::Same
 }
 
 /// A failed `PreparedCopy::try_commit`.

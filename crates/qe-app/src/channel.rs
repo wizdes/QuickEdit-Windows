@@ -46,15 +46,22 @@ pub fn encode(text: &str) -> String {
     }
     out
 }
+/// The value of `%XX` at the start of `bytes`, read from checked ASCII digits.
+fn escape_at(bytes: &[u8]) -> Option<u8> {
+    let [b'%', high, low, ..] = bytes else {
+        return None;
+    };
+    let digit = |byte: u8| char::from(byte).to_digit(16).filter(|_| byte.is_ascii());
+    let value = digit(*high)? * 16 + digit(*low)?;
+    u8::try_from(value).ok()
+}
+/// For commands that take any text. A `%` with no escape behind it stands for itself.
 pub fn decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'%'
-            && at + 2 < bytes.len()
-            && let Ok(value) = u8::from_str_radix(&text[at + 1..at + 3], 16)
-        {
+        if let Some(value) = escape_at(&bytes[at..]) {
             out.push(value);
             at += 3;
         } else {
@@ -63,6 +70,24 @@ pub fn decode(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+/// `decode` for commands where damaged text must be an error, as `encode` writes only ASCII.
+pub fn decode_strict(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(value) = escape_at(&bytes[at..]) {
+            out.push(value);
+            at += 3;
+        } else if bytes[at] == b'%' || !bytes[at].is_ascii() {
+            return Err(format!("bad escape at byte {at}"));
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "the escapes are not UTF-8".to_owned())
 }
 
 pub fn reply(text: &str) {
@@ -896,12 +921,15 @@ impl App {
                 }
                 _ => "error no window or row number".to_owned(),
             },
-            "open-recent-data" => {
-                if let Some(window) = window {
-                    self.open_recent(window, &decode(rest.first().copied().unwrap_or("")));
+            "open-recent-data" => match decode_strict(rest.first().copied().unwrap_or("")) {
+                Ok(data) => {
+                    if let Some(window) = window {
+                        self.open_recent(window, &data);
+                    }
+                    "ok".to_owned()
                 }
-                "ok".to_owned()
-            }
+                Err(problem) => format!("error {problem}"),
+            },
             "panels" => self.test_panels.len().to_string(),
             "panel-title" => self
                 .test_panels

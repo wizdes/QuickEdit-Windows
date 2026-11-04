@@ -1002,6 +1002,44 @@ impl App {
                 return;
             }
             "notes" => encode(&self.notes.join("\n")),
+            "doc-notices" => {
+                let doc = self.doc_in_use();
+                let notices = doc
+                    .and_then(|doc| self.docs.get(&doc))
+                    .map_or_else(String::new, |ui| ui.notices.join("\n"));
+                encode(&notices)
+            }
+            "hold-after-swap" => {
+                use std::os::windows::fs::OpenOptionsExt;
+                let path = PathBuf::from(decode(rest.first().copied().unwrap_or("")));
+                let faults = self.store.faults();
+                let slot = faults.clone();
+                let hook: Box<dyn Fn() + Send> = Box::new(move || {
+                    let held = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(&path);
+                    match (held, slot.held_file.lock()) {
+                        (Ok(file), Ok(mut place)) => *place = Some(file),
+                        (Err(error), _) => eprintln!("hold-after-swap: {error}"),
+                        (_, Err(error)) => eprintln!("hold-after-swap: {error}"),
+                    }
+                });
+                match faults.after_swap.lock() {
+                    Ok(mut place) => {
+                        *place = Some(hook);
+                        "ok".to_owned()
+                    }
+                    Err(error) => format!("error {error}"),
+                }
+            }
+            "release-hold" => match self.store.faults().held_file.lock() {
+                Ok(mut place) => {
+                    *place = None;
+                    "ok".to_owned()
+                }
+                Err(error) => format!("error {error}"),
+            },
             "marks" => {
                 let count = self
                     .doc_in_use()

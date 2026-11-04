@@ -975,10 +975,13 @@ impl App {
             } => {
                 self.doc_changed(doc);
                 if unconfirmed {
-                    self.note(
-                        "QuickEdit wrote this file but could not read it back to confirm the save. Another program may be holding it. The document stays marked as unsaved, so save it again when the file is free."
-                            .to_owned(),
+                    let text = format!(
+                        "QuickEdit wrote {} but could not read it back to confirm the save. Another program may be holding it. The document stays marked as unsaved, so save it again when the file is free.",
+                        self.store.display_name(doc)
                     );
+                    eprintln!("{text}");
+                    self.notes.push(text.clone());
+                    self.add_notice(doc, text);
                 }
                 if let Some(path) = other_version {
                     self.note(format!(

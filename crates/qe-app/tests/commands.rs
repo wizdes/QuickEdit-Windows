@@ -417,6 +417,34 @@ fn a_bad_percent_escape_on_the_channel_gives_an_error_and_no_abort() {
 }
 
 #[test]
+fn an_unconfirmed_save_names_the_file_on_its_own_tab() {
+    let folder = Folder::new("unconfirmed");
+    let file = folder.file("held file.txt", b"old");
+    std::fs::write(format!("{}:Zone.Identifier", file.display()), b"ZoneId=3").unwrap();
+    let mut app = App::start(&folder.root(), &[&file]);
+    app.wait_text("old");
+    app.type_text("x");
+    app.ok(&format!(
+        "hold-after-swap {}",
+        encode(&file.to_string_lossy())
+    ));
+    app.run("Save");
+    // The read back takes about half a second of retries, so the tab changes first.
+    app.run("NewTab");
+    app.wait_for("the notice", |app| app.notes().contains("held file.txt"));
+    assert!(
+        !decode(&app.ask("doc-notices")).contains("held file.txt"),
+        "the notice landed on another tab"
+    );
+    app.run("PreviousTab");
+    let notices = decode(&app.ask("doc-notices"));
+    assert!(notices.contains("held file.txt"), "{notices}");
+    assert!(notices.contains("read it back"), "{notices}");
+    app.ok("release-hold");
+    app.quit();
+}
+
+#[test]
 fn rename_changes_the_file_and_the_tab() {
     let folder = Folder::new("rename");
     let file = folder.file("old.txt", b"words");

@@ -947,7 +947,7 @@ fn a_short_hold_after_the_swap_is_waited_out() {
 }
 
 #[test]
-fn a_hold_that_lasts_keeps_the_text_dirty_says_so_and_asks_nothing_later() {
+fn a_hold_that_lasts_keeps_the_text_dirty_says_so_and_asks_at_the_next_save() {
     let folder = test_folder("fix5-long-hold");
     let path = folder.join("f.txt");
     write(&path, b"old");
@@ -966,12 +966,10 @@ fn a_hold_that_lasts_keeps_the_text_dirty_says_so_and_asks_nothing_later() {
     *held.lock().unwrap() = None;
     h.events.clear();
     h.store.save(doc).unwrap();
+    let question = open_question(&mut h, QuestionKind::ChangedOnDisk);
+    h.store.answer(question, Answer::SaveAnyway).unwrap();
     h.saved(doc);
-    assert!(
-        h.store.open_questions().is_empty(),
-        "no false changed question"
-    );
-    assert!(!h.store.is_dirty(doc));
+    assert!(!h.store.is_dirty(doc), "Save Anyway clears it");
     assert_eq!(std::fs::read(&path).unwrap(), b"xold");
 }
 
@@ -1237,4 +1235,139 @@ fn a_target_that_cannot_be_checked_asks_the_lossy_question() {
         .unwrap();
     open_question(&mut h, QuestionKind::LossyOverwrite);
     assert_eq!(std::fs::read(&path).unwrap(), LOSSY_UTF16);
+}
+
+// ---- The fourth review of the save checks.
+
+#[test]
+fn an_outside_write_under_a_lasting_hold_is_not_overwritten_silently() {
+    let folder = test_folder("fix6-write-under-hold");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    add_named_stream(&path);
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let held = HeldFile::default();
+    let (slot, target) = (held.clone(), path.clone());
+    *faults.after_swap.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(OUTSIDE_WAIT);
+        std::fs::write(&target, b"THEM").unwrap();
+        *slot.lock().unwrap() = Some(hold_exclusively(&target));
+    }));
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(was_unconfirmed(&h), "the notice still shows");
+    assert!(h.store.is_dirty(doc));
+    *held.lock().unwrap() = None;
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    let question = open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"THEM",
+        "the other program's bytes stay until the person agrees"
+    );
+    h.store.answer(question, Answer::SaveAnyway).unwrap();
+    h.saved(doc);
+    assert_eq!(std::fs::read(&path).unwrap(), b"xold");
+}
+
+/// A lossy document, and another file that exists, as bytes the document never saw.
+fn lossy_and_another_file(
+    name: &str,
+) -> (
+    Harness,
+    qe_docs::DocId,
+    std::path::PathBuf,
+    std::sync::Arc<qe_docs::Faults>,
+) {
+    let folder = test_folder(name);
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let other = folder.join("other.txt");
+    write(&other, b"another file");
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    (h, doc, other, faults)
+}
+
+#[test]
+fn a_changed_result_keeps_the_lossy_mark_when_the_target_was_not_known_to_be_own() {
+    use std::sync::atomic::Ordering;
+    let (mut h, doc, other, faults) = lossy_and_another_file("fix6-unsure-lossy");
+    faults.fail_target_check.store(5, Ordering::Relaxed);
+    h.store
+        .save_as(doc, other.clone(), Some(qe_api::TextEncoding::Utf8))
+        .unwrap();
+    let lossy = open_question(&mut h, QuestionKind::LossyOverwrite);
+    faults.fail_target_check.store(0, Ordering::Relaxed);
+    h.store.answer(lossy, Answer::Overwrite).unwrap();
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&other).unwrap(), b"another file");
+    assert!(
+        h.store.format(doc).unwrap().lossy,
+        "the document's own file was never touched, so its warning still holds"
+    );
+}
+
+#[test]
+fn a_changed_result_clears_the_lossy_mark_when_the_target_was_the_own_file() {
+    let (mut h, doc, path) = changed_during_lossy_save_as("fix6-sure-lossy");
+    open_question(&mut h, QuestionKind::ChangedOnDisk);
+    assert_eq!(std::fs::read(&path).unwrap(), b"an outside version");
+    assert!(!h.store.format(doc).unwrap().lossy);
+}
+
+#[test]
+fn a_repeated_save_that_ends_unconfirmed_still_gets_its_shutdown_copy() {
+    let folder = test_folder("fix6-repeat-unconfirmed");
+    let path = folder.join("f.txt");
+    write(&path, b"old");
+    add_named_stream(&path);
+    let (mut h, faults) = with_faults(&folder);
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let copies = h.store.session_end_copies().expect("a round of copies");
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(!h.store.is_dirty(doc), "the first save is confirmed");
+    let held = hold_after_swap(&faults, &path);
+    h.events.clear();
+    h.store.save(doc).unwrap();
+    h.saved(doc);
+    assert!(was_unconfirmed(&h));
+    assert!(copies.write().is_empty());
+    assert!(copy_holds(&folder, b"xold"), "the only copy was skipped");
+    drop(held);
+}
+
+#[test]
+fn save_as_onto_the_new_name_of_a_file_another_program_renamed_asks() {
+    let folder = test_folder("fix6-renamed");
+    let path = folder.join("f.txt");
+    write(&path, &LOSSY_UTF16);
+    let mut h = Harness::new(&folder.join("root"));
+    let doc = h.open(&path);
+    h.type_text(doc, "x");
+    let renamed = folder.join("renamed.txt");
+    std::fs::rename(&path, &renamed).unwrap();
+    h.store
+        .save_as(doc, renamed.clone(), Some(qe_api::TextEncoding::Utf8))
+        .unwrap();
+    open_question(&mut h, QuestionKind::LossyOverwrite);
+    assert_eq!(std::fs::read(&renamed).unwrap(), LOSSY_UTF16);
+}
+
+#[test]
+fn an_own_name_that_cannot_be_checked_asks_the_lossy_question() {
+    use std::sync::atomic::Ordering;
+    let (mut h, doc, other, faults) = lossy_and_another_file("fix6-own-name-error");
+    faults.fail_own_name_check.store(5, Ordering::Relaxed);
+    h.store
+        .save_as(doc, other.clone(), Some(qe_api::TextEncoding::Utf8))
+        .unwrap();
+    open_question(&mut h, QuestionKind::LossyOverwrite);
+    assert_eq!(std::fs::read(&other).unwrap(), b"another file");
 }

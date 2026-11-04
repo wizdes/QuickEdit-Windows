@@ -17,3 +17,8 @@
 - A file too large to edit is refused for Save As onto its own name by name text only (`save_as`), so another name that reaches it is not refused there. Check what the large-copy path does in that case.
 - When a kept stamp no longer matches and the file also has a read-only mark, the Locked question comes before the changed question (`atomic_write_expecting`). Unlock can then clear a mark another program set.
 - A document saved through a `\\?\` path shows twice in Open Recent, once under each form of the name.
+- The shutdown copy can be skipped in the milliseconds before the window handles a finished save.
+- A `TargetExists` leftover path is dropped in `map_save_error` when `expect_absent` is set.
+- `CouldNotCheck(0)`, from a failed stamp query during a read back, gets no retry.
+- `the_watch_stops_with_the_last_document_in_a_folder` and `ten_kills_in_the_middle_of_saves_leave_a_whole_file` failed under about 8 test programs at once. The cause is not proven.
+- `file_holds_bytes` has no caller outside tests.

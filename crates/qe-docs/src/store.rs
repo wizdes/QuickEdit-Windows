@@ -100,6 +100,12 @@ pub struct Faults {
     pub before_replace: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Called inside the codec's write, the moment after the swap.
     pub after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// A handle a test channel route keeps open, so that other openers are refused.
+    pub held_file: Mutex<Option<std::fs::File>>,
+    /// Non-zero: a Save As's look at its target fails with this Windows code.
+    pub fail_target_check: AtomicU32,
+    /// Non-zero: a Save As's look at the document's own name fails with this Windows code.
+    pub fail_own_name_check: AtomicU32,
     /// While true, a restore's read of an autosaved copy waits before it reads.
     pub hold_restore_load: AtomicBool,
     pub restore_load_is_held: AtomicBool,
@@ -538,6 +544,8 @@ struct Doc {
     /// The open dialog came from the first-edit encoding question, so its Cancel undoes.
     fit_panel_undoes: bool,
     pending_save_as: Option<PendingSaveAs>,
+    /// The running or last save's target was never shown to be this document's own file.
+    save_target_unsure: bool,
     unlocking: bool,
     panel_open: bool,
     /// The user said to quit without this document's unsaved text.
@@ -600,6 +608,8 @@ enum LoadKind {
 struct PendingSaveAs {
     target: (PathBuf, Option<TextEncoding>),
     own: Option<PathBuf>,
+    /// The worker could not tell whether the target is the document's own file.
+    unsure: bool,
 }
 
 /// How a Save As onto this document's own file is known.
@@ -611,6 +621,8 @@ enum OwnFile {
     AskIfSameFile,
     /// The worker has found it, or the person has answered about it.
     Known,
+    /// The worker could not tell, so the save is guarded as if it were the own file.
+    Unsure,
 }
 
 struct SaveDone {
@@ -700,8 +712,11 @@ enum SaveTrouble {
     Changed {
         new_text: Option<PathBuf>,
     },
-    /// Another name reaches the lossy file this document came from, and nothing was written.
-    OwnLossyFile,
+    /// Another name reaches the lossy file this document came from, or the worker could not
+    /// tell (`unsure`). Nothing was written.
+    OwnLossyFile {
+        unsure: bool,
+    },
     DoesNotFit,
     Locked,
     Other {
@@ -1383,6 +1398,7 @@ impl DocumentStore {
             asked_fit: false,
             fit_panel_undoes: false,
             pending_save_as: None,
+            save_target_unsure: false,
             unlocking: false,
             panel_open: false,
             quit_skip: false,
@@ -2562,6 +2578,11 @@ impl DocumentStore {
         self.events.push(DocEvent::Question(question));
     }
 
+    /// The test faults this store runs under.
+    pub fn faults(&self) -> Arc<Faults> {
+        self.config.faults.clone()
+    }
+
     /// The store's last look at this document's file found the read-only mark.
     pub fn file_has_read_only_mark(&self, doc: DocId) -> bool {
         self.docs
@@ -2599,6 +2620,7 @@ impl DocumentStore {
             Some(PendingSaveAs {
                 target: pending.target.clone(),
                 own: pending.own.clone(),
+                unsure: pending.unsure,
             })
         });
         if let Err(error) = self.apply_answer(&open, answer) {
@@ -2691,6 +2713,7 @@ impl DocumentStore {
                 if d.loading || d.reloading || d.saving {
                     return Err(self.busy(doc, "is busy with another file action"));
                 }
+                let unsure = d.pending_save_as.as_ref().is_some_and(|p| p.unsure);
                 // The file stays marked lossy until a save has really replaced it.
                 if let Some(target) = self.take_save_as_target(doc) {
                     let Some(d) = self.docs.get_mut(&doc) else {
@@ -2700,11 +2723,17 @@ impl DocumentStore {
                         d.pending_save_as = Some(PendingSaveAs {
                             target,
                             own: d.path.clone(),
+                            unsure,
                         });
                         self.ask_changed_on_disk(doc);
                         return Ok(());
                     }
-                    self.start_save_of(doc, Some(target), false, OwnFile::Known)?;
+                    let own_file = if unsure {
+                        OwnFile::Unsure
+                    } else {
+                        OwnFile::Known
+                    };
+                    self.start_save_of(doc, Some(target), false, own_file)?;
                 } else {
                     self.save_with(doc, true)?;
                 }
@@ -2945,6 +2974,7 @@ impl DocumentStore {
         doc: DocId,
         path: PathBuf,
         encoding: TextEncoding,
+        unsure: bool,
     ) {
         let Some(d) = self.docs.get_mut(&doc) else {
             return;
@@ -2955,6 +2985,7 @@ impl DocumentStore {
         d.pending_save_as = Some(PendingSaveAs {
             target: (path, Some(encoding)),
             own: d.path.clone(),
+            unsure,
         });
     }
 
@@ -3021,6 +3052,7 @@ impl DocumentStore {
             d.pending_save_as = Some(PendingSaveAs {
                 target: (path, encoding),
                 own: d.path.clone(),
+                unsure: false,
             });
             self.ask_lossy_overwrite(doc);
             return Ok(());
@@ -3191,7 +3223,8 @@ impl DocumentStore {
         };
         // A save to its own file expects the file as it was read. `force` is the user's
         // answer to the question about that.
-        let is_own = same_file || own_file == OwnFile::Known;
+        let is_own = same_file || matches!(own_file, OwnFile::Known | OwnFile::Unsure);
+        d.save_target_unsure = own_file == OwnFile::Unsure;
         let expected = if is_own && !force { d.stamp } else { None };
         let expect_absent = is_own && !force && d.file_state == FileState::Deleted;
         let own_check = (own_file == OwnFile::AskIfSameFile && !same_file).then(|| OwnFileCheck {
@@ -3272,19 +3305,23 @@ impl DocumentStore {
                     remove_save_temp(&path, temp);
                 }
                 // Another program has replaced the file the lossy question was about. From here
-                // the changed question guards what is there.
-                if let Some(d) = self.docs.get_mut(&doc) {
-                    d.format.lossy = false;
-                }
+                // the changed question guards what is there. A target that was never shown to be
+                // that file says nothing about it, so its warning stays.
+                let unsure = self.docs.get_mut(&doc).is_some_and(|d| {
+                    if !d.save_target_unsure {
+                        d.format.lossy = false;
+                    }
+                    d.save_target_unsure
+                });
                 // Only a lossy Save As answer gets here with `save_as`. Its Save Anyway must
                 // still write what the dialog chose.
                 if save_as {
-                    self.keep_save_as_unless_newer_save(doc, path, format.encoding);
+                    self.keep_save_as_unless_newer_save(doc, path, format.encoding, unsure);
                 }
                 self.ask_changed_on_disk(doc);
             }
-            Err(SaveTrouble::OwnLossyFile) => {
-                self.keep_save_as_unless_newer_save(doc, path, format.encoding);
+            Err(SaveTrouble::OwnLossyFile { unsure }) => {
+                self.keep_save_as_unless_newer_save(doc, path, format.encoding, unsure);
                 self.ask_lossy_overwrite(doc);
             }
             Err(SaveTrouble::DoesNotFit) => {
@@ -3366,7 +3403,9 @@ impl DocumentStore {
             let why = match trouble {
                 SaveTrouble::Other { error, .. } => error.message.clone(),
                 SaveTrouble::Changed { .. } => "another program changed the file.".to_owned(),
-                SaveTrouble::OwnLossyFile => "it could lose some of the file's text.".to_owned(),
+                SaveTrouble::OwnLossyFile { .. } => {
+                    "it could lose some of the file's text.".to_owned()
+                }
                 SaveTrouble::DoesNotFit => "its encoding cannot hold this text.".to_owned(),
                 SaveTrouble::Locked => "it has the read-only mark.".to_owned(),
             };
@@ -3406,7 +3445,7 @@ impl DocumentStore {
         let not_ours = done.base.is_none_or(|b| b.size != done.written) || done.stamp.is_none();
         // A session-end copy may be skipped only for text that is really on disk. An earlier
         // Save's claim ends with this one, because that text has been replaced as well.
-        if not_ours || done.unconfirmed {
+        if not_ours {
             d.saved_below.store(0, Ordering::Release);
         } else {
             d.saved_below.fetch_max(revision + 1, Ordering::AcqRel);
@@ -6004,8 +6043,10 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
     }
     if let Some(check) = job.own_check {
         hold_while(&job.faults.hold_save, &job.faults.save_is_held);
-        if may_reach_own_file(job.path, check) {
-            return Err(SaveTrouble::OwnLossyFile);
+        match own_file_reach(job.path, check, job.faults) {
+            OwnFileReach::No => {}
+            OwnFileReach::Yes => return Err(SaveTrouble::OwnLossyFile { unsure: false }),
+            OwnFileReach::CannotTell => return Err(SaveTrouble::OwnLossyFile { unsure: true }),
         }
     }
     let code = job.faults.save_error_code.load(Ordering::Relaxed);
@@ -6101,21 +6142,39 @@ fn run_save(job: &SaveJob<'_>) -> Result<SaveDone, SaveTrouble> {
 /// Whether `target` is, or cannot be shown not to be, the document's own file. The file the
 /// document last saw counts, and so does whatever is under its name now, since another
 /// program may have replaced it. A name with no file there cannot be the document's own.
-fn may_reach_own_file(target: &Path, check: &OwnFileCheck) -> bool {
-    let target = match file_base(target) {
+fn own_file_reach(target: &Path, check: &OwnFileCheck, faults: &Faults) -> OwnFileReach {
+    let failed = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            OwnFileReach::No
+        } else {
+            OwnFileReach::CannotTell
+        }
+    };
+    let query = |path: &Path, fault: &AtomicU32| match fault.load(Ordering::Relaxed) {
+        0 => file_base(path),
+        code => Err(std::io::Error::from_raw_os_error(code as i32)),
+    };
+    let target = match query(target, &faults.fail_target_check) {
         Ok((base, _)) => base.identity,
-        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+        Err(error) => return failed(error),
     };
     if check.identity == Some(target) {
-        return true;
+        return OwnFileReach::Yes;
     }
     let Some(own) = &check.path else {
-        return false;
+        return OwnFileReach::No;
     };
-    match file_base(own) {
-        Ok((base, _)) => base.identity == target,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    match query(own, &faults.fail_own_name_check) {
+        Ok((base, _)) if base.identity == target => OwnFileReach::Yes,
+        Ok(_) => OwnFileReach::No,
+        Err(error) => failed(error),
     }
+}
+
+enum OwnFileReach {
+    No,
+    Yes,
+    CannotTell,
 }
 
 /// What a save may keep of what it saw after the swap.
@@ -6127,7 +6186,7 @@ struct AfterSwap {
 
 /// Same size and time as its temp file is enough. Otherwise the file is read back, because
 /// copying a named stream or the file system itself can move the time. A file that cannot be
-/// read is neither ours nor another program's, so its stamp stays and the save says so.
+/// read keeps no stamp, and the save says so.
 fn after_swap(
     path: &Path,
     bytes: &[u8],
@@ -6147,8 +6206,10 @@ fn after_swap(
     match read_back(path, bytes, seen) {
         ReadBack::Same => trusted(Some(seen)),
         ReadBack::Different => trusted(None),
+        // The stamp just seen may be another program's write, so it earns no trust. The next
+        // Save asks.
         ReadBack::CouldNotCheck(_) => AfterSwap {
-            stamp: Some(seen),
+            stamp: None,
             unconfirmed: true,
         },
     }
